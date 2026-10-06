@@ -646,7 +646,7 @@ public class ContainerBuilder {
         public Builder withEmbeddedDns() {
             embeddedDnsServer.getServerIp().ifPresent(flociIp -> {
                 dnsServers.add(flociIp);
-                if (config.dns().containerFallbackEnabled()) {
+                if (!embeddedDnsServer.isolated() && config.dns().containerFallbackEnabled()) {
                     for (String fallback : config.dns().containerFallbackServers()) {
                         if (fallback != null && !fallback.isBlank() && !dnsServers.contains(fallback.trim())) {
                             dnsServers.add(fallback.trim());

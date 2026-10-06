@@ -134,6 +134,12 @@ Provide credentials for private registries (e.g. for Lambda base images). Use in
 
 ## DNS
 
+`FLOCI_NETWORK_CONFIG_FILE` selects the YAML/JSON file for
+[network isolation and simulated HTTP(S) services](workload-network.md). Isolation defaults to
+disabled in the network file.
+Configured network workloads receive `FLOCI_CA_BUNDLE`, pointing to their read-only public CA
+certificate; applications choose how to add it to their TLS trust configuration.
+
 Floci's embedded DNS server always resolves the following wildcard suffixes to Floci's container IP — no configuration required:
 
 | Built-in suffix | Covers |

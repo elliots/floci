@@ -54,7 +54,7 @@ AWS credentials are always `test` / `test` / `us-east-1`.
 ## Opt-in packaged on-demand runtime tests
 
 `tests/test_on_demand_runtime.py` contains all eight on-demand compatibility cases, using one
-packaged Floci process, one gateway, and `fixtures/on-demand-workloads.yaml`. Kubernetes/HTTP
+packaged Floci process, one gateway, and `fixtures/on-demand.yaml`. Kubernetes/HTTP
 cases use real pods in a Floci-created k3s cluster; ECS/gRPC cases use real ECS-managed Docker
 containers. Both use boto3 for AWS management and SQS, and gRPC cases also use grpcio. Each runtime
 fixture creates and deletes its own AWS resources. The gRPC test image remains cached locally.
@@ -71,8 +71,8 @@ mkdir -p /tmp/floci-on-demand-live
 # OrbStack makes container addresses reachable from a macOS host through .orb.local.
 # On other hosts, choose an address that reaches the k3s NodePort from Floci's process.
 sed 's/eks-on-demand-live:30080/eks-on-demand-live.orb.local:30080/' \
-  compatibility-tests/sdk-test-python/tests/fixtures/on-demand-workloads.yaml \
-  > /tmp/floci-on-demand-live/workloads.yaml
+  compatibility-tests/sdk-test-python/tests/fixtures/on-demand.yaml \
+  > /tmp/floci-on-demand-live/on-demand.yaml
 
 FLOCI_PORT=14566 \
 FLOCI_BASE_URL=http://127.0.0.1:14566 \
@@ -84,7 +84,7 @@ FLOCI_SERVICES_EKS_ECR_REGISTRY_MIRROR=false \
 FLOCI_SERVICES_EKS_EMBEDDED_DNS=false \
 FLOCI_SERVICES_EKS_POD_IDENTITY_WEBHOOK=false \
 FLOCI_ON_DEMAND_ENABLED=true \
-FLOCI_ON_DEMAND_CONFIG_FILE=/tmp/floci-on-demand-live/workloads.yaml \
+FLOCI_ON_DEMAND_CONFIG_FILE=/tmp/floci-on-demand-live/on-demand.yaml \
 FLOCI_ON_DEMAND_GATEWAY_PORT=18080 \
 java --enable-native-access=ALL-UNNAMED -jar target/quarkus-app/quarkus-run.jar
 ```
@@ -106,7 +106,8 @@ The k3s control plane must remain running after the application scales down. ECS
 verify compressed binary messages and metadata, trailers and errors, all four RPC types,
 per-stream cancellation, task protection, fresh tasks after restart, SQS activity, and deadlines.
 The ECS backend uses a fixed Docker host port 15051. Override
-`FLOCI_ON_DEMAND_TEST_ECS_BACKEND_PORT` and the workload file together if that port is occupied.
+`FLOCI_ON_DEMAND_TEST_ECS_BACKEND_PORT` and the on-demand configuration file together if that port
+is occupied.
 
 The same tests can target the native Docker image. Stop the JVM process first, then run:
 
@@ -115,15 +116,15 @@ make native native-image NATIVE_IMAGE=floci:on-demand-native
 mkdir -p /tmp/floci-on-demand-live
 # The native container reaches the ECS task's published port through the Docker host.
 sed 's/127.0.0.1:15051/host.docker.internal:15051/' \
-  compatibility-tests/sdk-test-python/tests/fixtures/on-demand-workloads.yaml \
-  > /tmp/floci-on-demand-live/native-workloads.yaml
+  compatibility-tests/sdk-test-python/tests/fixtures/on-demand.yaml \
+  > /tmp/floci-on-demand-live/native-on-demand.yaml
 docker network create floci-on-demand-live
 docker run -d --rm --name floci-on-demand-native-check \
   --network floci-on-demand-live \
   --add-host=host.docker.internal:host-gateway \
   -p 127.0.0.1:14566:4566 -p 127.0.0.1:18080:18080 \
   -v /var/run/docker.sock:/var/run/docker.sock \
-  -v /tmp/floci-on-demand-live/native-workloads.yaml:/app/workloads.yaml:ro \
+  -v /tmp/floci-on-demand-live/native-on-demand.yaml:/app/on-demand.yaml:ro \
   -e FLOCI_BASE_URL=http://127.0.0.1:14566 \
   -e FLOCI_DOCKER_RESOURCE_NAMESPACE=on-demand-live \
   -e FLOCI_SERVICES_EKS_DOCKER_NETWORK=floci-on-demand-live \
@@ -132,7 +133,7 @@ docker run -d --rm --name floci-on-demand-native-check \
   -e FLOCI_SERVICES_EKS_EMBEDDED_DNS=false \
   -e FLOCI_SERVICES_EKS_POD_IDENTITY_WEBHOOK=false \
   -e FLOCI_ON_DEMAND_ENABLED=true \
-  -e FLOCI_ON_DEMAND_CONFIG_FILE=/app/workloads.yaml \
+  -e FLOCI_ON_DEMAND_CONFIG_FILE=/app/on-demand.yaml \
   -e FLOCI_ON_DEMAND_GATEWAY_HOST=0.0.0.0 \
   -e FLOCI_ON_DEMAND_GATEWAY_PORT=18080 \
   -e FLOCI_SECURITY_ALLOW_UNSAFE_NETWORK_EXPOSURE=true \

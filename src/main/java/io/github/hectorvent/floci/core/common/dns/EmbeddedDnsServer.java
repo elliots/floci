@@ -4,6 +4,8 @@ import io.github.hectorvent.floci.config.EmulatorConfig;
 import io.github.hectorvent.floci.config.TlsConfigSource;
 import io.github.hectorvent.floci.core.common.RegionResolver;
 import io.github.hectorvent.floci.core.common.docker.ContainerDetector;
+import io.github.hectorvent.floci.runtime.network.NetworkConfiguration;
+import io.github.hectorvent.floci.runtime.network.NetworkDefinition;
 import io.quarkus.runtime.Startup;
 import io.vertx.core.Vertx;
 import io.vertx.core.buffer.Buffer;
@@ -93,6 +95,8 @@ public class EmbeddedDnsServer {
     private final Iterable<DnsRecordSource> recordSources;
     private final Iterable<DnsForwardingRuleSource> forwardingRuleSources;
     private final Iterable<DnsClientVpcSource> clientVpcSources;
+    private final NetworkDefinition network;
+    private final NetworkConfiguration networkConfiguration;
 
     EmbeddedDnsServer(List<String> suffixes) {
         this(suffixes, List.of());
@@ -119,8 +123,21 @@ public class EmbeddedDnsServer {
     }
 
     EmbeddedDnsServer(List<String> suffixes, Iterable<DnsRecordSource> recordSources,
+                      NetworkConfiguration configuration) {
+        this(suffixes, recordSources, List.of(), List.of(), configuration);
+    }
+
+    EmbeddedDnsServer(List<String> suffixes, Iterable<DnsRecordSource> recordSources,
                       Iterable<DnsForwardingRuleSource> forwardingRuleSources,
                       Iterable<DnsClientVpcSource> clientVpcSources) {
+        this(suffixes, recordSources, forwardingRuleSources, clientVpcSources, null);
+    }
+
+    private EmbeddedDnsServer(List<String> suffixes, Iterable<DnsRecordSource> recordSources,
+                              Iterable<DnsForwardingRuleSource> forwardingRuleSources,
+                              Iterable<DnsClientVpcSource> clientVpcSources, NetworkConfiguration configuration) {
+        networkConfiguration = configuration;
+        network = configuration == null ? NetworkDefinition.DISABLED : configuration.network();
         this.suffixes.addAll(BUILTIN_SUFFIXES);
         this.suffixes.addAll(suffixes);
         this.recordSources = recordSources;
@@ -128,14 +145,23 @@ public class EmbeddedDnsServer {
         this.clientVpcSources = clientVpcSources;
     }
 
-    @Inject
     public EmbeddedDnsServer(EmulatorConfig config, ContainerDetector containerDetector, Vertx vertx,
                              Instance<DnsRecordSource> recordSources,
                              Instance<DnsForwardingRuleSource> forwardingRuleSources,
                              Instance<DnsClientVpcSource> clientVpcSources) {
+        this(config, containerDetector, vertx, recordSources, forwardingRuleSources, clientVpcSources, null);
+    }
+
+    @Inject
+    public EmbeddedDnsServer(EmulatorConfig config, ContainerDetector containerDetector, Vertx vertx,
+                             Instance<DnsRecordSource> recordSources,
+                             Instance<DnsForwardingRuleSource> forwardingRuleSources,
+                             Instance<DnsClientVpcSource> clientVpcSources, NetworkConfiguration networkConfig) {
         this.recordSources = recordSources;
         this.forwardingRuleSources = forwardingRuleSources;
         this.clientVpcSources = clientVpcSources;
+        network = networkConfig == null ? NetworkDefinition.DISABLED : networkConfig.network();
+        networkConfiguration = networkConfig;
         if (!containerDetector.isRunningInContainer()) {
             return;
         }
@@ -174,6 +200,10 @@ public class EmbeddedDnsServer {
 
     public Optional<String> getServerIp() {
         return Optional.ofNullable(serverIp);
+    }
+
+    public boolean isolated() {
+        return network.isolated();
     }
 
     // ── packet handling ───────────────────────────────────────────────────────
@@ -239,7 +269,8 @@ public class EmbeddedDnsServer {
         return false;
     }
 
-    List<String> resolveARecord(String name, String myIp) {
+    /** Resolves only local records, without forwarding to any upstream resolver. */
+    public List<String> resolveARecord(String name, String myIp) {
         return resolveARecordWithOwnership(name, myIp)
                 .map(DnsAnswer::addresses).orElse(List.of());
     }
@@ -282,9 +313,27 @@ public class EmbeddedDnsServer {
      * hosted zone that matches the same name.
      */
     QueryPlan planQuery(String name, String clientAddress, String myIp, int type) {
+        QueryPlan plan = planNetworkQuery(name, clientAddress, myIp, type);
+        if (network.isolated()) {
+            LOG.infov("Network DNS source={0} name={1} type={2} outcome={3}", clientAddress, name, type,
+                    plan.answer().map(answer -> answer.nameExists() ? "local" : "denied").orElse("denied"));
+        }
+        return plan;
+    }
+
+    private QueryPlan planNetworkQuery(String name, String clientAddress, String myIp, int type) {
+        if (network.owns(name) || networkConfiguration != null && networkConfiguration.gatewayAddress().isPresent()
+                && "network.floci.internal".equalsIgnoreCase(name)) {
+            return QueryPlan.answering(networkConfiguration == null || networkConfiguration.gatewayAddress().isEmpty()
+                    ? DnsAnswer.nxDomain() : type == 1
+                    ? DnsAnswer.records(List.of(networkConfiguration.gatewayAddress().orElseThrow()), 0) : DnsAnswer.noData());
+        }
         Optional<DnsAnswer> emulatorName = resolveEmulatorName(name, myIp, type);
         if (emulatorName.isPresent()) {
             return QueryPlan.answering(emulatorName.orElseThrow());
+        }
+        if (network.isolated()) {
+            return QueryPlan.answering(resolveFromRecordSources(name, type).orElse(DnsAnswer.nxDomain()));
         }
         // A rule steers the name whatever the query asks about it, so this is deliberately not
         // gated on the record type: the raw query is relayed to the rule's resolvers as it stands.

@@ -8,7 +8,7 @@ import io.github.hectorvent.floci.core.common.docker.ContainerSpec;
 import io.github.hectorvent.floci.runtime.ondemand.ActivationCoordinator;
 import io.github.hectorvent.floci.runtime.ondemand.ActivationCoordinator.RequestLease;
 import io.github.hectorvent.floci.runtime.ondemand.ActivationCoordinator.State;
-import io.github.hectorvent.floci.runtime.ondemand.WorkloadConfigLoader;
+import io.github.hectorvent.floci.runtime.ondemand.OnDemandConfigLoader;
 import io.github.hectorvent.floci.runtime.ondemand.WorkloadDefinition;
 import io.github.hectorvent.floci.runtime.ondemand.WorkloadRuntime;
 import io.github.hectorvent.floci.runtime.ondemand.WorkloadRuntimeFactory;
@@ -135,7 +135,7 @@ class OnDemandEc2DockerIntegrationTest {
             instance.setDockerContainerId(containerId);
             instance.setState(InstanceState.running());
             ec2.putInstanceForTest(instance);
-            Path file = directory.resolve("workloads.yaml");
+            Path file = directory.resolve("on-demand.yaml");
             Files.writeString(file, """
                     workloads:
                       smoke:
@@ -145,7 +145,7 @@ class OnDemandEc2DockerIntegrationTest {
                           instance-id: %s
                           backend-url: %s
                     """.formatted(instanceId, backend));
-            WorkloadDefinition definition = WorkloadConfigLoader.load(file, "000000000000", "us-east-1").getFirst();
+            WorkloadDefinition definition = OnDemandConfigLoader.load(file, "000000000000", "us-east-1").getFirst();
             WorkloadRuntime runtime = factory.create(definition);
             runtime.stop(Duration.ofSeconds(40));
             AtomicLong time = new AtomicLong();

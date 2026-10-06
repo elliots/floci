@@ -186,6 +186,7 @@ public class TimestreamInfluxDbContainerManager implements ContainerTeardown {
     }
 
     public void restart(String containerId) {
+        lifecycleManager.prepareNetworkStart(containerId);
         lifecycleManager.getDockerClient().restartContainerCmd(containerId).exec();
     }
 

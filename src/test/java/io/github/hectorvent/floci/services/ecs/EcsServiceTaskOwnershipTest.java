@@ -13,6 +13,8 @@ import io.github.hectorvent.floci.services.ecs.model.ContainerInstance;
 import io.github.hectorvent.floci.services.ecs.model.EcsTask;
 import io.github.hectorvent.floci.services.ecs.model.LaunchType;
 import org.junit.jupiter.api.Test;
+import org.junit.jupiter.params.ParameterizedTest;
+import org.junit.jupiter.params.provider.ValueSource;
 
 import java.time.Instant;
 import java.util.HashMap;
@@ -40,6 +42,30 @@ class EcsServiceTaskOwnershipTest {
 
     private static final String REGION = "us-east-1";
     private static final String OTHER_REGION = "us-west-2";
+
+    @ParameterizedTest
+    @ValueSource(booleans = {true, false})
+    void deletingServiceStopsProtectedTasksIncludingAfterScaleToZero(boolean force) {
+        EcsService service = newMockModeService();
+        service.createCluster("protected-delete", REGION);
+        registerTaskDef(service);
+        service.createService("protected-delete", "api", "own-fam", 1, LaunchType.FARGATE, List.of(), null, REGION);
+        service.reconcileServices();
+        EcsTask task = ownedTasks(service, "protected-delete", "api").getFirst();
+        service.updateTaskProtection("protected-delete", List.of(task.getTaskArn()), true, 120, REGION);
+        if (!force) {
+            service.updateService("protected-delete", "api", null, 0, null, REGION);
+            service.reconcileServices();
+            assertEquals("RUNNING", task.getLastStatus());
+        }
+        assertEquals("INACTIVE", service.deleteService("protected-delete", "api", force, REGION).getStatus());
+        assertEquals("STOPPED", task.getLastStatus());
+        assertEquals("STOPPED", task.getDesiredStatus());
+        assertEquals("Service deleted", task.getStoppedReason());
+        assertEquals(EcsService.STOP_CODE_SERVICE_SCHEDULER_INITIATED, task.getStopCode());
+        service.reconcileServices();
+        assertTrue(ownedTasks(service, "protected-delete", "api").isEmpty());
+    }
 
     @Test
     void protectedServiceTasksSurviveScaleInUntilProtectionExpiresOrIsCleared() {

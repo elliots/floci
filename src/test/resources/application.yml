@@ -19,11 +19,12 @@ floci:
     gateway-host: 127.0.0.1
     gateway-port: 0
     reconcile-interval-millis: 1000
-    max-concurrent-starts: 4
+    max-concurrent-starts: 4                # Start/scale commands only; readiness waits release the slot
     max-pending-requests: 1024
     max-pending-requests-per-workload: 64
   base-url: "http://localhost:4566"
   network:
+    # config-file:                         # network YAML/JSON; isolation defaults to disabled
     security-group-enforcement:
       enabled: true
       helper-image: floci/network-helper:local

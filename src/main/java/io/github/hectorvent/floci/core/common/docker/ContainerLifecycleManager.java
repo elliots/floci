@@ -22,12 +22,14 @@ import com.github.dockerjava.api.model.MountType;
 import com.github.dockerjava.api.model.Ports;
 import com.github.dockerjava.core.command.WaitContainerResultCallback;
 import io.github.hectorvent.floci.config.ContainerCaBundle;
-import io.github.hectorvent.floci.config.EmulatorConfig;
 import io.github.hectorvent.floci.config.EmulatorConfig.EcsServiceConfig.ImagePullBehavior;
-import io.github.hectorvent.floci.services.lambda.launcher.ImageCacheService;
+import io.github.hectorvent.floci.config.EmulatorConfig;
+import io.github.hectorvent.floci.runtime.network.NetworkIsolationManager;
 import io.github.hectorvent.floci.services.lambda.launcher.ImageCacheService.LaunchImage;
+import io.github.hectorvent.floci.services.lambda.launcher.ImageCacheService;
 import io.quarkus.runtime.annotations.RegisterForReflection;
 import jakarta.enterprise.context.ApplicationScoped;
+import jakarta.enterprise.inject.Instance;
 import jakarta.inject.Inject;
 import org.apache.commons.compress.archivers.tar.TarArchiveEntry;
 import org.apache.commons.compress.archivers.tar.TarArchiveOutputStream;
@@ -84,6 +86,7 @@ public class ContainerLifecycleManager {
     private final ContainerDetector containerDetector;
     private final PortAllocator portAllocator;
     private final EmulatorConfig config;
+    private final Instance<NetworkIsolationManager> networkIsolation;
 
     /** Volumes whose shared-ownership root has already been initialised this process (run-once guard). */
     private final ConcurrentHashMap<String, Boolean> initializedSharedVolumes = new ConcurrentHashMap<>();
@@ -91,17 +94,24 @@ public class ContainerLifecycleManager {
     /** Daemon CPU count, resolved on first use. Null until then, so that empty can mean "unknown". */
     private final AtomicReference<OptionalInt> hostCpuCount = new AtomicReference<>();
 
-    @Inject
     public ContainerLifecycleManager(DockerClient dockerClient,
                                      ImageCacheService imageCacheService,
                                      ContainerDetector containerDetector,
                                      PortAllocator portAllocator,
                                      EmulatorConfig config) {
+        this(dockerClient, imageCacheService, containerDetector, portAllocator, config, null);
+    }
+
+    @Inject
+    public ContainerLifecycleManager(DockerClient dockerClient, ImageCacheService imageCacheService,
+                                     ContainerDetector containerDetector, PortAllocator portAllocator,
+                                     EmulatorConfig config, Instance<NetworkIsolationManager> networkIsolation) {
         this.dockerClient = dockerClient;
         this.imageCacheService = imageCacheService;
         this.containerDetector = containerDetector;
         this.portAllocator = portAllocator;
         this.config = config;
+        this.networkIsolation = networkIsolation;
     }
 
     /**
@@ -162,6 +172,14 @@ public class ContainerLifecycleManager {
 
     private String create(ContainerSpec spec, String resolvedImage, String platform) {
         String containerId = createWithCaBundle(spec, resolvedImage, platform);
+        if (networkIsolation != null) {
+            try {
+                networkIsolation.get().created(containerId, spec);
+            } catch (RuntimeException e) {
+                removeIfExists(containerId);
+                throw e;
+            }
+        }
         if (spec.hasNetworkConfiguration()) {
             try {
                 attachNetworkBeforeStart(containerId, spec);
@@ -179,19 +197,25 @@ public class ContainerLifecycleManager {
 
         // Built once: a dynamic port binding allocates its host port here.
         HostConfig hostConfig = buildHostConfig(spec);
+        List<String> environment = spec.env();
+        if (networkIsolation != null) {
+            NetworkIsolationManager isolation = networkIsolation.get();
+            isolation.prepare(spec, hostConfig);
+            environment = isolation.environment(spec);
+        }
         Optional<Path> caBundle = ContainerCaBundle.hostPath(config);
         if (caBundle.isEmpty()) {
-            return createContainer(spec, resolvedImage, platform, hostConfig, spec.env());
+            return createContainer(spec, resolvedImage, platform, hostConfig, environment);
         }
         String containerId = createContainer(spec, resolvedImage, platform, hostConfig,
-                ContainerCaBundle.appendEnv(spec.env()));
+                ContainerCaBundle.appendEnv(environment));
         if (copyCaBundle(containerId, caBundle.get())) {
             return containerId;
         }
         // SSL_CERT_FILE and friends replace the image's trust store, so they must never name a
         // file that is not there. Start over without them: the container keeps its own trust.
         dockerClient.removeContainerCmd(containerId).withForce(true).exec();
-        return createContainer(spec, resolvedImage, platform, hostConfig, spec.env());
+        return createContainer(spec, resolvedImage, platform, hostConfig, environment);
     }
 
     private String createContainer(ContainerSpec spec, String resolvedImage, String platform,
@@ -384,7 +408,8 @@ public class ContainerLifecycleManager {
         LOG.infov("Started container {0}", containerId);
 
         if (spec.networkMode() != null && !spec.networkMode().isBlank()
-                && spec.publishesPorts() && !spec.hasNetworkConfiguration()) {
+                && spec.publishesPorts() && !spec.hasNetworkConfiguration()
+                && (networkIsolation == null || !networkIsolation.get().active())) {
             try {
                 dockerClient.connectToNetworkCmd()
                         .withContainerId(containerId)
@@ -417,6 +442,17 @@ public class ContainerLifecycleManager {
         return new ContainerInfo(info.containerId(), info.endpoints(), publishedHostPorts);
     }
 
+    /** Enforces the network boundary before a start or restart. */
+    public void prepareNetworkStart(String containerId) {
+        if (networkIsolation != null) {
+            networkIsolation.get().beforeStart(containerId);
+        }
+    }
+
+    public boolean hasPendingPodAdmission(String containerId) {
+        return networkIsolation != null && networkIsolation.get().hasPendingPodAdmission(containerId);
+    }
+
     /**
      * Starts {@code containerId}, treating "already running" as success and translating
      * crun/runc's kernel-keyring-quota error into a message that names the actual cause and a fix,
@@ -432,10 +468,11 @@ public class ContainerLifecycleManager {
      * Letting it escape would turn a recovered blip into a hard launch failure, the exact bug
      * the retry exists to remove.
      *
-     * <p>Package-private so tests can verify a given call site routes through this translation
+     * <p>Shared by service managers so each call site routes through this translation
      * rather than a raw {@code dockerClient.startContainerCmd(...)} call.
      */
-    void startContainer(String containerId) {
+    public void startContainer(String containerId) {
+        prepareNetworkStart(containerId);
         try {
             dockerClient.startContainerCmd(containerId).exec();
         } catch (NotModifiedException alreadyRunning) {
@@ -871,6 +908,7 @@ public class ContainerLifecycleManager {
      */
     public ContainerInfo adopt(String containerId, List<Integer> ports) {
         LOG.infov("Adopting existing container {0}", containerId);
+        prepareNetworkStart(containerId);
 
         InspectContainerResponse inspect = dockerClient.inspectContainerCmd(containerId).exec();
         boolean running = Boolean.TRUE.equals(inspect.getState().getRunning());

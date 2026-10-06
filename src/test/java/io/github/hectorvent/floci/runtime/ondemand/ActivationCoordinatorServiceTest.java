@@ -6,6 +6,7 @@ import io.github.hectorvent.floci.runtime.ondemand.OnDemandTestSupport.FakeRunti
 import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.Test;
 
+import java.net.URI;
 import java.util.ArrayDeque;
 import java.util.List;
 import java.util.concurrent.AbstractExecutorService;
@@ -213,6 +214,84 @@ class ActivationCoordinatorServiceTest {
         coordinator.reconcile("other", false, true);
         assertEquals(State.SLEEPING, coordinator.state("other"));
         assertEquals(0, sleeping.starts.get());
+    }
+
+    @Test
+    void stoppedQueueConsumerRestartsWithoutWaitingForTheQueueToEmpty() {
+        register(List.of("orders-incoming"));
+        coordinator.reconcile("orders", true, true);
+        executor.runNext();
+        runtime.running = false;
+        runtime.backend = URI.create("http://localhost:8082");
+        coordinator.reconcile("orders", true, true);
+        assertEquals(State.STARTING, coordinator.state("orders"));
+        assertNull(coordinator.backend("orders"));
+        executor.runNext();
+        assertEquals(State.READY, coordinator.state("orders"));
+        assertEquals(runtime.backend, coordinator.backend("orders"));
+        assertEquals(2, runtime.starts.get());
+    }
+
+    @Test
+    void stoppedHttpWorkloadBecomesUnhealthyAndTheNextRequestRestartsIt() {
+        register(List.of());
+        RequestLease first = coordinator.acquire("orders");
+        executor.runNext();
+        runtime.running = false;
+        coordinator.reconcile("orders", false, true);
+        assertEquals(State.FAILED, coordinator.state("orders"));
+        assertFalse(coordinator.canReportSleepingHealth("orders"));
+        assertTrue(coordinator.acquireHealth("orders").isEmpty());
+        assertEquals(0, executor.tasks.size(), "Health checks and reconciliation alone must not restart it");
+        RequestLease next = coordinator.acquire("orders");
+        assertFalse(next.ready().isDone());
+        executor.runNext();
+        assertEquals(runtime.backend, next.ready().join());
+        assertEquals(2, runtime.starts.get(), "An older request's lease must not prevent recovery");
+        first.close();
+        next.close();
+    }
+
+    @Test
+    void failedLivenessInspectionDoesNotStopOrRestartARunningWorkload() {
+        FakeRuntime unavailable = new FakeRuntime() {
+            @Override
+            public boolean isRunning() {
+                throw new IllegalStateException("Control plane unavailable");
+            }
+        };
+        coordinator.register(OnDemandTestSupport.definition("orders", unavailable.backend, List.of()), unavailable);
+        RequestLease first = coordinator.acquire("orders");
+        executor.runNext();
+        first.close();
+        advance(600);
+        coordinator.reconcile("orders", false, true);
+        assertEquals(State.READY, coordinator.state("orders"));
+        assertEquals(0, executor.tasks.size());
+    }
+
+    @Test
+    void oldLivenessResultCannotInvalidateACompletedStopAndRestart() {
+        FakeRuntime racing = new FakeRuntime() {
+            @Override
+            public boolean isRunning() {
+                coordinator.tick("orders");
+                executor.runNext();
+                RequestLease next = coordinator.acquire("orders");
+                executor.runNext();
+                next.close();
+                return false;
+            }
+        };
+        coordinator.register(OnDemandTestSupport.definition("orders", racing.backend, List.of()), racing);
+        RequestLease first = coordinator.acquire("orders");
+        executor.runNext();
+        first.close();
+        advance(120);
+        coordinator.reconcile("orders", false, true);
+        assertEquals(State.READY, coordinator.state("orders"));
+        assertEquals(racing.backend, coordinator.backend("orders"));
+        assertEquals(2, racing.starts.get());
     }
 
     @Test

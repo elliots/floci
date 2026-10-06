@@ -59,7 +59,7 @@ public class OnDemandService implements Resettable {
             return;
         }
         validateSettings();
-        definitions = WorkloadConfigLoader.load(Path.of(config.onDemand().configFile()
+        definitions = OnDemandConfigLoader.load(Path.of(config.onDemand().configFile()
                 .orElseThrow(() -> new IllegalArgumentException("floci.on-demand.config-file is required"))),
                 config.defaultAccountId(), config.defaultRegion());
         startCoordinator();

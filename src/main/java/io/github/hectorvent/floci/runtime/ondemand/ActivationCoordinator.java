@@ -155,25 +155,46 @@ public final class ActivationCoordinator implements AutoCloseable {
                 entry.idleSince = nanoTime.getAsLong();
             }
         }
-        if (state(id) == State.UNKNOWN) {
-            try {
-                boolean running = entry.runtime.isRunning();
-                synchronized (entry) {
-                    if (entry.state == State.UNKNOWN && !running) {
-                        entry.state = State.SLEEPING;
-                    }
-                }
-                if (running) {
-                    ensureStarted(entry);
-                }
-            } catch (RuntimeException e) {
-                LOG.debugv("Cannot inspect on-demand workload {0}: {1}", id, e.getMessage());
-            }
-        }
+        boolean inspected = inspectRuntime(entry);
         if (queueActive) {
             ensureStarted(entry);
         }
-        tick(id);
+        if (inspected) {
+            tick(id);
+        }
+    }
+
+    private boolean inspectRuntime(Entry entry) {
+        State observed;
+        CompletableFuture<URI> transition;
+        synchronized (entry) {
+            observed = entry.state;
+            transition = entry.transition;
+            if (closed || (observed != State.UNKNOWN && observed != State.READY)) {
+                return true;
+            }
+        }
+        boolean running;
+        try {
+            running = entry.runtime.isRunning();
+        } catch (RuntimeException e) {
+            LOG.debugv("Cannot inspect on-demand workload {0}: {1}", entry.definition.id(), e.getMessage());
+            return false;
+        }
+        synchronized (entry) {
+            if (closed || entry.state != observed || entry.transition != transition) {
+                return true;
+            }
+            if (!running) {
+                entry.state = observed == State.UNKNOWN ? State.SLEEPING : State.FAILED;
+                entry.backend = null;
+                entry.idleSince = nanoTime.getAsLong();
+            }
+        }
+        if (running && observed == State.UNKNOWN) {
+            ensureStarted(entry);
+        }
+        return true;
     }
 
     public void tick(String id) {
@@ -266,15 +287,23 @@ public final class ActivationCoordinator implements AutoCloseable {
     }
 
     private void start(Entry entry, CompletableFuture<URI> starting, long deadline) {
-        boolean permit = false;
         try {
-            permit = starts.tryAcquire(remaining(deadline).toNanos(), TimeUnit.NANOSECONDS);
-            if (!permit || closed) {
+            entry.runtime.prepareStart(remaining(deadline));
+            if (!starts.tryAcquire(remaining(deadline).toNanos(), TimeUnit.NANOSECONDS)) {
                 throw new IllegalStateException("On-demand startup capacity timeout");
             }
-            entry.runtime.start(remaining(deadline));
+            try {
+                if (closed) {
+                    throw new IllegalStateException("On-demand runtime is shutting down");
+                }
+                entry.runtime.start(remaining(deadline));
+            } finally {
+                starts.release();
+            }
+            entry.runtime.awaitReady(remaining(deadline));
             URI backend = entry.runtime.backend();
             readiness.await(entry.definition, backend, remaining(deadline));
+            remaining(deadline);
             synchronized (entry) {
                 if (closed) {
                     throw new IllegalStateException("On-demand runtime is shutting down");
@@ -295,10 +324,6 @@ public final class ActivationCoordinator implements AutoCloseable {
             }
             starting.completeExceptionally(e);
             LOG.warnv(e, "Could not activate on-demand workload {0}", entry.definition.id());
-        } finally {
-            if (permit) {
-                starts.release();
-            }
         }
     }
 

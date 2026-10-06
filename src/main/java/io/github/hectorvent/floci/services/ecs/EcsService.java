@@ -2775,8 +2775,10 @@ public class EcsService implements ContainerTeardown, ResourceProvider, Resettab
                 .filter(t -> !TaskStatus.STOPPED.name().equals(t.getLastStatus()))
                 .forEach(t -> {
                     try {
-                        stopTask(cluster.getClusterName(), t.getTaskArn(), "Service deleted",
-                                STOP_CODE_SERVICE_SCHEDULER_INITIATED, region);
+                        synchronized (t) {
+                            // Deletion is explicit teardown, so scale-in protection must not orphan the task.
+                            stopTaskLocked(t, "Service deleted", STOP_CODE_SERVICE_SCHEDULER_INITIATED, region);
+                        }
                     } catch (Exception e) {
                         LOG.warnv("Failed to stop task {0} on service delete: {1}",
                                 t.getTaskArn(), e.getMessage());

@@ -13,7 +13,14 @@ import java.util.List;
 
 import static org.junit.jupiter.api.Assertions.*;
 
-class WorkloadConfigLoaderServiceTest {
+class OnDemandConfigLoaderServiceTest {
+    @Test
+    void rejectsNetworkConfigurationInTheOnDemandFile() throws Exception {
+        ObjectMapper mapper = new ObjectMapper(new YAMLFactory());
+        assertThrows(IllegalArgumentException.class, () -> OnDemandConfigLoader.parse(
+                mapper.readTree("workloads: {}\nnetwork: {}"), "000000000000", "us-east-1"));
+    }
+
     private static final String CONFIG = """
             workloads:
               orders:
@@ -36,9 +43,9 @@ class WorkloadConfigLoaderServiceTest {
 
     @Test
     void loadsExplicitWorkloadsAndDefaultsWithoutReflectingRecords(@TempDir Path directory) throws Exception {
-        Path file = directory.resolve("workloads.yaml");
+        Path file = directory.resolve("on-demand.yaml");
         Files.writeString(file, CONFIG);
-        WorkloadDefinition definition = WorkloadConfigLoader.load(file, "123456789012", "cn-north-1").getFirst();
+        WorkloadDefinition definition = OnDemandConfigLoader.load(file, "123456789012", "cn-north-1").getFirst();
         assertEquals("123456789012", definition.accountId());
         assertEquals("cn-north-1", definition.region());
         assertEquals(Duration.ofSeconds(120), definition.idleTimeout());
@@ -199,6 +206,6 @@ class WorkloadConfigLoaderServiceTest {
     }
 
     private List<WorkloadDefinition> parse(String yaml) throws Exception {
-        return WorkloadConfigLoader.parse(new ObjectMapper(new YAMLFactory()).readTree(yaml), "000000000000", "us-east-1");
+        return OnDemandConfigLoader.parse(new ObjectMapper(new YAMLFactory()).readTree(yaml), "000000000000", "us-east-1");
     }
 }

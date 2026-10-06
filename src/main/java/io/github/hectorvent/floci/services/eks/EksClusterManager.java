@@ -935,7 +935,8 @@ public class EksClusterManager
                 disableSslVerification(https);
             }
             int code = conn.getResponseCode();
-            return code == 200 || code == 401 || code == 403;
+            return (code == 200 || code == 401 || code == 403)
+                    && !lifecycleManager.hasPendingPodAdmission(cluster.getContainerId());
         } catch (Exception e) {
             return false;
         }

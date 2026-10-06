@@ -985,7 +985,7 @@ public class Ec2ContainerManager {
         instance.setState(InstanceState.pending());
         executor.submit(() -> {
             try {
-                dockerClient.startContainerCmd(containerId).exec();
+                lifecycleManager.startContainer(containerId);
                 boolean running = false;
                 for (int i = 0; i < 20 && !running; i++) {
                     running = lifecycleManager.isContainerRunning(containerId);
@@ -1402,6 +1402,7 @@ public class Ec2ContainerManager {
         }
         executor.submit(() -> {
             try {
+                lifecycleManager.prepareNetworkStart(containerId);
                 dockerClient.restartContainerCmd(containerId).exec();
                 LOG.infov("Rebooted EC2 container {0}", containerId);
             } catch (Exception e) {
