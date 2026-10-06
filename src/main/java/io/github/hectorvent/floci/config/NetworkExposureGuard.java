@@ -67,7 +67,7 @@ public class NetworkExposureGuard {
         return QUARKUS_DEFAULT_HOST;
     }
 
-    static void requireConsent(String host, EmulatorConfig.SecurityConfig security) {
+    public static void requireConsent(String host, EmulatorConfig.SecurityConfig security) {
         if (!isValidHost(host)) {
             throw new IllegalStateException("Refusing to listen on malformed host: " + host);
         }
