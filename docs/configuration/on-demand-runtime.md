@@ -17,14 +17,18 @@ plane stays running while application deployments scale to zero.
 
 ```bash
 export FLOCI_ON_DEMAND_ENABLED=true
-export FLOCI_ON_DEMAND_CONFIG_FILE=/path/to/workloads.yaml
+export FLOCI_ON_DEMAND_CONFIG_FILE=/path/to/on-demand.yaml
 export JAVA_HOME=/path/to/jdk-25
 ./mvnw quarkus:dev
 ```
 
-The workload file accepts YAML or JSON. Floci validates and reads it at startup. Restart Floci
-after changing the file. Resource identifiers can refer to resources created later by your normal
-deployment workflow; a missing resource fails activation and can be retried after provisioning.
+The on-demand configuration file accepts YAML or JSON. Floci validates and reads it at startup.
+Restart Floci after changing the file. Resource identifiers can refer to resources created later
+by your normal deployment workflow; a missing resource fails activation and can be retried after
+provisioning.
+
+Configure [network isolation and simulated third-party origins](workload-network.md) with
+`FLOCI_NETWORK_CONFIG_FILE`. Network routes can call this gateway through a backend URL.
 
 ```yaml
 workloads:
@@ -110,7 +114,7 @@ Tasks holding active ECS task scale-in protection keep the workload awake, and t
 respects protection during scale-in and deployment replacement. Use the standard
 `UpdateTaskProtection` API for work continuing after an RPC response or queue acknowledgement;
 clear protection when that work finishes. Protection defaults to 120 minutes and honors its expiry.
-A deliberate `StopTask` can still stop a protected task. ECS restarts create new tasks and containers;
+A deliberate `StopTask` or service deletion can still stop a protected task. ECS restarts create new tasks and containers;
 keep durable state in mounted volumes or external stores.
 
 ```yaml
@@ -228,8 +232,19 @@ need another activity signal or must remain outside this facility.
 Ordinary requests, response streams, WebSockets, and queue activity prevent idle shutdown. A
 request arriving during shutdown waits for shutdown to finish and the next startup to become
 ready. Concurrent requests share startup, and readiness and pending-request capacity are bounded.
+The concurrent-start limit applies only while submitting start or scale commands. Runtime and
+application readiness checks run after the slot is released, so a starting application can call another
+sleeping workload even when the limit is one. No dependency declarations are required. More
+workloads than this limit may be warming up simultaneously. One startup deadline covers lifecycle
+preparation, waiting for a launch slot, the start command, and both readiness checks.
 Gateway startup failures return 503; a request exceeding its startup deadline returns 504. Backend
 connection/stream failures return 502, or close a response whose headers were already sent.
+
+Reconciliation also checks whether a ready workload is still running. If it has stopped, Floci
+discards its backend address and marks it failed. Queue work or the next application request
+activates it again and resolves a fresh backend address. Health probes do not trigger recovery,
+and requests already sent to the old backend are not replayed. A failed runtime inspection defers
+idle shutdown until its state can be checked again.
 
 Kubernetes deployments scale to zero, retaining Services and persistent volumes. Shutdown waits
 for matching pods to disappear, including terminating pods, before a subsequent activation starts.
@@ -251,11 +266,11 @@ current replica count for adoption on the next startup.
 | Variable | Default | Meaning |
 |---|---|---|
 | `FLOCI_ON_DEMAND_ENABLED` | `false` | Enable the runtime and application gateway |
-| `FLOCI_ON_DEMAND_CONFIG_FILE` | unset | Required workload YAML/JSON file |
+| `FLOCI_ON_DEMAND_CONFIG_FILE` | unset | Required on-demand YAML/JSON configuration file |
 | `FLOCI_ON_DEMAND_GATEWAY_HOST` | `127.0.0.1` | Application gateway bind address |
 | `FLOCI_ON_DEMAND_GATEWAY_PORT` | `8080` | Application gateway port, separate from AWS API port |
 | `FLOCI_ON_DEMAND_RECONCILE_INTERVAL_MILLIS` | `1000` | Queue and idle reconciliation cadence, minimum 100 ms |
-| `FLOCI_ON_DEMAND_MAX_CONCURRENT_STARTS` | `4` | Concurrent runtime startup/readiness operations |
+| `FLOCI_ON_DEMAND_MAX_CONCURRENT_STARTS` | `4` | Concurrent start/scale commands; readiness waits do not hold a slot |
 | `FLOCI_ON_DEMAND_MAX_PENDING_REQUESTS` | `1024` | Global maximum requests waiting for startup |
 | `FLOCI_ON_DEMAND_MAX_PENDING_REQUESTS_PER_WORKLOAD` | `64` | Maximum pending requests per workload |
 

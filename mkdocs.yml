@@ -91,6 +91,7 @@ nav:
     - TLS / HTTPS: configuration/tls.md
     - Initialization Hooks: configuration/initialization-hooks.md
     - On-demand Application Runtime: configuration/on-demand-runtime.md
+    - Workload Network Isolation: configuration/workload-network.md
     - Advanced:
       - application.yml Reference: configuration/advanced/application-yml.md
   - Services:

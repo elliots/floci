@@ -3,6 +3,8 @@ package io.github.hectorvent.floci.runtime.ondemand;
 import com.fasterxml.jackson.databind.JsonNode;
 import io.github.hectorvent.floci.core.common.AwsArnUtils;
 import io.github.hectorvent.floci.core.common.RequestScopes;
+import io.github.hectorvent.floci.runtime.network.NetworkConfiguration;
+import io.github.hectorvent.floci.runtime.ondemand.WorkloadDefinition.RuntimeType;
 import io.github.hectorvent.floci.services.ec2.Ec2Service;
 import io.github.hectorvent.floci.services.ec2.model.Instance;
 import io.github.hectorvent.floci.services.ecs.EcsService;
@@ -34,6 +36,7 @@ public class WorkloadRuntimeFactory {
     private final EcsService ecs;
     private final EksService eks;
     private final EksClusterManager clusters;
+    private final NetworkConfiguration network;
     private record ClusterClient(String containerId, KubernetesApiClient client) {}
 
     private final Map<String, ClusterClient> clusterClients = new ConcurrentHashMap<>();
@@ -46,9 +49,15 @@ public class WorkloadRuntimeFactory {
         this(ec2, kubernetes, eks, clusters, null);
     }
 
-    @Inject
     public WorkloadRuntimeFactory(Ec2Service ec2, KubernetesApiClient kubernetes, EksService eks,
                                   EksClusterManager clusters, EcsService ecs) {
+        this(ec2, kubernetes, eks, clusters, ecs, null);
+    }
+
+    @Inject
+    public WorkloadRuntimeFactory(Ec2Service ec2, KubernetesApiClient kubernetes, EksService eks,
+                                  EksClusterManager clusters, EcsService ecs, NetworkConfiguration network) {
+        this.network = network;
         this.ec2 = ec2;
         this.ecs = ecs;
         this.kubernetes = kubernetes;
@@ -63,6 +72,11 @@ public class WorkloadRuntimeFactory {
     }
 
     public WorkloadRuntime create(WorkloadDefinition definition) {
+        if (network != null && network.network().isolated()
+                && definition.type() == RuntimeType.KUBERNETES && definition.clusterName() == null) {
+            throw new IllegalArgumentException("Network isolation requires Floci-managed EKS clusters; external Kubernetes "
+                    + "clusters need a separate enforcement integration");
+        }
         return switch (definition.type()) {
             case EC2 -> new Ec2Runtime(definition);
             case ECS -> new EcsRuntime(definition);
@@ -88,17 +102,23 @@ public class WorkloadRuntimeFactory {
         }
 
         @Override
-        public void start(Duration timeout) throws Exception {
-            String state = instance().getState().getName();
-            if ("pending".equals(state)) {
-                awaitState("running", timeout);
-            } else if ("stopping".equals(state)) {
+        public void prepareStart(Duration timeout) throws Exception {
+            if ("stopping".equals(instance().getState().getName())) {
                 awaitState("stopped", timeout);
             }
-            if (!isRunning()) {
+        }
+
+        @Override
+        public void start(Duration timeout) {
+            String state = instance().getState().getName();
+            if (!"running".equals(state) && !"pending".equals(state)) {
                 RequestScopes.runAs(definition.accountId(), definition.region(),
                         () -> ec2.startInstances(definition.region(), List.of(definition.target())));
             }
+        }
+
+        @Override
+        public void awaitReady(Duration timeout) throws Exception {
             awaitState("running", timeout);
         }
 
@@ -208,8 +228,12 @@ public class WorkloadRuntimeFactory {
         }
 
         @Override
-        public void start(Duration timeout) throws Exception {
+        public void start(Duration timeout) {
             scale(definition.replicas());
+        }
+
+        @Override
+        public void awaitReady(Duration timeout) throws Exception {
             await(() -> {
                 EcsServiceModel service = service();
                 return tasks(service).stream().filter(task -> TaskStatus.RUNNING.name().equals(task.getLastStatus()))
@@ -282,8 +306,12 @@ public class WorkloadRuntimeFactory {
         }
 
         @Override
-        public void start(Duration timeout) throws Exception {
+        public void start(Duration timeout) {
             client().scaleDeployment(definition.namespace(), definition.target(), definition.replicas());
+        }
+
+        @Override
+        public void awaitReady(Duration timeout) throws Exception {
             await(() -> {
                 JsonNode node = deployment();
                 return node.path("status").path("observedGeneration").asLong()

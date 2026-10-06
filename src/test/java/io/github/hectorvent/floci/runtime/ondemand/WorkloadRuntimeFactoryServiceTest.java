@@ -2,6 +2,8 @@ package io.github.hectorvent.floci.runtime.ondemand;
 
 import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
+import io.github.hectorvent.floci.runtime.network.NetworkConfiguration;
+import io.github.hectorvent.floci.runtime.network.NetworkDefinition;
 import io.github.hectorvent.floci.runtime.ondemand.WorkloadDefinition.BackendProtocol;
 import io.github.hectorvent.floci.runtime.ondemand.WorkloadDefinition.RuntimeType;
 import io.github.hectorvent.floci.services.ec2.Ec2Service;
@@ -20,21 +22,34 @@ import io.github.hectorvent.floci.services.lambda.launcher.kubernetes.Kubernetes
 import org.junit.jupiter.api.Test;
 
 import java.net.URI;
-import java.time.Instant;
 import java.time.Duration;
+import java.time.Instant;
 import java.util.List;
 import java.util.Map;
 import java.util.Optional;
 import java.util.concurrent.CountDownLatch;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
+import java.util.concurrent.Future;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
 
 import static org.awaitility.Awaitility.await;
-
 import static org.junit.jupiter.api.Assertions.*;
 import static org.mockito.Mockito.*;
 
 class WorkloadRuntimeFactoryServiceTest {
+    @Test
+    void refusesExternalKubernetesWhenTheNetworkPolicyCannotProtectIt() {
+        NetworkConfiguration network = mock(NetworkConfiguration.class);
+        when(network.network()).thenReturn(new NetworkDefinition(true, List.of()));
+        WorkloadRuntimeFactory isolated = new WorkloadRuntimeFactory(ec2, kubernetes, null, null, null, network);
+        WorkloadDefinition definition = OnDemandTestSupport.definition("orders", URI.create("http://orders:8080"), List.of());
+        assertThrows(IllegalArgumentException.class, () -> isolated.create(definition));
+        when(network.network()).thenReturn(NetworkDefinition.DISABLED);
+        assertNotNull(isolated.create(definition));
+    }
+
     private final Ec2Service ec2 = mock(Ec2Service.class);
     private final KubernetesApiClient kubernetes = mock(KubernetesApiClient.class);
     private final WorkloadRuntimeFactory factory = new WorkloadRuntimeFactory(ec2, kubernetes);
@@ -66,7 +81,7 @@ class WorkloadRuntimeFactoryServiceTest {
             task.setDesiredStatus(update.getDesiredCount() == 0 ? "STOPPED" : "RUNNING");
             return service;
         });
-        WorkloadDefinition definition = WorkloadConfigLoader.parse(new ObjectMapper().readTree("""
+        WorkloadDefinition definition = OnDemandConfigLoader.parse(new ObjectMapper().readTree("""
                 {"workloads":{"orders":{"account-id":"123456789012","region":"cn-north-1",
                 "host":"orders.test","runtime":{"type":"ecs","cluster-name":"cluster",
                 "service":"Orders_API","backend-url":"http://stable-backend:9000"}}}}
@@ -76,10 +91,12 @@ class WorkloadRuntimeFactoryServiceTest {
         Container container = new Container();
         container.setHealthStatus("UNKNOWN");
         task.setContainers(List.of(container));
-        assertThrows(IllegalStateException.class, () -> runtime.start(Duration.ofMillis(100)),
+        runtime.start(Duration.ofMillis(100));
+        assertThrows(IllegalStateException.class, () -> runtime.awaitReady(Duration.ofMillis(100)),
                 "RUNNING alone is insufficient while a configured container health check is unknown");
         container.setHealthStatus("HEALTHY");
         runtime.start(Duration.ofSeconds(1));
+        runtime.awaitReady(Duration.ofSeconds(1));
         assertTrue(runtime.isRunning());
         assertEquals(definition.backendUrl(), runtime.backend());
         task.setProtectionEnabled(true);
@@ -109,6 +126,7 @@ class WorkloadRuntimeFactoryServiceTest {
             assertFalse(stopping.isAlive());
             assertFalse(runtime.isRunning());
             runtime.start(Duration.ofSeconds(1));
+            runtime.awaitReady(Duration.ofSeconds(1));
             verify(ecs, times(4)).updateService(any(UpdateServiceRequest.class), eq("cn-north-1"));
         } finally {
             stopping.interrupt();
@@ -119,7 +137,7 @@ class WorkloadRuntimeFactoryServiceTest {
     @Test
     void ecsRejectsMissingInactiveDaemonAndExternalServices() throws Exception {
         EcsService ecs = mock(EcsService.class);
-        WorkloadDefinition definition = WorkloadConfigLoader.parse(new ObjectMapper().readTree("""
+        WorkloadDefinition definition = OnDemandConfigLoader.parse(new ObjectMapper().readTree("""
                 {"workloads":{"worker":{"queues":["events"],"runtime":{"type":"ecs","service":"worker"}}}}
                 """), "000000000000", "us-east-1").getFirst();
         WorkloadRuntime runtime = new WorkloadRuntimeFactory(ec2, kubernetes, null, null, ecs).create(definition);
@@ -160,10 +178,12 @@ class WorkloadRuntimeFactoryServiceTest {
         WorkloadRuntime runtime = factory.create(definition);
         assertFalse(runtime.isRunning());
         runtime.start(Duration.ofSeconds(1));
+        runtime.awaitReady(Duration.ofSeconds(1));
         assertEquals(URI.create("http://172.18.0.10:9000"), runtime.backend());
         runtime.stop(Duration.ofSeconds(1));
         instance.setContainerBridgeIp("172.18.0.20");
         runtime.start(Duration.ofSeconds(1));
+        runtime.awaitReady(Duration.ofSeconds(1));
         assertEquals(URI.create("http://172.18.0.20:9000"), runtime.backend());
         verify(ec2, times(2)).startInstances("cn-north-1", List.of("i-1234"));
         verify(ec2).stopInstances("cn-north-1", List.of("i-1234"));
@@ -180,9 +200,13 @@ class WorkloadRuntimeFactoryServiceTest {
                 {"metadata":{"generation":4},"spec":{"replicas":1},
                  "status":{"observedGeneration":4,"replicas":1,"availableReplicas":1}}
                 """);
+        JsonNode starting = mapper.readTree("""
+                {"metadata":{"generation":4},"spec":{"replicas":1},
+                 "status":{"observedGeneration":3,"replicas":0,"availableReplicas":0}}
+                """);
         when(kubernetes.getDeployment("default", "orders")).thenReturn(Optional.of(stopped));
         doAnswer(invocation -> {
-            when(kubernetes.getDeployment("default", "orders")).thenReturn(Optional.of(ready));
+            when(kubernetes.getDeployment("default", "orders")).thenReturn(Optional.of(starting));
             return null;
         }).when(kubernetes).scaleDeployment("default", "orders", 1);
         doAnswer(invocation -> {
@@ -193,6 +217,9 @@ class WorkloadRuntimeFactoryServiceTest {
         WorkloadRuntime runtime = factory.create(definition);
         assertFalse(runtime.isRunning());
         runtime.start(Duration.ofSeconds(1));
+        assertThrows(IllegalStateException.class, () -> runtime.awaitReady(Duration.ofMillis(10)));
+        when(kubernetes.getDeployment("default", "orders")).thenReturn(Optional.of(ready));
+        runtime.awaitReady(Duration.ofSeconds(1));
         assertTrue(runtime.isRunning());
         assertEquals(definition.backendUrl(), runtime.backend());
         runtime.stop(Duration.ofSeconds(1));
@@ -272,6 +299,48 @@ class WorkloadRuntimeFactoryServiceTest {
     }
 
     @Test
+    void ec2PreparesForThePreviousStopAndSubmitsStartWithoutWaitingForRunning() throws Exception {
+        Instance instance = new Instance();
+        instance.setState(InstanceState.stopping());
+        CountDownLatch inspected = new CountDownLatch(1);
+        when(ec2.findInstanceForAccount("000000000000", "us-east-1", "i-launch")).thenAnswer(invocation -> {
+            inspected.countDown();
+            return Optional.of(instance);
+        });
+        doAnswer(invocation -> {
+            instance.setState(InstanceState.pending());
+            return List.of();
+        }).when(ec2).startInstances("us-east-1", List.of("i-launch"));
+        WorkloadDefinition definition = OnDemandConfigLoader.parse(new ObjectMapper().readTree("""
+                {"workloads":{"worker":{"queues":["events"],
+                "runtime":{"type":"ec2","instance-id":"i-launch"}}}}
+                """), "000000000000", "us-east-1").getFirst();
+        WorkloadRuntime runtime = factory.create(definition);
+        try (ExecutorService workers = Executors.newVirtualThreadPerTaskExecutor()) {
+            Future<?> launch = workers.submit(() -> {
+                runtime.prepareStart(Duration.ofSeconds(2));
+                runtime.start(Duration.ofSeconds(2));
+                return null;
+            });
+            try {
+                assertTrue(inspected.await(1, TimeUnit.SECONDS));
+                assertFalse(launch.isDone());
+                verify(ec2, never()).startInstances(anyString(), anyList());
+                instance.setState(InstanceState.stopped());
+                launch.get(2, TimeUnit.SECONDS);
+                assertEquals("pending", instance.getState().getName());
+                runtime.start(Duration.ofSeconds(1));
+                verify(ec2, times(1)).startInstances("us-east-1", List.of("i-launch"));
+                instance.setState(InstanceState.running());
+                runtime.awaitReady(Duration.ofSeconds(1));
+            } finally {
+                instance.setState(InstanceState.running());
+                launch.cancel(true);
+            }
+        }
+    }
+
+    @Test
     void interruptedEc2ActivationDrainsTheAcceptedBackgroundStartBeforeReturning() throws Exception {
         Instance instance = new Instance();
         instance.setState(InstanceState.stopped());
@@ -290,6 +359,7 @@ class WorkloadRuntimeFactoryServiceTest {
         Thread task = Thread.startVirtualThread(() -> {
             try {
                 runtime.start(Duration.ofSeconds(5));
+                runtime.awaitReady(Duration.ofSeconds(5));
             } catch (InterruptedException expected) {
                 cancelled.set(true);
             } catch (Exception e) {

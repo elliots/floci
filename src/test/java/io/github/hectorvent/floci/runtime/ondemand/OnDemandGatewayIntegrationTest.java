@@ -1,5 +1,8 @@
 package io.github.hectorvent.floci.runtime.ondemand;
 
+import io.github.hectorvent.floci.core.common.http.HttpReverseProxy;
+import io.github.hectorvent.floci.runtime.network.NetworkDefinition;
+import io.github.hectorvent.floci.runtime.network.NetworkOriginRouter;
 import io.github.hectorvent.floci.runtime.ondemand.ActivationCoordinator.State;
 import io.github.hectorvent.floci.runtime.ondemand.OnDemandTestSupport.FakeRuntime;
 import io.github.hectorvent.floci.runtime.ondemand.WorkloadDefinition.BackendProtocol;
@@ -8,14 +11,14 @@ import io.vertx.core.MultiMap;
 import io.vertx.core.Vertx;
 import io.vertx.core.buffer.Buffer;
 import io.vertx.core.http.HttpClient;
-import io.vertx.core.http.HttpClientResponse;
 import io.vertx.core.http.HttpClientOptions;
 import io.vertx.core.http.HttpClientRequest;
-import io.vertx.core.http.HttpVersion;
+import io.vertx.core.http.HttpClientResponse;
 import io.vertx.core.http.HttpMethod;
 import io.vertx.core.http.HttpServer;
 import io.vertx.core.http.HttpServerRequest;
 import io.vertx.core.http.HttpServerResponse;
+import io.vertx.core.http.HttpVersion;
 import io.vertx.core.http.WebSocket;
 import io.vertx.core.http.WebSocketConnectOptions;
 import io.vertx.core.net.HostAndPort;
@@ -28,10 +31,10 @@ import java.time.Duration;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.concurrent.CompletableFuture;
-import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.CopyOnWriteArrayList;
-import java.util.concurrent.Executors;
+import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.ExecutionException;
+import java.util.concurrent.Executors;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicLong;
 import java.util.concurrent.atomic.AtomicReference;
@@ -75,6 +78,37 @@ class OnDemandGatewayIntegrationTest {
         waitFor(backend.close());
         waitFor(vertx.close());
         assertEquals(List.of(), unhandled, "No unhandled event-loop exceptions are allowed");
+    }
+
+    @Test
+    void networkUrlActivatesThroughThePublicGatewayAndPreservesRequestData() throws Exception {
+        URI gatewayUrl = URI.create("http://orders.test:" + gateway.port());
+        NetworkDefinition network = new NetworkDefinition(true, List.of(new NetworkDefinition.Route("orders",
+                List.of(URI.create("http://api.vendor.test:80")), gatewayUrl, false)));
+        try (HttpReverseProxy proxy = new HttpReverseProxy(vertx, null, uri -> "127.0.0.1")) {
+            NetworkOriginRouter router = new NetworkOriginRouter(network, proxy);
+            HttpServer origin = waitFor(vertx.createHttpServer().requestHandler(request -> router.route(request, "http", 80))
+                    .listen(0, "127.0.0.1"));
+            try {
+                backendHandler = request -> request.bodyHandler(body -> request.response().setStatusCode(201)
+                        .putHeader("X-Backend-Host", request.host())
+                        .putHeader("X-Original-Host", request.getHeader("X-Forwarded-Host"))
+                        .putHeader("X-Request-Uri", request.uri()).end(body));
+                assertEquals(0, runtime.starts.get());
+                Reply response = waitFor(client.request(HttpMethod.POST, origin.actualPort(), "127.0.0.1", "/create?a=%2F")
+                        .compose(request -> request.putHeader("Host", "api.vendor.test")
+                                .putHeader("X-Forwarded-Host", "untrusted.example").send(Buffer.buffer("payload")))
+                        .compose(this::readReply));
+                assertEquals(201, response.status());
+                assertEquals("payload", response.body().toString());
+                assertEquals("orders.test:" + gateway.port(), response.headers().get("X-Backend-Host"));
+                assertEquals("api.vendor.test", response.headers().get("X-Original-Host"));
+                assertEquals("/create?a=%2F", response.headers().get("X-Request-Uri"));
+                assertEquals(1, runtime.starts.get());
+            } finally {
+                waitFor(origin.close());
+            }
+        }
     }
 
     @Test

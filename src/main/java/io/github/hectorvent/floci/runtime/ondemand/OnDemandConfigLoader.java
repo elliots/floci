@@ -21,9 +21,9 @@ import java.util.Locale;
 import java.util.Map;
 import java.util.Set;
 
-/** Reads configuration as a tree so workload records need no native-image reflection. */
-public final class WorkloadConfigLoader {
-    private WorkloadConfigLoader() {}
+/** Reads on-demand configuration as a tree so workload records need no native-image reflection. */
+public final class OnDemandConfigLoader {
+    private OnDemandConfigLoader() {}
 
     public static List<WorkloadDefinition> load(Path file, String defaultAccount, String defaultRegion) {
         try {

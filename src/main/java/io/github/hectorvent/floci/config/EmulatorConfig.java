@@ -154,6 +154,9 @@ public interface EmulatorConfig {
     }
 
     interface NetworkConfig {
+        /** Path to the network isolation and origin-routing YAML/JSON file. */
+        Optional<String> configFile();
+
         SecurityGroupEnforcementConfig securityGroupEnforcement();
     }
 

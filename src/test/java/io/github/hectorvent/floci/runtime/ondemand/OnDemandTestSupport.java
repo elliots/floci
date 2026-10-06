@@ -55,6 +55,9 @@ final class OnDemandTestSupport {
         }
 
         @Override
+        public void awaitReady(Duration timeout) throws Exception {}
+
+        @Override
         public void stop(Duration timeout) {
             stops.incrementAndGet();
             running = false;

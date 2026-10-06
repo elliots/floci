@@ -106,7 +106,7 @@ class OnDemandEksDockerIntegrationTest {
                 new String[]{"sh", "-c", "cat <<'FLOCI_MANIFEST' | kubectl apply -f -\n"
                         + manifest + "FLOCI_MANIFEST\n"}, 30);
         assertEquals(0, applied.exitCode(), applied.summary());
-        Path file = directory.resolve("workloads.yaml");
+        Path file = directory.resolve("on-demand.yaml");
         Files.writeString(file, """
                 workloads:
                   worker:
@@ -116,9 +116,10 @@ class OnDemandEksDockerIntegrationTest {
                       cluster-name: %s
                       deployment: worker
                 """.formatted(name));
-        WorkloadRuntime runtime = factory.create(WorkloadConfigLoader.load(file, "000000000000", "us-east-1").getFirst());
+        WorkloadRuntime runtime = factory.create(OnDemandConfigLoader.load(file, "000000000000", "us-east-1").getFirst());
         assertFalse(runtime.isRunning());
         runtime.start(Duration.ofMinutes(2));
+        runtime.awaitReady(Duration.ofMinutes(2));
         assertTrue(runtime.isRunning());
         runtime.stop(Duration.ofMinutes(1));
         assertFalse(runtime.isRunning());

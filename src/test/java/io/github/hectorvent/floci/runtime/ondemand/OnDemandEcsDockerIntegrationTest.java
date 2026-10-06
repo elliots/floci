@@ -121,7 +121,7 @@ class OnDemandEcsDockerIntegrationTest {
         }
         service = ecs.createService(cluster, "worker", definition.getTaskDefinitionArn(), 0,
                 launchType, List.of(), network, REGION);
-        Path file = directory.resolve("workloads.yaml");
+        Path file = directory.resolve("on-demand.yaml");
         Files.writeString(file, """
                 workloads:
                   worker:
@@ -131,9 +131,10 @@ class OnDemandEcsDockerIntegrationTest {
                       cluster-name: %s
                       service: worker
                 """.formatted(cluster));
-        WorkloadRuntime runtime = factory.create(WorkloadConfigLoader.load(file, "000000000000", REGION).getFirst());
+        WorkloadRuntime runtime = factory.create(OnDemandConfigLoader.load(file, "000000000000", REGION).getFirst());
         assertFalse(runtime.isRunning());
         runtime.start(Duration.ofSeconds(60));
+        runtime.awaitReady(Duration.ofSeconds(60));
         EcsTask first = runningTask();
         String firstContainer = first.getContainers().getFirst().getRuntimeId();
         assertTrue(docker.inspectContainerCmd(firstContainer).exec().getState().getRunning());
@@ -143,6 +144,7 @@ class OnDemandEcsDockerIntegrationTest {
         assertThrows(NotFoundException.class,
                 () -> docker.inspectContainerCmd(firstContainer).exec());
         runtime.start(Duration.ofSeconds(60));
+        runtime.awaitReady(Duration.ofSeconds(60));
         EcsTask second = runningTask();
         assertNotEquals(first.getTaskArn(), second.getTaskArn());
         assertNotEquals(firstContainer, second.getContainers().getFirst().getRuntimeId());
