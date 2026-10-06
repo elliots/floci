@@ -212,6 +212,9 @@ public class ContainerLifecycleManager {
         if (env != null && !env.isEmpty()) {
             createCmd.withEnv(env);
         }
+        if (spec.healthCheck() != null) {
+            createCmd.withHealthcheck(spec.healthCheck());
+        }
         if (spec.cmd() != null && !spec.cmd().isEmpty()) {
             createCmd.withCmd(spec.cmd());
         }

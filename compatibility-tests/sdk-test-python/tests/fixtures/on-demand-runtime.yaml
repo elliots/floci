@@ -1,0 +1,67 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: on-demand-app
+spec:
+  replicas: 0
+  selector:
+    matchLabels: {app: on-demand-app}
+  template:
+    metadata:
+      labels: {app: on-demand-app}
+    spec:
+      terminationGracePeriodSeconds: 1
+      containers:
+        - name: app
+          image: python:3.11-alpine
+          command: [python, -u, -c]
+          args:
+            - |
+              from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+              import os
+              import time
+
+              class Handler(BaseHTTPRequestHandler):
+                  def do_GET(self):
+                      if self.path == '/slow':
+                          self.send_response(200)
+                          self.send_header('Content-Length', '2')
+                          self.end_headers()
+                          self.wfile.write(b'O')
+                          self.wfile.flush()
+                          time.sleep(6)
+                          self.wfile.write(b'K')
+                          return
+                      status = 503 if self.path == '/health' else 200
+                      self.send_response(status)
+                      self.send_header('Content-Length', '2')
+                      self.end_headers()
+                      self.wfile.write(b'OK')
+
+                  def do_POST(self):
+                      body = self.rfile.read(int(self.headers.get('Content-Length', '0')))
+                      self.send_response(200)
+                      self.send_header('Content-Length', str(len(body)))
+                      self.send_header('X-Request-Path', self.path)
+                      self.send_header('X-Request-Host', self.headers.get('Host', ''))
+                      self.send_header('X-Request-Auth', self.headers.get('Authorization', ''))
+                      self.send_header('X-Pod-Name', os.environ['HOSTNAME'])
+                      self.end_headers()
+                      self.wfile.write(body)
+
+              ThreadingHTTPServer(('0.0.0.0', 8080), Handler).serve_forever()
+          readinessProbe:
+            httpGet: {path: /ready, port: 8080}
+            periodSeconds: 1
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: on-demand-backend
+spec:
+  type: NodePort
+  selector: {app: on-demand-app}
+  ports:
+    - port: 8080
+      targetPort: 8080
+      nodePort: 30080

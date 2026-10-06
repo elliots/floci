@@ -346,6 +346,8 @@ class EventBridgeSchedulerIntegrationTest {
                 };
             }
             @Override
+            public OnDemandConfig onDemand() { return null; }
+            @Override
             public TlsConfig tls() {
                 return new TlsConfig() {
                     @Override public boolean enabled() { return false; }

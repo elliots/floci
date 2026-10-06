@@ -942,9 +942,19 @@ public class EksClusterManager
     }
 
     /**
-     * Extracts the kubeconfig from the running k3s container, rewrites the server URL,
-     * and sets the certificate authority data on the cluster.
+     * Reads administrator credentials from Floci's own k3s container for internal runtime controllers.
      */
+    public String readKubeconfig(Cluster cluster) {
+        if (cluster.getContainerId() == null) {
+            throw new IllegalStateException("EKS cluster has no running Kubernetes container: " + cluster.getName());
+        }
+        try {
+            return execInContainer(cluster.getContainerId(), new String[]{"cat", "/etc/rancher/k3s/k3s.yaml"});
+        } catch (Exception e) {
+            throw new IllegalStateException("Cannot read Kubernetes credentials for EKS cluster " + cluster.getName(), e);
+        }
+    }
+
     public void finalizeCluster(Cluster cluster) {
         String containerId = cluster.getContainerId();
         if (containerId == null) {
@@ -952,8 +962,7 @@ public class EksClusterManager
         }
 
         try {
-            String kubeconfigYaml = execInContainer(containerId,
-                    new String[]{"cat", "/etc/rancher/k3s/k3s.yaml"});
+            String kubeconfigYaml = readKubeconfig(cluster);
 
             // Extract CA data
             String caData = extractYamlField(kubeconfigYaml, "certificate-authority-data");

@@ -133,6 +133,15 @@ quarkus:
 
 
 floci:
+  on-demand:
+    enabled: false                         # FLOCI_ON_DEMAND_ENABLED
+    # config-file:                         # FLOCI_ON_DEMAND_CONFIG_FILE; external workload YAML/JSON
+    gateway-host: 127.0.0.1                # FLOCI_ON_DEMAND_GATEWAY_HOST
+    gateway-port: 8080                     # FLOCI_ON_DEMAND_GATEWAY_PORT; application traffic only
+    reconcile-interval-millis: 1000
+    max-concurrent-starts: 4
+    max-pending-requests: 1024
+    max-pending-requests-per-workload: 64
   port: 4566
   base-url: "http://localhost:4566"
   network:

@@ -1,0 +1,2 @@
+-r requirements.txt
+grpcio==1.78.0

@@ -25,6 +25,7 @@ import io.github.hectorvent.floci.services.sqs.model.MessageAttributeValue;
 import io.github.hectorvent.floci.services.sqs.model.Queue;
 import jakarta.annotation.PreDestroy;
 import jakarta.enterprise.context.ApplicationScoped;
+import jakarta.enterprise.event.Event;
 import jakarta.enterprise.inject.Instance;
 import jakarta.inject.Inject;
 import org.jboss.logging.Logger;
@@ -277,6 +278,7 @@ public class SqsService implements Resettable, ResourceProvider {
     private final String receiptHandleSecret;
     private final Instance<RequestContext> requestContextInstance;
     private final IamService iamService;
+    private final Event<QueueActivity> activityEvents;
 
     public SqsService(StorageFactory storageFactory, EmulatorConfig config, RegionResolver regionResolver,
                       SnsService snsService) {
@@ -288,11 +290,18 @@ public class SqsService implements Resettable, ResourceProvider {
         this(storageFactory, config, regionResolver, snsService, clock, null, null);
     }
 
-    @Inject
     public SqsService(StorageFactory storageFactory, EmulatorConfig config, RegionResolver regionResolver,
                       SnsService snsService, Clock clock,
                       Instance<RequestContext> requestContextInstance,
                       IamService iamService) {
+        this(storageFactory, config, regionResolver, snsService, clock, requestContextInstance, iamService, null);
+    }
+
+    @Inject
+    public SqsService(StorageFactory storageFactory, EmulatorConfig config, RegionResolver regionResolver,
+                      SnsService snsService, Clock clock,
+                      Instance<RequestContext> requestContextInstance,
+                      IamService iamService, Event<QueueActivity> activityEvents) {
         this(
                 storageFactory.create("sqs", "sqs-queues.json",
                         new TypeReference<Map<String, Queue>>() {
@@ -315,7 +324,8 @@ public class SqsService implements Resettable, ResourceProvider {
                 clock,
                 config.services().sqs().receiptHandleSecret(),
                 requestContextInstance,
-                iamService
+                iamService,
+                activityEvents
         );
     }
 
@@ -397,6 +407,19 @@ public class SqsService implements Resettable, ResourceProvider {
                RegionResolver regionResolver, boolean clearFifoDeduplicationCacheOnPurge,
                SnsService snsService, Clock clock, String receiptHandleSecret,
                Instance<RequestContext> requestContextInstance, IamService iamService) {
+        this(queueStore, messageStore, dedupStore, dedupIdentityStore, defaultVisibilityTimeout, maxMessageSize,
+                baseUrl, regionResolver, clearFifoDeduplicationCacheOnPurge, snsService, clock,
+                receiptHandleSecret, requestContextInstance, iamService, null);
+    }
+
+    SqsService(StorageBackend<String, Queue> queueStore, StorageBackend<String, List<Message>> messageStore,
+               StorageBackend<String, Map<String, Long>> dedupStore,
+               StorageBackend<String, Map<String, Map<String, String>>> dedupIdentityStore,
+               int defaultVisibilityTimeout, int maxMessageSize, String baseUrl,
+               RegionResolver regionResolver, boolean clearFifoDeduplicationCacheOnPurge,
+               SnsService snsService, Clock clock, String receiptHandleSecret,
+               Instance<RequestContext> requestContextInstance, IamService iamService,
+               Event<QueueActivity> activityEvents) {
         this.queueStore = queueStore;
         this.messageStore = messageStore;
         this.dedupStore = dedupStore;
@@ -412,6 +435,7 @@ public class SqsService implements Resettable, ResourceProvider {
         this.receiptHandleSecret = receiptHandleSecret;
         this.requestContextInstance = requestContextInstance;
         this.iamService = iamService;
+        this.activityEvents = activityEvents;
         this.moveTasksByHandle = new MoveTaskStore(clock);
         loadPersistedMessages();
         loadPersistedDedup();
@@ -986,6 +1010,7 @@ public class SqsService implements Resettable, ResourceProvider {
                                 new DeduplicationIdentity(message.getMessageId(), message.getSequenceNumber()));
                 persistDedupIdentities(storageKey);
                 notifyReceivers(storageKey);
+                notifyActivity(queueUrl, region);
                 LOG.debugv("Sent FIFO message {0} to queue {1}, group={2}, seq={3}",
                         message.getMessageId(), queueUrl, messageGroupId, message.getSequenceNumber());
                 LOG.tracev("Sent message {0} to queue {1} body={2} attributes={3}",
@@ -1010,6 +1035,7 @@ public class SqsService implements Resettable, ResourceProvider {
 
         getOrCreateQueue(storageKey).addMessage(message);
         notifyReceivers(storageKey);
+        notifyActivity(queueUrl, region);
         LOG.debugv("Sent message {0} to queue {1}", message.getMessageId(), queueUrl);
         LOG.tracev("Sent message {0} to queue {1} body={2} attributes={3}",
                 message.getMessageId(), queueUrl, body, message.getMessageAttributes());
@@ -1147,6 +1173,21 @@ public class SqsService implements Resettable, ResourceProvider {
             synchronized (lock) {
                 lock.notifyAll();
             }
+        }
+    }
+
+    private void notifyActivity(String queueUrl, String region) {
+        if (activityEvents == null) {
+            return;
+        }
+        String normalized = normalizeQueueUrl(queueUrl);
+        String accountId = accountFromQueueUrl(normalized);
+        String queueName = normalized.substring(normalized.lastIndexOf('/') + 1);
+        try {
+            activityEvents.fire(new QueueActivity(accountId, region, queueName));
+        } catch (RuntimeException e) {
+            // Enqueue has succeeded. Activation is recoverable and must not change the AWS response.
+            LOG.warnv(e, "Queue activity notification failed for {0}", queueUrl);
         }
     }
 

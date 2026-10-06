@@ -2,6 +2,7 @@ package io.github.hectorvent.floci.core.common.docker;
 
 import com.github.dockerjava.api.model.Bind;
 import com.github.dockerjava.api.model.DeviceRequest;
+import com.github.dockerjava.api.model.HealthCheck;
 import com.github.dockerjava.api.model.LogConfig;
 import com.github.dockerjava.api.model.Mount;
 import com.github.dockerjava.api.model.VolumesFrom;
@@ -43,6 +44,7 @@ import java.util.regex.Pattern;
  * @param cpuShares Relative CPU weight against other containers (null = daemon default)
  * @param readonlyRootfs Whether the container's own filesystem is mounted read only
  * @param linkLocalIps Link-local IPv4 addresses assigned to the container's endpoint on the configured network
+ * @param healthCheck Docker health check, or null to keep the image default
  * @param portBindingHostIps Host interface each published port binds to, keyed by container port.
  *        A port with no entry here, and not in {@code loopbackPortBindings}, binds every interface
  */
@@ -74,7 +76,8 @@ public record ContainerSpec(
         Integer cpuShares,
         boolean readonlyRootfs,
         List<String> linkLocalIps,
-        Map<Integer, String> portBindingHostIps
+        Map<Integer, String> portBindingHostIps,
+        HealthCheck healthCheck
 ) {
     private static final Pattern LINK_LOCAL_IPV4 = Pattern.compile("^169\\.254\\.(\\d{1,3})\\.(\\d{1,3})$");
     private static final Set<String> NETWORKS_WITHOUT_ENDPOINT_IPAM = Set.of("bridge", "default", "host", "none");
@@ -85,6 +88,42 @@ public record ContainerSpec(
             requireUserDefinedNetwork(networkMode);
             linkLocalIps.forEach(ContainerSpec::requireLinkLocalIpv4);
         }
+    }
+
+    public ContainerSpec(
+            String image,
+            String name,
+            List<String> env,
+            List<String> cmd,
+            List<String> entrypoint,
+            Long memoryBytes,
+            Map<Integer, Integer> portBindings,
+            List<Integer> loopbackPortBindings,
+            List<Integer> exposedPorts,
+            String networkMode,
+            List<Mount> mounts,
+            List<Bind> binds,
+            List<VolumesFrom> volumesFrom,
+            List<String> extraHosts,
+            Map<String, String> labels,
+            LogConfig logConfig,
+            boolean privileged,
+            String cgroupnsMode,
+            List<String> dnsServers,
+            String workingDir,
+            String user,
+            List<String> groupAdd,
+            List<DeviceRequest> deviceRequests,
+            Long nanoCpus,
+            Integer cpuShares,
+            boolean readonlyRootfs,
+            List<String> linkLocalIps,
+            Map<Integer, String> portBindingHostIps
+    ) {
+        this(image, name, env, cmd, entrypoint, memoryBytes, portBindings, loopbackPortBindings, exposedPorts, networkMode,
+                mounts, binds, volumesFrom, extraHosts, labels, logConfig, privileged, cgroupnsMode,
+                dnsServers, workingDir, user, groupAdd, deviceRequests, nanoCpus, cpuShares, readonlyRootfs,
+                linkLocalIps, portBindingHostIps, null);
     }
 
     /**

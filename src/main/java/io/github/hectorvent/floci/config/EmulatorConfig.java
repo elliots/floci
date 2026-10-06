@@ -125,6 +125,33 @@ public interface EmulatorConfig {
 
     ProtocolsConfig protocols();
 
+    OnDemandConfig onDemand();
+
+    interface OnDemandConfig {
+        @WithDefault("false")
+        boolean enabled();
+
+        Optional<String> configFile();
+
+        @WithDefault("127.0.0.1")
+        String gatewayHost();
+
+        @WithDefault("8080")
+        int gatewayPort();
+
+        @WithDefault("1000")
+        long reconcileIntervalMillis();
+
+        @WithDefault("4")
+        int maxConcurrentStarts();
+
+        @WithDefault("1024")
+        int maxPendingRequests();
+
+        @WithDefault("64")
+        int maxPendingRequestsPerWorkload();
+    }
+
     interface NetworkConfig {
         SecurityGroupEnforcementConfig securityGroupEnforcement();
     }

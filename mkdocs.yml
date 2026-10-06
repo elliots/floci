@@ -90,6 +90,7 @@ nav:
     - Storage Modes: configuration/storage.md
     - TLS / HTTPS: configuration/tls.md
     - Initialization Hooks: configuration/initialization-hooks.md
+    - On-demand Application Runtime: configuration/on-demand-runtime.md
     - Advanced:
       - application.yml Reference: configuration/advanced/application-yml.md
   - Services:

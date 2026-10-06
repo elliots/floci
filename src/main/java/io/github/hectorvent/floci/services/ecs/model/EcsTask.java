@@ -204,6 +204,10 @@ public class EcsTask {
     public String getContainerInstanceArn() { return containerInstanceArn; }
     public void setContainerInstanceArn(String containerInstanceArn) { this.containerInstanceArn = containerInstanceArn; }
 
+    public boolean hasActiveProtection() {
+        return protectionEnabled && (protectedUntil == null || protectedUntil.isAfter(Instant.now()));
+    }
+
     public boolean isProtectionEnabled() { return protectionEnabled; }
     public void setProtectionEnabled(boolean protectionEnabled) { this.protectionEnabled = protectionEnabled; }
 

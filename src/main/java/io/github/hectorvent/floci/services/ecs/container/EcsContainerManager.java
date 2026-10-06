@@ -1,5 +1,6 @@
 package io.github.hectorvent.floci.services.ecs.container;
 
+import com.github.dockerjava.api.model.HealthCheck;
 import com.github.dockerjava.api.model.Ports;
 import io.github.hectorvent.floci.core.common.AwsArnUtils;
 import io.github.hectorvent.floci.config.EmulatorConfig;
@@ -341,6 +342,16 @@ public class EcsContainerManager {
                         .withLabels(ContainerStorageHelper.resourceIdentityLabels(
                                 "ecs", taskId, regionResolver.getAccountId(), region))
                         .withLabels(ownerLabels());
+                if (def.getHealthCheck() != null) {
+                    specBuilder.withHealthCheck(new HealthCheck().withTest(def.getHealthCheck().command())
+                            .withInterval(Duration.ofSeconds(def.getHealthCheck().interval() == null
+                                    ? 30 : def.getHealthCheck().interval()).toNanos())
+                            .withTimeout(Duration.ofSeconds(def.getHealthCheck().timeout() == null
+                                    ? 5 : def.getHealthCheck().timeout()).toNanos())
+                            .withRetries(def.getHealthCheck().retries() == null ? 3 : def.getHealthCheck().retries())
+                            .withStartPeriod(Duration.ofSeconds(def.getHealthCheck().startPeriod() == null
+                                    ? 0 : def.getHealthCheck().startPeriod()).toNanos()));
+                }
                 if (protectedNetwork != null) {
                     specBuilder.withNetworkMode("container:" + protectedNetwork.namespace().helperId());
                     specBuilder.withLabels(Map.of(ContainerStorageHelper.SECURITY_GROUP_WORKLOAD_LABEL, "true"));

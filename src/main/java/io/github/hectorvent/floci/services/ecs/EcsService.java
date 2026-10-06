@@ -1752,6 +1752,9 @@ public class EcsService implements ContainerTeardown, ResourceProvider, Resettab
     private EcsTask stopTask(String clusterRef, String taskRef, String reason, String stopCode, String region) {
         EcsTask task = resolveTaskOrThrow(taskRef, region);
         synchronized (task) {
+            if (STOP_CODE_SERVICE_SCHEDULER_INITIATED.equals(stopCode) && task.hasActiveProtection()) {
+                return task;
+            }
             return stopTaskLocked(task, reason, stopCode, region);
         }
     }
@@ -2264,18 +2267,23 @@ public class EcsService implements ContainerTeardown, ResourceProvider, Resettab
     public List<ProtectedTask> updateTaskProtection(String clusterRef, List<String> taskRefs,
                                                      boolean protectionEnabled, Integer expiresInMinutes,
                                                      String region) {
+        if (expiresInMinutes != null && (expiresInMinutes < 1 || expiresInMinutes > 2880)) {
+            throw new AwsException("InvalidParameterException", "expiresInMinutes must be between 1 and 2880.", 400);
+        }
         List<ProtectedTask> result = new ArrayList<>();
         for (String ref : taskRefs) {
             EcsTask task = resolveTaskOrThrow(ref, region);
-            task.setProtectionEnabled(protectionEnabled);
-            Instant expiration = null;
-            if (protectionEnabled && expiresInMinutes != null) {
-                expiration = Instant.now().plusSeconds(expiresInMinutes * 60L);
-                task.setProtectedUntil(expiration);
-            } else {
-                task.setProtectedUntil(null);
+            synchronized (task) {
+                task.setProtectionEnabled(protectionEnabled);
+                Instant expiration = null;
+                if (protectionEnabled) {
+                    expiration = Instant.now().plusSeconds((expiresInMinutes == null ? 120 : expiresInMinutes) * 60L);
+                    task.setProtectedUntil(expiration);
+                } else {
+                    task.setProtectedUntil(null);
+                }
+                result.add(new ProtectedTask(task.getTaskArn(), protectionEnabled, expiration));
             }
-            result.add(new ProtectedTask(task.getTaskArn(), protectionEnabled, expiration));
         }
         return result;
     }
@@ -2284,7 +2292,11 @@ public class EcsService implements ContainerTeardown, ResourceProvider, Resettab
         List<ProtectedTask> result = new ArrayList<>();
         for (String ref : taskRefs) {
             EcsTask task = resolveTaskOrThrow(ref, region);
-            result.add(new ProtectedTask(task.getTaskArn(), task.isProtectionEnabled(), task.getProtectedUntil()));
+            synchronized (task) {
+                boolean protectedTask = task.hasActiveProtection();
+                result.add(new ProtectedTask(task.getTaskArn(), protectedTask,
+                        protectedTask ? task.getProtectedUntil() : null));
+            }
         }
         return result;
     }
@@ -4707,27 +4719,36 @@ public class EcsService implements ContainerTeardown, ResourceProvider, Resettab
 
     /**
      * Refreshes a running task's health from its containers' health checks. The task is HEALTHY
-     * only when every container that has a health check reports healthy, UNHEALTHY as soon as one
-     * does not, and UNKNOWN when nothing is being probed, which is how ECS aggregates it.
+     * only when every essential container with a declared health check reports healthy. Image-only
+     * checks do not participate; an unready essential check leaves the task UNKNOWN.
      */
     private void updateHealth(EcsTask task, EcsTaskHandle handle) {
         if (task.getContainers() == null || task.getContainers().isEmpty()) {
             return;
         }
+        TaskDefinition definition = resolveTaskDefinitionOrThrow(task.getTaskDefinitionArn(), taskRegion(task));
+        Map<String, ContainerDefinition> definitions = definition.getContainerDefinitions().stream()
+                .collect(Collectors.toMap(ContainerDefinition::getName, container -> container));
         boolean anyUnhealthy = false;
+        boolean anyUnknown = false;
         boolean anyHealthy = false;
         for (Container container : task.getContainers()) {
-            String dockerId = handle.getContainerIds().get(container.getName());
-            if (dockerId == null) {
+            ContainerDefinition declared = definitions.get(container.getName());
+            if (declared == null || declared.getHealthCheck() == null) {
+                container.setHealthStatus(null);
                 continue;
             }
-            String health = containerManager.ecsHealthStatus(dockerId);
+            String dockerId = handle.getContainerIds().get(container.getName());
+            String health = dockerId == null ? HEALTH_STATUS_UNKNOWN : containerManager.ecsHealthStatus(dockerId);
             container.setHealthStatus(health);
-            anyUnhealthy |= HEALTH_STATUS_UNHEALTHY.equals(health);
-            anyHealthy |= HEALTH_STATUS_HEALTHY.equals(health);
+            if (declared.isEssential()) {
+                anyUnhealthy |= HEALTH_STATUS_UNHEALTHY.equals(health);
+                anyUnknown |= HEALTH_STATUS_UNKNOWN.equals(health);
+                anyHealthy |= HEALTH_STATUS_HEALTHY.equals(health);
+            }
         }
         String aggregate = anyUnhealthy ? HEALTH_STATUS_UNHEALTHY
-                : anyHealthy ? HEALTH_STATUS_HEALTHY : HEALTH_STATUS_UNKNOWN;
+                : anyUnknown || !anyHealthy ? HEALTH_STATUS_UNKNOWN : HEALTH_STATUS_HEALTHY;
         if (!aggregate.equals(task.getHealthStatus())) {
             task.setHealthStatus(aggregate);
             task.bumpVersion();
@@ -5004,6 +5025,14 @@ public class EcsService implements ContainerTeardown, ResourceProvider, Resettab
                 && cluster.getClusterArn().equals(task.getClusterArn());
     }
 
+    /** Includes STOPPING tasks until every container has been removed, using scheduler ownership. */
+    public List<EcsTask> tasksForService(EcsServiceModel service) {
+        return tasks.values().stream()
+                .filter(task -> service.getServiceArn().equals(task.getOwningServiceArn()))
+                .filter(task -> service.getClusterArn().equals(task.getClusterArn()))
+                .toList();
+    }
+
     private void reconcileService(String key, EcsServiceModel svc) {
         if (!"ACTIVE".equals(svc.getStatus())) {
             return;
@@ -5101,6 +5130,7 @@ public class EcsService implements ContainerTeardown, ResourceProvider, Resettab
             // half of the rolling deployment, not a scale-in.
             Stream.concat(staleTasks.stream(),
                             runningTasks.stream().filter(t -> !staleTasks.contains(t)))
+                    .filter(t -> !t.hasActiveProtection())
                     .limit(toStop)
                     .forEach(t -> {
                         boolean stale = staleTasks.contains(t);

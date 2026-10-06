@@ -6,6 +6,7 @@ import com.fasterxml.jackson.databind.node.JsonNodeFactory;
 import com.fasterxml.jackson.databind.node.NullNode;
 import com.fasterxml.jackson.databind.node.ObjectNode;
 import com.fasterxml.jackson.dataformat.yaml.YAMLFactory;
+import io.github.hectorvent.floci.core.common.Pem;
 import jakarta.enterprise.context.ApplicationScoped;
 
 import java.util.Collection;
@@ -29,13 +30,11 @@ import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.security.GeneralSecurityException;
-import java.security.KeyFactory;
 import java.security.KeyStore;
 import java.security.PrivateKey;
 import java.security.cert.Certificate;
 import java.security.cert.CertificateFactory;
 import java.security.cert.X509Certificate;
-import java.security.spec.PKCS8EncodedKeySpec;
 import java.time.Duration;
 import java.util.ArrayList;
 import java.util.Base64;
@@ -73,7 +72,7 @@ import java.util.stream.Collectors;
  * </ul>
  */
 @ApplicationScoped
-public class KubernetesApiClient {
+public class KubernetesApiClient implements AutoCloseable {
 
     private static final Path SERVICE_ACCOUNT_DIR = Path.of("/var/run/secrets/kubernetes.io/serviceaccount");
     private static final Path SERVICE_ACCOUNT_TOKEN = SERVICE_ACCOUNT_DIR.resolve("token");
@@ -119,12 +118,56 @@ public class KubernetesApiClient {
         ensureInitialized();
     }
 
+    public static KubernetesApiClient fromKubeconfig(String yaml, URI endpoint) {
+        KubernetesApiClient client = new KubernetesApiClient();
+        try {
+            client.resolveKubeconfig(new ObjectMapper(new YAMLFactory()).readTree(yaml), Path.of("floci-eks-kubeconfig"));
+        } catch (IOException e) {
+            throw new IllegalArgumentException("Cannot parse Floci EKS kubeconfig", e);
+        }
+        client.baseUri = endpoint;
+        client.initialized = true;
+        return client;
+    }
+
+    @Override
+    public void close() {
+        if (http != null) {
+            http.shutdownNow();
+        }
+    }
+
     public JsonNode createPod(String namespace, JsonNode pod) {
         return send("POST", podsPath(namespace), pod, 201);
     }
 
     public Optional<JsonNode> getPod(String namespace, String name) {
         return getOptional(podPath(namespace, name));
+    }
+
+    public Optional<JsonNode> getDeployment(String namespace, String name) {
+        return getOptional(deploymentPath(namespace, name));
+    }
+
+    /** Updates the scale subresource without replacing the deployment's application specification. */
+    public void scaleDeployment(String namespace, String name, int replicas) {
+        String path = deploymentPath(namespace, name) + "/scale";
+        for (int attempt = 0; attempt < 3; attempt++) {
+            JsonNode scale = send("GET", path, null, 200);
+            ((ObjectNode) scale.path("spec")).put("replicas", replicas);
+            try {
+                send("PUT", path, scale, 200);
+                return;
+            } catch (KubernetesApiException e) {
+                if (e.getStatusCode() != 409 || attempt == 2) {
+                    throw e;
+                }
+            }
+        }
+    }
+
+    private static String deploymentPath(String namespace, String name) {
+        return "/apis/apps/v1/namespaces/" + namespace + "/deployments/" + name;
     }
 
     public List<JsonNode> listPods(String namespace, Map<String, String> labelSelector) {
@@ -333,6 +376,10 @@ public class KubernetesApiClient {
             throw new IllegalStateException("Could not read kubeconfig at " + path + ": " + e.getMessage(), e);
         }
 
+        resolveKubeconfig(root, path);
+    }
+
+    private void resolveKubeconfig(JsonNode root, Path path) {
         String currentContextName = root.path("current-context").asText(null);
         if (currentContextName == null || currentContextName.isBlank()) {
             throw new IllegalStateException("kubeconfig at " + path + " has no current-context set");
@@ -510,27 +557,7 @@ public class KubernetesApiClient {
     }
 
     private static PrivateKey privateKeyFromPem(byte[] pem) {
-        String text = new String(pem, StandardCharsets.US_ASCII);
-        if (text.contains("BEGIN RSA PRIVATE KEY") || text.contains("BEGIN EC PRIVATE KEY")) {
-            throw new IllegalStateException(
-                    "kubeconfig client-key is in PKCS#1 format (BEGIN RSA/EC PRIVATE KEY); only PKCS#8 "
-                            + "(BEGIN PRIVATE KEY) is supported. Convert it with: openssl pkcs8 -topk8 "
-                            + "-nocrypt -in key.pem -out key-pkcs8.pem");
-        }
-        String base64 = text.replaceAll("-----BEGIN [^-]+-----", "")
-                .replaceAll("-----END [^-]+-----", "")
-                .replaceAll("\\s", "");
-        PKCS8EncodedKeySpec keySpec = new PKCS8EncodedKeySpec(Base64.getDecoder().decode(base64));
-        GeneralSecurityException last = null;
-        for (String algorithm : new String[]{"RSA", "EC"}) {
-            try {
-                return KeyFactory.getInstance(algorithm).generatePrivate(keySpec);
-            } catch (GeneralSecurityException e) {
-                last = e;
-            }
-        }
-        throw new IllegalStateException("Could not parse kubeconfig client-key as an RSA or EC private key: "
-                + (last == null ? "unknown format" : last.getMessage()));
+        return Pem.parsePrivateKey(new String(pem, StandardCharsets.US_ASCII));
     }
 
     private static SSLContext sslContext(X509TrustManager trustManager, KeyManager[] keyManagers) {

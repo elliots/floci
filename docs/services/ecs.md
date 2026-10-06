@@ -229,6 +229,15 @@ overrode, which is how AWS answers a task nobody overrode. `group` defaults to `
 for a `RunTask` and is `service:<name>` for a service's tasks. A container that asked for no CPU
 units reports `"cpu": "0"`, as on AWS.
 
+In Docker mode, task-definition `healthCheck` commands run inside the container with the configured
+interval, timeout, retry count, and start period. Omitted timings use the ECS defaults. Task health
+aggregates essential containers with declared checks: an unhealthy check takes priority over an
+unknown check, and all checks must pass for the task to be healthy. Image-only checks and
+nonessential containers do not determine task health, following
+[AWS health-check rules](https://docs.aws.amazon.com/AmazonECS/latest/developerguide/healthcheck.html).
+
+Configured ECS services can also use [on-demand activation](../configuration/on-demand-runtime.md#ecs-services).
+
 A task's `attachments` entry is an `ElasticNetworkInterface` carrying `subnetId`,
 `networkInterfaceId`, `macAddress`, `privateDnsName` and `privateIPv4Address`. `DescribeTasks` and
 `DescribeServices` report tags only when the request asks for them with `include: ["TAGS"]`, as

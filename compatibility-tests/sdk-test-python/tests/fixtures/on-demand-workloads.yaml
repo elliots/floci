@@ -1,0 +1,32 @@
+workloads:
+  application:
+    host: on-demand.dev.test
+    idle-timeout-seconds: 3
+    startup-timeout-seconds: 120
+    runtime:
+      type: kubernetes
+      cluster-name: on-demand-live
+      deployment: on-demand-app
+      backend-url: http://floci-aws-on-demand-live-eks-on-demand-live:30080
+    queues: [on-demand-live-events]
+    health:
+      requests:
+        - method: GET
+          path: /health
+      sleeping-response:
+        status: 200
+        body: '{"status":"UP"}'
+        content-type: application/json
+  ecs-grpc:
+    host: ecs-on-demand.dev.test
+    idle-timeout-seconds: 3
+    startup-timeout-seconds: 90
+    runtime:
+      type: ecs
+      cluster-name: on-demand-ecs-live
+      service: grpc
+      backend-url: http://127.0.0.1:15051
+      backend-protocol: http2
+    queues: [on-demand-ecs-live-events]
+    readiness:
+      enabled: false

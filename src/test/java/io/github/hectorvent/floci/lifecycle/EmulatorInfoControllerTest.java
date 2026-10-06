@@ -74,6 +74,7 @@ class EmulatorInfoControllerTest {
         controller.reset();
 
         InOrder order = inOrder(sageMakerTeardown, batchTeardown, storageFactory, resettable);
+        order.verify(resettable).beforeReset();
         order.verify(sageMakerTeardown).stopManagedContainers();
         order.verify(batchTeardown).stopManagedContainers();
         order.verify(storageFactory).clearAll();
@@ -145,21 +146,18 @@ class EmulatorInfoControllerTest {
         Resettable failing = mock(Resettable.class);
         Resettable later = mock(Resettable.class);
         doThrow(new IllegalStateException("drain timed out")).when(failing).beforeReset();
-        when(containerTeardowns.iterator()).thenReturn(List.of(sageMakerTeardown).iterator());
         when(resettables.iterator()).thenReturn(List.of(resettable, failing, later).iterator());
 
         IllegalStateException thrown = assertThrows(IllegalStateException.class, controller::reset);
 
         assertEquals("drain timed out", thrown.getMessage());
-        // The teardown already shut down the pools that afterReset() restores, so the service
-        // whose beforeReset() never ran needs afterReset() just as much as the ones that ran.
         InOrder order = inOrder(sageMakerTeardown, resettable, failing, later);
-        order.verify(sageMakerTeardown).stopManagedContainers();
         order.verify(resettable).beforeReset();
         order.verify(failing).beforeReset();
         order.verify(later).afterReset();
         order.verify(failing).afterReset();
         order.verify(resettable).afterReset();
+        verify(sageMakerTeardown, never()).stopManagedContainers();
         verify(later, never()).beforeReset();
         verify(storageFactory, never()).clearAll();
         verify(resettable, never()).clear();

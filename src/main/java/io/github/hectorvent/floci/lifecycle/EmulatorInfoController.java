@@ -171,16 +171,14 @@ public class EmulatorInfoController {
         for (Resettable service : services) {
             service.checkReset();
         }
-        // Containers next: they are tracked independently of StorageBackend, so this can run
-        // in any order relative to the storage wipe below, but stopping them here means a
-        // client's reset actually reflects a clean slate instead of leaving Batch, CodeBuild,
-        // or SageMaker containers running with no record of them left in the store.
-        ContainerTeardowns.stopAll(containerTeardowns, LOG);
         RuntimeException failure = null;
         try {
             for (Resettable service : services) {
                 service.beforeReset();
             }
+            // Quiesce launchers before teardown, so activation cannot recreate containers
+            // between stopping managed containers and clearing their resource records.
+            ContainerTeardowns.stopAll(containerTeardowns, LOG);
             // Storage still precedes clear(): services recreate their bootstrap state there.
             storageFactory.clearAll();
             for (Resettable service : services) {
@@ -189,9 +187,7 @@ public class EmulatorInfoController {
         } catch (RuntimeException e) {
             failure = e;
         } finally {
-            // Every service, not only those whose beforeReset() ran: the teardowns above already
-            // shut down the pools that afterReset() restores, and a beforeReset() that throws
-            // would otherwise leave every later service with its pool terminated for good.
+            // Restore every service, including one whose beforeReset() failed partway through.
             for (Resettable service : services.reversed()) {
                 try {
                     service.afterReset();
