@@ -76,10 +76,11 @@ class ElastiCacheMemcachedServiceTest {
         service.createCacheCluster(new ElastiCacheService.CreateCacheClusterRequest(
                 "sized", "memcached", null, "cache.m5.large", 3, null, null, null,
                 "default.memcached1.6", "my-subnets", null, null, null, "us-east-1c",
-                List.of("sg-1", "sg-2"), null, null, null, "us-east-1", null));
+                List.of("sg-1", "sg-2"), null, null, null, "us-east-1", Map.of("env", "test")));
 
         // read back through a separate lookup, not the create's own return value
         CacheCluster stored = service.getCacheCluster("sized");
+        assertEquals(Map.of("env", "test"), stored.getTags());
         assertEquals(3, stored.getNumCacheNodes());
         assertEquals("cache.m5.large", stored.getCacheNodeType());
         assertEquals("default.memcached1.6", stored.getCacheParameterGroupName());

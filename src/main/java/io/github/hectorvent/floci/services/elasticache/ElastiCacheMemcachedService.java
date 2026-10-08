@@ -19,6 +19,7 @@ import org.jboss.logging.Logger;
 import java.time.Instant;
 import java.util.ArrayList;
 import java.util.Collection;
+import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.concurrent.CompletableFuture;
@@ -141,6 +142,9 @@ public class ElastiCacheMemcachedService {
         cluster.setPreferredAvailabilityZone(request.preferredAvailabilityZone() != null
                 && !request.preferredAvailabilityZone().isBlank()
                 ? request.preferredAvailabilityZone() : regionResolver.getRegion() + "a");
+        if (request.tags() != null && !request.tags().isEmpty()) {
+            cluster.setTags(new LinkedHashMap<>(request.tags()));
+        }
         cluster.setArn(regionResolver.buildArn("elasticache", request.region(), "cluster:" + clusterId));
         if (handle != null) {
             cluster.setContainerId(handle.getContainerId());

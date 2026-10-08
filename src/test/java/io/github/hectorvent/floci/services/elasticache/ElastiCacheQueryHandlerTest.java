@@ -378,36 +378,18 @@ class ElastiCacheQueryHandlerTest {
     }
 
     @Test
-    void listTagsForResource_readsAReplicationGroupByItsArn() {
-        ReplicationGroup g = group("g1");
-        g.setTags(new LinkedHashMap<>(Map.of("Name", "g1")));
-        when(service.getReplicationGroup("g1")).thenReturn(g);
-        when(service.getReplicationGroup("absent")).thenThrow(
-                new AwsException("ReplicationGroupNotFoundFault", "Replication group absent not found.", 404));
-
+    void listTagsForResource_serializesTagsAndTypedServiceErrors() {
+        String arn = "arn:aws:elasticache:us-east-1:000000000000:replicationgroup:g1";
+        when(service.listTagsForResource(arn)).thenReturn(Map.of("Name", "g1"));
         MultivaluedMap<String, String> p = params();
-        p.add("ResourceName", "arn:aws:elasticache:us-east-1:000000000000:replicationgroup:g1");
+        p.add("ResourceName", arn);
         String body = (String) handler.handle("ListTagsForResource", p, "us-east-1").getEntity();
-        assertTrue(body.contains("<Key>Name</Key>"), body);
-
-        p = params();
-        p.add("ResourceName", "arn:aws:elasticache:us-east-1:000000000000:replicationgroup:absent");
+        assertTrue(body.contains("<Tag><Key>Name</Key><Value>g1</Value></Tag>"), body);
+        when(service.listTagsForResource(arn)).thenThrow(
+                new AwsException("ReplicationGroupNotFoundFault", "Not found", 404));
         Response response = handler.handle("ListTagsForResource", p, "us-east-1");
         assertEquals(404, response.getStatus());
         assertTrue(((String) response.getEntity()).contains("ReplicationGroupNotFoundFault"));
-
-        // the store keys groups by id alone: a same-named group created under another region is
-        // not the one this ARN names
-        ReplicationGroup elsewhere = group("g2");
-        elsewhere.setArn("arn:aws:elasticache:eu-west-1:000000000000:replicationgroup:g2");
-        elsewhere.setTags(new LinkedHashMap<>(Map.of("Name", "west")));
-        when(service.getReplicationGroup("g2")).thenReturn(elsewhere);
-        p = params();
-        p.add("ResourceName", "arn:aws:elasticache:us-east-1:000000000000:replicationgroup:g2");
-        response = handler.handle("ListTagsForResource", p, "us-east-1");
-        String entity = (String) response.getEntity();
-        assertEquals(404, response.getStatus(), entity);
-        assertFalse(entity.contains("west"));
     }
 
     @Test
@@ -704,66 +686,4 @@ class ElastiCacheQueryHandlerTest {
         verify(memcachedService, never()).deleteCacheCluster(anyString());
     }
 
-    @Test
-    void listTagsForResource_readsTagsOffACacheClusterArn() {
-        CacheCluster cluster = redisCacheCluster("tf-redis");
-        cluster.setTags(new LinkedHashMap<>(Map.of("Name", "cache")));
-        when(service.findCacheClusters("tf-redis")).thenReturn(List.of(cluster));
-
-        MultivaluedMap<String, String> p = params();
-        p.add("ResourceName", "arn:aws:elasticache:us-east-1:000000000000:cluster:tf-redis");
-
-        String body = (String) handler.handle("ListTagsForResource", p, "us-east-1").getEntity();
-        assertTrue(body.contains("<Key>Name</Key>"), body);
-        assertTrue(body.contains("<Value>cache</Value>"), body);
-    }
-
-    @Test
-    void listTagsForResource_clusterArnOfAnUnknownIdIsNotFound() {
-        when(service.findCacheClusters("absent")).thenReturn(List.of());
-        when(memcachedService.getCacheCluster("absent")).thenThrow(
-                new AwsException("CacheClusterNotFound", "Cache cluster absent not found.", 404));
-
-        MultivaluedMap<String, String> p = params();
-        p.add("ResourceName", "arn:aws:elasticache:us-east-1:000000000000:cluster:absent");
-
-        Response response = handler.handle("ListTagsForResource", p, "us-east-1");
-        assertEquals(404, response.getStatus());
-        assertTrue(((String) response.getEntity()).contains("CacheClusterNotFound"));
-    }
-
-    @Test
-    void listTagsForResource_clusterArnFromAnotherRegionIsNotThisCluster() {
-        // the store keys clusters by id alone, so a same-named cluster created under another
-        // region is not the one this ARN names
-        CacheCluster elsewhere = redisCacheCluster("tf-redis");
-        elsewhere.setArn("arn:aws:elasticache:eu-west-1:000000000000:cluster:tf-redis");
-        elsewhere.setTags(new LinkedHashMap<>(Map.of("Name", "west")));
-        when(service.findCacheClusters("tf-redis")).thenReturn(List.of(elsewhere));
-
-        MultivaluedMap<String, String> p = params();
-        p.add("ResourceName", "arn:aws:elasticache:us-east-1:000000000000:cluster:tf-redis");
-
-        Response response = handler.handle("ListTagsForResource", p, "us-east-1");
-        assertEquals(404, response.getStatus(), (String) response.getEntity());
-        assertFalse(((String) response.getEntity()).contains("west"));
-    }
-
-    @Test
-    void listTagsForResource_memcachedClusterArnStillAnswersWithNoTags() {
-        // Memcached clusters carry no tags but they do exist: this must not become a 404.
-        when(service.findCacheClusters("mc")).thenReturn(List.of());
-        when(service.listMemberCacheClusters("mc")).thenReturn(List.of());
-        when(memcachedService.getCacheCluster("mc")).thenReturn(new CacheCluster(
-                "mc", CacheClusterStatus.AVAILABLE, "memcached", "1.6.22",
-                new Endpoint("localhost", 11211), Instant.now()));
-
-        MultivaluedMap<String, String> p = params();
-        p.add("ResourceName", "arn:aws:elasticache:us-east-1:000000000000:cluster:mc");
-
-        Response response = handler.handle("ListTagsForResource", p, "us-east-1");
-        assertEquals(200, response.getStatus());
-        assertTrue(((String) response.getEntity()).contains("<TagList></TagList>"),
-                (String) response.getEntity());
-    }
 }

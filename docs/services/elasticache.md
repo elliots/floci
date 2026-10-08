@@ -32,8 +32,19 @@ Floci manages real Valkey/Redis Docker containers and proxies TCP connections to
 | `ModifyCacheParameterGroup` | Set parameters on a group |
 | `DescribeCacheParameters` | List the parameters set on a group |
 | `DeleteCacheParameterGroup` | Delete a cache parameter group |
-| `ListTagsForResource` | Tags on a parameter group ARN |
+| `ListTagsForResource` | Read tags on users, replication groups, cache clusters, parameter groups and subnet groups |
+| `AddTagsToResource` | Add or replace resource tags, with a maximum of 50 keys |
+| `RemoveTagsFromResource` | Remove tags by key |
 <!-- floci:actions:end -->
+
+### Resource tags
+
+User tags are accepted at creation and through the tagging actions.
+Tags live with their resources and survive restarts in persistent, hybrid and WAL storage modes.
+Replication-group tag updates propagate to member clusters. Tags are read through
+`ListTagsForResource`; the AWS user and cache describe shapes do not contain tag lists.
+Snapshot creation and snapshot storage are not implemented. Tag requests for a snapshot ARN
+return `SnapshotNotFoundFault`.
 
 ### Single-node Redis/Valkey clusters
 

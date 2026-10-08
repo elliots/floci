@@ -4,11 +4,14 @@ import com.fasterxml.jackson.annotation.JsonIgnore;
 import io.quarkus.runtime.annotations.RegisterForReflection;
 
 import java.time.Instant;
+import java.util.LinkedHashMap;
 import java.util.List;
+import java.util.Map;
 
 @RegisterForReflection
 public class ElastiCacheUser {
 
+    private Map<String, String> tags = new LinkedHashMap<>();
     private String userId;
     private String userName;
     private AuthMode authMode;
@@ -35,6 +38,9 @@ public class ElastiCacheUser {
         this.status = status;
         this.createdAt = createdAt;
     }
+
+    public Map<String, String> getTags() { return tags; }
+    public void setTags(Map<String, String> tags) { this.tags = new LinkedHashMap<>(tags); }
 
     public String getUserId() { return userId; }
     public void setUserId(String userId) { this.userId = userId; }

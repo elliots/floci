@@ -185,6 +185,8 @@ floci:
       # the S3 object index) fold their .wal file into the store's JSON file.
       compaction-interval-ms: 30000
     services:
+      elasticache:
+        flush-interval-ms: 5000
       ssm:
         flush-interval-ms: 5000
       dynamodb:

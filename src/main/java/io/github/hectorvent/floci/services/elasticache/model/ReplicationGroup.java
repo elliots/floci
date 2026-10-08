@@ -21,6 +21,7 @@ public class ReplicationGroup {
     private Instant createdAt;
     private int proxyPort;
     private String authToken; // stored plain-text for PASSWORD auth validation in the proxy
+    private Map<String, Map<String, String>> memberTags = new LinkedHashMap<>();
     private Set<String> associatedUserIds = new HashSet<>();
     private String arn;
     private String region;
@@ -110,6 +111,11 @@ public class ReplicationGroup {
 
     public String getSnapshotWindow() { return snapshotWindow; }
     public void setSnapshotWindow(String snapshotWindow) { this.snapshotWindow = snapshotWindow; }
+
+    public Map<String, Map<String, String>> getMemberTags() { return memberTags; }
+    public void setMemberTags(Map<String, Map<String, String>> memberTags) {
+        this.memberTags = memberTags == null ? new LinkedHashMap<>() : memberTags;
+    }
 
     public Map<String, String> getTags() { return tags; }
     public void setTags(Map<String, String> tags) { this.tags = tags == null ? new LinkedHashMap<>() : tags; }

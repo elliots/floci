@@ -2,7 +2,6 @@ package io.github.hectorvent.floci.services.elasticache;
 
 import io.github.hectorvent.floci.core.common.AwsArnUtils;
 import io.github.hectorvent.floci.core.common.AwsException;
-import io.github.hectorvent.floci.core.common.AwsRegions;
 import io.github.hectorvent.floci.core.common.BackupWindows;
 import io.github.hectorvent.floci.core.common.AwsNamespaces;
 import io.github.hectorvent.floci.core.common.AwsQueryResponse;
@@ -84,7 +83,9 @@ public class ElastiCacheQueryHandler {
             case "ModifyCacheParameterGroup" -> handleModifyCacheParameterGroup(params);
             case "DescribeCacheParameters" -> handleDescribeCacheParameters(params);
             case "DeleteCacheParameterGroup" -> handleDeleteCacheParameterGroup(params);
-            case "ListTagsForResource" -> handleListTagsForResource(params);
+            case "ListTagsForResource" -> handleTags(action, params);
+            case "AddTagsToResource" -> handleTags(action, params);
+            case "RemoveTagsFromResource" -> handleTags(action, params);
             default -> AwsQueryResponse.error("UnsupportedOperation",
                     "Operation " + action + " is not supported.", AwsNamespaces.EC, 400);
         };
@@ -258,7 +259,8 @@ public class ElastiCacheQueryHandler {
             UserAuthentication auth = resolveUserAuthentication(params);
             AuthMode authMode = auth != null ? auth.mode() : AuthMode.NO_AUTH;
             List<String> passwords = auth != null ? auth.passwords() : List.of();
-            ElastiCacheUser user = service.createUser(userId, userName, authMode, passwords, accessString, engine);
+            ElastiCacheUser user = service.createUser(userId, userName, authMode, passwords,
+                    accessString, engine, parseTags(params));
             return Response.ok(AwsQueryResponse.envelope("CreateUser", AwsNamespaces.EC, userXml(user))).build();
         } catch (AwsException e) {
             return AwsQueryResponse.error(e.getErrorCode(), e.getMessage(), AwsNamespaces.EC, e.getHttpStatus());
@@ -648,79 +650,19 @@ private Response handleCreateCacheParameterGroup(MultivaluedMap<String, String> 
         }
     }
 
-    /**
-     * Tags for a resource ARN. Only parameter groups carry tags in floci, so any other ARN reports
-     * none — which is what floci knows, rather than a guess at what AWS would hold.
-     */
-    private Response handleListTagsForResource(MultivaluedMap<String, String> params) {
+    private Response handleTags(String action, MultivaluedMap<String, String> params) {
         try {
-            String resourceName = params.getFirst("ResourceName");
-            String[] arn = resourceName == null ? new String[0] : resourceName.split(":", -1);
-            if (arn.length != 7 || !"arn".equals(arn[0])) {
-                throw new AwsException("InvalidARN", "Input ARN string does not have 7 components.", 400);
-            }
-            // Every component names part of the resource, so each is checked before the name is
-            // used: a partition, service, region or account that is not this one asks about a
-            // different resource, and answering from the trailing name would describe the wrong.
-            String partition = AwsRegions.partitionFor(regionResolver.getRegion());
-            if (!partition.equals(arn[1])) {
-                throw new AwsException("InvalidARN", "partition field is wrong. Expected value is " + partition, 400);
-            }
-            if (!"elasticache".equals(arn[2])) {
-                throw new AwsException("InvalidARN",
-                        "service field is wrong. Expected value is elasticache", 400);
-            }
-            if (!regionResolver.getRegion().equals(arn[3])) {
-                throw new AwsException("InvalidParameterValue",
-                        "Unauthorized call. Please check the region or customer id", 400);
-            }
-            if (!regionResolver.getAccountId().equals(arn[4])) {
-                throw new AwsException("InvalidParameterValue",
-                        "The resource ARN does not belong to the caller's account.", 400);
-            }
-
-            Map<String, String> tags = Map.of();
-            if ("replicationgroup".equals(arn[5])) {
-                // the store keys groups by id alone; the record must be the one the ARN names
-                ReplicationGroup group = service.getReplicationGroup(arn[6]);
-                if (group.getArn() != null && !group.getArn().equalsIgnoreCase(resourceName)) {
-                    throw new AwsException("ReplicationGroupNotFoundFault",
-                            "Replication group " + arn[6] + " not found.", 404);
-                }
-                tags = group.getTags();
-            }
-            if ("cluster".equals(arn[5])) {
-                CacheCluster cluster = service.findCacheClusters(arn[6]).stream().findFirst().orElse(null);
-                if (cluster != null) {
-                    // Same shape as the replicationgroup arm: the store keys clusters by id
-                    // alone, so the record found must also be the one this ARN names.
-                    if (cluster.getArn() != null && !cluster.getArn().equalsIgnoreCase(resourceName)) {
-                        throw new AwsException("CacheClusterNotFound",
-                                "Cache cluster " + arn[6] + " not found.", 404);
-                    }
-                    tags = cluster.getTags();
-                } else if (service.listMemberCacheClusters(arn[6]).isEmpty()) {
-                    // Memcached clusters and replication group members carry no tags, but they do
-                    // exist. Only an id no source knows is a not-found.
-                    memcachedService.getCacheCluster(arn[6]);
-                }
-            }
-            if ("subnetgroup".equals(arn[5])) {
-                tags = service.describeCacheSubnetGroups(arn[6]).getFirst().getTags();
-            }
-            if ("parametergroup".equals(arn[5])) {
-                tags = service.findParameterGroup(arn[6])
-                        .orElseThrow(() -> new AwsException("CacheParameterGroupNotFound",
-                                arn[6] + " is not present", 404))
-                        .getTags();
-            }
+            String arn = params.getFirst("ResourceName");
+            Map<String, String> tags = switch (action) {
+                case "AddTagsToResource" -> service.addTagsToResource(arn, parseTags(params));
+                case "RemoveTagsFromResource" -> service.removeTagsFromResource(arn,
+                        extractMemberList(params, "TagKeys.member."));
+                default -> service.listTagsForResource(arn);
+            };
             XmlBuilder xml = new XmlBuilder().start("TagList");
-            tags.forEach((key, value) -> xml.start("Tag")
-                    .elem("Key", key)
-                    .elem("Value", value)
-                    .end("Tag"));
+            tags.forEach((key, value) -> xml.start("Tag").elem("Key", key).elem("Value", value).end("Tag"));
             xml.end("TagList");
-            return Response.ok(AwsQueryResponse.envelope("ListTagsForResource", AwsNamespaces.EC, xml.build())).build();
+            return Response.ok(AwsQueryResponse.envelope(action, AwsNamespaces.EC, xml.build())).build();
         } catch (AwsException e) {
             return AwsQueryResponse.error(e.getErrorCode(), e.getMessage(), AwsNamespaces.EC, e.getHttpStatus());
         }

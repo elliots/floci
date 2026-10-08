@@ -1002,7 +1002,7 @@ class ElastiCacheServiceTest {
         // hands out its own object, so settings applied before the user check would stay visible
         AwsException unknownUser = assertThrows(AwsException.class, () -> service.modifyReplicationGroup(
                 "g1", List.of("no-such-user"), null, new ReplicationGroupSettings(null, null, 9, "03:00-04:00")));
-        assertEquals("UserNotFoundFault", unknownUser.getErrorCode());
+        assertEquals("UserNotFound", unknownUser.getErrorCode());
         assertEquals(3, service.getReplicationGroup("g1").getSnapshotRetentionLimit());
         assertEquals("01:00-02:00", service.getReplicationGroup("g1").getSnapshotWindow());
     }

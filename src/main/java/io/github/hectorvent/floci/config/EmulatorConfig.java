@@ -529,6 +529,7 @@ public interface EmulatorConfig {
         long flushIntervalMs();
     }
 
+    /** Storage for cache resources, users, and their tags. */
     interface ElastiCacheStorageConfig {
         Optional<String> mode();
 
