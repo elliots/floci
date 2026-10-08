@@ -25,6 +25,7 @@ import io.github.hectorvent.floci.services.elasticache.model.CacheParameterGroup
 import io.github.hectorvent.floci.services.elasticache.model.CacheSubnetGroup;
 import io.github.hectorvent.floci.services.elasticache.model.ClusterNode;
 import io.github.hectorvent.floci.services.elasticache.model.ElastiCacheUser;
+import io.github.hectorvent.floci.services.elasticache.model.ElastiCacheUserGroup;
 import io.github.hectorvent.floci.services.elasticache.model.Endpoint;
 import io.github.hectorvent.floci.services.elasticache.model.ReplicationGroup;
 import io.github.hectorvent.floci.services.elasticache.model.ReplicationGroupSettings;
@@ -43,6 +44,8 @@ import java.net.UnknownHostException;
 import java.time.Instant;
 import java.util.ArrayList;
 import java.util.Collection;
+import java.util.Comparator;
+import java.util.LinkedHashSet;
 import java.util.HashSet;
 import java.util.LinkedHashMap;
 import java.util.List;
@@ -73,6 +76,7 @@ public class ElastiCacheService implements ResourceProvider {
      */
     private final StorageBackend<String, CacheCluster> memcachedClusters;
     private final StorageBackend<String, ElastiCacheUser> users;
+    private final StorageBackend<String, ElastiCacheUserGroup> userGroups;
     private final AccountAwareStorageBackend<CacheParameterGroup> parameterGroups;
     private final StorageBackend<String, CacheSubnetGroup> subnetGroups;
     private final ElastiCacheContainerManager containerManager;
@@ -134,6 +138,8 @@ public class ElastiCacheService implements ResourceProvider {
                 new TypeReference<Map<String, CacheCluster>>() {});
         this.memcachedClusters = storageFactory.create("elasticache", "elasticache-cache-clusters.json",
                 new TypeReference<Map<String, CacheCluster>>() {});
+        this.userGroups = storageFactory.create("elasticache", "elasticache-user-groups.json",
+                new TypeReference<Map<String, ElastiCacheUserGroup>>() {});
         this.users = storageFactory.create("elasticache", "elasticache-users.json",
                 new TypeReference<Map<String, ElastiCacheUser>>() {});
         this.parameterGroups = storageFactory.create("elasticache", "elasticache-parameter-groups.json",
@@ -1529,10 +1535,123 @@ public class ElastiCacheService implements ResourceProvider {
                 "KMS key does not exist with key id: " + kmsKeyId, 400);
     }
 
+    public synchronized ElastiCacheUserGroup createUserGroup(String id, String engine,
+                                                             List<String> userIds, Map<String, String> tags) {
+        String name = userGroupName(id);
+        if (userGroups.get(userGroupKey(name)).isPresent()) {
+            throw new AwsException("UserGroupAlreadyExists", "User group " + name + " already exists.", 400);
+        }
+        if (engine == null || engine.isBlank()) {
+            throw new AwsException("InvalidParameterValue", "Engine is required.", 400);
+        }
+        String normalizedEngine = normalizeEngine(engine);
+        List<String> members = new ArrayList<>(new LinkedHashSet<>(userIds));
+        validateUserGroupMembers(normalizedEngine, members);
+        validateTags(tags);
+        ElastiCacheUserGroup group = new ElastiCacheUserGroup();
+        group.setUserGroupId(name);
+        group.setEngine(normalizedEngine);
+        group.setStatus("creating");
+        group.setUserIds(members);
+        group.setTags(tags);
+        group.setArn(regionResolver.buildArn("elasticache", regionResolver.getRegion(), "usergroup:" + name));
+        userGroups.put(userGroupKey(name), group);
+        return group;
+    }
+
+    private static String userGroupName(String id) {
+        if (id == null || !id.matches("[a-zA-Z][a-zA-Z0-9-]*") || id.length() > 40) {
+            throw new AwsException("InvalidParameterValue", "Invalid UserGroupId.", 400);
+        }
+        return id.toLowerCase(Locale.ROOT);
+    }
+
+    private String userGroupKey(String id) {
+        return regionResolver.getRegion() + "::" + id;
+    }
+
+    private ElastiCacheUserGroup getUserGroup(String id) {
+        String name = userGroupName(id);
+        return userGroups.get(userGroupKey(name)).filter(group -> group.getArn().equals(
+                regionResolver.buildArn("elasticache", regionResolver.getRegion(), "usergroup:" + name)))
+                .orElseThrow(() -> new AwsException("UserGroupNotFound", "User group " + name + " not found.", 404));
+    }
+
+    public synchronized List<ElastiCacheUserGroup> describeUserGroups(String id) {
+        List<ElastiCacheUserGroup> result = id != null ? List.of(getUserGroup(id))
+                : userGroups.scan(key -> key.startsWith(regionResolver.getRegion() + "::")).stream()
+                    .filter(group -> group.getArn().equals(regionResolver.buildArn("elasticache",
+                            regionResolver.getRegion(), "usergroup:" + group.getUserGroupId())))
+                    .sorted(Comparator.comparing(ElastiCacheUserGroup::getUserGroupId)).toList();
+        for (ElastiCacheUserGroup group : result) {
+            if ("creating".equals(group.getStatus())) {
+                group.setStatus("active");
+                userGroups.put(userGroupKey(group.getUserGroupId()), group);
+            }
+        }
+        return result;
+    }
+
+    public synchronized ElastiCacheUserGroup modifyUserGroup(String id, String engine,
+                                                             List<String> add, List<String> remove) {
+        ElastiCacheUserGroup group = getUserGroup(id);
+        if (add.stream().anyMatch(remove::contains)) {
+            throw new AwsException("InvalidParameterCombination", "Cannot add and remove the same user.", 400);
+        }
+        String nextEngine = engine == null ? group.getEngine() : normalizeEngine(engine);
+        if ("valkey".equals(group.getEngine()) && "redis".equals(nextEngine)) {
+            throw new AwsException("InvalidParameterValue", "Cannot change a Valkey user group to Redis.", 400);
+        }
+        for (String userId : remove) {
+            requireGroupUser(userId);
+            if (!group.getUserIds().contains(userId)) {
+                throw new AwsException("InvalidParameterValue", "User is not a member of this group.", 400);
+            }
+        }
+        Set<String> members = new LinkedHashSet<>(group.getUserIds());
+        members.removeAll(remove);
+        members.addAll(add);
+        validateUserGroupMembers(nextEngine, members);
+        group.setUserIds(new ArrayList<>(members));
+        group.setEngine(nextEngine);
+        group.setStatus("active");
+        userGroups.put(userGroupKey(group.getUserGroupId()), group);
+        return group;
+    }
+
     private ElastiCacheUser requireGroupUser(String id) {
         return users.get(id).filter(user -> user.getArn() == null || user.getArn().equals(
                 regionResolver.buildArn("elasticache", regionResolver.getRegion(), "user:" + id)))
                 .orElseThrow(() -> new AwsException("UserNotFound", "User " + id + " not found.", 404));
+    }
+
+    private void validateUserGroupMembers(String engine, Collection<String> ids) {
+        Set<String> names = new HashSet<>();
+        for (String id : ids) {
+            ElastiCacheUser user = requireGroupUser(id);
+            if (!names.add(user.getUserName())) {
+                throw new AwsException("DuplicateUserName", "Duplicate user name " + user.getUserName() + ".", 400);
+            }
+            if ("redis".equals(engine) && !"redis".equals(user.getEngine())) {
+                throw new AwsException("InvalidParameterValue", "Redis groups require Redis users.", 400);
+            }
+        }
+        if ("redis".equals(engine) && !names.contains("default")) {
+            throw new AwsException("DefaultUserRequired", "You must add a default user to a Redis user group.", 400);
+        }
+    }
+
+    public synchronized ElastiCacheUserGroup deleteUserGroup(String id) {
+        ElastiCacheUserGroup group = getUserGroup(id);
+        group.setStatus("deleting");
+        userGroups.delete(userGroupKey(group.getUserGroupId()));
+        return group;
+    }
+
+    public List<String> userGroupIds(String userId) {
+        return userGroups.scan(key -> key.startsWith(regionResolver.getRegion() + "::")).stream()
+                .filter(group -> group.getUserIds().contains(userId))
+                .map(ElastiCacheUserGroup::getUserGroupId).sorted().toList();
     }
 
     private record TaggedResource(Map<String, String> tags, Collection<Map<String, String>> replicas, Runnable save) {
@@ -1613,6 +1732,10 @@ public class ElastiCacheService implements ResourceProvider {
             case "user" -> {
                 ElastiCacheUser user = requireGroupUser(id);
                 yield new TaggedResource(user.getTags(), () -> users.put(id, user));
+            }
+            case "usergroup" -> {
+                ElastiCacheUserGroup group = getUserGroup(id);
+                yield new TaggedResource(group.getTags(), () -> userGroups.put(userGroupKey(group.getUserGroupId()), group));
             }
             case "replicationgroup" -> {
                 ReplicationGroup group = getReplicationGroup(id);
@@ -1747,6 +1870,11 @@ public class ElastiCacheService implements ResourceProvider {
             throw new AwsException("UserNotFound", "User " + userId + " not found.", 404);
         }
         users.delete(userId);
+        for (ElastiCacheUserGroup group : userGroups.scan(key -> key.startsWith(regionResolver.getRegion() + "::"))) {
+            if (group.getUserIds().remove(userId)) {
+                userGroups.put(userGroupKey(group.getUserGroupId()), group);
+            }
+        }
         for (ReplicationGroup group : groups.scan(k -> true)) {
             synchronized (lockFor("rg:" + group.getReplicationGroupId())) {
                 if (group.getAssociatedUserIds().remove(userId)) {

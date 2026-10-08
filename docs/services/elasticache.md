@@ -32,19 +32,27 @@ Floci manages real Valkey/Redis Docker containers and proxies TCP connections to
 | `ModifyCacheParameterGroup` | Set parameters on a group |
 | `DescribeCacheParameters` | List the parameters set on a group |
 | `DeleteCacheParameterGroup` | Delete a cache parameter group |
-| `ListTagsForResource` | Read tags on users, replication groups, cache clusters, parameter groups and subnet groups |
+| `ListTagsForResource` | Read tags on users, user groups, replication groups, cache clusters, parameter groups and subnet groups |
 | `AddTagsToResource` | Add or replace resource tags, with a maximum of 50 keys |
 | `RemoveTagsFromResource` | Remove tags by key |
+| `CreateUserGroup` | Create a Redis or Valkey user group with existing users and optional tags |
+| `DescribeUserGroups` | Describe a user group or paginate groups; newly created groups become active |
+| `ModifyUserGroup` | Add or remove users and upgrade a group engine to Valkey |
+| `DeleteUserGroup` | Delete a user group |
 <!-- floci:actions:end -->
 
-### Resource tags
+### Users, user groups and tags
 
-User tags are accepted at creation and through the tagging actions.
+User and user-group tags are accepted at creation and through the tagging actions.
 Tags live with their resources and survive restarts in persistent, hybrid and WAL storage modes.
 Replication-group tag updates propagate to member clusters. Tags are read through
-`ListTagsForResource`; the AWS user and cache describe shapes do not contain tag lists.
+`ListTagsForResource`; the AWS user, user-group and cache describe shapes do not contain tag lists.
+Redis user groups require a member whose user name is `default`. Membership changes are
+applied immediately, and `DescribeUsers` reports the user's group IDs.
+
 Snapshot creation and snapshot storage are not implemented. Tag requests for a snapshot ARN
-return `SnapshotNotFoundFault`.
+return `SnapshotNotFoundFault`. Attaching these user-group resources to replication groups
+is not yet implemented; the existing replication-group authentication association path uses user IDs.
 
 ### Single-node Redis/Valkey clusters
 

@@ -14,6 +14,7 @@ import io.github.hectorvent.floci.services.elasticache.model.AuthMode;
 import io.github.hectorvent.floci.services.elasticache.model.CacheCluster;
 import io.github.hectorvent.floci.services.elasticache.model.CacheParameterGroup;
 import io.github.hectorvent.floci.services.elasticache.model.CacheSubnetGroup;
+import io.github.hectorvent.floci.services.elasticache.model.ElastiCacheUserGroup;
 import io.github.hectorvent.floci.services.elasticache.model.ReplicationGroup;
 import io.github.hectorvent.floci.services.elasticache.proxy.ElastiCacheProxyManager;
 import io.github.hectorvent.floci.services.kms.KmsService;
@@ -60,19 +61,24 @@ class ElastiCacheTagsAndUserGroupsServiceTest {
 
     @ParameterizedTest
     @ValueSource(strings = {"persistent", "hybrid", "wal"})
-    void tagsSurviveStorageLifecycle(String mode) {
+    void tagsAndMembershipSurviveStorageLifecycle(String mode) {
         StorageFactory first = factory(mode);
         ElastiCacheService service = service(first);
         service.createUser("owner", "default", AuthMode.NO_AUTH, List.of(), "on ~* +@all", "redis");
+        service.createUserGroup("team", "redis", List.of("owner"), Map.of("created", "yes"));
         service.addTagsToResource(arn("user:owner"), Map.of("env", "dev", "remove", "me"));
         service.addTagsToResource(arn("user:owner"), Map.of("env", "test"));
         service.removeTagsFromResource(arn("user:owner"), List.of("remove"));
+        service.addTagsToResource(arn("usergroup:team"), Map.of("owner", "team"));
         first.shutdownAll();
 
         StorageFactory second = factory(mode);
         try {
             ElastiCacheService restored = service(second);
             assertEquals(Map.of("env", "test"), restored.listTagsForResource(arn("user:owner")));
+            assertEquals(Map.of("created", "yes", "owner", "team"), restored.listTagsForResource(arn("usergroup:team")));
+            assertEquals(List.of("owner"), restored.describeUserGroups("team").getFirst().getUserIds());
+            restored.deleteUserGroup("team");
             restored.deleteUser("owner");
             restored.createUser("owner", "default", AuthMode.NO_AUTH, List.of(), "on", "redis");
             assertTrue(restored.listTagsForResource(arn("user:owner")).isEmpty());
@@ -129,7 +135,7 @@ class ElastiCacheTagsAndUserGroupsServiceTest {
     @Test
     void invalidResourcesReturnTypedErrorsAndTagsAreAtomic() {
         ElastiCacheService service = service(factory("memory"));
-        Map<String, String> errors = Map.of("user", "UserNotFound",
+        Map<String, String> errors = Map.of("user", "UserNotFound", "usergroup", "UserGroupNotFound",
                 "cluster", "CacheClusterNotFound", "replicationgroup", "ReplicationGroupNotFoundFault",
                 "parametergroup", "CacheParameterGroupNotFound", "subnetgroup", "CacheSubnetGroupNotFoundFault",
                 "snapshot", "SnapshotNotFoundFault");
@@ -192,9 +198,33 @@ class ElastiCacheTagsAndUserGroupsServiceTest {
                 mock(EmulatorConfig.class), mock(Ec2Service.class), new RegionResolver("cn-north-1", "000000000000"),
                 mock(KmsService.class), new ElastiCacheProvisioningIds());
         china.createUser("china-user", "default", AuthMode.NO_AUTH, List.of(), "on", "redis");
-        String userArn = "arn:aws-cn:elasticache:cn-north-1:000000000000:user:china-user";
-        assertEquals(Map.of("region", "china"), china.addTagsToResource(userArn, Map.of("region", "china")));
+        ElastiCacheUserGroup group = china.createUserGroup("china-group", "redis", List.of("china-user"), Map.of());
+        assertEquals("arn:aws-cn:elasticache:cn-north-1:000000000000:usergroup:china-group", group.getArn());
+        assertEquals(Map.of("region", "china"), china.addTagsToResource(group.getArn(), Map.of("region", "china")));
         assertEquals("InvalidARN", assertThrows(AwsException.class,
-                () -> service.listTagsForResource(userArn)).getErrorCode());
+                () -> service.listTagsForResource(group.getArn())).getErrorCode());
+    }
+
+    @Test
+    void groupLifecycleValidatesMembershipBeforeMutation() {
+        ElastiCacheService service = service(factory("memory"));
+        service.createUser("default-user", "default", AuthMode.NO_AUTH, List.of(), "on", "redis");
+        service.createUser("extra", "extra", AuthMode.NO_AUTH, List.of(), "on", "redis");
+        assertEquals("DefaultUserRequired", assertThrows(AwsException.class,
+                () -> service.createUserGroup("team", "redis", List.of("extra"), Map.of())).getErrorCode());
+        ElastiCacheUserGroup group = service.createUserGroup("TEAM", "redis", List.of("default-user"), Map.of());
+        assertEquals("creating", group.getStatus());
+        assertEquals("team", group.getUserGroupId());
+        assertEquals("active", service.describeUserGroups("team").getFirst().getStatus());
+        assertEquals("UserNotFound", assertThrows(AwsException.class,
+                () -> service.modifyUserGroup("team", null, List.of("missing"), List.of("default-user"))).getErrorCode());
+        assertEquals(List.of("default-user"), group.getUserIds());
+        service.modifyUserGroup("team", null, List.of("extra"), List.of());
+        assertEquals(List.of("team"), service.userGroupIds("extra"));
+        service.modifyUserGroup("team", null, List.of(), List.of("extra"));
+        assertTrue(service.userGroupIds("extra").isEmpty());
+        assertEquals("deleting", service.deleteUserGroup("team").getStatus());
+        assertEquals("UserGroupNotFound", assertThrows(AwsException.class,
+                () -> service.describeUserGroups("team")).getErrorCode());
     }
 }

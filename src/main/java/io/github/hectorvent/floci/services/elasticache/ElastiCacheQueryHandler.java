@@ -13,6 +13,7 @@ import io.github.hectorvent.floci.services.elasticache.model.CacheParameterGroup
 import io.github.hectorvent.floci.services.elasticache.model.CacheSubnetGroup;
 import io.github.hectorvent.floci.services.elasticache.model.ClusterNode;
 import io.github.hectorvent.floci.services.elasticache.model.ElastiCacheUser;
+import io.github.hectorvent.floci.services.elasticache.model.ElastiCacheUserGroup;
 import io.github.hectorvent.floci.services.elasticache.model.Endpoint;
 import io.github.hectorvent.floci.services.elasticache.model.ReplicationGroup;
 import io.github.hectorvent.floci.services.elasticache.model.ReplicationGroupSettings;
@@ -86,6 +87,10 @@ public class ElastiCacheQueryHandler {
             case "ListTagsForResource" -> handleTags(action, params);
             case "AddTagsToResource" -> handleTags(action, params);
             case "RemoveTagsFromResource" -> handleTags(action, params);
+            case "CreateUserGroup" -> handleUserGroup(action, params);
+            case "DescribeUserGroups" -> handleUserGroup(action, params);
+            case "ModifyUserGroup" -> handleUserGroup(action, params);
+            case "DeleteUserGroup" -> handleUserGroup(action, params);
             default -> AwsQueryResponse.error("UnsupportedOperation",
                     "Operation " + action + " is not supported.", AwsNamespaces.EC, 400);
         };
@@ -668,6 +673,64 @@ private Response handleCreateCacheParameterGroup(MultivaluedMap<String, String> 
         }
     }
 
+    private Response handleUserGroup(String action, MultivaluedMap<String, String> params) {
+        try {
+            String id = params.getFirst("UserGroupId");
+            String result = switch (action) {
+                case "CreateUserGroup" -> userGroupXml(service.createUserGroup(id, params.getFirst("Engine"),
+                        extractMemberList(params, "UserIds.member."), parseTags(params)));
+                case "ModifyUserGroup" -> userGroupXml(service.modifyUserGroup(id, params.getFirst("Engine"),
+                        extractMemberList(params, "UserIdsToAdd.member."),
+                        extractMemberList(params, "UserIdsToRemove.member.")));
+                case "DeleteUserGroup" -> userGroupXml(service.deleteUserGroup(id));
+                default -> describeUserGroupsXml(params);
+            };
+            return Response.ok(AwsQueryResponse.envelope(action, AwsNamespaces.EC, result)).build();
+        } catch (AwsException e) {
+            return AwsQueryResponse.error(e.getErrorCode(), e.getMessage(), AwsNamespaces.EC, e.getHttpStatus());
+        }
+    }
+
+    private String describeUserGroupsXml(MultivaluedMap<String, String> params) {
+        Integer requestedLimit = intParam(params, "MaxRecords");
+        int limit = requestedLimit == null ? 100 : requestedLimit;
+        if (limit < 1) {
+            throw new AwsException("InvalidParameterValue", "MaxRecords must be positive.", 400);
+        }
+        List<ElastiCacheUserGroup> groups = service.describeUserGroups(params.getFirst("UserGroupId"));
+        String marker = params.getFirst("Marker");
+        int start = 0;
+        if (marker != null) {
+            while (start < groups.size() && !groups.get(start).getUserGroupId().equals(marker)) {
+                start++;
+            }
+            if (start == groups.size()) {
+                throw new AwsException("InvalidParameterValue", "Invalid Marker.", 400);
+            }
+            start++;
+        }
+        int end = (int) Math.min((long) start + limit, groups.size());
+        XmlBuilder xml = new XmlBuilder().start("UserGroups");
+        for (ElastiCacheUserGroup group : groups.subList(start, end)) {
+            xml.start("member").raw(userGroupXml(group)).end("member");
+        }
+        xml.end("UserGroups");
+        if (end < groups.size()) {
+            xml.elem("Marker", groups.get(end - 1).getUserGroupId());
+        }
+        return xml.build();
+    }
+
+    private String userGroupXml(ElastiCacheUserGroup group) {
+        XmlBuilder xml = new XmlBuilder().elem("UserGroupId", group.getUserGroupId())
+                .elem("Engine", group.getEngine()).elem("Status", group.getStatus())
+                .elem("MinimumEngineVersion", "valkey".equals(group.getEngine()) ? "7.2" : "6.0")
+                .elem("ARN", group.getArn()).start("UserIds");
+        group.getUserIds().forEach(id -> xml.elem("member", id));
+        return xml.end("UserIds").start("PendingChanges").end("PendingChanges")
+                .start("ReplicationGroups").end("ReplicationGroups").build();
+    }
+
     private Response handleDeleteCacheParameterGroup(MultivaluedMap<String, String> params) {
         try {
             service.deleteCacheParameterGroup(params.getFirst("CacheParameterGroupName"));
@@ -988,7 +1051,7 @@ private Response handleCreateCacheParameterGroup(MultivaluedMap<String, String> 
             case NO_AUTH -> "no-password-required";
         };
         int pwCount = (u.getPasswords() != null) ? u.getPasswords().size() : 0;
-        return new XmlBuilder()
+        XmlBuilder xml = new XmlBuilder()
                 .elem("UserId", u.getUserId())
                 .elem("UserName", u.getUserName())
                 .elem("Status", u.getStatus())
@@ -1000,9 +1063,9 @@ private Response handleCreateCacheParameterGroup(MultivaluedMap<String, String> 
                 .elem("Engine", u.getEngine())
                 // MinimumEngineVersion: the only value AWS documents; no valkey-specific one is published.
                 .elem("MinimumEngineVersion", "6.0")
-                .start("UserGroupIds").end("UserGroupIds")
-                .elem("ARN", userArn(u))
-                .build();
+                .start("UserGroupIds");
+        service.userGroupIds(u.getUserId()).forEach(id -> xml.elem("member", id));
+        return xml.end("UserGroupIds").elem("ARN", userArn(u)).build();
     }
 
     /**
