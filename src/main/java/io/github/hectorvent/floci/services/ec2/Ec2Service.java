@@ -5129,6 +5129,45 @@ public class Ec2Service implements ContainerTeardown, ResourceProvider {
                         + prefix + MODELLED_ZONE_SUFFIXES.length + ".", 400);
     }
 
+    public Subnet createDefaultSubnet(String region, String availabilityZone, String availabilityZoneId) {
+        if ((availabilityZone == null) == (availabilityZoneId == null)) {
+            throw new AwsException("InvalidParameterCombination",
+                    "Specify exactly one of AvailabilityZone and AvailabilityZoneId.", 400);
+        }
+        String zone = resolveSubnetZoneName(region, availabilityZone, availabilityZoneId);
+        if (Arrays.stream(MODELLED_ZONE_SUFFIXES).noneMatch(suffix -> zone.equals(region + suffix))) {
+            throw new AwsException("InvalidParameterValue", "Invalid availability zone: " + zone, 400);
+        }
+        ensureDefaultResources(region);
+        synchronized (attachmentTopologyLock(region)) {
+            Vpc vpc = vpcs.scan(k -> k.startsWith(region + "::")).stream().filter(Vpc::isDefault)
+                    .findFirst().orElseThrow(() -> new AwsException("DefaultVpcNotFound",
+                            "No default VPC exists in this region.", 400));
+            synchronized (lockFor(key(region, vpc.getVpcId()))) {
+                List<Subnet> existing = subnets.scan(k -> k.startsWith(region + "::")).stream()
+                        .filter(subnet -> vpc.getVpcId().equals(subnet.getVpcId())).toList();
+                if (existing.stream().anyMatch(subnet -> subnet.isDefaultForAz()
+                        && zone.equals(subnet.getAvailabilityZone()))) {
+                    throw new AwsException("DefaultSubnetAlreadyExistsInAvailabilityZone",
+                            "A default subnet already exists in availability zone " + zone + ".", 400);
+                }
+                List<String> occupied = existing.stream().map(Subnet::getCidrBlock)
+                        .filter(Ipv4Cidrs::isIpv4).toList();
+                String cidr = Ipv4Cidrs.firstFreeBlock(List.of(vpc.getCidrBlock()), occupied, 20);
+                if (cidr == null) {
+                    throw new AwsException("InsufficientFreeAddressesInVpc",
+                            "The default VPC has no available /20 CIDR block.", 400);
+                }
+                Subnet subnet = createSubnet(region, vpc.getVpcId(), cidr, zone);
+                subnet.setDefaultForAz(true);
+                subnet.setMapPublicIpOnLaunch(true);
+                subnet.setAvailableIpAddressCount(4091);
+                subnets.put(key(region, subnet.getSubnetId()), subnet);
+                return subnet;
+            }
+        }
+    }
+
     public Subnet createSubnet(String region, String vpcId, String cidrBlock, String availabilityZone) {
         return createSubnet(region, vpcId, cidrBlock, availabilityZone, null);
     }
