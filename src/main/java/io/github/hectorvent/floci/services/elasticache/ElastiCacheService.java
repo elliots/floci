@@ -4,6 +4,7 @@ import com.fasterxml.jackson.core.type.TypeReference;
 import io.github.hectorvent.floci.config.EmulatorConfig;
 import io.github.hectorvent.floci.core.common.AwsArnUtils;
 import io.github.hectorvent.floci.core.common.AwsException;
+import io.github.hectorvent.floci.core.common.AwsRegions;
 import io.github.hectorvent.floci.core.common.BackupWindows;
 import io.github.hectorvent.floci.core.common.RegionResolver;
 import io.github.hectorvent.floci.core.resource.ExplorerResource;
@@ -31,6 +32,7 @@ import io.github.hectorvent.floci.services.elasticache.model.Endpoint;
 import io.github.hectorvent.floci.services.elasticache.model.ReplicationGroup;
 import io.github.hectorvent.floci.services.elasticache.model.ReplicationGroupSettings;
 import io.github.hectorvent.floci.services.elasticache.model.ReplicationGroupStatus;
+import io.github.hectorvent.floci.services.elasticache.model.ServerlessCache;
 import io.github.hectorvent.floci.services.elasticache.proxy.ElastiCacheAuthProxy;
 import io.github.hectorvent.floci.services.elasticache.proxy.ElastiCacheProxyManager;
 import io.github.hectorvent.floci.services.kms.KmsService;
@@ -81,6 +83,7 @@ public class ElastiCacheService implements ResourceProvider {
     private final StorageBackend<String, CacheCluster> memcachedClusters;
     private final AccountAwareStorageBackend<ElastiCacheUser> users;
     private final AccountAwareStorageBackend<ElastiCacheUserGroup> userGroups;
+    private final AccountAwareStorageBackend<ServerlessCache> serverlessCaches;
     private final AccountAwareStorageBackend<CacheParameterGroup> parameterGroups;
     private final StorageBackend<String, CacheSubnetGroup> subnetGroups;
     private final ElastiCacheContainerManager containerManager;
@@ -164,6 +167,8 @@ public class ElastiCacheService implements ResourceProvider {
                 new TypeReference<Map<String, CacheCluster>>() {});
         this.memcachedClusters = storageFactory.create("elasticache", "elasticache-cache-clusters.json",
                 new TypeReference<Map<String, CacheCluster>>() {});
+        this.serverlessCaches = storageFactory.create("elasticache", "elasticache-serverless-caches.json",
+                new TypeReference<Map<String, ServerlessCache>>() {});
         this.users = storageFactory.create("elasticache", "elasticache-users.json",
                 new TypeReference<Map<String, ElastiCacheUser>>() {});
         this.userGroups = storageFactory.create("elasticache", "elasticache-user-groups.json",
@@ -1844,8 +1849,163 @@ public class ElastiCacheService implements ResourceProvider {
                 "KMS key does not exist with key id: " + kmsKeyId, 400);
     }
 
+    private ElastiCacheUser requireGroupUser(String id) {
+        return users.get(id).filter(user -> user.getArn() == null || user.getArn().equals(
+                regionResolver.buildArn("elasticache", regionResolver.getRegion(), "user:" + id)))
+                .orElseThrow(() -> new AwsException("UserNotFound", "User " + id + " not found.", 404));
+    }
+
+    private record TaggedResource(Map<String, String> tags, Collection<Map<String, String>> replicas, Runnable save) {
+        private TaggedResource(Map<String, String> tags, Runnable save) {
+            this(tags, List.of(), save);
+        }
+    }
+
+    public synchronized Map<String, String> listTagsForResource(String arn) {
+        return new LinkedHashMap<>(taggedResource(arn).tags());
+    }
+
+    public synchronized Map<String, String> addTagsToResource(String arn, Map<String, String> tags) {
+        TaggedResource resource = taggedResource(arn);
+        Map<String, String> merged = new LinkedHashMap<>(resource.tags());
+        merged.putAll(tags);
+        validateTags(merged);
+        for (Map<String, String> replica : resource.replicas()) {
+            Map<String, String> next = new LinkedHashMap<>(replica);
+            next.putAll(tags);
+            validateTags(next);
+        }
+        resource.tags().putAll(tags);
+        resource.replicas().forEach(replica -> replica.putAll(tags));
+        resource.save().run();
+        return new LinkedHashMap<>(resource.tags());
+    }
+
+    public synchronized Map<String, String> removeTagsFromResource(String arn, List<String> keys) {
+        TaggedResource resource = taggedResource(arn);
+        for (String key : keys) {
+            if (!resource.tags().containsKey(key)) {
+                throw new AwsException("TagNotFound", "Tag " + key + " not found.", 404);
+            }
+        }
+        keys.forEach(resource.tags()::remove);
+        resource.replicas().forEach(replica -> keys.forEach(replica::remove));
+        resource.save().run();
+        return new LinkedHashMap<>(resource.tags());
+    }
+
+    private static void validateTags(Map<String, String> tags) {
+        if (tags.size() > 50) {
+            throw new AwsException("TagQuotaPerResourceExceeded", "A resource can have at most 50 tags.", 400);
+        }
+        tags.forEach((key, value) -> {
+            if (key == null || key.isEmpty() || key.length() > 128 || key.toLowerCase(Locale.ROOT).startsWith("aws:")
+                    || (value != null && value.length() > 256)) {
+                throw new AwsException("InvalidParameterValue", "Invalid tag key or value.", 400);
+            }
+        });
+    }
+
+    private TaggedResource taggedResource(String resourceName) {
+        String[] arn = resourceName == null ? new String[0] : resourceName.split(":", -1);
+        if (arn.length != 7 || !"arn".equals(arn[0])) {
+            throw new AwsException("InvalidARN", "Input ARN string does not have 7 components.", 400);
+        }
+        String partition = AwsRegions.partitionFor(regionResolver.getRegion());
+        if (!partition.equals(arn[1])) {
+            throw new AwsException("InvalidARN", "partition field is wrong. Expected value is " + partition, 400);
+        }
+        if (!"elasticache".equals(arn[2])) {
+            throw new AwsException("InvalidARN", "service field is wrong. Expected value is elasticache", 400);
+        }
+        if (!AwsArnUtils.isArn(resourceName) || arn[3].isBlank() || !arn[4].matches("[0-9]{12}")
+                || !arn[6].matches("[a-zA-Z0-9][a-zA-Z0-9._-]*")) {
+            throw new AwsException("InvalidARN", "Invalid ElastiCache resource ARN.", 400);
+        }
+        if (!regionResolver.getRegion().equals(arn[3])) {
+            throw new AwsException("InvalidParameterValue", "Unauthorized call. Please check the region or customer id", 400);
+        }
+        if (!regionResolver.getAccountId().equals(arn[4])) {
+            throw new AwsException("InvalidParameterValue", "The resource ARN does not belong to the caller's account.", 400);
+        }
+        String id = arn[6];
+        return switch (arn[5]) {
+            case "serverlesscache" -> {
+                String key = regionResolver.getRegion() + "/" + id;
+                ServerlessCache cache = serverlessCaches.get(key).orElseThrow(() ->
+                        new AwsException("ServerlessCacheNotFoundFault", "Serverless cache " + id + " not found.", 404));
+                checkTagArn(resourceName, cache.getArn(), "ServerlessCacheNotFoundFault");
+                Map<String, String> tags = cache.getTags();
+                yield new TaggedResource(tags, () -> {
+                    cache.setTags(tags);
+                    serverlessCaches.put(key, cache);
+                });
+            }
+            case "usergroup" -> {
+                ElastiCacheUserGroup group = getUserGroup(id);
+                checkTagArn(resourceName, group.getArn(), "UserGroupNotFound");
+                yield new TaggedResource(group.getTags(), () -> userGroups.put(group.getUserGroupId(), group));
+            }
+            case "user" -> {
+                ElastiCacheUser user = requireGroupUser(id);
+                yield new TaggedResource(user.getTags(), () -> users.put(id, user));
+            }
+            case "replicationgroup" -> {
+                ReplicationGroup group = getReplicationGroup(id);
+                checkTagArn(resourceName, group.getArn(), "ReplicationGroupNotFoundFault");
+                yield new TaggedResource(group.getTags(), group.getMemberTags().values(), () -> groups.put(id, group));
+            }
+            case "cluster" -> {
+                CacheCluster cluster = cacheClusters.get(id).orElse(null);
+                StorageBackend<String, CacheCluster> backend = cacheClusters;
+                if (cluster == null) {
+                    cluster = memcachedClusters.get(id).orElse(null);
+                    backend = memcachedClusters;
+                }
+                if (cluster != null) {
+                    checkTagArn(resourceName, cluster.getArn(), "CacheClusterNotFound");
+                    CacheCluster stored = cluster;
+                    StorageBackend<String, CacheCluster> store = backend;
+                    yield new TaggedResource(cluster.getTags(), () -> store.put(id, stored));
+                }
+                MemberCacheCluster member = listMemberCacheClusters(id).stream().findFirst()
+                        .orElseThrow(() -> new AwsException("CacheClusterNotFound", "Cluster " + id + " not found.", 404));
+                ReplicationGroup group = member.group();
+                checkTagArn(regionResolver.buildArn("elasticache", regionResolver.getRegion(),
+                        "replicationgroup:" + group.getReplicationGroupId()), group.getArn(), "CacheClusterNotFound");
+                Map<String, String> tags = group.getMemberTags().computeIfAbsent(id,
+                        key -> new LinkedHashMap<>(group.getTags()));
+                yield new TaggedResource(tags, () -> groups.put(group.getReplicationGroupId(), group));
+            }
+            case "parametergroup" -> {
+                CacheParameterGroup group = findParameterGroup(id).orElseThrow(() ->
+                        new AwsException("CacheParameterGroupNotFound", id + " is not present", 404));
+                yield new TaggedResource(group.getTags(), () -> parameterGroups.put(id, group));
+            }
+            case "subnetgroup" -> {
+                CacheSubnetGroup group = describeCacheSubnetGroups(id).getFirst();
+                yield new TaggedResource(group.getTags(), () -> subnetGroups.put(id, group));
+            }
+            case "snapshot" -> throw new AwsException("SnapshotNotFoundFault", "Snapshot " + id + " not found.", 404);
+            default -> throw new AwsException("InvalidARN", "Unsupported ElastiCache ARN resource type.", 400);
+        };
+    }
+
+    private static void checkTagArn(String requested, String actual, String error) {
+        if (actual != null && !actual.equalsIgnoreCase(requested)) {
+            throw new AwsException(error, "Resource " + requested + " not found.", 404);
+        }
+    }
+
     public ElastiCacheUser createUser(String userId, String userName, AuthMode authMode,
                                       List<String> passwords, String accessString, String engine) {
+        return createUser(userId, userName, authMode, passwords, accessString, engine, Map.of());
+    }
+
+    public ElastiCacheUser createUser(String userId, String userName, AuthMode authMode,
+                                      List<String> passwords, String accessString, String engine,
+                                      Map<String, String> tags) {
+        validateTags(tags);
         if (users.get(userId).isPresent()) {
             throw new AwsException("UserAlreadyExists",
                     "User " + userId + " already exists.", 400);
@@ -1861,6 +2021,7 @@ public class ElastiCacheService implements ResourceProvider {
                 normalizedEngine, "active", Instant.now());
         user.setArn(regionResolver.buildArn("elasticache", regionResolver.getRegion(), "user:" + userId));
 
+        user.setTags(tags);
         users.put(userId, user);
         LOG.infov("ElastiCache user {0} created with authMode={1}", userId, authMode);
         return user;
@@ -1956,6 +2117,12 @@ public class ElastiCacheService implements ResourceProvider {
 
     public ElastiCacheUserGroup createUserGroup(String userGroupId, String engine, List<String> userIds,
                                                 String region) {
+        return createUserGroup(userGroupId, engine, userIds, region, Map.of());
+    }
+
+    public ElastiCacheUserGroup createUserGroup(String userGroupId, String engine, List<String> userIds,
+                                                String region, Map<String, String> tags) {
+        validateTags(tags);
         String id = normalizeUserGroupId(userGroupId);
         // Engine is required on AWS; a missing value defaults to redis as CreateUser does.
         String normalizedEngine = (engine == null || engine.isBlank()) ? "redis" : normalizeEngine(engine);
@@ -1969,6 +2136,7 @@ public class ElastiCacheService implements ResourceProvider {
             ElastiCacheUserGroup userGroup = new ElastiCacheUserGroup(
                     id, normalizedEngine, members, "active", Instant.now());
             userGroup.setArn(regionResolver.buildArn("elasticache", region, "usergroup:" + id));
+            userGroup.setTags(tags);
             userGroups.put(id, userGroup);
             LOG.infov("ElastiCache user group {0} created with {1} users", id, members.size());
             return userGroup;
