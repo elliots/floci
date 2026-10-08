@@ -18,6 +18,7 @@ public class ElastiCacheUserGroup {
     private Set<String> userIds = new LinkedHashSet<>();
     private Instant createdAt;
     private String arn;
+    private Map<String, String> tags = new LinkedHashMap<>();
     // Serverless caches attached to this group, by cache name, with the engine each runs.
     private Map<String, String> serverlessCacheEngines = new LinkedHashMap<>();
 
@@ -48,6 +49,9 @@ public class ElastiCacheUserGroup {
 
     public Instant getCreatedAt() { return createdAt; }
     public void setCreatedAt(Instant createdAt) { this.createdAt = createdAt; }
+
+    public Map<String, String> getTags() { return tags; }
+    public void setTags(Map<String, String> tags) { this.tags = new LinkedHashMap<>(tags); }
 
     public String getArn() { return arn; }
     public void setArn(String arn) { this.arn = arn; }
