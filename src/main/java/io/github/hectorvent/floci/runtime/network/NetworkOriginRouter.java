@@ -33,8 +33,7 @@ public final class NetworkOriginRouter {
             deny(request, "invalid-authority");
             return;
         }
-        Optional<NetworkDefinition.Route> match = network.routes().stream()
-                .filter(route -> route.origins().contains(origin)).findFirst();
+        Optional<NetworkDefinition.Route> match = network.routeFor(origin);
         if (match.isEmpty()) {
             deny(request, origin.toString());
             return;

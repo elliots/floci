@@ -20,6 +20,7 @@ import io.vertx.core.buffer.Buffer;
 import io.vertx.core.http.HttpServer;
 import io.vertx.core.http.HttpServerOptions;
 import io.vertx.core.http.HttpVersion;
+import io.vertx.core.net.KeyCertOptions;
 import io.vertx.core.net.PemKeyCertOptions;
 import io.vertx.core.net.PemTrustOptions;
 import jakarta.annotation.Priority;
@@ -37,6 +38,7 @@ import java.util.List;
 import java.util.Map;
 import java.util.Optional;
 import java.util.concurrent.TimeUnit;
+import java.util.stream.Stream;
 
 /** Serves simulated HTTP(S) origins through a dedicated local gateway. */
 @ApplicationScoped
@@ -86,14 +88,14 @@ public class NetworkService {
                     .map(URI::getHost).distinct().forEach(names::add);
             GeneratedCertificate certificate = ca.issueServerCertificate(NetworkPodAdmission.HOST, names,
                     KeyAlgorithm.RSA_2048, null);
-            PemKeyCertOptions keys = new PemKeyCertOptions().setCertValue(Buffer.buffer(certificate.certificatePem()))
-                    .setKeyValue(Buffer.buffer(certificate.privateKeyPem()));
+            KeyCertOptions keys = new OriginKeyCertOptions(new PemKeyCertOptions().setCertValue(Buffer.buffer(certificate.certificatePem()))
+                    .setKeyValue(Buffer.buffer(certificate.privateKeyPem())), configuration.network(), ca);
             proxy = new HttpReverseProxy(vertx,
                     new PemTrustOptions().addCertValue(Buffer.buffer(ca.caPem())), isolation::resolveBackend);
             NetworkOriginRouter router = new NetworkOriginRouter(configuration.network(), proxy);
             Map<Integer, String> ports = new LinkedHashMap<>();
             for (NetworkDefinition.Route route : configuration.network().routes()) {
-                for (URI origin : route.origins()) {
+                for (URI origin : Stream.concat(route.origins().stream(), route.wildcards().stream()).toList()) {
                     if (origin.getPort() == NetworkPodAdmission.PORT) {
                         throw new IllegalArgumentException("Origin port 9443 is reserved for Kubernetes trust admission");
                     }
@@ -145,11 +147,12 @@ public class NetworkService {
         }
     }
 
-    private static HttpServerOptions options(boolean tls, PemKeyCertOptions keys) {
+    private static HttpServerOptions options(boolean tls, KeyCertOptions keys) {
         HttpServerOptions options = new HttpServerOptions().setHandle100ContinueAutomatically(true)
                 .setHttp2ClearTextEnabled(true);
         if (tls) {
-            options.setSsl(true).setKeyCertOptions(keys).setUseAlpn(true)
+            // SNI, so a name a wildcard origin covers is given a certificate of its own (OriginKeyCertOptions)
+            options.setSsl(true).setSni(true).setKeyCertOptions(keys).setUseAlpn(true)
                     .setAlpnVersions(List.of(HttpVersion.HTTP_2, HttpVersion.HTTP_1_1));
         }
         return options;

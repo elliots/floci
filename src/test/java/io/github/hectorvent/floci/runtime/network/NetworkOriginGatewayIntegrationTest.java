@@ -52,7 +52,7 @@ class NetworkOriginGatewayIntegrationTest {
         GeneratedCertificate certificate = ca.issueServerCertificate("api.vendor.test",
                 List.of("api.vendor.test", "uploads.vendor.test", "cold.vendor.test", "unknown.vendor.test"),
                 KeyAlgorithm.RSA_2048, null);
-        trusted = vertx.createHttpClient(new HttpClientOptions().setTrustOptions(new PemTrustOptions()
+        trusted = vertx.createHttpClient(new HttpClientOptions().setForceSni(true).setTrustOptions(new PemTrustOptions()
                 .addCertValue(Buffer.buffer(ca.caPem()))));
         untrusted = vertx.createHttpClient();
         proxy = new HttpReverseProxy(vertx, null, uri -> "127.0.0.1");
@@ -60,10 +60,12 @@ class NetworkOriginGatewayIntegrationTest {
                 new NetworkDefinition.Route("payments", List.of(URI.create("https://api.vendor.test:443"),
                         URI.create("https://uploads.vendor.test:443")), destination, false),
                 new NetworkDefinition.Route("preserved", List.of(URI.create("https://cold.vendor.test:443")),
-                        destination, true)));
+                        destination, true),
+                new NetworkDefinition.Route("front", List.of(), List.of(URI.create("https://env.test:443")), destination, true)));
         NetworkOriginRouter router = new NetworkOriginRouter(network, proxy);
-        gateway = waitFor(vertx.createHttpServer(new HttpServerOptions().setSsl(true).setKeyCertOptions(new PemKeyCertOptions()
-                        .setCertValue(Buffer.buffer(certificate.certificatePem())).setKeyValue(Buffer.buffer(certificate.privateKeyPem()))))
+        gateway = waitFor(vertx.createHttpServer(new HttpServerOptions().setSsl(true).setSni(true).setKeyCertOptions(
+                        new OriginKeyCertOptions(new PemKeyCertOptions().setCertValue(Buffer.buffer(certificate.certificatePem()))
+                                .setKeyValue(Buffer.buffer(certificate.privateKeyPem())), network, ca)))
                 .requestHandler(request -> router.route(request, "https", 443)).listen(0, "127.0.0.1"));
     }
 
@@ -100,6 +102,17 @@ class NetworkOriginGatewayIntegrationTest {
         Reply response = waitFor(send(trusted, "unknown.vendor.test", Buffer.buffer()));
         assertEquals(502, response.status());
         assertEquals("Unmapped network origin", response.body().toString());
+    }
+
+    @Test
+    void aNameAWildcardOriginCoversIsRoutedWithACertificateOfItsOwn() throws Exception {
+        // a certificate's own wildcard covers one label; these are one and three below the origin's domain
+        for (String host : List.of("api.env.test", "pay.inbound.connect.env.test")) {
+            Reply response = waitFor(send(trusted, host, Buffer.buffer("request")));
+            assertEquals(201, response.status(), host);
+            assertEquals(host, response.backendHost());
+        }
+        assertThrows(ExecutionException.class, () -> waitFor(send(untrusted, "api.env.test", Buffer.buffer())));
     }
 
     @Test

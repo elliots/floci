@@ -26,7 +26,10 @@ network:
 ```
 
 Each route needs a nonempty `origins` list and a `target.backend-url`. Origins are exact HTTP(S)
-origins using DNS hostnames, without paths, credentials, queries, fragments, or wildcards.
+origins using DNS hostnames, without paths, credentials, queries, or fragments.
+Wildcard origins such as `https://*.example.test` cover subdomains at any depth, but
+not `example.test` itself. Exact origins take priority; otherwise the most specific
+wildcard wins. The gateway issues certificates for matching HTTPS names on demand.
 Hostnames are case insensitive; omitted ports mean 80 for HTTP and 443 for HTTPS. Duplicate
 origins, unknown fields, and obvious backend loops fail startup. HTTP and HTTPS cannot share
 the same origin port. Port 9443 and `network.floci.internal` are reserved for pod admission.

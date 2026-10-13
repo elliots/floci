@@ -17,10 +17,14 @@ class EmbeddedDnsIsolationServiceTest {
         NetworkConfiguration config = mock(NetworkConfiguration.class);
         when(config.network()).thenReturn(new NetworkDefinition(true, List.of(
                 new NetworkDefinition.Route("payments", List.of(URI.create("https://api.vendor.test:443"),
-                        URI.create("https://uploads.vendor.test:443")), URI.create("http://mock:8080"), false))));
+                        URI.create("https://uploads.vendor.test:443")), URI.create("http://mock:8080"), false),
+                new NetworkDefinition.Route("front", List.of(), List.of(URI.create("https://env.test:443")),
+                        URI.create("http://front:80"), true))));
         when(config.gatewayAddress()).thenReturn(Optional.of("172.20.0.3"));
         EmbeddedDnsServer dns = new EmbeddedDnsServer(List.of(), List.of(), config);
-        for (String hostname : List.of("api.vendor.test", "uploads.vendor.test")) {
+        // a wildcard origin (https://*.env.test) answers for every name below its domain, not for the domain itself
+        assertFalse(dns.planQuery("env.test", "172.20.0.5", "172.20.0.2", 1).answer().orElseThrow().nameExists());
+        for (String hostname : List.of("api.vendor.test", "uploads.vendor.test", "api.env.test", "pay.connect.env.test")) {
             EmbeddedDnsServer.QueryPlan plan = dns.planQuery(hostname, "172.20.0.5", "172.20.0.2", 1);
             assertEquals(List.of("172.20.0.3"), plan.answer().orElseThrow().addresses());
             assertTrue(plan.ruleTargets().isEmpty());

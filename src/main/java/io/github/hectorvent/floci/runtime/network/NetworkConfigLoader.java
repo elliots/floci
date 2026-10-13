@@ -44,6 +44,7 @@ public final class NetworkConfigLoader {
         }
         object(routes, "network.routes");
         Set<URI> seen = new HashSet<>();
+        Set<URI> seenWildcards = new HashSet<>();
         Set<String> hosts = new HashSet<>();
         Map<Integer, String> protocols = new HashMap<>();
         List<NetworkDefinition.Route> result = new ArrayList<>();
@@ -52,38 +53,50 @@ public final class NetworkConfigLoader {
             JsonNode route = entry.getValue();
             fields(route, name, Set.of("origins", "target"));
             List<URI> origins = new ArrayList<>();
+            List<URI> wildcards = new ArrayList<>();
             for (String value : strings(route, "origins")) {
-                URI origin = networkOrigin(value, name);
+                // https://*.example.test takes every name below example.test, kept as the domain it covers
+                boolean wildcard = value.matches("(?i)https?://\\*\\..*");
+                URI origin = networkOrigin(wildcard ? value.replaceFirst("\\*\\.", "") : value, name);
                 if (origin.getHost().matches("[0-9.]+")) {
                     throw invalid(name, "origin must use a DNS hostname so Floci can redirect it locally");
                 }
-                if (origin.getPort() == NetworkPodAdmission.PORT || NetworkPodAdmission.HOST.equals(origin.getHost())) {
+                if (origin.getPort() == NetworkPodAdmission.PORT || NetworkPodAdmission.HOST.equals(origin.getHost())
+                        || wildcard && NetworkPodAdmission.HOST.endsWith("." + origin.getHost())) {
                     throw invalid(name, "origin uses the reserved Kubernetes trust admission host or port");
                 }
-                if (!seen.add(origin)) {
-                    throw invalid(name, "origin is already assigned: " + origin);
+                if (wildcard && !origin.getHost().contains(".")) {
+                    throw invalid(name, "a wildcard origin must cover a domain below a top-level one: " + value);
+                }
+                if (!(wildcard ? seenWildcards : seen).add(origin)) {
+                    throw invalid(name, "origin is already assigned: " + value);
                 }
                 String protocol = protocols.putIfAbsent(origin.getPort(), origin.getScheme());
                 if (protocol != null && !protocol.equals(origin.getScheme())) {
                     throw invalid(name, "HTTP and HTTPS origins cannot share a listener port");
                 }
-                hosts.add(origin.getHost());
-                origins.add(origin);
+                if (wildcard) {
+                    wildcards.add(origin);
+                } else {
+                    hosts.add(origin.getHost());
+                    origins.add(origin);
+                }
             }
-            if (origins.isEmpty()) {
+            if (origins.isEmpty() && wildcards.isEmpty()) {
                 throw invalid(name, "origins must not be empty");
             }
             JsonNode target = route.path("target");
             fields(target, name + ".target", Set.of("backend-url", "preserve-host"));
             URI backend = networkOrigin(text(target, "backend-url"), name);
-            result.add(new NetworkDefinition.Route(name, origins, backend, bool(target, "preserve-host", false)));
+            result.add(new NetworkDefinition.Route(name, origins, wildcards, backend, bool(target, "preserve-host", false)));
         }
+        NetworkDefinition network = new NetworkDefinition(enabled, result);
         for (NetworkDefinition.Route route : result) {
-            if (hosts.contains(route.backendUrl().getHost())) {
+            if (hosts.contains(route.backendUrl().getHost()) || network.owns(route.backendUrl().getHost())) {
                 throw invalid(route.name(), "backend-url resolves to a network gateway hostname");
             }
         }
-        return new NetworkDefinition(enabled, result);
+        return network;
     }
 
     private static URI networkOrigin(String value, String name) {
