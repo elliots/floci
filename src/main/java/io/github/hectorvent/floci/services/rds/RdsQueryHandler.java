@@ -895,8 +895,12 @@ public class RdsQueryHandler {
                .elem("Engine", option.get("engine"))
                .elem("EngineVersion", option.get("engineVersion"))
                .elem("DBInstanceClass", option.get("dbInstanceClass"))
-               .elem("LicenseModel", licenseModel(option.get("engine")))
-               .start("AvailabilityZones")
+               .elem("LicenseModel", licenseModel(option.get("engine")));
+            if (option.get("storageType") != null) {
+                // the AWS provider filters aws_rds_orderable_db_instance on storage_type client-side
+                xml.elem("StorageType", option.get("storageType"));
+            }
+            xml.start("AvailabilityZones")
                  .start("AvailabilityZone")
                    .elem("Name", config.defaultAvailabilityZone())
                  .end("AvailabilityZone")
@@ -1180,6 +1184,7 @@ public class RdsQueryHandler {
         try {
             List<DbRoleAssociation> associatedRoles = parseAssociatedRoles(params);
             service.validateClusterRoleAssociations(id, engine, associatedRoles);
+            String kmsKeyId = service.resolveClusterKmsKey(params.getFirst("KmsKeyId"), region, storageEncrypted);
             Double serverlessV2Min = parseDoubleParam(params, "ServerlessV2ScalingConfiguration.MinCapacity");
             Double serverlessV2Max = parseDoubleParam(params, "ServerlessV2ScalingConfiguration.MaxCapacity");
             Integer serverlessV2SecondsUntilAutoPause = parseIntegerParam(
@@ -1221,6 +1226,9 @@ public class RdsQueryHandler {
                     service.deleteDbCluster(id, region);
                     throw e;
                 }
+            }
+            if (kmsKeyId != null && !kmsKeyId.isBlank()) {
+                cluster = service.recordClusterKmsKey(id, region, kmsKeyId);
             }
             String result = dbClusterXml(cluster);
             return Response.ok(AwsQueryResponse.envelope("CreateDBCluster", AwsNamespaces.RDS, result)).build();
@@ -2932,6 +2940,14 @@ public class RdsQueryHandler {
            .elem("DBSubnetGroup", c.getDbSubnetGroupName() != null ? c.getDbSubnetGroupName() : "default")
            .elem("DbClusterResourceId", c.getDbClusterResourceId())
            .elem("DBClusterArn", c.getDbClusterArn());
+        // AWS returns the key an encrypted cluster was created with and the cluster parameter group it uses; a client that
+        // reads them back (Terraform's aws_rds_cluster) compares them with what it asked for.
+        if (c.getKmsKeyId() != null && !c.getKmsKeyId().isBlank()) {
+            xml.elem("KmsKeyId", c.getKmsKeyId());
+        }
+        if (c.getParameterGroupName() != null && !c.getParameterGroupName().isBlank()) {
+            xml.elem("DBClusterParameterGroup", c.getParameterGroupName());
+        }
         if (c.getMasterUserSecretArn() != null && !c.getMasterUserSecretArn().isBlank()) {
             xml.start("MasterUserSecret")
                     .elem("SecretArn", c.getMasterUserSecretArn())
@@ -2961,10 +2977,10 @@ public class RdsQueryHandler {
         if (c.getDbClusterMembers() != null) {
             String writer = c.resolveWriterIdentifier();
             for (String memberId : c.getDbClusterMembers()) {
-                xml.start("member")
+                xml.start("DBClusterMember")
                    .elem("DBInstanceIdentifier", memberId)
                    .elem("IsClusterWriter", memberId.equals(writer))
-                   .end("member");
+                   .end("DBClusterMember");
             }
         }
         xml.end("DBClusterMembers");

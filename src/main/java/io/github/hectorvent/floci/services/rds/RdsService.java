@@ -60,6 +60,7 @@ import io.github.hectorvent.floci.services.rds.model.OptionGroupOption;
 import io.github.hectorvent.floci.services.rds.model.PointInTimeRestoreRequest;
 import io.github.hectorvent.floci.services.rds.model.RdsEvent;
 import io.github.hectorvent.floci.services.rds.model.ReadReplicaRequest;
+import io.github.hectorvent.floci.services.rds.proxy.AuroraMySqlEmulation;
 import io.github.hectorvent.floci.services.rds.proxy.RdsProxyBinding;
 import io.github.hectorvent.floci.services.rds.proxy.RdsProxyManager;
 import io.github.hectorvent.floci.services.resourcegroupstagging.ResourceGroupsTaggingService;
@@ -3174,8 +3175,12 @@ public class RdsService implements Resettable, ResourceProvider {
         List<Map<String, String>> options = new ArrayList<>();
         for (RdsEngineCatalog.EngineVersion version : RdsEngineCatalog.VERSIONS) {
             for (String instanceClass : version.instanceClasses()) {
-                options.add(Map.of("engine", version.engine(), "engineVersion", version.version(),
-                        "dbInstanceClass", instanceClass));
+                Map<String, String> option = new LinkedHashMap<>(Map.of("engine", version.engine(),
+                        "engineVersion", version.version(), "dbInstanceClass", instanceClass));
+                if (isAuroraEngine(version.engine())) {
+                    option.put("storageType", "aurora");
+                }
+                options.add(option);
             }
         }
         return options.stream()
@@ -3617,8 +3622,8 @@ public class RdsService implements Resettable, ResourceProvider {
                     cluster.getMasterUsername() != null ? cluster.getMasterUsername() : "root",
                     cluster.getMasterPassword(), cluster.getDatabaseName(),
                     (user, pw) -> validateDbClusterPasswordForScope(accountId, clusterRegion, id, user, pw),
-                    proxyBinding(cluster.getEngine(), cluster.getEndpoint().address(), cluster.getEndpoint().port(),
-                            clusterRegion, accountId, cluster.getDbClusterResourceId()));
+                    clusterProxyBinding(cluster, cluster.getEndpoint().address(), cluster.getEndpoint().port(),
+                            clusterRegion, accountId));
             applyAutoPause(cluster);
         }
     }
@@ -3724,6 +3729,27 @@ public class RdsService implements Resettable, ResourceProvider {
                 || config.services().rds().iamTokenEndpointBinding();
         return new RdsProxyBinding(advertisedHost, publishedPort, region, accountId, resourceId,
                 tokensBoundToEndpoint);
+    }
+
+    /**
+     * The binding of an Aurora cluster's endpoint. For Aurora MySQL it also carries what the cluster answers that its plain
+     * MySQL backend does not (which instance a client reached, the topology, the Aurora version): the writer is looked up
+     * when a statement arrives, since the cluster is created before its instances.
+     */
+    private RdsProxyBinding clusterProxyBinding(DbCluster cluster, String advertisedHost, int publishedPort,
+                                                String region, String accountId) {
+        RdsProxyBinding binding = proxyBinding(cluster.getEngine(), advertisedHost, publishedPort, region, accountId,
+                cluster.getDbClusterResourceId());
+        if (cluster.getEngine() != DatabaseEngine.MYSQL || !isAuroraEngine(cluster.getEngineIdentifier())) {
+            return binding;
+        }
+        String clusterId = cluster.getDbClusterIdentifier();
+        return binding.withAuroraMySql(() -> {
+            DbCluster current = findClusterForScope(accountId, region, clusterId);
+            String writer = current == null ? null : current.resolveWriterIdentifier();
+            return writer == null ? null
+                    : new AuroraMySqlEmulation.Server(writer, AuroraMySqlEmulation.auroraVersion(current.getEngineVersion()));
+        });
     }
 
     private static boolean hasBackend(String host, int port) {
@@ -3910,8 +3936,8 @@ public class RdsService implements Resettable, ResourceProvider {
                     effectiveMasterUser, cluster.getMasterPassword(), cluster.getDatabaseName(),
                     (user, pw) -> validateDbClusterPasswordForScope(
                             accountId, clusterRegion, id, user, pw),
-                    proxyBinding(cluster.getEngine(), relayEndpoint.address(),
-                            relayEndpoint.port(), clusterRegion, accountId, cluster.getDbClusterResourceId()));
+                    clusterProxyBinding(cluster, relayEndpoint.address(),
+                            relayEndpoint.port(), clusterRegion, accountId));
         } catch (RuntimeException e) {
             if (allocatedRelayPort) {
                 releaseProxyPort(relayPort);
@@ -4347,8 +4373,8 @@ public class RdsService implements Resettable, ResourceProvider {
                         effectiveMasterUser, masterPassword, databaseName,
                         (user, pw) -> validateDbClusterPasswordForScope(
                                 accountId, clusterRegion, id, user, pw),
-                        proxyBinding(engine, cluster.getEndpoint().address(), cluster.getEndpoint().port(),
-                                clusterRegion, accountId, cluster.getDbClusterResourceId()));
+                        clusterProxyBinding(cluster, cluster.getEndpoint().address(), cluster.getEndpoint().port(),
+                                clusterRegion, accountId));
             }
 
             cluster.setServerlessV2MinCapacity(serverlessV2MinCapacity);
@@ -4643,6 +4669,26 @@ public class RdsService implements Resettable, ResourceProvider {
                 .orElseThrow(() ->
                 new AwsException("DBClusterNotFoundFault",
                         "DB cluster " + id + " not found.", 404));
+    }
+
+    /**
+     * Records the KMS key a cluster was created encrypted with. A client that reads the cluster back (Terraform's
+     * aws_rds_cluster, whose kms_key_id cannot be changed in place) compares it with what it asked for, and replaces the
+     * cluster on every run when the answer has no key.
+     */
+    String resolveClusterKmsKey(String kmsKeyId, String region, boolean storageEncrypted) {
+        if (kmsKeyId != null && !kmsKeyId.isBlank() && !storageEncrypted) {
+            throw new AwsException("InvalidParameterCombination", "KmsKeyId requires StorageEncrypted.", 400);
+        }
+        return resolveKmsKeyArn(kmsKeyId, effectiveRegion(region));
+    }
+
+    public DbCluster recordClusterKmsKey(String id, String region, String kmsKeyId) {
+        String effectiveRegion = effectiveRegion(region);
+        DbCluster cluster = getDbCluster(id, effectiveRegion);
+        cluster.setKmsKeyId(kmsKeyId);
+        putClusterForScope(currentAccountId(), effectiveRegion, id, cluster);
+        return cluster;
     }
 
     public Collection<DbCluster> listDbClusters(String filterId) {
@@ -8005,8 +8051,8 @@ public class RdsService implements Resettable, ResourceProvider {
                             (user, pw) -> validateDbClusterPasswordForScope(
                                     accountId, clusterRegion,
                                     cluster.getDbClusterIdentifier(), user, pw),
-                            proxyBinding(cluster.getEngine(), cluster.getEndpoint().address(), cluster.getEndpoint().port(),
-                                    clusterRegion, accountId, cluster.getDbClusterResourceId()));
+                            clusterProxyBinding(cluster, cluster.getEndpoint().address(), cluster.getEndpoint().port(),
+                                    clusterRegion, accountId));
                 }
                 cluster.setStatus(DbInstanceStatus.AVAILABLE);
                 putClusterForScope(accountId, clusterRegion,

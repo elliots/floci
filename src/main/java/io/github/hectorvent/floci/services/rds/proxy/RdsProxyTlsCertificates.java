@@ -12,6 +12,7 @@ import org.jboss.logging.Logger;
 
 import javax.net.ssl.KeyManagerFactory;
 import javax.net.ssl.SSLContext;
+
 import java.io.IOException;
 import java.nio.file.Files;
 import java.nio.file.Path;
@@ -87,6 +88,19 @@ public class RdsProxyTlsCertificates {
             Set<String> updated = new LinkedHashSet<>(currentSans);
             updated.add(host);
             regenerate(updated);
+        }
+    }
+
+    /**
+     * The proxy's current certificate as PEM: the trust anchor a client puts in its trust store. It is the file persisted at
+     * {@code {persistent-path}/tls/rds-ca.crt}, so a caller need not know where floci keeps its data.
+     */
+    public String certificatePem() {
+        ensureInitialized();
+        try {
+            return Files.readString(tlsDir().resolve(CERT_NAME));
+        } catch (IOException e) {
+            throw new IllegalStateException("Failed to read the RDS proxy TLS certificate", e);
         }
     }
 

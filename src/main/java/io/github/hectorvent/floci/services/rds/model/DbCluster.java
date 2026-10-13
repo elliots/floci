@@ -135,6 +135,12 @@ public class DbCluster {
     public String getGlobalClusterIdentifier() { return globalClusterIdentifier; }
     public void setGlobalClusterIdentifier(String globalClusterIdentifier) { this.globalClusterIdentifier = globalClusterIdentifier; }
 
+    // The KMS key the storage was created encrypted with (CreateDBCluster's KmsKeyId), null when none was given.
+    private String kmsKeyId;
+
+    public String getKmsKeyId() { return kmsKeyId; }
+    public void setKmsKeyId(String kmsKeyId) { this.kmsKeyId = kmsKeyId; }
+
     public String getParameterGroupName() { return parameterGroupName; }
     public void setParameterGroupName(String parameterGroupName) { this.parameterGroupName = parameterGroupName; }
 
