@@ -1,6 +1,8 @@
 package io.github.hectorvent.floci.services.cloudfront;
 
+import io.github.hectorvent.floci.core.common.AccountContextFilter;
 import io.github.hectorvent.floci.core.common.RequestHost;
+import io.github.hectorvent.floci.core.storage.AccountAwareStorageBackend.AccountEntry;
 import io.github.hectorvent.floci.services.cloudfront.model.Distribution;
 import jakarta.annotation.Priority;
 import jakarta.enterprise.inject.Instance;
@@ -55,10 +57,11 @@ public class CloudFrontDistributionFilter implements ContainerRequestFilter {
             return;
         }
 
-        Distribution dist = service.get().findByHost(host);
-        if (dist == null) {
+        AccountEntry<Distribution> entry = service.get().findEntryByHost(host);
+        if (entry == null) {
             return;
         }
+        Distribution dist = entry.value();
         if (dist.getConfig() == null || !dist.getConfig().isEnabled()) {
             requestContext.abortWith(Response.status(404).build());
             return;
@@ -86,6 +89,7 @@ public class CloudFrontDistributionFilter implements ContainerRequestFilter {
 
         LOG.debugv("CloudFront distribution routing: {0}{1} -> {2}", host, rawPath, newUri.getPath());
         requestContext.setProperty(ROUTED_PROPERTY, Boolean.TRUE);
+        requestContext.setProperty(AccountContextFilter.PINNED_ACCOUNT_PROPERTY, entry.accountId());
         requestContext.setRequestUri(newUri);
     }
 }
