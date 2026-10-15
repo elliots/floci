@@ -683,6 +683,7 @@ public class ElastiCacheService implements ResourceProvider {
             if (group.getStatus() == ReplicationGroupStatus.DELETING) {
                 continue;
             }
+            proxyManager.setTlsHostnames(group.getReplicationGroupId(), tlsHostnames(group.getTags()));
             if (group.isClusterEnabled() && !group.getClusterNodes().isEmpty()) {
                 reserveClusterModeGroup(entry, clusterModeToRestore);
             } else {
@@ -1878,6 +1879,7 @@ public class ElastiCacheService implements ResourceProvider {
         resource.tags().putAll(tags);
         resource.replicas().forEach(replica -> replica.putAll(tags));
         resource.save().run();
+        refreshTlsHostnames(arn, resource.tags());
         return new LinkedHashMap<>(resource.tags());
     }
 
@@ -1891,7 +1893,41 @@ public class ElastiCacheService implements ResourceProvider {
         keys.forEach(resource.tags()::remove);
         resource.replicas().forEach(replica -> keys.forEach(replica::remove));
         resource.save().run();
+        refreshTlsHostnames(arn, resource.tags());
         return new LinkedHashMap<>(resource.tags());
+    }
+
+    /**
+     * The tag that names the hostnames a replication group's proxy answers to, besides the one Floci reports
+     * (comma-separated): the addresses a client takes from its own configuration, such as a real endpoint's name.
+     */
+    public static final String TLS_HOSTNAMES_TAG = "floci:tls-hostnames";
+
+    private static final Pattern HOSTNAME = Pattern.compile("[a-z0-9](?:[a-z0-9.-]*[a-z0-9])?");
+
+    static Set<String> tlsHostnames(Map<String, String> tags) {
+        Set<String> names = new LinkedHashSet<>();
+        if (tags == null) {
+            return names;
+        }
+        for (String name : tags.getOrDefault(TLS_HOSTNAMES_TAG, "").split("[,\\s]+")) {
+            String n = name.toLowerCase(Locale.ROOT);
+            if (HOSTNAME.matcher(n).matches()) {
+                names.add(n);
+            }
+        }
+        return names;
+    }
+
+    private void refreshTlsHostnames(String arn, Map<String, String> tags) {
+        try {
+            String resource = AwsArnUtils.parse(arn).resource();
+            if (resource.startsWith("replicationgroup:")) {
+                proxyManager.setTlsHostnames(resource.substring("replicationgroup:".length()), tlsHostnames(tags));
+            }
+        } catch (IllegalArgumentException ignored) {
+            // The caller has already validated the resource ARN.
+        }
     }
 
     private static void validateTags(Map<String, String> tags) {
