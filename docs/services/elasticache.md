@@ -41,6 +41,8 @@ Floci manages real Valkey/Redis Docker containers and proxies TCP connections to
 | `DescribeCacheParameters` | List the parameters set on a group |
 | `DeleteCacheParameterGroup` | Delete a cache parameter group |
 | `ListTagsForResource` | Read stored tags for supported ElastiCache resource ARNs |
+| `AddTagsToResource` | Add or update persisted resource tags |
+| `RemoveTagsFromResource` | Remove persisted resource tags |
 <!-- floci:actions:end -->
 
 ### Serverless caches and user groups
@@ -65,8 +67,10 @@ to one VPC. Names, settings, tags, owner account and runtime identity use the ex
 storage mode. Restart recovery reserves proxy ports and restores authentication and endpoints;
 the cache keyspace itself comes back empty, as for the other local cache runtimes.
 
-Tags on a serverless cache are set at creation and are not editable afterwards, because
-`AddTagsToResource` and `RemoveTagsFromResource` are not implemented for ElastiCache.
+`ListTagsForResource`, `AddTagsToResource`, and `RemoveTagsFromResource` persist tags on
+users, user groups, replication groups, member clusters, standalone clusters, serverless
+caches, subnet groups, and parameter groups. Replication-group tag changes propagate to
+member clusters. User-group listing supports `MaxRecords` and `Marker`.
 
 Local serverless caches have fixed capacity and plaintext TCP endpoints. Usage limits, subnet and
 security-group placement, KMS encryption and snapshot schedules are metadata; they do not enable
@@ -324,3 +328,17 @@ aws elasticache create-user \
   --no-no-password-required \
   --endpoint-url $AWS_ENDPOINT_URL
 ```
+
+### Local TLS connections
+
+Redis and Valkey proxies accept both plaintext Redis and TLS connections on their published
+ports. Certificates are signed by Floci's local CA. Trust that CA in your client before
+using `rediss://` with hostname verification.
+
+`FLOCI_SERVICES_ELASTICACHE_TLS_SUFFIXES` is a comma-separated list of domains for which
+the proxy can issue certificates using SNI. Its default, `auto`, derives cache domains
+from the AWS partition catalogue. Explicit domain lists replace this automatic list.
+
+For clients that do not send SNI, set the replication-group tag `floci:tls-hostnames`
+to a comma-separated list of endpoint names. Tag updates apply to subsequent handshakes;
+persisted tags are restored when Floci restarts.
