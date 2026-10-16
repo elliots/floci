@@ -110,6 +110,10 @@ func TestProjectionUpdatesUseStdinAndRetainLastGoodData(t *testing.T) {
 	if !bytes.Equal(updated, retained) {
 		t.Fatal("missing required source destroyed last good data")
 	}
+	if err := p.refreshVolumes(t.Context(), e, true); err != nil {
+		t.Fatalf("a successfully projected source became required again: %v", err)
+	}
+	e.volumeDigests = nil
 	if err := p.refreshVolumes(t.Context(), e, true); err == nil {
 		t.Fatal("initial required source absence accepted")
 	}
@@ -299,5 +303,103 @@ func TestInitialProjectionSurvivesSourceDeletionAfterPreflight(t *testing.T) {
 				t.Fatal("initial source bytes remained retained after projection")
 			}
 		})
+	}
+}
+
+func TestPreparedVolumesSurviveSourceDeletionBetweenInitAndApplication(t *testing.T) {
+	for _, kind := range []string{"ConfigMap", "Secret"} {
+		t.Run(kind, func(t *testing.T) {
+			p, e := probeFixture(t)
+			e.started = time.Time{}
+			volume := corev1.Volume{Name: "settings"}
+			client := fake.NewClientset()
+			metadata := metav1.ObjectMeta{Name: "source", Namespace: e.pod.Namespace}
+			if kind == "ConfigMap" {
+				volume.ConfigMap = &corev1.ConfigMapVolumeSource{LocalObjectReference: corev1.LocalObjectReference{Name: metadata.Name}}
+				if _, err := client.CoreV1().ConfigMaps(metadata.Namespace).Create(t.Context(), &corev1.ConfigMap{ObjectMeta: metadata, Data: map[string]string{"key": "retained"}}, metav1.CreateOptions{}); err != nil {
+					t.Fatal(err)
+				}
+			} else {
+				volume.Secret = &corev1.SecretVolumeSource{SecretName: metadata.Name}
+				if _, err := client.CoreV1().Secrets(metadata.Namespace).Create(t.Context(), &corev1.Secret{ObjectMeta: metadata, Data: map[string][]byte{"key": []byte("retained")}}, metav1.CreateOptions{}); err != nil {
+					t.Fatal(err)
+				}
+			}
+			p.client = client
+			e.pod.Spec.Volumes = []corev1.Volume{volume}
+			e.pod.Spec.Containers[0].VolumeMounts = []corev1.VolumeMount{{Name: volume.Name, MountPath: "/settings"}}
+			payload := filepath.Join(p.runner.cfg.state, "projection")
+			stub := "#!/bin/sh\ncase \" $* \" in *\" --stream \"*) cat >" + quote(payload) + ";; esac\n"
+			if err := os.WriteFile(p.runner.cfg.msb, []byte(stub), 0700); err != nil {
+				t.Fatal(err)
+			}
+			if err := p.prepareVolumes(t.Context(), e); err != nil {
+				t.Fatalf("initial mount failed: %v", err)
+			}
+			initial, err := os.ReadFile(payload)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if kind == "ConfigMap" {
+				err = client.CoreV1().ConfigMaps(metadata.Namespace).Delete(t.Context(), metadata.Name, metav1.DeleteOptions{})
+			} else {
+				err = client.CoreV1().Secrets(metadata.Namespace).Delete(t.Context(), metadata.Name, metav1.DeleteOptions{})
+			}
+			if err != nil {
+				t.Fatal(err)
+			}
+			if err := p.prepareVolumes(t.Context(), e); err != nil {
+				t.Fatalf("next container discarded existing mount after source deletion: %v", err)
+			}
+			retained, err := os.ReadFile(payload)
+			if err != nil || !bytes.Equal(initial, retained) {
+				t.Fatalf("source deletion changed last good projection: %v", err)
+			}
+		})
+	}
+}
+
+func TestRecoveredInitStateRetainsVolumesOnlyAfterARealStart(t *testing.T) {
+	started := metav1.Now()
+	for name, scenario := range map[string]struct {
+		status   corev1.ContainerStatus
+		retained bool
+	}{
+		"waiting":     {},
+		"running":     {status: corev1.ContainerStatus{State: corev1.ContainerState{Running: &corev1.ContainerStateRunning{StartedAt: started}}}, retained: true},
+		"completed":   {status: corev1.ContainerStatus{State: corev1.ContainerState{Terminated: &corev1.ContainerStateTerminated{StartedAt: started}}}, retained: true},
+		"retrying":    {status: corev1.ContainerStatus{LastTerminationState: corev1.ContainerState{Terminated: &corev1.ContainerStateTerminated{ExitCode: 7, StartedAt: started}}}, retained: true},
+		"start error": {status: corev1.ContainerStatus{State: corev1.ContainerState{Terminated: &corev1.ContainerStateTerminated{ExitCode: 128, Reason: "StartError"}}}},
+	} {
+		t.Run(name, func(t *testing.T) {
+			p, e := probeFixture(t)
+			e.started = time.Time{}
+			e.volumeDigests = nil
+			e.pod.Status.InitContainerStatuses = []corev1.ContainerStatus{scenario.status}
+			e.pod.Spec.Volumes = []corev1.Volume{{Name: "settings", VolumeSource: corev1.VolumeSource{ConfigMap: &corev1.ConfigMapVolumeSource{LocalObjectReference: corev1.LocalObjectReference{Name: "deleted"}}}}}
+			e.pod.Spec.Containers[0].VolumeMounts = []corev1.VolumeMount{{Name: "settings", MountPath: "/settings"}}
+			p.client = fake.NewClientset()
+			if err := os.WriteFile(p.runner.cfg.msb, []byte("#!/bin/sh\nexit 0\n"), 0700); err != nil {
+				t.Fatal(err)
+			}
+			err := p.prepareVolumes(t.Context(), e)
+			if (err == nil) != scenario.retained {
+				t.Fatalf("retention=%t, want %t: %v", err == nil, scenario.retained, err)
+			}
+		})
+	}
+}
+
+func TestPartialProjectionCannotMaskAnUnpreparedRequiredVolume(t *testing.T) {
+	p, e := probeFixture(t)
+	e.started = time.Time{}
+	e.volumeDigests = map[string][32]byte{"prepared": {}}
+	p.client = fake.NewClientset()
+	for _, name := range []string{"prepared", "missing"} {
+		e.pod.Spec.Volumes = append(e.pod.Spec.Volumes, corev1.Volume{Name: name, VolumeSource: corev1.VolumeSource{ConfigMap: &corev1.ConfigMapVolumeSource{LocalObjectReference: corev1.LocalObjectReference{Name: name}}}})
+		e.pod.Spec.Containers[0].VolumeMounts = append(e.pod.Spec.Containers[0].VolumeMounts, corev1.VolumeMount{Name: name, MountPath: "/" + name})
+	}
+	if err := p.refreshVolumes(t.Context(), e, true); err == nil || !strings.Contains(err.Error(), "populate volume missing") {
+		t.Fatalf("one successful projection masked another required volume: %v", err)
 	}
 }

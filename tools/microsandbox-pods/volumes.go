@@ -88,7 +88,27 @@ func (p *provider) prepareVolumes(ctx context.Context, e *podEntry) error {
 		e.volumesChecked = time.Now()
 		return nil
 	}
-	return p.refreshVolumes(ctx, e, e.started.IsZero())
+	return p.refreshVolumes(ctx, e, volumeSourcesRequired(e))
+}
+
+// Every mounted volume is prepared before the first init starts. Its journaled
+// start time proves existing projections after recovery, when digest caches are
+// empty. Synthetic StartError statuses have no start time and prove nothing.
+func volumeSourcesRequired(e *podEntry) bool {
+	if !e.started.IsZero() {
+		return false
+	}
+	for _, status := range e.pod.Status.InitContainerStatuses {
+		if running := status.State.Running; running != nil && !running.StartedAt.IsZero() {
+			return false
+		}
+		for _, terminated := range []*corev1.ContainerStateTerminated{status.State.Terminated, status.LastTerminationState.Terminated} {
+			if terminated != nil && !terminated.StartedAt.IsZero() {
+				return false
+			}
+		}
+	}
+	return true
 }
 
 func (p *provider) refreshVolumes(ctx context.Context, e *podEntry, required bool) error {
@@ -102,7 +122,8 @@ func (p *provider) refreshVolumes(ctx context.Context, e *podEntry, required boo
 			err = p.writeProjection(ctx, e, volume.Name, files)
 		}
 		if err != nil {
-			if required {
+			_, alreadyProjected := e.volumeDigests[volume.Name]
+			if required && !alreadyProjected {
 				return fmt.Errorf("populate volume %s: %w", volume.Name, err)
 			}
 			// Kubernetes retains the last good mounted data if a source cannot be
