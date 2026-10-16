@@ -196,6 +196,9 @@ func (p *provider) waitForVolumeSources(ctx context.Context, e *podEntry) error 
 }
 
 func volumeSetupScript(volume corev1.Volume, memoryMiB int) string {
+	if volume.HostPath != nil {
+		return "test -f " + quote(reservedCAPath) + "; test ! -L " + quote(reservedCAPath) + "; chmod 0444 " + quote(reservedCAPath)
+	}
 	root := quote(guestVolumePath(volume.Name))
 	script := "umask 022; mkdir -p /var/lib/floci-volumes; chmod 0700 /var/lib/floci-volumes; "
 	if volume.EmptyDir != nil && volume.EmptyDir.Medium == corev1.StorageMediumDefault {
@@ -229,10 +232,13 @@ func volumeMountArgsForContainer(pod *corev1.Pod, container corev1.Container) []
 	for index, mount := range container.VolumeMounts {
 		volume := volumes[mount.Name]
 		mode := "rw"
-		if mount.ReadOnly || volume.ConfigMap != nil || volume.Secret != nil {
+		if mount.ReadOnly || volume.ConfigMap != nil || volume.Secret != nil || volume.HostPath != nil {
 			mode = "ro"
 		}
 		source := guestVolumePath(mount.Name)
+		if volume.HostPath != nil {
+			source = reservedCAPath
+		}
 		if mount.SubPath != "" || mount.SubPathExpr != "" {
 			source = guestSubpathPath(container.Name, index)
 		}

@@ -77,7 +77,8 @@ func (p *provider) serveControl(address, tokenFile string) (*http.Server, error)
 		allocated := p.activeMemoryMiB
 		p.budgetMu.Unlock()
 		writeJSON(w, 200, map[string]any{"status": "ok", "name": "microsandbox-pods", "contract": 1, "clusterName": p.runner.cfg.clusterName,
-			"activeMemoryMiB": allocated, "maxActiveMemoryMiB": p.runner.cfg.maxActiveMemoryMiB, "maxPods": p.runner.cfg.maxPods})
+			"activeMemoryMiB": allocated, "maxActiveMemoryMiB": p.runner.cfg.maxActiveMemoryMiB, "maxPods": p.runner.cfg.maxPods,
+			"networkPolicy": p.runner.networkFingerprint()})
 	})
 	mux.HandleFunc("GET /v1/deployments/{namespace}/{name}", p.deployment)
 	mux.HandleFunc("GET /v1/deployments", p.deploymentSnapshot)

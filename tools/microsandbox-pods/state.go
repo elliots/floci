@@ -138,6 +138,9 @@ func (p *provider) recover(ctx context.Context) error {
 		e.startupComplete, e.probeFailure = record.StartupComplete, record.ProbeFailure
 		e.terminationReason = record.TerminationReason
 		if !orphan {
+			if err := validateVolumesWithCA(e.pod, p.runner.guestCAPath()); err != nil {
+				return fmt.Errorf("stored Pod volume is incompatible with the configured runtime: %w", err)
+			}
 			if err := reconcileDeclaredSpec(e, current); err != nil {
 				return err
 			}

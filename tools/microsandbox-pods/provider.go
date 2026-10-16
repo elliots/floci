@@ -104,6 +104,9 @@ func newProvider(ctx context.Context, cfg config, client kubernetes.Interface) (
 	if err := runner.checkPending(); err != nil {
 		return nil, err
 	}
+	if err := runner.verifyNetworkBoundary(ctx); err != nil {
+		return nil, fmt.Errorf("verify native environment network boundary: %w", err)
+	}
 	version, err := runner.vm(ctx, "--version")
 	if err != nil {
 		return nil, err
@@ -138,6 +141,10 @@ func newProvider(ctx context.Context, cfg config, client kubernetes.Interface) (
 }
 
 func validatePod(pod *corev1.Pod) error {
+	return validatePodWithCA(pod, "")
+}
+
+func validatePodWithCA(pod *corev1.Pod, caPath string) error {
 	spec := pod.Spec
 	if len(spec.Containers) == 0 || len(spec.EphemeralContainers) != 0 {
 		return errdefs.InvalidInput("at least one regular container is required; ephemeral containers are not yet supported")
@@ -171,7 +178,7 @@ func validatePod(pod *corev1.Pod) error {
 			return errdefs.InvalidInput(err.Error())
 		}
 	}
-	if err := validateVolumes(pod); err != nil {
+	if err := validateVolumesWithCA(pod, caPath); err != nil {
 		return errdefs.InvalidInput(err.Error())
 	}
 	if err := validateInitContainers(pod); err != nil {
@@ -181,7 +188,7 @@ func validatePod(pod *corev1.Pod) error {
 }
 
 func (p *provider) CreatePod(ctx context.Context, pod *corev1.Pod) error {
-	if err := validatePod(pod); err != nil {
+	if err := validatePodWithCA(pod, p.runner.guestCAPath()); err != nil {
 		return err
 	}
 	allocation, err := derivePodAllocation(pod)
@@ -189,7 +196,7 @@ func (p *provider) CreatePod(ctx context.Context, pod *corev1.Pod) error {
 		return errdefs.InvalidInput(err.Error())
 	}
 	if podNetworkProbes(pod) && p.runner.cfg.relayBinary == "" {
-		return errdefs.InvalidInput("HTTP/TCP probes require --network-relay-binary")
+		return errdefs.InvalidInput("HTTP/TCP/gRPC probes require --network-relay-binary")
 	}
 	if p.client != nil {
 		if err := p.checkNetworkPolicy(ctx, pod); err != nil {

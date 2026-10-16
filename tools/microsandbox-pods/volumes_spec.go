@@ -28,19 +28,23 @@ func guestVolumePath(volumeName string) string {
 }
 
 func validateVolumes(pod *corev1.Pod) error {
+	return validateVolumesWithCA(pod, "")
+}
+
+func validateVolumesWithCA(pod *corev1.Pod, caPath string) error {
 	allocation, err := derivePodAllocation(pod)
 	if err != nil {
 		return err
 	}
-	volumes := make(map[string]struct{}, len(pod.Spec.Volumes))
+	volumes := make(map[string]corev1.Volume, len(pod.Spec.Volumes))
 	for _, volume := range pod.Spec.Volumes {
 		if _, found := volumes[volume.Name]; found {
 			return fmt.Errorf("duplicate volume %q", volume.Name)
 		}
-		if err := validateVolume(volume, allocation.MemoryMiB); err != nil {
+		if err := validateVolumeWithCA(volume, allocation.MemoryMiB, caPath); err != nil {
 			return fmt.Errorf("volume %q: %w", volume.Name, err)
 		}
-		volumes[volume.Name] = struct{}{}
+		volumes[volume.Name] = volume
 	}
 	for _, container := range slices.Concat(pod.Spec.InitContainers, pod.Spec.Containers) {
 		if len(container.VolumeDevices) != 0 {
@@ -50,6 +54,9 @@ func validateVolumes(pod *corev1.Pod) error {
 		for _, mount := range container.VolumeMounts {
 			if _, found := volumes[mount.Name]; !found {
 				return fmt.Errorf("mount references undefined volume %q", mount.Name)
+			}
+			if volumes[mount.Name].HostPath != nil && (!mount.ReadOnly || mount.MountPath != reservedCAPath || mount.SubPath != "" || mount.SubPathExpr != "") {
+				return fmt.Errorf("volume %q: the public CA requires its reserved read-only mount path without subPath", mount.Name)
 			}
 			if len(mount.BindMountOptions) != 0 ||
 				mount.MountPropagation != nil && *mount.MountPropagation != corev1.MountPropagationNone ||
@@ -79,8 +86,22 @@ func validateVolumes(pod *corev1.Pod) error {
 }
 
 func validateVolume(volume corev1.Volume, memoryMiB int) error {
+	return validateVolumeWithCA(volume, memoryMiB, "")
+}
+
+func validateVolumeWithCA(volume corev1.Volume, memoryMiB int, caPath string) error {
 	if len(validation.IsDNS1123Label(volume.Name)) != 0 {
 		return fmt.Errorf("name must be a DNS label")
+	}
+	if volume.HostPath != nil {
+		source := volume.HostPath
+		remaining := volume.VolumeSource
+		remaining.HostPath = nil
+		if caPath != reservedCAPath || source.Path != caPath || source.Type == nil || *source.Type != corev1.HostPathFile ||
+			!reflect.DeepEqual(remaining, corev1.VolumeSource{}) {
+			return fmt.Errorf("hostPath is limited to the configured public network CA file")
+		}
+		return nil
 	}
 	remaining := volume.VolumeSource
 	remaining.EmptyDir, remaining.ConfigMap, remaining.Secret = nil, nil, nil
