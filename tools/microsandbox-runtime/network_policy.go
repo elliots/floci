@@ -274,6 +274,15 @@ func (c *Client) NetworkPolicyFingerprint() string {
 	return c.boundary.fingerprint
 }
 
+// GuestCAPath identifies the public CA copied into each guest before boot.
+// Empty means no validated CA was configured for this environment boundary.
+func (c *Client) GuestCAPath() string {
+	if c.boundary == nil || c.boundary.CAFile == "" {
+		return ""
+	}
+	return networkCAPath
+}
+
 // VerifyNetworkBoundary refuses to advertise an isolated runtime while an older
 // unprotected guest is still running in its dedicated home. It does not stop or
 // destroy that guest. Stopped guests remain removable but cannot be restarted.

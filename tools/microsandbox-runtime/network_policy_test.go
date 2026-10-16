@@ -111,6 +111,21 @@ func TestBoundaryIdentityRejectsOlderGuestsAndCheckpoints(t *testing.T) {
 	}
 }
 
+func TestGuestCAPathRequiresConfiguredBoundaryCertificate(t *testing.T) {
+	client := &Client{}
+	if client.GuestCAPath() != "" {
+		t.Fatal("CA advertised without a boundary")
+	}
+	client.boundary = boundaryFixture()
+	if client.GuestCAPath() != "" {
+		t.Fatal("CA advertised without a certificate")
+	}
+	client.boundary.CAFile = "/validated/public-ca.pem"
+	if client.GuestCAPath() != "/etc/floci/certs/ca.crt" {
+		t.Fatal("configured guest CA path missing")
+	}
+}
+
 func TestBoundaryConfigurationRequiresExplicitLocalDestinationsAndDNS(t *testing.T) {
 	good := "network:\n  isolation:\n    enabled: true\n  native:\n    dns-nameservers: ['127.0.0.1:5300']\n    allowed-egress:\n      - destination: 172.24.0.0/16\n        protocol: tcp\n        ports: '443'\n"
 	file := filepath.Join(t.TempDir(), "network.yaml")
