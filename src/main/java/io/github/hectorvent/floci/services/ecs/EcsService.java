@@ -4908,20 +4908,40 @@ public class EcsService implements ContainerTeardown, ResourceProvider, Resettab
 
         updateHealth(task, handle);
 
-        // Inspect every container; abort if any are still running. A container that exited on its
-        // own has a finish time of its own, read here while the daemon still remembers it.
+        // An essential exit stops the whole task, even while a sidecar is still running.
         Map<String, Integer> exitCodes = new LinkedHashMap<>();
         Map<String, Instant> finishedAt = new LinkedHashMap<>();
+        Set<String> essential = resolveTaskDefinitionOrThrow(task.getTaskDefinitionArn(), taskRegion(task))
+                .getContainerDefinitions().stream().filter(ContainerDefinition::isEssential)
+                .map(ContainerDefinition::getName).collect(Collectors.toSet());
+        boolean anyRunning = false;
         for (Map.Entry<String, String> entry : handle.getContainerIds().entrySet()) {
             Integer code = containerManager.getExitCodeIfStopped(entry.getValue());
             if (code == null) {
-                return;
+                anyRunning = true;
+                continue;
             }
             exitCodes.put(entry.getKey(), code);
             Instant finished = containerManager.getFinishedAtIfStopped(entry.getValue());
             if (finished != null) {
                 finishedAt.put(entry.getKey(), finished);
             }
+            if (task.getContainers() != null) {
+                for (Container container : task.getContainers()) {
+                    if (entry.getKey().equals(container.getName())) {
+                        container.setLastStatus(TaskStatus.STOPPED.name());
+                        container.setExitCode(code);
+                        container.setFinishedAt(finished);
+                    }
+                }
+            }
+        }
+        if (anyRunning) {
+            if (exitCodes.keySet().stream().anyMatch(essential::contains)) {
+                stopTask(task.getClusterArn(), taskArn, "Essential container in task exited",
+                        STOP_CODE_ESSENTIAL_CONTAINER_EXITED, taskRegion(task));
+            }
+            return;
         }
 
         // All containers have exited. Atomically claim the handle to avoid

@@ -23,6 +23,44 @@ import static org.mockito.Mockito.*;
 
 class EcsHealthCheckServiceTest {
     @Test
+    void essentialExitStopsARunningSidecarButNonessentialExitDoesNot() {
+        EmulatorConfig config = mock(EmulatorConfig.class, RETURNS_DEEP_STUBS);
+        EcsContainerManager containers = mock(EcsContainerManager.class);
+        EcsService service = new EcsService(new RegionResolver("us-east-1", "000000000000"),
+                containers, config, mock(EcsLoadBalancerRegistrar.class), null, null);
+        service.createCluster("essential", "us-east-1");
+        ContainerDefinition app = new ContainerDefinition();
+        app.setName("app");
+        app.setImage("busybox:stable");
+        ContainerDefinition sidecar = new ContainerDefinition();
+        sidecar.setName("sidecar");
+        sidecar.setImage("busybox:stable");
+        sidecar.setEssential(false);
+        service.registerTaskDefinition("essential", List.of(app, sidecar), null, null, null, null, null, List.of(), "us-east-1");
+        when(containers.startTask(any(), any(), any(), anyString())).thenAnswer(invocation -> {
+            EcsTask task = invocation.getArgument(0);
+            return new EcsTaskHandle(task.getTaskArn(), Map.of("app", "app-id", "sidecar", "sidecar-id"), Map.of());
+        });
+        when(containers.stopTaskAndCollectExitCodes(any())).thenAnswer(invocation -> {
+            EcsTaskHandle handle = invocation.getArgument(0);
+            handle.getContainerIds().keySet().forEach(handle::recordContainerRemoved);
+            return Map.of("app", 1, "sidecar", 143);
+        });
+        EcsTask task = service.runTask("essential", "essential", 1, LaunchType.EC2,
+                null, null, null, null, "us-east-1").getFirst();
+        when(containers.getExitCodeIfStopped(anyString())).thenReturn(null);
+        when(containers.getExitCodeIfStopped("sidecar-id")).thenReturn(0);
+        service.reconcile();
+        assertEquals("RUNNING", task.getLastStatus());
+        when(containers.getExitCodeIfStopped("sidecar-id")).thenReturn(null);
+        when(containers.getExitCodeIfStopped("app-id")).thenReturn(1);
+        service.reconcile();
+        assertEquals("STOPPED", task.getLastStatus());
+        assertEquals("EssentialContainerExited", task.getStopCode());
+        verify(containers).stopTaskAndCollectExitCodes(any());
+    }
+
+    @Test
     void taskHealthAggregatesOnlyEssentialDeclaredChecksAndWaitsForEveryCheck() {
         EmulatorConfig config = mock(EmulatorConfig.class, RETURNS_DEEP_STUBS);
         when(config.services().ecs().mock()).thenReturn(false);
