@@ -71,7 +71,7 @@ func (p *provider) restart(ctx context.Context, e *podEntry, code int32) error {
 	e.mu.Lock()
 	status := &e.pod.Status.ContainerStatuses[0]
 	status.LastTerminationState = corev1.ContainerState{Terminated: &corev1.ContainerStateTerminated{
-		ExitCode: code, StartedAt: metav1.NewTime(e.started), FinishedAt: metav1.Now()}}
+		ExitCode: code, Reason: e.probeFailure, StartedAt: metav1.NewTime(e.started), FinishedAt: metav1.Now()}}
 	count := status.RestartCount
 	e.mu.Unlock()
 	delay := min(10*time.Second*time.Duration(1<<min(count, 5)), 300*time.Second)
@@ -86,8 +86,6 @@ func (p *provider) restart(ctx context.Context, e *podEntry, code int32) error {
 	e.mu.Lock()
 	e.pod.Status.ContainerStatuses[0].RestartCount++
 	e.mu.Unlock()
-	e.probeAt = time.Time{}
-	e.probeSuccesses = 0
-	e.probeFailures = 0
+	resetProbeProgress(e)
 	return p.startApplication(ctx, e)
 }

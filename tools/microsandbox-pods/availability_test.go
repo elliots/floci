@@ -64,7 +64,7 @@ func TestProxyProjectionDoesNotMakeApplicationReady(t *testing.T) {
 			entry := availabilityEntry(t)
 			entry.state = state
 			entry.started = time.Now().Add(-time.Hour)
-			entry.probeAt = time.Now()
+			entry.readiness.at = time.Now()
 			entry.pod.Spec.Containers[0].ReadinessProbe = &corev1.Probe{PeriodSeconds: 60}
 			p := &provider{}
 			p.projectProxyAvailability(entry)
@@ -92,7 +92,7 @@ func TestProbeThresholdDoesNotReuseProjectedReadiness(t *testing.T) {
 	}
 	p := &provider{runner: commandRunner{cfg: config{msb: script}}}
 	p.projectProxyAvailability(entry)
-	if p.probe(t.Context(), entry) || entry.probeFailures != 1 {
+	if p.probe(t.Context(), entry) || entry.readiness.failures != 1 {
 		t.Fatal("readiness hysteresis treated proxy availability as a successful app probe")
 	}
 }

@@ -187,7 +187,7 @@ func (p *provider) journal(e *podEntry) error {
 	e.mu.Lock()
 	pod := e.pod.DeepCopy()
 	e.mu.Unlock()
-	if err := json.NewEncoder(file).Encode(journalRecord{Version: 1, DeclaredSpec: e.declaredSpec, ProxyPorts: e.proxyPorts, BackendIP: e.backendIP, SnapshotIDs: e.snapshotIDs, RestoredParent: e.restoredParent, View: view(e), Pod: pod, Slot: e.slot, GuestIP: e.guestIP, Started: e.started, Snapshots: e.snapshots}); err != nil {
+	if err := json.NewEncoder(file).Encode(journalRecord{Version: 1, StartupComplete: e.startupComplete, ProbeFailure: e.probeFailure, DeclaredSpec: e.declaredSpec, ProxyPorts: e.proxyPorts, BackendIP: e.backendIP, SnapshotIDs: e.snapshotIDs, RestoredParent: e.restoredParent, View: view(e), Pod: pod, Slot: e.slot, GuestIP: e.guestIP, Started: e.started, Snapshots: e.snapshots}); err != nil {
 		file.Close()
 		return err
 	}
@@ -214,6 +214,7 @@ func (p *provider) unavailable(e *podEntry, reason string) {
 	e.mu.Lock()
 	e.pod.Status.Reason = reason
 	e.pod.Status.ContainerStatuses[0].Ready = false
+	e.pod.Status.ContainerStatuses[0].Started = new(false)
 	e.pod.Status.ContainerStatuses[0].State = corev1.ContainerState{Waiting: &corev1.ContainerStateWaiting{Reason: reason}}
 	e.pod.Status.Conditions = podConditions(false)
 	e.mu.Unlock()
@@ -223,6 +224,9 @@ func (p *provider) unavailable(e *podEntry, reason string) {
 func (p *provider) hibernate(ctx context.Context, e *podEntry) error {
 	if err := ctx.Err(); err != nil {
 		return err
+	}
+	if e.probeFailure != "" {
+		return errors.New("cannot hibernate a container awaiting probe-triggered termination")
 	}
 	if e.activeConnections > 0 {
 		return errors.New("proxy connections are active")
@@ -415,9 +419,7 @@ func (p *provider) resume(ctx context.Context, e *podEntry) error {
 		}
 	}
 	e.state = "RUNNING"
-	e.probeAt = time.Time{}
-	e.probeFailures = 0
-	e.probeSuccesses = 0
+	resetProbeProgress(e)
 	if err := p.journal(e); err != nil {
 		return err
 	}

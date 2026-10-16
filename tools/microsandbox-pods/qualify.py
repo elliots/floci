@@ -90,6 +90,11 @@ def qualify(args):
             wait("default service account", lambda: resource("serviceaccount", "default"))
             wait("Docker worker ready", lambda: any(c["type"] == "Ready" and c["status"] == "True"
                  for c in resource("node", peer)["status"]["conditions"]))
+            def cluster_dns_ready():
+                values=json.loads(kubectl("get","pods","-n","kube-system","-l","k8s-app=kube-dns","-o","json"))["items"]
+                return values and all(any(c["type"]=="Ready" and c["status"]=="True" for c in value.get("status",{}).get("conditions",[])) for value in values)
+            wait("CoreDNS ready",cluster_dns_ready,300)
+            report["checks"]["cluster_dns_ready"]=True
             inspect = json.loads(docker("inspect", peer))[0]
             api_port = inspect["NetworkSettings"]["Ports"]["6443/tcp"][0]["HostPort"]
             kubeconfig = docker("exec", peer, "cat", "/etc/rancher/k3s/k3s.yaml")
@@ -190,8 +195,10 @@ def qualify(args):
                     raise ValueError("proxy-pods requires 1..500 and network-relay-binary")
                 lazy = pod("lazy-probe",server_script)
                 lazy["spec"]["restartPolicy"]="Always"
-                lazy["spec"]["containers"][0]["ports"]=[{"containerPort":8080}]
-                lazy["spec"]["containers"][0]["readinessProbe"]={"exec":{"command":["wget","-qO-","http://127.0.0.1:8080/cgi-bin/source"]},"periodSeconds":1,"timeoutSeconds":5,"failureThreshold":1}
+                lazy["spec"]["containers"][0]["ports"]=[{"name":"http","containerPort":8080}]
+                lazy["spec"]["containers"][0]["readinessProbe"]={"httpGet":{"path":"/cgi-bin/source","port":"http"},"periodSeconds":1,"timeoutSeconds":5,"failureThreshold":1}
+                lazy["spec"]["containers"][0]["startupProbe"]={"tcpSocket":{"port":"http"},"periodSeconds":1,"timeoutSeconds":5,"failureThreshold":30}
+                lazy["spec"]["containers"][0]["livenessProbe"]={"httpGet":{"path":"/cgi-bin/source","port":"http"},"periodSeconds":1,"timeoutSeconds":5,"failureThreshold":3}
                 lazy_annotations={"microsandbox.dev/availability":"proxy","microsandbox.dev/idle-timeout-seconds":"20"}
                 registration_started=time.monotonic()
                 apply({"apiVersion":"apps/v1","kind":"Deployment","metadata":{"name":"lazy-probe"},"spec":{
@@ -226,6 +233,7 @@ def qualify(args):
                 wait("proxy Docker client ready",lambda:ready("proxy-docker"))
                 apply(pod("proxy-native","exec sleep 900"))
                 wait("proxy native client ready",lambda:ready("proxy-native"),300)
+                wait("lazy Service DNS propagated",lambda:kubectl("exec","proxy-docker","--","nslookup","lazy-probe.default.svc.cluster.local."),60)
                 began=time.monotonic()
                 response=kubectl("exec","proxy-docker","--","wget","-T","180","-qO-","http://lazy-probe/cgi-bin/source",timeout=210)
                 assert response
@@ -266,9 +274,11 @@ def qualify(args):
                 kubectl("delete","deployment","lazy-probe","--wait=true",timeout=900)
                 kubectl("delete","pod","proxy-native","proxy-docker","--wait=true",timeout=120)
                 wait("proxy fixture releases RAM",lambda:control_get("health")["activeMemoryMiB"]==0,180)
-            server = pod("native-server", server_script)
+            server = pod("native-server", "mkdir -p /www; httpd -p 9090 -h /www; " + server_script)
             server["spec"]["containers"][0]["ports"] = [{"containerPort":8080}]
-            server["spec"]["containers"][0]["readinessProbe"] = {"exec":{"command":["test","-f","/tmp/ready"]},"periodSeconds":1,"timeoutSeconds":5,"failureThreshold":1}
+            server["spec"]["containers"][0]["readinessProbe"] = {"httpGet":{"path":"/ready","port":9090},"periodSeconds":1,"timeoutSeconds":5,"failureThreshold":1}
+            server["spec"]["containers"][0]["startupProbe"] = {"exec":{"command":["test","-f","/tmp/started"]},"periodSeconds":1,"timeoutSeconds":5,"failureThreshold":120}
+            server["spec"]["containers"][0]["livenessProbe"] = {"exec":{"command":["test","-f","/tmp/live"]},"periodSeconds":1,"timeoutSeconds":5,"failureThreshold":2,"terminationGracePeriodSeconds":1}
             server["spec"]["restartPolicy"] = "Always"
             server["spec"]["containers"][0]["envFrom"] = [{"configMapRef":{"name":"native-settings"}},{"secretRef":{"name":"native-secrets"}}]
             apply({"apiVersion":"v1","kind":"ConfigMap","metadata":{"name":"native-settings"},"data":{"SETTING":"configured"}})
@@ -277,11 +287,18 @@ def qualify(args):
                 "replicas":1,"selector":{"matchLabels":{"app":"native-server"}},"template":{"metadata":{"labels":{"app":"native-server"}},"spec":server["spec"]}}})
             server_name = wait("Deployment pod scheduled",lambda:next((pod["metadata"]["name"] for pod in json.loads(kubectl("get","pods","-l","app=native-server","-o","json"))["items"]),None))
             wait("native task Running", lambda: resource("pod","native-server").get("status",{}).get("phase") == "Running", 300)
-            assert not ready("native-server"), "exec readiness must stay false until the guest file exists"
+            assert not ready("native-server"), "startup must gate readiness"
+            time.sleep(4)
+            status=resource("pod","native-server")["status"]["containerStatuses"][0]
+            assert status.get("started") is False and status.get("restartCount",0)==0, "startup must gate failing liveness"
+            kubectl("exec","native-server","--","touch","/tmp/started","/tmp/live")
+            wait("startup probe completes",lambda:resource("pod","native-server")["status"]["containerStatuses"][0].get("started"))
+            assert not ready("native-server"), "HTTP readiness must inspect the undeclared health port"
+            report["checks"]["startup_gates_readiness_and_liveness"] = True
             report["checks"]["readiness_from_guest_probe"] = True
             print("Native task running; checking actual logs and exec", flush=True)
             assert "native-pod-executed" in kubectl("logs","native-server")
-            kubectl("exec","native-server","--","touch","/tmp/ready")
+            kubectl("exec","native-server","--","touch","/www/ready")
             native = wait("native server Ready", lambda: ready("native-server"))
             native_ip = native["status"]["podIP"]
             report["native_pod_ip"] = native_ip
@@ -305,6 +322,7 @@ def qualify(args):
             report["checks"]["native_to_native_service_and_source"] = True
             uid = native["metadata"]["uid"]
             initial_boot = kubectl("exec","native-server","--","cat","/proc/sys/kernel/random/boot_id")
+            kubectl("exec","native-server","--","rm","/tmp/started")
             for cycle in (1,2):
                 marker = f"ram-cycle-{cycle}-{owner}"
                 kubectl("exec","native-server","--","sh","-ec",f"printf '%s' '{marker}' >/dev/shm/marker")
@@ -342,24 +360,42 @@ def qualify(args):
                     assert kubectl("exec","native-server","--","cat","/dev/shm/marker") == marker
                     report["checks"]["restored_controller_crash_recovery"] = True
             report["checks"]["two_ram_preserving_resumes_and_live_node_lease"] = True
-            kubectl("exec","native-server","--","rm","/tmp/ready")
+            report["checks"]["startup_success_retained_across_sleep_and_controller_recovery"] = True
+            kubectl("exec","native-server","--","rm","/www/ready")
             wait("readiness removal", lambda: not ready("native-server"))
             report["checks"]["readiness_loss_observed"] = True
-            command(args.msb,"exec","--no-stdin",lifecycle(uid)["vm"],"--","ctr","--address","/run/containerd/containerd.sock","tasks","kill","--signal","SIGKILL","application",env=environment)
-            wait("Always restart observed",lambda:resource("pod","native-server")["status"]["containerStatuses"][0].get("restartCount",0)>=1)
+            kubectl("exec","native-server","--","rm","/tmp/live")
+            wait("liveness restarts unhealthy task",lambda:resource("pod","native-server")["status"]["containerStatuses"][0].get("restartCount",0)>=1)
+            wait("liveness replacement task running",lambda:resource("pod","native-server")["status"]["containerStatuses"][0].get("state",{}).get("running"))
+            assert resource("pod","native-server")["metadata"]["uid"]==uid
+            assert resource("pod","native-server")["status"]["containerStatuses"][0]["lastState"]["terminated"]["reason"]=="LivenessProbeFailed"
+            kubectl("exec","native-server","--","touch","/tmp/started","/tmp/live","/www/ready")
+            wait("liveness replacement ready",lambda:ready("native-server"))
+            report["checks"]["liveness_restarts_container_without_replacing_pod"] = True
+            command(args.msb,"exec","--no-stdin",lifecycle(uid)["vm"],"--","sh","-ec","printf 'nameserver 127.0.0.1\\n' >/etc/resolv.conf; ctr --address /run/containerd/containerd.sock tasks kill --signal SIGKILL application",env=environment)
+            wait("Always restart observed",lambda:resource("pod","native-server")["status"]["containerStatuses"][0].get("restartCount",0)>=2)
             wait("restarted task running",lambda:resource("pod","native-server")["status"]["containerStatuses"][0].get("state",{}).get("running"))
-            kubectl("exec","native-server","--","touch","/tmp/ready")
+            kubectl("exec","native-server","--","touch","/tmp/started","/tmp/live","/www/ready")
             wait("restarted application Ready",lambda:ready("native-server"))
             assert resource("pod","native-server")["metadata"]["uid"] == uid
             report["checks"]["deployment_always_restart_preserves_pod_uid"] = True
+            report["checks"]["cached_image_restart_without_registry_dns"] = True
             request = urllib.request.Request(f"http://127.0.0.1:{control_port}/v1/deployments/default/native-server",headers={"Authorization":"Bearer "+token})
             with urllib.request.urlopen(request,timeout=30) as response:
                 deployment = json.load(response)
             assert deployment["replicas"] == 1 and deployment["clusterName"] == "qualification" and deployment["pods"][0]["uid"] == uid
             report["checks"]["deployment_owner_discovery"] = True
+            failed = pod("startup-failure", "exec sleep 600")
+            failed["spec"]["containers"][0]["startupProbe"]={"tcpSocket":{"port":9099},"periodSeconds":1,"timeoutSeconds":2,"failureThreshold":2,"terminationGracePeriodSeconds":1}
+            apply(failed)
+            status=wait("failed TCP startup terminates Never pod",lambda:(value if (value:=resource("pod","startup-failure")).get("status",{}).get("phase")=="Failed" else None),300)
+            assert status["status"]["containerStatuses"][0].get("restartCount",0)==0
+            assert status["status"]["containerStatuses"][0]["state"]["terminated"]["reason"]=="StartupProbeFailed"
+            report["checks"]["tcp_startup_failure_respects_restart_never"]=True
+            kubectl("delete","pod","startup-failure","--wait=true",timeout=180)
             if args.floci_checkout:
                 cold_spec=json.loads(json.dumps(server["spec"]))
-                cold_spec["containers"][0]["command"]=["sh","-ec","touch /tmp/ready; "+server_script]
+                cold_spec["containers"][0]["command"]=["sh","-ec","mkdir -p /www; touch /www/ready /tmp/started /tmp/live; httpd -p 9090 -h /www; "+server_script]
                 cold_annotations={"microsandbox.dev/on-demand":"true"}
                 if args.proxy_pods:
                     cold_annotations.update({"microsandbox.dev/availability":"proxy","microsandbox.dev/idle-owner":"external"})

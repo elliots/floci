@@ -58,7 +58,7 @@ func (p *provider) ensureRelay(ctx context.Context) (*networkRelay, error) {
 		return p.relay, nil
 	}
 	if p.runner.cfg.relayBinary == "" {
-		return nil, errors.New("proxy availability requires --network-relay-binary")
+		return nil, errors.New("proxy availability and network probes require --network-relay-binary")
 	}
 	if err := verifyPeerReachability(ctx, p.runner, p.network.hostIP); err != nil {
 		return nil, err
@@ -151,11 +151,12 @@ func (r *networkRelay) health(ctx context.Context, owner string) error {
 	var health struct {
 		Owner, Status string
 		Contract      int
+		ProbeContract int
 	}
 	if err := json.Unmarshal(data, &health); err != nil {
 		return err
 	}
-	if health.Owner != owner || health.Status != "ok" || health.Contract != 1 {
+	if health.Owner != owner || health.Status != "ok" || health.Contract != 1 || health.ProbeContract != 1 {
 		return errors.New("network relay ownership or contract mismatch")
 	}
 	return nil

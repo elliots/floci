@@ -23,18 +23,20 @@ type stateIdentity struct {
 	Node, ClusterUID, PeerOwner, Peer, PodCIDR, ProxyBackendCIDR string
 }
 type journalRecord struct {
-	ProxyPorts     []proxyPortBinding `json:"proxyPorts,omitempty"`
-	BackendIP      string             `json:"backendIP,omitempty"`
-	SnapshotIDs    map[string]string  `json:"snapshotIDs,omitempty"`
-	RestoredParent string             `json:"restoredParent,omitempty"`
-	Version        int                `json:"version"`
-	View           lifecycleView      `json:"view"`
-	Pod            *corev1.Pod        `json:"pod"`
-	DeclaredSpec   *corev1.PodSpec    `json:"declaredSpec,omitempty"`
-	Slot           int                `json:"slot"`
-	GuestIP        string             `json:"guestIP"`
-	Started        time.Time          `json:"started"`
-	Snapshots      []string           `json:"snapshots,omitempty"`
+	StartupComplete bool               `json:"startupComplete,omitzero"`
+	ProbeFailure    string             `json:"probeFailure,omitempty"`
+	ProxyPorts      []proxyPortBinding `json:"proxyPorts,omitempty"`
+	BackendIP       string             `json:"backendIP,omitempty"`
+	SnapshotIDs     map[string]string  `json:"snapshotIDs,omitempty"`
+	RestoredParent  string             `json:"restoredParent,omitempty"`
+	Version         int                `json:"version"`
+	View            lifecycleView      `json:"view"`
+	Pod             *corev1.Pod        `json:"pod"`
+	DeclaredSpec    *corev1.PodSpec    `json:"declaredSpec,omitempty"`
+	Slot            int                `json:"slot"`
+	GuestIP         string             `json:"guestIP"`
+	Started         time.Time          `json:"started"`
+	Snapshots       []string           `json:"snapshots,omitempty"`
 }
 
 func openState(ctx context.Context, cfg config, client kubernetes.Interface) (*os.File, bool, error) {
@@ -107,6 +109,7 @@ func (p *provider) recover(ctx context.Context) error {
 			httpPort: record.View.HTTPPort, appPort: record.View.ApplicationPort, guestIP: record.GuestIP, started: record.Started,
 			generation: record.View.Generation, state: record.View.State, snapshots: record.Snapshots, lifetime: lifetime, cancel: cancel, done: make(chan struct{})}
 		e.declaredSpec = record.DeclaredSpec
+		e.startupComplete, e.probeFailure = record.StartupComplete, record.ProbeFailure
 		if !orphan {
 			if err := reconcileDeclaredSpec(e, current); err != nil {
 				return err

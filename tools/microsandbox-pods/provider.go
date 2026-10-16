@@ -2,6 +2,7 @@ package main
 
 import (
 	"bytes"
+	"cmp"
 	"context"
 	"errors"
 	"fmt"
@@ -76,8 +77,10 @@ type podEntry struct {
 	cancel                                           context.CancelFunc
 	done                                             chan struct{}
 	created                                          bool
-	started, probeAt                                 time.Time
-	probeSuccesses, probeFailures                    int32
+	started                                          time.Time
+	readiness, startup, liveness                     probeProgress
+	startupComplete                                  bool
+	probeFailure                                     string
 }
 
 func newProvider(ctx context.Context, cfg config, client kubernetes.Interface) (*provider, error) {
@@ -151,12 +154,12 @@ func validatePod(pod *corev1.Pod) error {
 	if container.Resources.Requests.Memory().Value() > vmMemoryMiB*1024*1024 || container.Resources.Requests.Cpu().MilliValue() > 1000 {
 		return errdefs.InvalidInput("pod requests exceed the fixed one-vCPU, 768 MiB guest")
 	}
-	if len(container.Command) == 0 || container.LivenessProbe != nil || container.StartupProbe != nil || container.SecurityContext != nil ||
+	if len(container.Command) == 0 || container.SecurityContext != nil || container.RestartPolicy != nil || len(container.RestartPolicyRules) != 0 ||
 		len(container.VolumeMounts) != 0 || len(container.VolumeDevices) != 0 || len(container.Resources.Limits) != 0 || container.Lifecycle != nil || container.Stdin || container.TTY {
-		return errdefs.InvalidInput("explicit command required; liveness/startup probes, security contexts, mounts, limits, hooks and TTY are not qualified")
+		return errdefs.InvalidInput("explicit command required; container restart overrides, security contexts, mounts, limits, hooks and TTY are not qualified")
 	}
-	if probe := container.ReadinessProbe; probe != nil && (probe.Exec == nil || len(probe.Exec.Command) == 0) {
-		return errdefs.InvalidInput("qualification supports exec readiness probes only")
+	if err := validateProbes(container); err != nil {
+		return errdefs.InvalidInput(err.Error())
 	}
 	for _, port := range container.Ports {
 		if port.HostPort != 0 || port.HostIP != "" {
@@ -174,6 +177,9 @@ func validatePod(pod *corev1.Pod) error {
 func (p *provider) CreatePod(ctx context.Context, pod *corev1.Pod) error {
 	if err := validatePod(pod); err != nil {
 		return err
+	}
+	if networkProbes(pod.Spec.Containers[0]) && p.runner.cfg.relayBinary == "" {
+		return errdefs.InvalidInput("HTTP/TCP probes require --network-relay-binary")
 	}
 	if p.client != nil {
 		if err := p.checkNetworkPolicy(ctx, pod); err != nil {
@@ -322,6 +328,11 @@ func (p *provider) start(ctx context.Context, e *podEntry) error {
 }
 
 func (p *provider) startAdmitted(ctx context.Context, e *podEntry) error {
+	if networkProbes(e.pod.Spec.Containers[0]) {
+		if _, err := p.ensureRelay(ctx); err != nil {
+			return err
+		}
+	}
 	if _, exists, err := p.inspectOwned(ctx, e); err != nil {
 		return err
 	} else if exists {
@@ -377,8 +388,8 @@ func (p *provider) startAdmitted(ctx context.Context, e *podEntry) error {
 func (p *provider) startApplication(ctx context.Context, e *podEntry) error {
 	container := e.pod.Spec.Containers[0]
 	image := normalizeImage(container.Image)
-	if _, err := p.runner.guest(ctx, e.vm, ctr+" images pull "+quote(image)+" >/tmp/image-pull.log 2>&1"); err != nil {
-		return fmt.Errorf("pull application image: %w", err)
+	if err := p.ensureApplicationImage(ctx, e, container); err != nil {
+		return err
 	}
 	if _, err := p.runner.guest(ctx, e.vm, "cp /etc/pod-resolv.conf /etc/resolv.conf"); err != nil {
 		return fmt.Errorf("configure application DNS: %w", err)
@@ -398,6 +409,9 @@ func (p *provider) startApplication(ctx context.Context, e *podEntry) error {
 		return fmt.Errorf("submit application process to guest supervisor: %w", err)
 	}
 	e.started = time.Now()
+	e.startupComplete = false
+	e.probeFailure = ""
+	resetProbeProgress(e)
 	e.state = "RUNNING"
 	return p.journal(e)
 }
@@ -408,6 +422,9 @@ func normalizeImage(image string) string {
 		image = "docker.io/library/" + image
 	} else if !strings.ContainsAny(first, ".:") && first != "localhost" {
 		image = "docker.io/" + image
+	}
+	if !strings.Contains(image, "@") && !strings.Contains(image[strings.LastIndex(image, "/")+1:], ":") {
+		image += ":latest"
 	}
 	return image
 }
@@ -441,7 +458,7 @@ func (p *provider) monitor(ctx context.Context, e *podEntry) {
 				e.op.Unlock()
 				return
 			}
-			if e.pod.Spec.RestartPolicy == corev1.RestartPolicyAlways || e.pod.Spec.RestartPolicy == corev1.RestartPolicyOnFailure && code != 0 {
+			if e.pod.Spec.RestartPolicy == corev1.RestartPolicyAlways || e.pod.Spec.RestartPolicy == corev1.RestartPolicyOnFailure && (code != 0 || e.probeFailure != "") {
 				if err := p.restart(ctx, e, int32(code)); err != nil {
 					if ctx.Err() == nil {
 						p.fail(e, err)
@@ -457,7 +474,22 @@ func (p *provider) monitor(ctx context.Context, e *podEntry) {
 			return
 		}
 		if strings.Contains(output, "RUNNING") {
-			ready := p.probe(ctx, e)
+			failed, reason, err := p.healthChecks(ctx, e)
+			if err == nil && reason != "" {
+				err = p.stopUnhealthy(ctx, e, failed, reason)
+			}
+			if err != nil {
+				if ctx.Err() == nil {
+					p.fail(e, err)
+				}
+				e.op.Unlock()
+				return
+			}
+			if reason != "" {
+				e.op.Unlock()
+				continue
+			}
+			ready := e.startupComplete && p.probe(ctx, e)
 			e.actualReady = ready
 			e.state = "RUNNING"
 			if ready {
@@ -470,7 +502,7 @@ func (p *provider) monitor(ctx context.Context, e *podEntry) {
 			status := &e.pod.Status.ContainerStatuses[0]
 			status.ContainerID = "containerd://" + e.vm + "/application"
 			status.State = corev1.ContainerState{Running: &corev1.ContainerStateRunning{StartedAt: metav1.NewTime(e.started)}}
-			status.Started, status.Ready = new(true), ready
+			status.Started, status.Ready = new(e.startupComplete), ready
 			e.pod.Status.Conditions = podConditions(ready)
 			e.mu.Unlock()
 			p.publish(e)
@@ -479,40 +511,9 @@ func (p *provider) monitor(ctx context.Context, e *podEntry) {
 		select {
 		case <-ctx.Done():
 			return
-		case <-time.After(2 * time.Second):
+		case <-time.After(time.Second):
 		}
 	}
-}
-
-func (p *provider) probe(ctx context.Context, e *podEntry) bool {
-	probe := e.pod.Spec.Containers[0].ReadinessProbe
-	if probe == nil {
-		return true
-	}
-	if time.Since(e.started) < time.Duration(probe.InitialDelaySeconds)*time.Second {
-		return false
-	}
-	if time.Since(e.probeAt) < time.Duration(max(probe.PeriodSeconds, 1))*time.Second {
-		return e.actualReady
-	}
-	e.probeAt = time.Now()
-	check, cancel := context.WithTimeout(ctx, time.Duration(max(probe.TimeoutSeconds, 1))*time.Second)
-	defer cancel()
-	_, err := p.runner.guest(check, e.vm, ctr+" tasks exec --exec-id probe-"+strconv.FormatInt(time.Now().UnixNano(), 10)+" application "+joinCommand(probe.Exec.Command))
-	if err == nil {
-		e.probeFailures = 0
-		e.probeSuccesses++
-	} else {
-		e.probeSuccesses = 0
-		e.probeFailures++
-	}
-	if e.probeSuccesses >= max(probe.SuccessThreshold, 1) {
-		return true
-	}
-	if e.probeFailures >= max(probe.FailureThreshold, 1) {
-		return false
-	}
-	return e.actualReady
 }
 
 func podConditions(ready bool) []corev1.PodCondition {
@@ -532,12 +533,14 @@ func (p *provider) terminated(e *podEntry, code int32) {
 	e.state = "TERMINATED"
 	e.mu.Lock()
 	e.pod.Status.Phase = corev1.PodSucceeded
-	if code != 0 {
+	if code != 0 || e.probeFailure != "" {
 		e.pod.Status.Phase = corev1.PodFailed
 	}
+	e.actualReady = false
 	e.pod.Status.ContainerStatuses[0].Ready = false
+	e.pod.Status.ContainerStatuses[0].Started = new(false)
 	e.pod.Status.ContainerStatuses[0].State = corev1.ContainerState{Terminated: &corev1.ContainerStateTerminated{
-		ExitCode: code, Reason: string(e.pod.Status.Phase), StartedAt: metav1.NewTime(e.started), FinishedAt: metav1.Now()}}
+		ExitCode: code, Reason: cmp.Or(e.probeFailure, string(e.pod.Status.Phase)), StartedAt: metav1.NewTime(e.started), FinishedAt: metav1.Now()}}
 	e.pod.Status.Conditions = podConditions(false)
 	e.mu.Unlock()
 	if err := p.journal(e); err != nil {
