@@ -309,3 +309,98 @@ func TestSubpathAcceptsSymlinksThatRemainInsideVolume(t *testing.T) {
 		t.Fatalf("safe symlink was rejected: %v: %s", err, output)
 	}
 }
+
+func TestSubpathCleanupRecognizesFileAndDirectoryBindMounts(t *testing.T) {
+	for _, scenario := range []struct {
+		name       string
+		directory  bool
+		mounted    bool
+		extraField bool
+	}{
+		{name: "mounted file", mounted: true},
+		{name: "mounted directory", directory: true, mounted: true},
+		{name: "unmounted file"},
+		{name: "unmounted directory", directory: true},
+		{name: "path in root field only", extraField: true},
+	} {
+		t.Run(scenario.name, func(t *testing.T) {
+			base := t.TempDir()
+			target := filepath.Join(base, "0")
+			if scenario.directory {
+				if err := os.Mkdir(target, 0755); err != nil {
+					t.Fatal(err)
+				}
+			} else if err := os.WriteFile(target, []byte("mounted-data"), 0600); err != nil {
+				t.Fatal(err)
+			}
+			mountinfo := filepath.Join(base, "mountinfo")
+			data := "22 1 0:20 / " + target + "-prefix rw - tmpfs tmpfs rw\n"
+			if scenario.mounted {
+				data += "23 1 0:20 /source " + target + " rw - tmpfs tmpfs rw\n"
+			}
+			if scenario.extraField {
+				data += "24 1 0:20 " + target + " /unrelated rw - tmpfs tmpfs rw\n"
+			}
+			if err := os.WriteFile(mountinfo, []byte(data), 0600); err != nil {
+				t.Fatal(err)
+			}
+			// BusyBox's directory-only mountpoint result must not control cleanup.
+			prefix := "mountpoint() { return 1; }; busybox() { test \"$1\" = umount; test -e \"$2\"; echo unmounted; }; "
+			script := strings.ReplaceAll(subpathCleanupScript(target), "/proc/self/mountinfo", mountinfo)
+			script = strings.ReplaceAll(script, "/bin/busybox ", "busybox ")
+			output, err := exec.CommandContext(t.Context(), "sh", "-ec", prefix+script).CombinedOutput()
+			if err != nil || strings.Contains(string(output), "unmounted") != scenario.mounted {
+				t.Fatalf("wrong unmount decision: mounted=%t output=%s error=%v", scenario.mounted, output, err)
+			}
+			if _, err := os.Stat(target); !os.IsNotExist(err) {
+				t.Fatalf("target was not removed after unmount: %v", err)
+			}
+		})
+	}
+}
+
+func TestSubpathCleanupRetainsTargetWhenMountTableCannotBeRead(t *testing.T) {
+	base := t.TempDir()
+	target := filepath.Join(base, "0")
+	if err := os.WriteFile(target, []byte("must-remain"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	script := strings.ReplaceAll(subpathCleanupScript(target), "/proc/self/mountinfo", filepath.Join(base, "missing-mountinfo"))
+	if output, err := exec.CommandContext(t.Context(), "sh", "-ec", script).CombinedOutput(); err == nil {
+		t.Fatalf("unreadable mount table was ignored: %s", output)
+	}
+	data, err := os.ReadFile(target)
+	if err != nil || string(data) != "must-remain" {
+		t.Fatalf("uncertain mount target was removed: %s: %v", data, err)
+	}
+}
+
+func TestSubpathRestartUnmountsExistingFileBeforeRebinding(t *testing.T) {
+	if runtime.GOOS != "linux" {
+		t.Skip("Linux guest descriptor script")
+	}
+	base := t.TempDir()
+	root := filepath.Join(base, "volume")
+	target := filepath.Join(base, "pins", "app", "0")
+	for _, directory := range []string{root, filepath.Dir(target)} {
+		if err := os.MkdirAll(directory, 0755); err != nil {
+			t.Fatal(err)
+		}
+	}
+	for _, name := range []string{target, filepath.Join(root, "file")} {
+		if err := os.WriteFile(name, []byte("data"), 0600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	mountinfo := filepath.Join(base, "mountinfo")
+	if err := os.WriteFile(mountinfo, []byte("23 1 0:20 /file "+target+" rw - tmpfs tmpfs rw\n"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	prefix := "mountpoint() { return 1; }; busybox() { echo \"$1\"; }; "
+	script := strings.ReplaceAll(subpathSetupScript(root, target, "file", true), "/proc/self/mountinfo", mountinfo)
+	script = strings.ReplaceAll(script, "/bin/busybox ", "busybox ")
+	output, err := exec.CommandContext(t.Context(), "sh", "-ec", prefix+script).CombinedOutput()
+	if err != nil || string(output) != "umount\nmount\n" {
+		t.Fatalf("file mount was not unmounted before replacement: %s: %v", output, err)
+	}
+}

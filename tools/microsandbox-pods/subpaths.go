@@ -144,14 +144,25 @@ func (p *provider) releaseContainerSubpaths(ctx context.Context, e *podEntry, co
 		if mount.SubPath == "" && mount.SubPathExpr == "" {
 			continue
 		}
-		target := quote(guestSubpathPath(container.Name, index))
-		script := "target=" + target + "; if mountpoint -q \"$target\"; then /bin/busybox umount \"$target\"; fi; " +
-			"rm -rf -- \"$target\"; rm -f -- \"$target.generation\""
+		script := subpathCleanupScript(guestSubpathPath(container.Name, index))
 		if _, err := p.runner.guest(ctx, e.vm, script); err != nil {
 			return fmt.Errorf("release subPath for container %s volume %s: %w", container.Name, mount.Name, err)
 		}
 	}
 	return nil
+}
+
+func subpathCleanupScript(target string) string {
+	return "target=" + quote(target) + "; " + subpathUnmountScript("/proc/self/mountinfo") +
+		"rm -rf -- \"$target\"; rm -f -- \"$target.generation\""
+}
+
+// BusyBox mountpoint compares directory metadata and misses file bind mounts.
+// Our owned target contains only DNS labels and an index, so mountinfo's fifth
+// field has no escaped whitespace. Read errors abort before any target removal.
+func subpathUnmountScript(mountinfo string) string {
+	return "mounted=$(awk -v target=\"$target\" '$5 == target {print \"mounted\"; exit}' " + quote(mountinfo) + "); " +
+		"if test \"$mounted\" = mounted; then /bin/busybox umount \"$target\"; fi; "
 }
 
 // The pinned inode is mounted through /proc/<pid>/fd, never through a path that
@@ -162,7 +173,7 @@ func subpathSetupScript(root, target, subpath string, createDirectories bool) st
 	script := "umask 022; root=" + quote(root) + "; target=" + quote(target) + "; " +
 		"test \"$(readlink -f \"$root\")\" = \"$root\"; " +
 		"mkdir -p " + quote(path.Dir(target)) + "; chmod 0700 " + quote(path.Dir(path.Dir(target))) + "; " +
-		"if mountpoint -q \"$target\"; then /bin/busybox umount \"$target\"; fi; " +
+		subpathUnmountScript("/proc/self/mountinfo") +
 		"rm -rf -- \"$target\"; rm -f -- \"$target.generation\"; exec 3<\"$root\"; "
 	for component := range strings.SplitSeq(subpath, "/") {
 		script += "next=\"/proc/$$/fd/3/\"" + quote(component) + "; "
