@@ -142,9 +142,9 @@ func validatePod(pod *corev1.Pod) error {
 		return errdefs.InvalidInput("qualification supports exactly one regular container and no init or ephemeral containers")
 	}
 
-	if spec.HostNetwork || spec.HostPID || spec.HostIPC || len(spec.ImagePullSecrets) != 0 ||
+	if spec.HostNetwork || spec.HostPID || spec.HostIPC ||
 		spec.ShareProcessNamespace != nil {
-		return errdefs.InvalidInput("host namespaces, shared process namespaces and image pull credentials are not qualified")
+		return errdefs.InvalidInput("host namespaces and shared process namespaces are not qualified")
 	}
 	if err := validateSecurityContexts(pod); err != nil {
 		return errdefs.InvalidInput(err.Error())

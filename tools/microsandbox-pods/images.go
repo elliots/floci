@@ -41,6 +41,13 @@ func (p *provider) ensureApplicationImage(ctx context.Context, e *podEntry, cont
 			return fmt.Errorf("image %s is not fully cached in this guest and imagePullPolicy is Never", image)
 		}
 	}
+	credentials, err := p.imageCredentials(ctx, e.pod, image)
+	if err != nil {
+		return err
+	}
+	if len(credentials) != 0 {
+		return p.pullWithCredentials(ctx, e.vm, image, credentials)
+	}
 	if _, err := p.runner.guest(ctx, e.vm, ctr+" images pull "+quote(image)+" >/tmp/image-pull.log 2>&1"); err != nil {
 		return fmt.Errorf("pull application image: %w", err)
 	}
