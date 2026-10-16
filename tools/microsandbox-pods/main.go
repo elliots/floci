@@ -19,7 +19,6 @@ import (
 	"github.com/virtual-kubelet/virtual-kubelet/node"
 	"github.com/virtual-kubelet/virtual-kubelet/node/nodeutil"
 	corev1 "k8s.io/api/core/v1"
-	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apiserver/pkg/server/dynamiccertificates"
 )
@@ -56,9 +55,15 @@ func run() error {
 	flag.StringVar(&cfg.clusterName, "cluster-name", "", "Cluster identity advertised by lifecycle discovery")
 	flag.IntVar(&cfg.maxPods, "max-pods", 512, "Maximum tracked pods including sleeping pods")
 	flag.IntVar(&cfg.maxActiveMemoryMiB, "max-active-memory-mib", 4096, "Memory admission budget for active pod VMs only")
+	flag.StringVar(&cfg.schedulingCPU, "scheduling-cpu", "", "Virtual node CPU capacity for scheduling, as a Kubernetes quantity (default 4)")
+	flag.StringVar(&cfg.schedulingMemory, "scheduling-memory", "", "Virtual node memory capacity for scheduling, as a Kubernetes quantity (default active memory budget)")
 	flag.BoolVar(&cfg.cleanupOnExit, "cleanup-on-exit", false, "Delete owned guests on exit, for disposable qualification only")
 	flag.Parse()
 	if err := cfg.validate(); err != nil {
+		return err
+	}
+	capacity, err := cfg.nodeCapacity()
+	if err != nil {
 		return err
 	}
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
@@ -112,11 +117,6 @@ func run() error {
 	if err != nil {
 		return err
 	}
-	capacity := corev1.ResourceList{
-		corev1.ResourceCPU:    resource.MustParse("4"),
-		corev1.ResourceMemory: *resource.NewQuantity(int64(cfg.maxActiveMemoryMiB)*1024*1024, resource.BinarySI),
-		corev1.ResourcePods:   *resource.NewQuantity(int64(cfg.maxPods), resource.DecimalSI),
-	}
 	now := metav1.Now()
 	spec := corev1.Node{
 		ObjectMeta: metav1.ObjectMeta{Name: cfg.nodeName, Labels: map[string]string{
@@ -148,7 +148,9 @@ func run() error {
 	if err != nil {
 		return err
 	}
-	slog.Info("starting experimental native pod controller", "node", cfg.nodeName, "listen", cfg.listen)
+	slog.Info("starting experimental native pod controller", "node", cfg.nodeName, "listen", cfg.listen,
+		"schedulingCPU", capacity.Cpu().String(), "schedulingMemory", capacity.Memory().String(),
+		"maxActiveMemoryMiB", cfg.maxActiveMemoryMiB)
 	err = vk.Run(ctx)
 	if errors.Is(err, context.Canceled) {
 		return nil

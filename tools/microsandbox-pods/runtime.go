@@ -29,6 +29,7 @@ type config struct {
 	podCIDR, clusterCIDR, serviceCIDR, clusterDNS           string
 	clusterName                                             string
 	maxPods, maxActiveMemoryMiB                             int
+	schedulingCPU, schedulingMemory                         string
 	cleanupOnExit                                           bool
 	controlListen, tokenFile                                string
 	listen, nodeIP, cert, key, ca                           string
