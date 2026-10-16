@@ -80,7 +80,13 @@ func dnsHostAddress(path string) (netip.Addr, error) {
 				continue
 			}
 			address, err := netip.ParseAddr(fields[0])
-			if err != nil || !address.Is4() || !address.IsPrivate() {
+			if err != nil {
+				return netip.Addr{}, errors.New("guest hosts mapping contains an invalid address")
+			}
+			if address.Is6() {
+				continue
+			}
+			if !address.IsPrivate() {
 				return netip.Addr{}, errors.New("guest hosts mapping must contain a private IPv4 address")
 			}
 			if found.IsValid() && found != address {

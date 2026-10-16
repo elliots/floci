@@ -66,6 +66,27 @@ func TestDNSRoutingRejectsAmbiguousOrPublicHostMapping(t *testing.T) {
 	}
 }
 
+func TestDNSRoutingSelectsIPv4FromDualStackGuestHosts(t *testing.T) {
+	ipv4 := "172.16.0.5 host.microsandbox.internal\n"
+	ipv6 := "fd42:6d73:62:1::1 host.microsandbox.internal\n"
+	for _, content := range []string{ipv4 + ipv6, ipv6 + ipv4} {
+		path := filepath.Join(t.TempDir(), "hosts")
+		if err := os.WriteFile(path, []byte(content), 0600); err != nil {
+			t.Fatal(err)
+		}
+		address, err := dnsHostAddress(path)
+		if err != nil || address.String() != "172.16.0.5" {
+			t.Fatalf("dual-stack hosts mapping: %v, %v", address, err)
+		}
+		if err := os.WriteFile(path, []byte(content+"invalid host.microsandbox.internal\n"), 0600); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := dnsHostAddress(path); err == nil {
+			t.Fatal("invalid address alongside valid mapping must be rejected")
+		}
+	}
+}
+
 func TestDNSRoutingPreservesSearchAndOptionsWithoutPublicFallback(t *testing.T) {
 	routes, err := planDNSRouting(DNSRouting{Nameservers: []string{"10.1.2.3:5300", "10.1.2.4:5301"}}, "unused")
 	if err != nil {
