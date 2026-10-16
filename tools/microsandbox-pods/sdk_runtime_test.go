@@ -25,6 +25,14 @@ func testCommandRunner(cfg config) commandRunner {
 
 type scriptNativeRuntime struct{ cfg config }
 
+func (r scriptNativeRuntime) PrepareAdmission(context.Context, msbruntime.AdmissionRequest) (string, error) {
+	return "test-permit", nil
+}
+func (r scriptNativeRuntime) CancelAdmission(context.Context, string) error { return nil }
+func (r scriptNativeRuntime) ExecuteAdmitted(ctx context.Context, args []string, input []byte, _ string) (msbruntime.Result, error) {
+	return r.Execute(ctx, args, input)
+}
+
 func (r scriptNativeRuntime) Execute(ctx context.Context, args []string, input []byte) (msbruntime.Result, error) {
 	var stdout, stderr bytes.Buffer
 	exitCode, err := r.ExecuteStream(ctx, args, bytes.NewReader(input), &stdout, &stderr)
@@ -48,8 +56,20 @@ func (r scriptNativeRuntime) ExecuteStream(ctx context.Context, args []string, s
 }
 
 type stubNativeRuntime struct {
+	prepare func(context.Context, msbruntime.AdmissionRequest) (string, error)
 	execute func(context.Context, []string, []byte) (msbruntime.Result, error)
 	stream  func(context.Context, []string, io.Reader, io.Writer, io.Writer) (int, error)
+}
+
+func (r stubNativeRuntime) PrepareAdmission(ctx context.Context, request msbruntime.AdmissionRequest) (string, error) {
+	if r.prepare != nil {
+		return r.prepare(ctx, request)
+	}
+	return "test-permit", nil
+}
+func (r stubNativeRuntime) CancelAdmission(context.Context, string) error { return nil }
+func (r stubNativeRuntime) ExecuteAdmitted(ctx context.Context, args []string, input []byte, _ string) (msbruntime.Result, error) {
+	return r.Execute(ctx, args, input)
 }
 
 func (r stubNativeRuntime) Execute(ctx context.Context, args []string, input []byte) (msbruntime.Result, error) {
@@ -70,6 +90,28 @@ func TestNativeRuntimeRequiresExplicitClient(t *testing.T) {
 	}
 	if err := runner.nativeStream(t.Context(), []string{"exec"}, nil, io.Discard, io.Discard); err == nil {
 		t.Fatal("streaming exec fell back to a native CLI")
+	}
+}
+
+func TestNativeCapacityRefusalDoesNotLeaveUncertainMutationMarker(t *testing.T) {
+	refused := true
+	runner := commandRunner{cfg: config{state: t.TempDir()}, runtime: stubNativeRuntime{
+		execute: func(context.Context, []string, []byte) (msbruntime.Result, error) {
+			if refused {
+				return msbruntime.Result{}, msbruntime.ErrCapacityUnavailable
+			}
+			return msbruntime.Result{}, nil
+		},
+	}}
+	if _, err := runner.vm(t.Context(), "run", "--name", "pod"); !errors.Is(err, msbruntime.ErrCapacityUnavailable) {
+		t.Fatal(err)
+	}
+	if err := runner.checkPending(); err != nil {
+		t.Fatal("capacity refusal left an uncertain operation marker", err)
+	}
+	refused = false
+	if _, err := runner.vm(t.Context(), "run", "--name", "pod"); err != nil {
+		t.Fatal("retry after known refusal failed", err)
 	}
 }
 

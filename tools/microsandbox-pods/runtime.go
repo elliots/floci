@@ -15,6 +15,8 @@ import (
 	"strings"
 	"sync"
 	"time"
+
+	msbruntime "github.com/floci-io/floci/tools/microsandbox-runtime"
 )
 
 const guestImage = "rancher/k3s:v1.35.0-k3s1"
@@ -86,6 +88,9 @@ func (r commandRunner) vm(ctx context.Context, args ...string) (string, error) {
 		}
 		output, err := r.nativeOutput(ctx, args, nil)
 		if err != nil {
+			if errors.Is(err, msbruntime.ErrCapacityUnavailable) {
+				return "", errors.Join(err, os.Remove(marker), syncDirectory(r.cfg.state))
+			}
 			return "", err
 		}
 		if err := os.Remove(marker); err != nil {
@@ -102,7 +107,7 @@ func nativeMutation(args []string) bool {
 		return false
 	}
 	switch args[0] {
-	case "run", "create", "pause", "stop", "resume", "rm":
+	case "run", "create", "start", "pause", "stop", "resume", "rm":
 		return true
 	case "snap":
 		return len(args) > 1 && (args[1] == "create" || args[1] == "restore" || args[1] == "rm")

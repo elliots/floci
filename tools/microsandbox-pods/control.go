@@ -13,6 +13,7 @@ import (
 	"strings"
 	"time"
 
+	msbruntime "github.com/floci-io/floci/tools/microsandbox-runtime"
 	corev1 "k8s.io/api/core/v1"
 )
 
@@ -352,6 +353,13 @@ func (p *provider) requireVMStatus(ctx context.Context, e *podEntry, wanted stri
 }
 
 func (p *provider) resume(ctx context.Context, e *podEntry) error {
+	if e.lifetime != nil {
+		linked, cancel := context.WithCancel(ctx)
+		stop := context.AfterFunc(e.lifetime, cancel)
+		defer stop()
+		defer cancel()
+		ctx = linked
+	}
 	if err := ctx.Err(); err != nil {
 		return err
 	}
@@ -376,6 +384,11 @@ func (p *provider) resume(ctx context.Context, e *podEntry) error {
 			return err
 		}
 		if err := p.startAdmitted(ctx, e); err != nil {
+			if errors.Is(err, msbruntime.ErrCapacityUnavailable) {
+				p.releaseMemory(e)
+				e.state = "COLD"
+				return errors.Join(err, p.journal(e))
+			}
 			return p.transitionFailed(e, err)
 		}
 		wakeMonitor(e)
@@ -403,16 +416,37 @@ func (p *provider) resume(ctx context.Context, e *podEntry) error {
 	if _, err := p.runner.vm(ctx, "snap", "verify", selector); err != nil {
 		return err
 	}
+	args := []string{"snap", "restore", selector, "--name", e.vm, "--port", fmt.Sprintf("127.0.0.1:%d:8472/udp", e.port),
+		"--net-default", "deny", "--net-rule", "allow:egress@host,allow:egress@private,allow:egress@public", "--net-rule", "allow:ingress@any"}
+	if e.proxyAvailability {
+		for _, binding := range e.proxyPorts {
+			args = append(args, "--port", fmt.Sprintf("127.0.0.1:%d:%d", binding.BackendPort, binding.ContainerPort))
+		}
+	} else if e.httpPort != 0 {
+		args = append(args, "--port", fmt.Sprintf("127.0.0.1:%d:%d", e.httpPort, e.appPort))
+	}
 	release, err := p.acquireStart(ctx, e)
 	if err != nil {
 		return err
 	}
 	defer release()
+	permit, err := p.runner.prepareAdmission(ctx, args, e.vm)
+	if err != nil {
+		p.releaseMemory(e)
+		return err
+	}
+	sourceRemovalStarted := false
+	defer func() {
+		if !sourceRemovalStarted {
+			_ = p.runner.runtime.CancelAdmission(context.WithoutCancel(ctx), permit)
+		}
+	}()
 	e.generation++
 	e.state = "RESUMING"
 	if err := p.journal(e); err != nil {
 		return err
 	}
+	sourceRemovalStarted = true
 	if _, err := p.runner.vm(ctx, "rm", e.vm); err != nil {
 		return p.transitionFailed(e, err)
 	}
@@ -424,16 +458,7 @@ func (p *provider) resume(ctx context.Context, e *podEntry) error {
 	if err := p.journal(e); err != nil {
 		return err
 	}
-	args := []string{"snap", "restore", selector, "--name", e.vm, "--port", fmt.Sprintf("127.0.0.1:%d:8472/udp", e.port),
-		"--net-default", "deny", "--net-rule", "allow:egress@host,allow:egress@private,allow:egress@public", "--net-rule", "allow:ingress@any"}
-	if e.proxyAvailability {
-		for _, binding := range e.proxyPorts {
-			args = append(args, "--port", fmt.Sprintf("127.0.0.1:%d:%d", binding.BackendPort, binding.ContainerPort))
-		}
-	} else if e.httpPort != 0 {
-		args = append(args, "--port", fmt.Sprintf("127.0.0.1:%d:%d", e.httpPort, e.appPort))
-	}
-	if _, err := p.runner.vm(ctx, args...); err != nil {
+	if _, err := p.runner.vm(context.WithValue(ctx, nativeAdmissionKey{}, permit), args...); err != nil {
 		return p.transitionFailed(e, err)
 	}
 	e.created = true

@@ -6,6 +6,7 @@ import (
 	"context"
 	"crypto/rand"
 	"crypto/sha256"
+	"errors"
 	"fmt"
 	"log/slog"
 	"maps"
@@ -14,12 +15,27 @@ import (
 	"strings"
 	"time"
 
+	msbruntime "github.com/floci-io/floci/tools/microsandbox-runtime"
 	corev1 "k8s.io/api/core/v1"
 )
 
 const volumeRefreshInterval = 30 * time.Second
 
 func (p *provider) startStrictPod(e *podEntry) error {
+	for {
+		err := p.startStrictPodAttempt(e)
+		if !errors.Is(err, msbruntime.ErrCapacityUnavailable) {
+			return err
+		}
+		select {
+		case <-e.lifetime.Done():
+			return e.lifetime.Err()
+		case <-time.After(time.Second):
+		}
+	}
+}
+
+func (p *provider) startStrictPodAttempt(e *podEntry) error {
 	if err := p.waitForVolumeSources(e.lifetime, e); err != nil {
 		return err
 	}
@@ -42,6 +58,12 @@ func (p *provider) startStrictPod(e *podEntry) error {
 		if err == nil {
 			err = p.startAdmitted(ctx, e)
 		}
+	}
+	if errors.Is(err, msbruntime.ErrCapacityUnavailable) {
+		p.releaseMemory(e)
+		e.state = "WAITINGVOLUMES"
+		p.unavailable(e, "NativeCapacityUnavailable")
+		return errors.Join(err, p.journal(e))
 	}
 	if err != nil && e.lifetime.Err() == nil {
 		p.fail(e, err)

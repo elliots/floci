@@ -14,6 +14,9 @@ import (
 type nativeRuntime interface {
 	Execute(context.Context, []string, []byte) (msbruntime.Result, error)
 	ExecuteStream(context.Context, []string, io.Reader, io.Writer, io.Writer) (int, error)
+	PrepareAdmission(context.Context, msbruntime.AdmissionRequest) (string, error)
+	CancelAdmission(context.Context, string) error
+	ExecuteAdmitted(context.Context, []string, []byte, string) (msbruntime.Result, error)
 }
 
 type interactiveRuntime interface {
@@ -32,11 +35,23 @@ func (r commandRunner) nativeOutput(ctx context.Context, args []string, input []
 	if r.runtime == nil {
 		return nil, errors.New("native SDK runtime is not configured")
 	}
-	result, err := r.runtime.Execute(ctx, args, input)
+	var result msbruntime.Result
+	var err error
+	if token, _ := ctx.Value(nativeAdmissionKey{}).(string); token != "" {
+		result, err = r.runtime.ExecuteAdmitted(ctx, args, input, token)
+	} else {
+		result, err = r.runtime.Execute(ctx, args, input)
+	}
 	if err != nil || result.ExitCode != 0 {
 		return nil, nativeFailure(args, result.ExitCode, err)
 	}
 	return []byte(result.Stdout), nil
+}
+
+type nativeAdmissionKey struct{}
+
+func (r commandRunner) prepareAdmission(ctx context.Context, args []string, source string) (string, error) {
+	return r.runtime.PrepareAdmission(ctx, msbruntime.AdmissionRequest{Arguments: args, SourceName: source})
 }
 
 func (r commandRunner) nativeStream(ctx context.Context, args []string, stdin io.Reader, stdout, stderr io.Writer) error {
