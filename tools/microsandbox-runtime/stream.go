@@ -101,7 +101,6 @@ func streamExec(ctx context.Context, sandbox *msb.Sandbox, r command, input io.R
 			}
 		}()
 	}
-	var inputErr <-chan error
 	if input != nil {
 		sink := stream.TakeStdin()
 		if sink == nil {
@@ -116,8 +115,6 @@ func streamExec(ctx context.Context, sandbox *msb.Sandbox, r command, input io.R
 				}
 			}()
 		}
-		finished := make(chan error, 1)
-		inputErr = finished
 		go func() {
 			buf := make([]byte, 32<<10)
 			var copyErr error
@@ -142,13 +139,41 @@ func streamExec(ctx context.Context, sandbox *msb.Sandbox, r command, input io.R
 			}
 			closeErr := sink.Close()
 			copyErr = errors.Join(copyErr, closeErr)
-			finished <- copyErr
 			if copyErr != nil {
-				cancel()
+				cancelCause(copyErr)
 			}
 		}()
 	}
-	return consumeEvents(ctx, stream, stdout, stderr, inputErr)
+	return consumeAttachedEvents(ctx, stream, stdout, stderr)
+}
+
+func consumeAttachedEvents(ctx context.Context, stream eventStream, stdout, stderr io.Writer) (int, error) {
+	// A canceled SDK Recv can continue in the FFI and consume the eventual exit
+	// event. Keep a single reader alive while cancellation kills this process,
+	// then allow a bounded drain to observe its real exit status.
+	events, cancelEvents := context.WithCancelCause(context.WithoutCancel(ctx))
+	defer cancelEvents(context.Canceled)
+	finished := make(chan struct{})
+	defer close(finished)
+	stop := context.AfterFunc(ctx, func() {
+		cleanup, cancel := context.WithTimeout(context.WithoutCancel(ctx), 5*time.Second)
+		defer cancel()
+		if err := stream.Kill(cleanup); err != nil {
+			cancelEvents(err)
+			return
+		}
+		select {
+		case <-finished:
+		case <-cleanup.Done():
+			cancelEvents(errors.New("canceled exec did not report its exit status"))
+		}
+	})
+	defer stop()
+	code, err := consumeEvents(events, stream, stdout, stderr, nil)
+	if err != nil {
+		return 0, errors.Join(err, context.Cause(events))
+	}
+	return code, nil
 }
 
 func consumeEvents(ctx context.Context, stream eventStream, stdout, stderr io.Writer, inputErr <-chan error) (int, error) {
