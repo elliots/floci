@@ -127,6 +127,10 @@ def qualify(args):
                 "--client-ca", str(temporary/"client-ca.crt"), "--control-listen", f"127.0.0.1:{control_port}", "--control-token-file", str(token_path), "--cleanup-on-exit", "--cluster-name", "qualification"]
             if args.network_relay_binary:
                 controller_args.extend(["--network-relay-binary",args.network_relay_binary])
+            if args.scheduling_cpu:
+                controller_args.extend(["--scheduling-cpu", args.scheduling_cpu])
+            if args.scheduling_memory:
+                controller_args.extend(["--scheduling-memory", args.scheduling_memory])
             process = subprocess.Popen(controller_args, stdout=log, stderr=log)
             def control_get(path):
                 request = urllib.request.Request(f"http://127.0.0.1:{control_port}/v1/"+path,headers={"Authorization":"Bearer "+token})
@@ -191,6 +195,18 @@ def qualify(args):
                 kubectl("delete","pod","-l","qualification=cold","--wait=true",timeout=600)
                 wait("cold fixture releases RAM",lambda:control_get("health")["activeMemoryMiB"]==0)
             server_script = 'mkdir -p /www/cgi-bin; cat >/www/cgi-bin/source <<\'CGI\'\n#!/bin/sh\nprintf \'Content-Type: text/plain\\r\\n\\r\\n\'\nprintf \'%s\\n\' "$REMOTE_ADDR"\nCGI\nchmod +x /www/cgi-bin/source; echo native-pod-executed; exec httpd -f -p 8080 -h /www'
+            image_default = pod("image-default", "unused")
+            image_default["spec"]["containers"][0] = {
+                "name":"app", "image":"public.ecr.aws/docker/library/nginx:1.28.0-alpine",
+                "ports":[{"containerPort":80}],
+                "readinessProbe":{"httpGet":{"path":"/", "port":80}, "periodSeconds":1}}
+            apply(image_default)
+            wait("image ENTRYPOINT and CMD start without Pod overrides",lambda:ready("image-default"),300)
+            assert "Welcome to nginx!" in kubectl("exec","image-default","--","wget","-qO-","http://127.0.0.1/")
+            assert kubectl("exec","image-default","--","printenv","NGINX_VERSION")=="1.28.0"
+            report["checks"]["image_entrypoint_cmd_and_environment_defaults"] = True
+            kubectl("delete","pod","image-default","--wait=true",timeout=90)
+            wait("image-default fixture releases RAM",lambda:control_get("health")["activeMemoryMiB"]==0)
             volume_binary = b"\x00\xffnative-volume\x00\r\n"
             def volume_sources(version, old_key=False):
                 data = {"setting":version,"paired":version}
@@ -235,6 +251,7 @@ def qualify(args):
                     raise ValueError("proxy-pods requires 1..500 and network-relay-binary")
                 lazy = pod("lazy-probe",server_script)
                 lazy["spec"]["restartPolicy"]="Always"
+                lazy["spec"]["containers"][0]["resources"]={"requests":{"cpu":"1", "memory":"768Mi"}}
                 lazy["spec"]["containers"][0]["ports"]=[{"name":"http","containerPort":8080}]
                 lazy["spec"]["containers"][0]["readinessProbe"]={"httpGet":{"path":"/cgi-bin/source","port":"http"},"periodSeconds":1,"timeoutSeconds":5,"failureThreshold":1}
                 lazy["spec"]["containers"][0]["startupProbe"]={"tcpSocket":{"port":"http"},"periodSeconds":1,"timeoutSeconds":5,"failureThreshold":30}
@@ -253,6 +270,13 @@ def qualify(args):
                 discovery=control_get("deployments/default/lazy-probe")
                 assert len(discovery["pods"])==args.proxy_pods and all(p["state"]=="COLD" for p in discovery["pods"])
                 assert control_get("health")["activeMemoryMiB"]==0
+                scheduled=json.loads(kubectl("get","pods","-l","app=lazy-probe","-o","json"))["items"]
+                assert all(value["spec"]["nodeName"]==node for value in scheduled)
+                assert all(value["spec"]["containers"][0]["resources"]["requests"]=={"cpu":"1", "memory":"768Mi"} for value in scheduled)
+                report["scheduling"]={"capacity":resource("node",node)["status"]["allocatable"],
+                    "requested_cpu":args.proxy_pods,"requested_memory_mib":args.proxy_pods*768,
+                    "active_memory_mib":0,"active_memory_budget_mib":control_get("health")["maxActiveMemoryMiB"]}
+                report["checks"]["scheduler_preserves_cold_pod_requests"]=True
                 lazy_vms={p["vm"] for p in discovery["pods"]}
                 assert not any(v["name"] in lazy_vms for v in json.loads(command(args.msb,"ls","--format","json",env=environment)))
                 apply({"apiVersion":"v1","kind":"ConfigMap","metadata":{"name":"native-cold-settings"},"data":{"version":"after-cold"}})
@@ -327,6 +351,9 @@ def qualify(args):
             server["spec"]["containers"][0]["livenessProbe"] = {"exec":{"command":["test","-f","/tmp/live"]},"periodSeconds":1,"timeoutSeconds":5,"failureThreshold":2,"terminationGracePeriodSeconds":1}
             server["spec"]["restartPolicy"] = "Always"
             server["spec"]["containers"][0]["envFrom"] = [{"configMapRef":{"name":"native-settings"}},{"secretRef":{"name":"native-secrets"}}]
+            command_args = server["spec"]["containers"][0]["command"]
+            command_args[2] = 'test "$1" = configured; test "$2" = \'$(SETTING)\'; test "$3" = \'$(UNDEFINED)\'; ' + command_args[2]
+            server["spec"]["containers"][0]["args"] = ["expansion-check", "$(SETTING)", "$$(SETTING)", "$(UNDEFINED)"]
             apply({"apiVersion":"v1","kind":"ConfigMap","metadata":{"name":"native-settings"},"data":{"SETTING":"configured"}})
             apply({"apiVersion":"v1","kind":"Secret","metadata":{"name":"native-secrets"},"stringData":{"SECRET_SETTING":"private-value"}})
             kubectl("delete","configmap","native-volume-settings","--wait=true")
@@ -371,6 +398,7 @@ def qualify(args):
             report["checks"]["native_oci_logs_exec"] = True
             assert kubectl("exec","native-server","--","sh","-ec",'printf "%s/%s" "$SETTING" "$SECRET_SETTING"') == "configured/private-value"
             report["checks"]["configmap_secret_environment"] = True
+            report["checks"]["pod_command_environment_expansion_and_escaping"] = True
             assert volume_version("initial")
             for mount_path in ("/mounted/settings/binary","/mounted/secrets/binary"):
                 actual = kubectl("exec","native-server","--","sh","-ec",f"od -An -tx1 {mount_path} | tr -d ' \\n'")
@@ -410,8 +438,26 @@ def qualify(args):
             response = kubectl("exec","docker-client","--","wget","-T","10","-qO-","http://native-server/cgi-bin/source")
             assert source_ip(response) == client["status"]["podIP"]
             report["checks"]["dns_clusterip"] = True
-            apply(pod("native-client", "exec sleep 600"))
+            native_client = pod("native-client", "exec sleep 600")
+            client_container = native_client["spec"]["containers"][0]
+            client_container["args"] = client_container.pop("command")
+            client_container["workingDir"] = "/tmp"
+            native_client["spec"]["securityContext"] = {"runAsUser":1000, "runAsGroup":2000, "runAsNonRoot":True,
+                                                       "seccompProfile":{"type":"RuntimeDefault"}}
+            client_container["securityContext"] = {"readOnlyRootFilesystem":True, "allowPrivilegeEscalation":False, "capabilities":{"drop":["ALL"]}}
+            apply(native_client)
             second = wait("second native pod ready", lambda: ready("native-client"), 300)
+            security = kubectl("exec","native-client","--","sh","-ec",
+                'test "$(id -u)" = 1000; test "$(id -g)" = 2000; test "$(pwd)" = /tmp; '
+                'test "$(awk \'/NoNewPrivs/ {print $2}\' /proc/self/status)" = 1; '
+                'test "$(awk \'/^Seccomp:/ {print $2}\' /proc/self/status)" = 2; '
+                'test "$(awk \'/CapEff/ {print $2}\' /proc/self/status)" = 0000000000000000; '
+                'if output=$(touch /tmp/floci-readonly-check 2>&1); then exit 1; fi; '
+                'case "$output" in *"Read-only file system"*) echo secure;; *) exit 1;; esac')
+            assert security == "secure"
+            report["checks"]["args_only_and_working_directory_override"] = True
+            report["checks"]["nonroot_uid_gid_readonly_root_no_privilege_escalation_and_capabilities"] = True
+            report["checks"]["runtime_default_seccomp"] = True
             response = kubectl("exec","native-client","--","wget","-T","10","-qO-","http://native-server/cgi-bin/source")
             assert source_ip(response) == second["status"]["podIP"], f"native source Pod IP changed: {response}"
             report["checks"]["native_to_native_service_and_source"] = True
@@ -614,4 +660,6 @@ if __name__ == "__main__":
     parser.add_argument("--cold-pods",type=int,default=2)
     parser.add_argument("--proxy-pods",type=int,default=0)
     parser.add_argument("--network-relay-binary")
+    parser.add_argument("--scheduling-cpu", help="virtual CPU capacity advertised to the Kubernetes scheduler")
+    parser.add_argument("--scheduling-memory", help="virtual memory capacity advertised to the Kubernetes scheduler")
     raise SystemExit(0 if qualify(parser.parse_args()) else 1)

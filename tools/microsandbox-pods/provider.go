@@ -10,7 +10,6 @@ import (
 	"log/slog"
 	"os"
 	"path/filepath"
-	"reflect"
 	"strconv"
 	"strings"
 	"sync"
@@ -141,8 +140,11 @@ func validatePod(pod *corev1.Pod) error {
 	}
 
 	if spec.HostNetwork || spec.HostPID || spec.HostIPC || len(spec.ImagePullSecrets) != 0 ||
-		spec.ShareProcessNamespace != nil || spec.SecurityContext != nil && !reflect.DeepEqual(*spec.SecurityContext, corev1.PodSecurityContext{}) {
-		return errdefs.InvalidInput("host namespaces, image pull credentials and security contexts are not qualified")
+		spec.ShareProcessNamespace != nil {
+		return errdefs.InvalidInput("host namespaces, shared process namespaces and image pull credentials are not qualified")
+	}
+	if err := validateSecurityContexts(pod); err != nil {
+		return errdefs.InvalidInput(err.Error())
 	}
 	if spec.DNSPolicy != corev1.DNSClusterFirst || spec.DNSConfig != nil {
 		return errdefs.InvalidInput("qualification supports ClusterFirst DNS without overrides")
@@ -157,9 +159,9 @@ func validatePod(pod *corev1.Pod) error {
 	if container.Resources.Requests.Memory().Value() > vmMemoryMiB*1024*1024 || container.Resources.Requests.Cpu().MilliValue() > 1000 {
 		return errdefs.InvalidInput("pod requests exceed the fixed one-vCPU, 768 MiB guest")
 	}
-	if len(container.Command) == 0 || container.SecurityContext != nil || container.RestartPolicy != nil || len(container.RestartPolicyRules) != 0 ||
+	if container.RestartPolicy != nil || len(container.RestartPolicyRules) != 0 ||
 		len(container.VolumeDevices) != 0 || len(container.Resources.Limits) != 0 || container.Lifecycle != nil || container.Stdin || container.TTY {
-		return errdefs.InvalidInput("explicit command required; container restart overrides, security contexts, volume devices, limits, hooks and TTY are not qualified")
+		return errdefs.InvalidInput("container restart overrides, volume devices, limits, hooks and TTY are not qualified")
 	}
 	if err := validateVolumes(pod); err != nil {
 		return errdefs.InvalidInput(err.Error())
@@ -380,23 +382,31 @@ func (p *provider) startApplication(ctx context.Context, e *podEntry) error {
 	if err := p.ensureApplicationImage(ctx, e, container); err != nil {
 		return err
 	}
+	launch, err := p.applicationLaunch(ctx, e, container)
+	if err != nil {
+		return fmt.Errorf("resolve application image configuration: %w", err)
+	}
+	security, err := securityArgs(e.pod, container, launch.ImageUser)
+	if err != nil {
+		return fmt.Errorf("configure application security: %w", err)
+	}
 	if err := p.prepareVolumes(ctx, e); err != nil {
 		return err
 	}
 	if _, err := p.runner.guest(ctx, e.vm, "cp /etc/pod-resolv.conf /etc/resolv.conf"); err != nil {
 		return fmt.Errorf("configure application DNS: %w", err)
 	}
-	args := []string{"ctr", "--address", "/run/containerd/containerd.sock", "run", "--rm", "--net-host", "--mount", "type=bind,src=/etc/pod-resolv.conf,dst=/etc/resolv.conf,options=rbind:ro"}
+	args := []string{"ctr", "--address", "/run/containerd/containerd.sock", "run", "--rm", "--net-host", "--platform", launch.Platform, "--mount", "type=bind,src=/etc/pod-resolv.conf,dst=/etc/resolv.conf,options=rbind:ro"}
 	args = append(args, volumeMountArgs(e.pod)...)
-	if container.WorkingDir != "" {
-		args = append(args, "--cwd", container.WorkingDir)
+	args = append(args, security...)
+	if launch.WorkingDir != "" {
+		args = append(args, "--cwd", launch.WorkingDir)
 	}
 	for _, env := range container.Env {
 		args = append(args, "--env", env.Name+"="+env.Value)
 	}
 	args = append(args, image, "application")
-	args = append(args, container.Command...)
-	args = append(args, container.Args...)
+	args = append(args, launch.Args...)
 	script := "set +e; " + joinCommand(args) + " >/tmp/application.log 2>&1; code=$?; printf '%s\\n' \"$code\" >/tmp/application.exit; exit \"$code\""
 	if _, err := p.runner.guest(ctx, e.vm, "printf '%s' "+quote(script)+" >/tmp/application.pending; mv /tmp/application.pending /tmp/application.request"); err != nil {
 		return fmt.Errorf("submit application process to guest supervisor: %w", err)
