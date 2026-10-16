@@ -8,6 +8,7 @@ import (
 	"net"
 	"net/netip"
 	"os"
+	"slices"
 	"strconv"
 	"strings"
 )
@@ -42,6 +43,9 @@ func planDNSRouting(config DNSRouting, hostsPath string) ([]dnsRoute, error) {
 		port, err := strconv.ParseUint(portText, 10, 16)
 		if err != nil || port == 0 {
 			return nil, errors.New("guest DNS nameserver port must be between 1 and 65535")
+		}
+		if slices.Contains([]uint64{53, 853, 5353, 5355, 137}, port) {
+			return nil, errors.New("guest DNS nameserver port is reserved by the runtime DNS interceptor")
 		}
 		var address netip.Addr
 		if host == "host.microsandbox.internal" {

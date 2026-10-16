@@ -11,7 +11,7 @@ import (
 
 func TestDNSRoutingResolvesHostAgainOnReconfiguration(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "hosts")
-	config := DNSRouting{Nameservers: []string{"host.microsandbox.internal:5300", "10.1.2.3:53", "172.16.2.3:5353"}}
+	config := DNSRouting{Nameservers: []string{"host.microsandbox.internal:5300", "10.1.2.3:5301", "172.16.2.3:5302"}}
 	for _, address := range []string{"192.168.127.1", "192.168.126.1"} {
 		if err := os.WriteFile(path, []byte("127.0.0.1 localhost\n"+address+" host.microsandbox.internal # gateway\n"), 0600); err != nil {
 			t.Fatal(err)
@@ -39,6 +39,7 @@ func TestDNSRoutingRejectsImplicitAndPublicResolvers(t *testing.T) {
 		{"10.0.0.1"}, {"10.0.0.1:0"}, {"10.0.0.1:65536"}, {"10.0.0.1:dns"},
 		{"localhost:53"}, {"resolver.example:53"}, {"[fd00::1]:53"},
 		{"198.18.0.53:53"}, {"host.microsandbox.internal:53"},
+		{"10.0.0.1:53"}, {"10.0.0.1:853"}, {"10.0.0.1:5353"}, {"10.0.0.1:5355"}, {"10.0.0.1:137"},
 	} {
 		t.Run(strings.Join(nameservers, ","), func(t *testing.T) {
 			if _, err := planDNSRouting(DNSRouting{Nameservers: nameservers}, filepath.Join(t.TempDir(), "missing")); err == nil {
