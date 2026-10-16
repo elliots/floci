@@ -29,6 +29,16 @@ func TestNativeNetworkBoundary(t *testing.T) {
 	if config.Executable == "" || config.Home == "" || config.GuestAgentPath == "" {
 		t.Fatal("native qualification requires FLOCI_NATIVE_TEST_MSB, FLOCI_NATIVE_TEST_HOME and FLOCI_MICROSANDBOX_GUEST_AGENT_PATH")
 	}
+	agent, err := os.ReadFile(config.GuestAgentPath)
+	if err != nil || len(agent) < 64 {
+		t.Fatalf("cannot copy native guest helper: %v", err)
+	}
+	var invalidAgent [64]byte
+	copy(invalidAgent[:], agent[:64])
+	config.GuestAgentPath = filepath.Join(t.TempDir(), "guestnet")
+	if err := os.WriteFile(config.GuestAgentPath, agent, 0600); err != nil {
+		t.Fatal(err)
+	}
 	ctx, cancel := context.WithTimeout(t.Context(), 5*time.Minute)
 	defer cancel()
 	var forbiddenHits, dnsQueries atomic.Int32
@@ -131,8 +141,9 @@ func TestNativeNetworkBoundary(t *testing.T) {
 		}
 		return result
 	}
-	execute("run", "-d", "--name", vm, "--cpus", "1", "--memory", "384M", "--root-disk", "flat:2G", "--net", "all",
-		"--entrypoint", "/bin/sh", "rancher/k3s:v1.35.0-k3s1", "--", "-c", "exec sleep 2147483647")
+	launch := []string{"run", "-d", "--name", vm, "--cpus", "1", "--memory", "384M", "--root-disk", "flat:2G", "--net", "all",
+		"--entrypoint", "/bin/sh", "rancher/k3s:v1.35.0-k3s1", "--", "-c", "exec sleep 2147483647"}
+	execute(launch...)
 	check := func() {
 		t.Helper()
 		before := dnsQueries.Load()
@@ -187,4 +198,60 @@ func TestNativeNetworkBoundary(t *testing.T) {
 	if err := os.WriteFile(config.NetworkConfigFile, []byte(policy), 0600); err != nil {
 		t.Fatal(err)
 	}
+
+	stoppedID := func() string {
+		t.Helper()
+		var guests []struct{ Name, ID, Status string }
+		if err := json.Unmarshal([]byte(execute("ls").Stdout), &guests); err != nil {
+			t.Fatal(err)
+		}
+		for _, guest := range guests {
+			if guest.Name == vm {
+				if guest.ID == "" || guest.Status != "Stopped" {
+					t.Fatalf("failed admission left an active or unidentified guest: %#v", guest)
+				}
+				return guest.ID
+			}
+		}
+		t.Fatal("failed admission lost the owned guest instead of stopping it")
+		return ""
+	}
+	checkRejectedBoot := func(expectedID string) {
+		t.Helper()
+		if actualID := stoppedID(); actualID != expectedID {
+			t.Fatalf("failed admission replaced the owned guest: %s != %s", actualID, expectedID)
+		}
+		for _, args := range [][]string{{"exec", vm, "--", "true"}, {"start", vm}} {
+			if _, err := client.Execute(ctx, args, nil); err == nil {
+				t.Fatalf("good helper accepted %s after failed network admission", args[0])
+			}
+		}
+		if actualID := stoppedID(); actualID != expectedID {
+			t.Fatal("rejected retry changed the owned guest identity")
+		}
+	}
+	execute("stop", "--force", vm)
+	previousID := stoppedID()
+	// Keep the configured path stable, but make only the test-owned copy fail
+	// inside the guest after passing ELF header validation in runtime.New.
+	if err := os.WriteFile(config.GuestAgentPath, invalidAgent[:], 0600); err != nil {
+		t.Fatal(err)
+	}
+	broken, err := runtime.New(config)
+	if err != nil {
+		t.Fatal("invalid execution fixture did not pass helper admission:", err)
+	}
+	if _, err := broken.Execute(ctx, []string{"start", vm}, nil); err == nil {
+		t.Fatal("cold start accepted a helper that cannot execute")
+	}
+	checkRejectedBoot(previousID)
+	execute("rm", vm)
+	if _, err := broken.Execute(ctx, launch, nil); err == nil {
+		t.Fatal("fresh launch accepted a helper that cannot execute")
+	}
+	freshID := stoppedID()
+	if freshID == previousID {
+		t.Fatal("fresh failed launch reused the removed guest identity")
+	}
+	checkRejectedBoot(freshID)
 }
