@@ -41,7 +41,7 @@ func initializeSDK(config Config) error {
 	}
 	config.Executable = path
 	if sdkProcess.initialized {
-		if sdkProcess.config != config {
+		if sdkProcess.config.Home != config.Home || sdkProcess.config.Executable != config.Executable {
 			return errors.New("microsandbox SDK process already uses different runtime paths")
 		}
 		return sdkProcess.err
@@ -128,6 +128,10 @@ func (b *sdkBackend) execute(ctx context.Context, r command, stdin io.Reader, st
 		if _, err = h.Refresh(ctx); err != nil {
 			return 0, err
 		}
+		geometry, err := h.Config()
+		if err != nil || geometry.MemoryMiB == 0 {
+			return 0, errors.Join(errors.New("snapshot memory geometry unavailable"), err)
+		}
 		var labels map[string]string
 		var boundaryRecord restoredBoundary
 		if r.boundary != nil {
@@ -142,6 +146,9 @@ func (b *sdkBackend) execute(ctx context.Context, r command, stdin io.Reader, st
 			return 0, err
 		}
 		if _, err = h.Refresh(ctx); err != nil {
+			return 0, err
+		}
+		if err := recordSnapshotMemory(b.config.Home, artifact.ID(), artifact.Digest(), uint64(max(geometry.MemoryMiB, geometry.MaxMemoryMiB))); err != nil {
 			return 0, err
 		}
 		if r.boundary != nil {

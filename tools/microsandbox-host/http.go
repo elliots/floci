@@ -40,6 +40,10 @@ func newHandler(config hostConfig, runtime executor) http.Handler {
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /health", h.health)
 	mux.HandleFunc("POST /v1/command", h.command)
+	mux.HandleFunc("GET /v1/capacity", h.capacity)
+	mux.HandleFunc("POST /v1/capacity/prepare", h.capacity)
+	mux.HandleFunc("POST /v1/capacity/cancel", h.capacity)
+	mux.HandleFunc("POST /v1/capacity/limits", h.capacity)
 	mux.HandleFunc("POST /v1/port", h.port)
 	mux.HandleFunc("POST /v1/guest-task/plan", h.guestTaskPlan)
 	mux.HandleFunc("POST /v1/guest-task", h.guestTask)
@@ -117,6 +121,7 @@ func (h *hostHandler) command(w http.ResponseWriter, r *http.Request) {
 	var request struct {
 		Arguments []*string `json:"arguments"`
 		Input     string    `json:"input"`
+		Admission string    `json:"admission,omitempty"`
 	}
 	body, err := io.ReadAll(http.MaxBytesReader(w, r.Body, maxTransportBytes))
 	if err != nil {
@@ -142,7 +147,20 @@ func (h *hostHandler) command(w http.ResponseWriter, r *http.Request) {
 	// A lost HTTP connection does not cancel an accepted runtime mutation.
 	ctx, cancel := context.WithTimeout(context.WithoutCancel(r.Context()), h.config.timeout)
 	defer cancel()
-	result, err := h.runtime.Execute(ctx, args, []byte(request.Input))
+	var result microsandboxruntime.Result
+	if request.Admission != "" {
+		manager, ok := h.runtime.(capacityRuntime)
+		if !ok {
+			writeError(w, http.StatusServiceUnavailable, "Native capacity manager is unavailable")
+			return
+		}
+		result, err = manager.ExecuteAdmitted(ctx, args, []byte(request.Input), request.Admission)
+	} else {
+		result, err = h.runtime.Execute(ctx, args, []byte(request.Input))
+	}
+	if capacityRefusal(w, err) {
+		return
+	}
 	if errors.Is(err, microsandboxruntime.ErrInvalidArgument) {
 		writeError(w, http.StatusBadRequest, "Unsupported runtime command or options")
 		return

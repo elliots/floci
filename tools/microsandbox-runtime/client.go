@@ -27,6 +27,8 @@ type Config struct {
 	Home              string
 	NetworkConfigFile string
 	GuestAgentPath    string
+	MemoryLimitMiB    uint64
+	StartLimit        uint32
 }
 
 type Result struct {
@@ -46,6 +48,7 @@ type Client struct {
 	cli         func(context.Context, []string, io.Writer, io.Writer) (int, error)
 	boundary    *nativeNetworkBoundary
 	bootNetwork func(context.Context, command) error
+	capacity    *capacityManager
 }
 
 // New validates configuration without loading the SDK or running a subprocess.
@@ -90,6 +93,10 @@ func New(config Config) (*Client, error) {
 		}
 	}
 	c := &Client{config: config, core: &sdkBackend{config: config}, boundary: boundary}
+	c.capacity, err = newCapacityManager(config)
+	if err != nil {
+		return nil, err
+	}
 	c.cli = c.executeCLI
 	c.bootNetwork = func(ctx context.Context, request command) error {
 		return boundary.completeBoot(ctx, request.name, config.Home, request.config.Network)
@@ -142,7 +149,8 @@ func (c *Client) execute(ctx context.Context, args []string, stdin io.Reader, ha
 	return c.executeWithOptions(ctx, args, stdin, hasInput, stdout, stderr, StreamOptions{})
 }
 
-func (c *Client) executeWithOptions(ctx context.Context, args []string, stdin io.Reader, hasInput bool, stdout, stderr io.Writer, options StreamOptions) (int, error) {
+func (c *Client) executeWithOptions(ctx context.Context, args []string, stdin io.Reader, hasInput bool, stdout, stderr io.Writer, options StreamOptions) (code int, resultErr error) {
+	originalArgs := args
 	req, err := parse(args)
 	if err != nil {
 		return 0, err
@@ -176,6 +184,11 @@ func (c *Client) executeWithOptions(ctx context.Context, args []string, stdin io
 	if stderr == nil {
 		stderr = io.Discard
 	}
+	complete, err := c.admit(ctx, req, originalArgs)
+	if err != nil {
+		return 0, err
+	}
+	defer func() { complete(resultErr == nil) }()
 	if req.fallback {
 		if req.op == "run" {
 			if err := c.core.initialize(); err != nil {
@@ -199,7 +212,7 @@ func (c *Client) executeWithOptions(ctx context.Context, args []string, stdin io
 	if !hasInput {
 		stdin = nil
 	}
-	code, err := c.core.execute(ctx, req, stdin, stdout, stderr)
+	code, err = c.core.execute(ctx, req, stdin, stdout, stderr)
 	return code, safeError(req.op, err)
 }
 

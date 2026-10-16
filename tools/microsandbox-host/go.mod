@@ -7,6 +7,7 @@ require github.com/floci-io/floci/tools/microsandbox-runtime v0.0.0
 require (
 	go.yaml.in/yaml/v3 v3.0.5 // indirect
 	golang.org/x/net v0.33.0 // indirect
+	golang.org/x/sys v0.28.0 // indirect
 )
 
 require (
