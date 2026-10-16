@@ -18,6 +18,7 @@ type command struct {
 	timeout                                             *time.Duration
 	config                                              msb.SandboxConfig
 	stream                                              StreamOptions
+	boundary                                            *nativeNetworkBoundary
 }
 
 func parse(args []string) (command, error) {

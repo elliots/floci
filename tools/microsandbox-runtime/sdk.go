@@ -128,7 +128,14 @@ func (b *sdkBackend) execute(ctx context.Context, r command, stdin io.Reader, st
 		if _, err = h.Refresh(ctx); err != nil {
 			return 0, err
 		}
-		artifact, err := msb.Snapshot.Create(ctx, msb.SnapshotCreateOptions{Name: r.selector, FromSandbox: r.source, Full: r.full, RecordIntegrity: r.integrity})
+		var labels map[string]string
+		if r.boundary != nil {
+			if err := r.boundary.requireGuest(h, b.config.Home); err != nil {
+				return 0, err
+			}
+			labels = map[string]string{networkPolicyLabel: r.boundary.fingerprint}
+		}
+		artifact, err := msb.Snapshot.Create(ctx, msb.SnapshotCreateOptions{Name: r.selector, FromSandbox: r.source, Full: r.full, RecordIntegrity: r.integrity, Labels: labels})
 		if err != nil {
 			return 0, err
 		}
@@ -152,7 +159,24 @@ func (b *sdkBackend) execute(ctx context.Context, r command, stdin io.Reader, st
 	case "snap rm":
 		return 0, msb.Snapshot.Remove(ctx, r.selector, r.force)
 	case "snap restore":
-		sandbox, err := msb.RestoreSandbox(ctx, r.selector, r.name, msb.WithRestoreConfig(msb.RestoreConfig{Ports: r.config.PortBindings, NetworkPolicy: r.config.Network}))
+		var policyParent string
+		if r.boundary != nil {
+			artifact, err := msb.Snapshot.Open(ctx, r.selector)
+			if err != nil {
+				return 0, err
+			}
+			if err := r.boundary.requireIdentity(artifact.Labels()); err != nil {
+				return 0, err
+			}
+			policyParent = artifact.ID()
+		}
+		policy := r.config.Network
+		if policy != nil {
+			// Restore can override rules only. DNS and public CA settings are
+			// retained from the fingerprint-verified captured configuration.
+			policy = &msb.NetworkConfig{Rules: policy.Rules, DefaultEgress: policy.DefaultEgress, DefaultIngress: policy.DefaultIngress}
+		}
+		sandbox, err := msb.RestoreSandbox(ctx, r.selector, r.name, msb.WithRestoreConfig(msb.RestoreConfig{Ports: r.config.PortBindings, NetworkPolicy: policy}))
 		if err != nil {
 			return 0, err
 		}
@@ -161,12 +185,26 @@ func (b *sdkBackend) execute(ctx context.Context, r command, stdin io.Reader, st
 		if err = sandbox.Close(); err != nil {
 			return 0, err
 		}
+		if r.boundary != nil {
+			handle, err := msb.GetSandbox(ctx, r.name)
+			if err != nil {
+				return 0, err
+			}
+			if err := r.boundary.recordRestore(handle, b.config.Home, policyParent); err != nil {
+				return 0, err
+			}
+		}
 		_, err = io.WriteString(stdout, r.name+"\n")
 		return 0, err
 	}
 	h, err := msb.GetSandbox(ctx, r.name)
 	if err != nil {
 		return 0, err
+	}
+	if r.boundary != nil && (r.op == "start" || r.op == "resume" || r.op == "exec") {
+		if err := r.boundary.requireGuest(h, b.config.Home); err != nil {
+			return 0, err
+		}
 	}
 	switch r.op {
 	case "start":
@@ -185,9 +223,17 @@ func (b *sdkBackend) execute(ctx context.Context, r command, stdin io.Reader, st
 		return 0, h.Stop(ctx)
 	case "rm":
 		if r.force {
-			return 0, h.Destroy(ctx, msb.WithDestroyForce())
+			err = h.Destroy(ctx, msb.WithDestroyForce())
+		} else {
+			err = h.Remove(ctx)
 		}
-		return 0, h.Remove(ctx)
+		if err != nil {
+			return 0, err
+		}
+		if err := os.Remove(boundaryRecordPath(b.config.Home, h.ID())); err != nil && !errors.Is(err, os.ErrNotExist) {
+			return 0, err
+		}
+		return 0, nil
 	case "pause":
 		return 0, h.PauseWithGuestFlush(ctx, msb.GuestFlushSkip)
 	case "resume":

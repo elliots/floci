@@ -1,2 +1,4 @@
 github.com/superradcompany/microsandbox/sdk/go v0.7.8 h1:o2CSZvS1iHgvlfkKes6bO7fk3Y5ERD7nbq+C2iIAe4s=
 github.com/superradcompany/microsandbox/sdk/go v0.7.8/go.mod h1:p7Tm/p9zkO7sHO3N8A1fiTVeLB2w/fQoKdYlpN/5neA=
+go.yaml.in/yaml/v3 v3.0.5 h1:N6y/pJk8buWs9NY5ERU2HSMfm+IuD/OtfdAnq6kESPw=
+go.yaml.in/yaml/v3 v3.0.5/go.mod h1:HVTZu1O7/Vkt2N+BFy8Zza+lnLsABggaTM2ZpNIGuKg=

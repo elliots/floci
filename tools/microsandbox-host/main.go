@@ -44,6 +44,11 @@ func run(ctx context.Context) error {
 		if err != nil {
 			return fmt.Errorf("configure runtime: %w", err)
 		}
+		if verifier, ok := runtime.(interface{ VerifyNetworkBoundary(context.Context) error }); ok {
+			if err := verifier.VerifyNetworkBoundary(ctx); err != nil {
+				return err
+			}
+		}
 	}
 	listener, err := net.Listen("tcp", net.JoinHostPort(cmp.Or(os.Getenv("QUARKUS_HTTP_HOST"), "127.0.0.1"), port))
 	if err != nil {

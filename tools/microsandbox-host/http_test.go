@@ -53,6 +53,46 @@ func TestHealthContractWithoutRuntime(t *testing.T) {
 	}
 }
 
+type isolatedExecutor struct {
+	executor
+	fingerprint string
+}
+
+func (e isolatedExecutor) NetworkPolicyFingerprint() string { return e.fingerprint }
+
+func TestNetworkBoundaryIsAdvertisedAndCheckedBeforeExecution(t *testing.T) {
+	handler := newHandler(testConfig(), isolatedExecutor{unexpectedExecutor(t), "current-policy"})
+	response := request(handler, http.MethodGet, "/health", "", "")
+	var health map[string]string
+	if err := json.Unmarshal(response.Body.Bytes(), &health); err != nil || health["networkPolicy"] != "current-policy" {
+		t.Fatalf("policy health: %s, %v", response.Body, err)
+	}
+	for _, path := range []string{"/v1/command", "/v1/port", "/v1/guest-task", "/v1/guest-task/plan", "/v1/exec"} {
+		method := http.MethodPost
+		if path == "/v1/exec" {
+			method = http.MethodGet
+		}
+		r := httptest.NewRequest(method, path, strings.NewReader(`{}`))
+		r.Header.Set("Authorization", "Bearer test-token")
+		r.Header.Set("X-Floci-Network-Policy", "stale-policy")
+		w := httptest.NewRecorder()
+		handler.ServeHTTP(w, r)
+		if w.Code != http.StatusConflict {
+			t.Fatalf("%s accepted stale policy: %d %s", path, w.Code, w.Body)
+		}
+	}
+	for _, policy := range []string{"", "current-policy"} {
+		r := httptest.NewRequest(http.MethodPost, "/v1/port", nil)
+		r.Header.Set("Authorization", "Bearer test-token")
+		r.Header.Set("X-Floci-Network-Policy", policy)
+		w := httptest.NewRecorder()
+		handler.ServeHTTP(w, r)
+		if w.Code != http.StatusOK {
+			t.Fatalf("compatible policy rejected: %d %s", w.Code, w.Body)
+		}
+	}
+}
+
 func TestFunctionalEndpointsRequireConfigurationAndAuthorization(t *testing.T) {
 	for _, path := range []string{"/v1/command", "/v1/port"} {
 		t.Run(path, func(t *testing.T) {

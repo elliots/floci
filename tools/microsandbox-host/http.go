@@ -66,6 +66,7 @@ func newHandler(config hostConfig, runtime executor) http.Handler {
 func (h *hostHandler) health(w http.ResponseWriter, _ *http.Request) {
 	writeJSON(w, http.StatusOK, map[string]string{
 		"status": "ok", "name": "microsandbox", "version": h.config.version, "contract": "1",
+		"networkPolicy": h.networkPolicy(),
 	})
 }
 
@@ -78,7 +79,18 @@ func (h *hostHandler) authorize(w http.ResponseWriter, r *http.Request) bool {
 		writeError(w, http.StatusUnauthorized, "Unauthorized")
 		return false
 	}
+	if expected := r.Header.Get("X-Floci-Network-Policy"); expected != "" && expected != h.networkPolicy() {
+		writeError(w, http.StatusConflict, "Runtime network boundary does not match the requested environment")
+		return false
+	}
 	return true
+}
+
+func (h *hostHandler) networkPolicy() string {
+	if runtime, ok := h.runtime.(interface{ NetworkPolicyFingerprint() string }); ok {
+		return runtime.NetworkPolicyFingerprint()
+	}
+	return ""
 }
 
 func (h *hostHandler) port(w http.ResponseWriter, r *http.Request) {

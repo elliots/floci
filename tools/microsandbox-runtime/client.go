@@ -23,8 +23,9 @@ var ErrInvalidArgument = errors.New("invalid microsandbox command")
 var errOutputLimit = errors.New("microsandbox command output exceeds limit")
 
 type Config struct {
-	Executable string
-	Home       string
+	Executable        string
+	Home              string
+	NetworkConfigFile string
 }
 
 type Result struct {
@@ -39,9 +40,10 @@ type backend interface {
 }
 
 type Client struct {
-	config Config
-	core   backend
-	cli    func(context.Context, []string, io.Writer, io.Writer) (int, error)
+	config   Config
+	core     backend
+	cli      func(context.Context, []string, io.Writer, io.Writer) (int, error)
+	boundary *nativeNetworkBoundary
 }
 
 // New validates configuration without loading the SDK or running a subprocess.
@@ -69,7 +71,14 @@ func New(config Config) (*Client, error) {
 		return nil, errors.New("cannot resolve microsandbox home")
 	}
 	config.Home = filepath.Clean(home)
-	c := &Client{config: config, core: &sdkBackend{config: config}}
+	if config.NetworkConfigFile == "" {
+		config.NetworkConfigFile = os.Getenv("FLOCI_NETWORK_CONFIG_FILE")
+	}
+	boundary, err := readNetworkBoundary(config.NetworkConfigFile)
+	if err != nil {
+		return nil, err
+	}
+	c := &Client{config: config, core: &sdkBackend{config: config}, boundary: boundary}
 	c.cli = c.executeCLI
 	return c, nil
 }
@@ -128,6 +137,22 @@ func (c *Client) executeWithOptions(ctx context.Context, args []string, stdin io
 		return 0, err
 	}
 	req.stream = options
+	req.boundary = c.boundary
+	if c.boundary != nil && (req.op == "run" || req.op == "snap restore" && req.config.Network != nil) {
+		req.config.Network, err = c.boundary.restrict(req.config.Network)
+		if err != nil {
+			return 0, err
+		}
+		if req.op == "run" {
+			if _, exists := req.config.Labels[networkPolicyLabel]; exists {
+				return 0, invalid("network policy label is reserved")
+			}
+			args, err = c.boundary.launchArguments(args, req.config.Network)
+			if err != nil {
+				return 0, err
+			}
+		}
+	}
 	if hasInput && (req.op != "exec" || req.noStdin || req.detached) {
 		return 0, invalid("stdin is only supported for attached exec")
 	}
