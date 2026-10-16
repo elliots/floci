@@ -161,7 +161,7 @@ func (p *provider) projectProxyAvailability(e *podEntry) {
 	if ready {
 		e.pod.Status.Phase = corev1.PodRunning
 	}
-	e.pod.Status.Conditions = podConditions(ready)
+	e.pod.Status.Conditions = podConditionsFor(e.pod, ready)
 	e.pod.Status.ContainerStatuses[0].Ready = ready
 }
 
@@ -253,7 +253,7 @@ func (p *provider) withdrawProxyAvailability(e *podEntry) {
 	defer e.publication.Unlock()
 	e.mu.Lock()
 	e.pod.Status.ContainerStatuses[0].Ready = false
-	e.pod.Status.Conditions = podConditions(false)
+	e.pod.Status.Conditions = podConditionsFor(e.pod, false)
 	pod := e.pod.DeepCopy()
 	e.mu.Unlock()
 	p.notifySnapshot(pod)

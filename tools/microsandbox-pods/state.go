@@ -45,8 +45,11 @@ func (record journalRecord) guestAllocation() (podAllocation, error) {
 	if record.Version == 1 && record.Allocation == (podAllocation{}) {
 		return validateStoredAllocation(podAllocation{})
 	}
-	if record.Version != 2 || record.Allocation.Version == 0 {
+	if (record.Version != 2 && record.Version != 3) || record.Allocation.Version == 0 {
 		return podAllocation{}, errors.New("pod journal has an invalid version or missing guest allocation")
+	}
+	if record.Version == 3 && (record.Pod == nil || len(record.Pod.Spec.InitContainers) == 0) {
+		return podAllocation{}, errors.New("version 3 journal requires init containers")
 	}
 	return validateStoredAllocation(record.Allocation)
 }
@@ -123,6 +126,9 @@ func (p *provider) recover(ctx context.Context) error {
 		e.allocation, err = record.guestAllocation()
 		if err != nil {
 			return fmt.Errorf("invalid allocation for Pod %s: %w", record.View.UID, err)
+		}
+		if err := validateInitJournal(record); err != nil {
+			return fmt.Errorf("invalid init state for Pod %s: %w", record.View.UID, err)
 		}
 		e.declaredSpec = record.DeclaredSpec
 		e.startupComplete, e.probeFailure = record.StartupComplete, record.ProbeFailure
@@ -402,7 +408,7 @@ func recoverAction(journalState, runtimeStatus string, exists, verified bool) st
 	if journalState == "FAILED" || journalState == "TERMINATED" {
 		return journalState
 	}
-	if journalState == "STARTING" || journalState == "RESTARTING" {
+	if journalState == "STARTING" || journalState == "RESTARTING" || journalState == "INITSTARTING" {
 		// A launch can crash before submitting the application, including after
 		// removing an earlier exit marker. VM liveness cannot prove task liveness.
 		return "FAILED"
@@ -420,6 +426,9 @@ func recoverAction(journalState, runtimeStatus string, exists, verified bool) st
 		return "ROLLBACK"
 	}
 	if exists && runtimeStatus == "Running" {
+		if journalState == "INITIALIZING" {
+			return "INITIALIZING"
+		}
 		return "RUNNING"
 	}
 	return "FAILED"

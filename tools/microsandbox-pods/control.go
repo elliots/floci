@@ -195,7 +195,7 @@ func (p *provider) journal(e *podEntry) error {
 		file.Close()
 		return err
 	}
-	if err := json.NewEncoder(file).Encode(journalRecord{Version: 2, Allocation: allocation, StartupComplete: e.startupComplete, ProbeFailure: e.probeFailure, TerminationReason: e.terminationReason, DeclaredSpec: e.declaredSpec, ProxyPorts: e.proxyPorts, BackendIP: e.backendIP, SnapshotIDs: e.snapshotIDs, RestoredParent: e.restoredParent, View: view(e), Pod: pod, Slot: e.slot, GuestIP: e.guestIP, Started: e.started, Snapshots: e.snapshots}); err != nil {
+	if err := json.NewEncoder(file).Encode(journalRecord{Version: podJournalVersion(e.pod), Allocation: allocation, StartupComplete: e.startupComplete, ProbeFailure: e.probeFailure, TerminationReason: e.terminationReason, DeclaredSpec: e.declaredSpec, ProxyPorts: e.proxyPorts, BackendIP: e.backendIP, SnapshotIDs: e.snapshotIDs, RestoredParent: e.restoredParent, View: view(e), Pod: pod, Slot: e.slot, GuestIP: e.guestIP, Started: e.started, Snapshots: e.snapshots}); err != nil {
 		file.Close()
 		return err
 	}
@@ -224,7 +224,7 @@ func (p *provider) unavailable(e *podEntry, reason string) {
 	e.pod.Status.ContainerStatuses[0].Ready = false
 	e.pod.Status.ContainerStatuses[0].Started = new(false)
 	e.pod.Status.ContainerStatuses[0].State = corev1.ContainerState{Waiting: &corev1.ContainerStateWaiting{Reason: reason}}
-	e.pod.Status.Conditions = podConditions(false)
+	e.pod.Status.Conditions = podConditionsFor(e.pod, false)
 	e.mu.Unlock()
 	p.publish(e)
 }
@@ -365,7 +365,7 @@ func (p *provider) resume(ctx context.Context, e *podEntry) error {
 		wakeMonitor(e)
 		return nil
 	}
-	if e.state == "READY" || e.state == "RUNNING" {
+	if e.state == "READY" || e.state == "RUNNING" || e.state == "INITIALIZING" {
 		return p.requireVMStatus(ctx, e, "Running")
 	}
 	if e.state != "SLEEPING" || len(e.snapshots) == 0 {

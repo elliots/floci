@@ -1,6 +1,7 @@
 package main
 
 import (
+	"path"
 	"strings"
 	"time"
 )
@@ -12,16 +13,29 @@ func applicationRequestScript(script string) string {
 }
 
 func applicationProcessScript(args []string, completeAccounting string) string {
-	return "set +e; " + joinCommand(args) + " >/tmp/application.log 2>&1; code=$?; (" + completeAccounting +
-		"); if test $? -ne 0; then printf '%s\\n' 'cannot publish application memory accounting' >/tmp/application.oom-error.pending && " +
-		"mv /tmp/application.oom-error.pending /tmp/application.oom-error || exit 125; fi; " +
-		"printf '%s\\n' \"$code\" >/tmp/application.exit.pending && mv /tmp/application.exit.pending /tmp/application.exit || exit 125; exit \"$code\""
+	return containerProcessScript(args, completeAccounting, "/tmp")
+}
+
+func containerProcessScript(args []string, completeAccounting, root string) string {
+	log := quote(path.Join(root, "application.log"))
+	failure := quote(path.Join(root, "application.oom-error"))
+	failurePending := quote(path.Join(root, "application.oom-error.pending"))
+	exit := quote(path.Join(root, "application.exit"))
+	exitPending := quote(path.Join(root, "application.exit.pending"))
+	return "set +e; " + joinCommand(args) + " >" + log + " 2>&1; code=$?; (" + completeAccounting +
+		"); if test $? -ne 0; then printf '%s\\n' 'cannot publish container memory accounting' >" + failurePending + " && " +
+		"mv " + failurePending + " " + failure + " || exit 125; fi; " +
+		"printf '%s\\n' \"$code\" >" + exitPending + " && mv " + exitPending + " " + exit + " || exit 125; exit \"$code\""
 }
 
 func applicationTaskRunning(output string) bool {
+	return containerTaskRunning(output, "application")
+}
+
+func containerTaskRunning(output, task string) bool {
 	for line := range strings.SplitSeq(output, "\n") {
 		fields := strings.Fields(line)
-		if len(fields) == 3 && fields[0] == "application" && fields[2] == "RUNNING" {
+		if len(fields) == 3 && fields[0] == task && fields[2] == "RUNNING" {
 			return true
 		}
 	}

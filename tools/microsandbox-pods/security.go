@@ -46,7 +46,7 @@ func validateSecurityContexts(pod *corev1.Pod) error {
 			return fmt.Errorf("pod securityContext supports only runAsUser, runAsGroup, runAsNonRoot and RuntimeDefault/Unconfined seccomp; volume ownership, supplemental groups, SELinux, AppArmor, sysctls and Windows options are not qualified")
 		}
 	}
-	for _, container := range pod.Spec.Containers {
+	for container := range podContainers(pod) {
 		if err := validateContainerSecurity(container.SecurityContext); err != nil {
 			return fmt.Errorf("container %s securityContext: %w", container.Name, err)
 		}

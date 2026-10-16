@@ -31,12 +31,16 @@ func derivePodAllocation(pod *corev1.Pod) (podAllocation, error) {
 	if pod.Spec.Resources != nil || len(pod.Spec.ResourceClaims) != 0 || len(pod.Spec.Overhead) != 0 {
 		return podAllocation{}, fmt.Errorf("pod-level resources, resource claims and RuntimeClass overhead are not qualified")
 	}
-	container := pod.Spec.Containers[0]
-	if err := validateContainerResources(container); err != nil {
-		return podAllocation{}, err
+	var cpuMilli, memoryBytes int64
+	for container := range podContainers(pod) {
+		if err := validateContainerResources(container); err != nil {
+			return podAllocation{}, fmt.Errorf("container %s: %w", container.Name, err)
+		}
+		// Ordinary init containers run sequentially, before the single app.
+		// The VM must accommodate each stage, rather than their sum.
+		cpuMilli = max(cpuMilli, container.Resources.Requests.Cpu().MilliValue(), container.Resources.Limits.Cpu().MilliValue())
+		memoryBytes = max(memoryBytes, container.Resources.Requests.Memory().Value(), container.Resources.Limits.Memory().Value())
 	}
-	cpuMilli := max(container.Resources.Requests.Cpu().MilliValue(), container.Resources.Limits.Cpu().MilliValue())
-	memoryBytes := max(container.Resources.Requests.Memory().Value(), container.Resources.Limits.Memory().Value())
 	memoryMiB := int64(0)
 	if memoryBytes > 0 {
 		memoryMiB = (memoryBytes-1)/bytesPerMiB + 1

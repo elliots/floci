@@ -60,7 +60,7 @@ func recoveryStatusFixture(t *testing.T, record journalRecord, runtimeStatus str
 	record.Pod.Spec.NodeName = current.Spec.NodeName
 	record.DeclaredSpec = current.Spec.DeepCopy()
 	vm := "fvp-" + stringsWithoutHyphens(string(current.UID))[:20]
-	record.Version = 2
+	record.Version = podJournalVersion(record.Pod)
 	record.Allocation = podAllocation{Version: 1, VCPUs: 2, MemoryMiB: 1280}
 	record.View.UID, record.View.Namespace, record.View.Name = string(current.UID), current.Namespace, current.Name
 	record.View.VM, record.View.PodIP, record.View.UDPPort = vm, "10.42.200.2", 30000

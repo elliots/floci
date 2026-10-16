@@ -138,8 +138,8 @@ func newProvider(ctx context.Context, cfg config, client kubernetes.Interface) (
 
 func validatePod(pod *corev1.Pod) error {
 	spec := pod.Spec
-	if len(spec.Containers) != 1 || len(spec.InitContainers) != 0 || len(spec.EphemeralContainers) != 0 {
-		return errdefs.InvalidInput("qualification supports exactly one regular container and no init or ephemeral containers")
+	if len(spec.Containers) != 1 || len(spec.EphemeralContainers) != 0 {
+		return errdefs.InvalidInput("qualification supports exactly one regular container and no ephemeral containers")
 	}
 
 	if spec.HostNetwork || spec.HostPID || spec.HostIPC ||
@@ -172,15 +172,8 @@ func validatePod(pod *corev1.Pod) error {
 	if err := validateProbes(container); err != nil {
 		return errdefs.InvalidInput(err.Error())
 	}
-	for _, port := range container.Ports {
-		if port.HostPort != 0 || port.HostIP != "" {
-			return errdefs.InvalidInput("host ports are not qualified")
-		}
-	}
-	for _, env := range container.Env {
-		if env.ValueFrom != nil {
-			return errdefs.InvalidInput("unresolved environment reference")
-		}
+	if err := validateInitContainers(pod); err != nil {
+		return errdefs.InvalidInput(err.Error())
 	}
 	return nil
 }
@@ -269,6 +262,8 @@ func (p *provider) CreatePod(ctx context.Context, pod *corev1.Pod) error {
 	e.pod.Status = corev1.PodStatus{Phase: corev1.PodPending, Reason: "NativeVMStarting", StartTime: new(metav1.Now()),
 		ContainerStatuses: []corev1.ContainerStatus{{Name: pod.Spec.Containers[0].Name, Image: pod.Spec.Containers[0].Image,
 			State: corev1.ContainerState{Waiting: &corev1.ContainerStateWaiting{Reason: "ContainerCreating"}}}}}
+	initializeInitStatuses(e.pod)
+	e.pod.Status.Conditions = podConditionsFor(e.pod, false)
 	e.proxyAvailability, e.idleOwner, e.idleTimeout, _ = proxySettings(pod)
 	if e.proxyAvailability {
 		e.backendIP = addressAt(p.network.backendPrefix, slot)
@@ -369,6 +364,10 @@ func (p *provider) startAdmitted(ctx context.Context, e *podEntry) error {
 	if err := p.network.attach(ctx, e); err != nil {
 		return fmt.Errorf("attach native pod network: %w", err)
 	}
+	if len(e.pod.Spec.InitContainers) > 0 {
+		e.state = "INITIALIZING"
+		return p.advanceInit(ctx, e)
+	}
 	if err := p.startApplication(ctx, e); err != nil {
 		return err
 	}
@@ -390,45 +389,10 @@ func (p *provider) startAdmitted(ctx context.Context, e *podEntry) error {
 
 func (p *provider) startApplication(ctx context.Context, e *podEntry) error {
 	container := e.pod.Spec.Containers[0]
-	image := normalizeImage(container.Image)
-	if err := p.ensureApplicationImage(ctx, e, container); err != nil {
+	args, oom, err := p.containerLaunch(ctx, e, container, "application", "/tmp")
+	if err != nil {
 		return err
 	}
-	launch, err := p.applicationLaunch(ctx, e, container)
-	if err != nil {
-		return fmt.Errorf("resolve application image configuration: %w", err)
-	}
-	security, err := securityArgs(e.pod, container, launch.ImageUser)
-	if err != nil {
-		return fmt.Errorf("configure application security: %w", err)
-	}
-	resources, err := containerResourceArgs(container)
-	if err != nil {
-		return fmt.Errorf("configure application resources: %w", err)
-	}
-	if err := p.prepareVolumes(ctx, e); err != nil {
-		return err
-	}
-	if _, err := p.runner.guest(ctx, e.vm, "cp /etc/pod-resolv.conf /etc/resolv.conf"); err != nil {
-		return fmt.Errorf("configure application DNS: %w", err)
-	}
-	oom := newApplicationOOMTracking(e.generation)
-	if _, err := p.runner.guest(ctx, e.vm, oom.Setup); err != nil {
-		return fmt.Errorf("initialize application resource accounting: %w", err)
-	}
-	args := []string{"ctr", "--address", "/run/containerd/containerd.sock", "run", "--rm", "--net-host", "--platform", launch.Platform, "--mount", "type=bind,src=/etc/pod-resolv.conf,dst=/etc/resolv.conf,options=rbind:ro"}
-	args = append(args, volumeMountArgs(e.pod)...)
-	args = append(args, security...)
-	args = append(args, resources...)
-	args = append(args, oom.Args...)
-	if launch.WorkingDir != "" {
-		args = append(args, "--cwd", launch.WorkingDir)
-	}
-	for _, env := range container.Env {
-		args = append(args, "--env", env.Name+"="+env.Value)
-	}
-	args = append(args, image, "application")
-	args = append(args, launch.Args...)
 	script := applicationProcessScript(args, oom.Complete)
 	if _, err := p.runner.guest(ctx, e.vm, applicationRequestScript(script)); err != nil {
 		return fmt.Errorf("submit application process to guest supervisor: %w", err)
@@ -441,6 +405,56 @@ func (p *provider) startApplication(ctx context.Context, e *podEntry) error {
 	resetProbeProgress(e)
 	e.state = "RUNNING"
 	return p.journal(e)
+}
+
+func (p *provider) containerLaunch(ctx context.Context, e *podEntry, container corev1.Container, task, stateRoot string) ([]string, applicationOOMTracking, error) {
+	var empty applicationOOMTracking
+	image := normalizeImage(container.Image)
+	if err := p.ensureApplicationImage(ctx, e, container); err != nil {
+		return nil, empty, err
+	}
+	launch, err := p.applicationLaunch(ctx, e, container)
+	if err != nil {
+		return nil, empty, fmt.Errorf("resolve container image configuration: %w", err)
+	}
+	security, err := securityArgs(e.pod, container, launch.ImageUser)
+	if err != nil {
+		return nil, empty, fmt.Errorf("configure container security: %w", err)
+	}
+	resources, err := containerResourceArgs(container)
+	if err != nil {
+		return nil, empty, fmt.Errorf("configure container resources: %w", err)
+	}
+	if err := p.prepareVolumes(ctx, e); err != nil {
+		return nil, empty, err
+	}
+	if err := p.prepareContainerSubpaths(ctx, e, container); err != nil {
+		return nil, empty, err
+	}
+	if _, err := p.runner.guest(ctx, e.vm, "cp /etc/pod-resolv.conf /etc/resolv.conf"); err != nil {
+		return nil, empty, fmt.Errorf("configure container DNS: %w", err)
+	}
+	oom := newApplicationOOMTracking(e.generation)
+	if stateRoot != "/tmp" {
+		oom = buildApplicationOOMTracking(oom.Name, "/sys/fs/cgroup", stateRoot, "/proc/mounts")
+	}
+	if _, err := p.runner.guest(ctx, e.vm, oom.Setup); err != nil {
+		return nil, empty, fmt.Errorf("initialize container resource accounting: %w", err)
+	}
+	args := []string{"ctr", "--address", "/run/containerd/containerd.sock", "run", "--rm", "--net-host", "--platform", launch.Platform, "--mount", "type=bind,src=/etc/pod-resolv.conf,dst=/etc/resolv.conf,options=rbind:ro"}
+	args = append(args, volumeMountArgsForContainer(e.pod, container)...)
+	args = append(args, security...)
+	args = append(args, resources...)
+	args = append(args, oom.Args...)
+	if launch.WorkingDir != "" {
+		args = append(args, "--cwd", launch.WorkingDir)
+	}
+	for _, env := range container.Env {
+		args = append(args, "--env", env.Name+"="+env.Value)
+	}
+	args = append(args, image, task)
+	args = append(args, launch.Args...)
+	return args, oom, nil
 }
 
 func normalizeImage(image string) string {
@@ -459,6 +473,10 @@ func normalizeImage(image string) string {
 func (p *provider) monitor(ctx context.Context, e *podEntry) {
 	for {
 		e.op.Lock()
+		if e.state == "TERMINATED" {
+			e.op.Unlock()
+			return
+		}
 		if e.state == "COLD" || e.state == "SLEEPING" || e.state == "FAILED" || e.state == "CHECKPOINTED" || e.state == "RESUMING" || e.deleted {
 			e.applicationMissingSince = time.Time{}
 			e.op.Unlock()
@@ -466,6 +484,29 @@ func (p *provider) monitor(ctx context.Context, e *podEntry) {
 			case <-ctx.Done():
 				return
 			case <-e.wake:
+				continue
+			}
+		}
+		if e.state == "INITIALIZING" {
+			check, cancel := boundedContext(ctx)
+			err := p.monitorInit(check, e)
+			cancel()
+			if err != nil {
+				if ctx.Err() == nil {
+					p.fail(e, err)
+				}
+				e.op.Unlock()
+				return
+			}
+			if e.state == "TERMINATED" {
+				e.op.Unlock()
+				return
+			}
+			e.op.Unlock()
+			select {
+			case <-ctx.Done():
+				return
+			case <-time.After(time.Second):
 				continue
 			}
 		}
@@ -555,7 +596,7 @@ func (p *provider) monitor(ctx context.Context, e *podEntry) {
 			status.ContainerID = "containerd://" + e.vm + "/application"
 			status.State = corev1.ContainerState{Running: &corev1.ContainerStateRunning{StartedAt: metav1.NewTime(e.started)}}
 			status.Started, status.Ready = new(e.startupComplete), ready
-			e.pod.Status.Conditions = podConditions(ready)
+			e.pod.Status.Conditions = podConditionsFor(e.pod, ready)
 			e.mu.Unlock()
 			p.publish(e)
 		}
@@ -593,7 +634,7 @@ func (p *provider) terminated(e *podEntry, code int32) {
 	e.pod.Status.ContainerStatuses[0].Started = new(false)
 	e.pod.Status.ContainerStatuses[0].State = corev1.ContainerState{Terminated: &corev1.ContainerStateTerminated{
 		ExitCode: code, Reason: cmp.Or(e.terminationReason, e.probeFailure, string(e.pod.Status.Phase)), StartedAt: metav1.NewTime(e.started), FinishedAt: metav1.Now()}}
-	e.pod.Status.Conditions = podConditions(false)
+	e.pod.Status.Conditions = podConditionsFor(e.pod, false)
 	e.mu.Unlock()
 	if err := p.journal(e); err != nil {
 		slog.Error("cannot persist terminal pod", "pod", e.pod.Name, "error", err)
@@ -630,7 +671,7 @@ func (p *provider) fail(e *podEntry, err error) {
 	e.mu.Lock()
 	e.pod.Status.Phase, e.pod.Status.Reason, e.pod.Status.Message = corev1.PodFailed, "NativeRuntimeFailed", err.Error()
 	e.pod.Status.ContainerStatuses[0].Ready = false
-	e.pod.Status.Conditions = podConditions(false)
+	e.pod.Status.Conditions = podConditionsFor(e.pod, false)
 	e.mu.Unlock()
 	if journalErr := p.journal(e); journalErr != nil {
 		slog.Error("cannot persist failed pod", "pod", e.pod.Name, "error", journalErr)
@@ -734,6 +775,9 @@ func (p *provider) DeletePod(ctx context.Context, pod *corev1.Pod) error {
 	if _, exists, err := p.inspectOwned(ctx, e); err != nil || exists {
 		return errors.Join(err, errors.New("owned VM deletion did not complete"))
 	}
+	if err := os.RemoveAll(p.initLogDirectory(e)); err != nil {
+		return err
+	}
 	if err := os.Remove(filepath.Join(p.runner.cfg.state, string(e.pod.UID)+".json")); err != nil && !errors.Is(err, os.ErrNotExist) {
 		return err
 	}
@@ -800,14 +844,23 @@ func (p *provider) GetContainerLogs(ctx context.Context, namespace, name, contai
 	}
 	e.op.Lock()
 	defer e.op.Unlock()
+	if opts.Follow || opts.Previous || opts.Timestamps || opts.SinceSeconds != 0 || !opts.SinceTime.IsZero() {
+		return nil, errdefs.InvalidInput("follow, previous, timestamp and time-filtered logs are not qualified")
+	}
+	for index, init := range e.pod.Spec.InitContainers {
+		if container == init.Name {
+			data, err := p.readInitLogs(ctx, e, index, opts)
+			if err != nil {
+				return nil, err
+			}
+			return io.NopCloser(bytes.NewReader(data)), nil
+		}
+	}
 	if e.state != "READY" && e.state != "RUNNING" {
 		return nil, errdefs.InvalidInput("pod is not executing")
 	}
 	if container != e.pod.Spec.Containers[0].Name {
 		return nil, errdefs.NotFound("container not found")
-	}
-	if opts.Follow || opts.Previous || opts.Timestamps || opts.SinceSeconds != 0 || !opts.SinceTime.IsZero() {
-		return nil, errdefs.InvalidInput("follow, previous, timestamp and time-filtered logs are not qualified")
 	}
 	script := "cat /tmp/application.log"
 	if opts.Tail > 0 {
@@ -830,16 +883,14 @@ func (p *provider) RunInContainer(ctx context.Context, namespace, name, containe
 	}
 	e.op.Lock()
 	defer e.op.Unlock()
-	if e.state != "READY" && e.state != "RUNNING" {
-		return errdefs.InvalidInput("pod is not executing")
-	}
-	if container != e.pod.Spec.Containers[0].Name {
-		return errdefs.NotFound("container not found")
+	task, err := executingContainerTask(e, container)
+	if err != nil {
+		return err
 	}
 	if attach.TTY() {
 		return errdefs.InvalidInput("interactive TTY is not qualified")
 	}
-	command := []string{"exec", "--stream", e.vm, "--", "ctr", "--address", "/run/containerd/containerd.sock", "tasks", "exec", "--exec-id", "exec-" + strconv.FormatInt(time.Now().UnixNano(), 10), "application"}
+	command := []string{"exec", "--stream", e.vm, "--", "ctr", "--address", "/run/containerd/containerd.sock", "tasks", "exec", "--exec-id", "exec-" + strconv.FormatInt(time.Now().UnixNano(), 10), task}
 	command = append(command, args...)
 	cmd := p.runner.command(ctx, p.runner.cfg.msb, command...)
 	cmd.Stdin, cmd.Stdout, cmd.Stderr = attach.Stdin(), attach.Stdout(), attach.Stderr()
