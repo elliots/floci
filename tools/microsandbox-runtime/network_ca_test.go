@@ -8,6 +8,7 @@ import (
 	"crypto/rand"
 	"crypto/x509"
 	"encoding/pem"
+	"errors"
 	"io"
 	"math/big"
 	"os"
@@ -167,6 +168,54 @@ func TestBoundaryPublicCACachePublishesAtomicallyAcrossLaunches(t *testing.T) {
 	for err := range failures {
 		if err != nil {
 			t.Error(err)
+		}
+	}
+}
+
+func TestBoundaryRejectsReservedCAEnvironmentBeforeLaunch(t *testing.T) {
+	for _, flag := range []string{"--env", "-e"} {
+		for _, value := range []string{"FLOCI_CA_BUNDLE=/override", "FLOCI_CA_BUNDLE=" + networkCAPath} {
+			t.Run(flag+"/"+value, func(t *testing.T) {
+				boundary, _, _ := publicCAFixture(t)
+				client := &Client{config: Config{Home: t.TempDir()}, boundary: boundary}
+				client.cli = func(context.Context, []string, io.Writer, io.Writer) (int, error) {
+					t.Fatal("reserved CA variable reached launch")
+					return 0, nil
+				}
+				_, err := client.Execute(t.Context(), []string{"run", "-d", "--name", "owned", flag, value, "alpine"}, nil)
+				if !errors.Is(err, ErrInvalidArgument) {
+					t.Fatalf("expected reserved variable rejection, got %v", err)
+				}
+			})
+		}
+	}
+}
+
+func TestBoundaryPreservesCAEnvironmentWithoutConfiguredCAAndLiteralGuestArguments(t *testing.T) {
+	for _, configuredCA := range []bool{false, true} {
+		boundary := boundaryFixture()
+		arguments := []string{"run", "-d", "--name", "owned", "-e", "FLOCI_CA_BUNDLE=/application-ca", "alpine"}
+		if configuredCA {
+			boundary, _, _ = publicCAFixture(t)
+			arguments = []string{"run", "-d", "--name", "owned", "--env", "APPLICATION_CA=/application-ca", "alpine", "--", "echo", "--env", "FLOCI_CA_BUNDLE=literal"}
+		}
+		client := &Client{config: Config{Home: t.TempDir()}, boundary: boundary, core: fakeBackend(func(context.Context, command, io.Reader, io.Writer, io.Writer) (int, error) {
+			t.Fatal("launch must use the CLI fallback")
+			return 0, nil
+		})}
+		launched := false
+		client.cli = func(_ context.Context, args []string, _, _ io.Writer) (int, error) {
+			launched = true
+			if !strings.Contains(strings.Join(args, " "), arguments[len(arguments)-1]) {
+				t.Fatal("guest literal was rewritten")
+			}
+			return 0, nil
+		}
+		if _, err := client.Execute(t.Context(), arguments, nil); err != nil {
+			t.Fatal(err)
+		}
+		if !launched {
+			t.Fatal("valid launch was rejected")
 		}
 	}
 }

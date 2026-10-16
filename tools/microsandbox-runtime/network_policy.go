@@ -429,6 +429,12 @@ func (b *nativeNetworkBoundary) launchArguments(args []string, network *msb.Netw
 			result = append(result, args[i:]...)
 			break
 		}
+		if b.CAFile != "" && (args[i] == "--env" || args[i] == "-e") {
+			key, _, _ := strings.Cut(args[i+1], "=")
+			if key == "FLOCI_CA_BUNDLE" {
+				return nil, invalid("FLOCI_CA_BUNDLE is reserved for the native public CA")
+			}
+		}
 		if args[i] == "--net" || args[i] == "--net-rule" || args[i] == "--net-default" {
 			i++
 			continue
