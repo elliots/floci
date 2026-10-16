@@ -48,6 +48,7 @@ type provider struct {
 }
 
 type podEntry struct {
+	freeze *applicationFreeze
 	applicationProgress
 	completionPhase                                  corev1.PodPhase
 	shutdownDeadline                                 time.Time

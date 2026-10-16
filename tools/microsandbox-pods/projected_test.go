@@ -191,6 +191,7 @@ func TestInitialIdentityRefreshesAfterLongImagePull(t *testing.T) {
 func TestSleepingIdentityFailureDoesNotRestoreOrConsumeGeneration(t *testing.T) {
 	p, e, f := projectedFixture(t)
 	e.state, e.generation, e.snapshots = "SLEEPING", 7, []string{"owned:snapshot"}
+	e.freeze = frozenFixture()
 	f.failure = errors.New("private-response")
 	var commands [][]string
 	p.runner.runtime = stubNativeRuntime{execute: func(_ context.Context, args []string, _ []byte) (msbruntime.Result, error) {
@@ -210,7 +211,7 @@ func TestSleepingIdentityFailureDoesNotRestoreOrConsumeGeneration(t *testing.T) 
 	if err := p.resume(t.Context(), e); err == nil || strings.Contains(err.Error(), "private-response") {
 		t.Fatal("identity failure did not block wake safely")
 	}
-	if len(commands) != 2 || e.state != "SLEEPING" || e.generation != 7 || e.allocated {
+	if len(f.requests) != 1 || len(commands) != 2 || e.state != "SLEEPING" || e.generation != 7 || e.allocated {
 		t.Fatal("failed identity preflight changed sleeping runtime identity")
 	}
 }

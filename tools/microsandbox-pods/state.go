@@ -23,6 +23,7 @@ type stateIdentity struct {
 	Node, ClusterUID, PeerOwner, Peer, PodCIDR, ProxyBackendCIDR string
 }
 type journalRecord struct {
+	Freeze            *applicationFreeze           `json:"freeze,omitempty"`
 	CompletionPhase   corev1.PodPhase              `json:"completionPhase,omitempty"`
 	ShutdownDeadline  time.Time                    `json:"shutdownDeadline,omitzero"`
 	Applications      map[string]applicationRecord `json:"applications,omitempty"`
@@ -123,7 +124,7 @@ func (p *provider) recover(ctx context.Context) error {
 			return err
 		}
 		lifetime, cancel := context.WithCancel(p.ctx)
-		e := &podEntry{wake: make(chan struct{}, 1), snapshotIDs: record.SnapshotIDs, restoredParent: record.RestoredParent, pod: record.Pod, vm: record.View.VM, ip: record.View.PodIP, slot: record.Slot, port: record.View.UDPPort,
+		e := &podEntry{freeze: record.Freeze, wake: make(chan struct{}, 1), snapshotIDs: record.SnapshotIDs, restoredParent: record.RestoredParent, pod: record.Pod, vm: record.View.VM, ip: record.View.PodIP, slot: record.Slot, port: record.View.UDPPort,
 			httpPort: record.View.HTTPPort, appPort: record.View.ApplicationPort, guestIP: record.GuestIP, applicationProgress: applicationProgress{started: record.Started},
 			generation: record.View.Generation, state: record.View.State, snapshots: record.Snapshots, lifetime: lifetime, cancel: cancel, done: make(chan struct{})}
 		e.allocation, err = record.guestAllocation()
@@ -135,6 +136,9 @@ func (p *provider) recover(ctx context.Context) error {
 		}
 		if err := restoreApplicationRecords(e, record); err != nil {
 			return fmt.Errorf("invalid application state for Pod %s: %w", record.View.UID, err)
+		}
+		if err := validateFreeze(e); err != nil {
+			return err
 		}
 		e.declaredSpec = record.DeclaredSpec
 		e.completionPhase, e.shutdownDeadline = record.CompletionPhase, record.ShutdownDeadline
@@ -261,7 +265,12 @@ func (p *provider) recover(ctx context.Context) error {
 	// All journals and active allocations are accounted before any listener can wake a Pod.
 	for _, e := range recovered {
 		e.op.Lock()
-		err := p.refreshRecoveredTokens(ctx, e)
+		var err error
+		if e.freeze != nil && (e.state == "RUNNING" || e.state == "READY") {
+			err = p.refreshAndThaw(ctx, e)
+		} else {
+			err = p.refreshRecoveredTokens(ctx, e)
+		}
 		if err == nil {
 			err = p.prepareProxy(ctx, e)
 		}

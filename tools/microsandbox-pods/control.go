@@ -197,7 +197,7 @@ func (p *provider) journal(e *podEntry) error {
 		file.Close()
 		return err
 	}
-	if err := json.NewEncoder(file).Encode(journalRecord{Version: podJournalVersion(e.pod), CompletionPhase: e.completionPhase, ShutdownDeadline: e.shutdownDeadline, Applications: e.applicationRecords(), Allocation: allocation, StartupComplete: e.startupComplete, ProbeFailure: e.probeFailure, TerminationReason: e.terminationReason, DeclaredSpec: e.declaredSpec, ProxyPorts: e.proxyPorts, BackendIP: e.backendIP, SnapshotIDs: e.snapshotIDs, RestoredParent: e.restoredParent, View: view(e), Pod: pod, Slot: e.slot, GuestIP: e.guestIP, Started: e.started, Snapshots: e.snapshots}); err != nil {
+	if err := json.NewEncoder(file).Encode(journalRecord{Freeze: e.freeze, Version: podJournalVersion(e.pod), CompletionPhase: e.completionPhase, ShutdownDeadline: e.shutdownDeadline, Applications: e.applicationRecords(), Allocation: allocation, StartupComplete: e.startupComplete, ProbeFailure: e.probeFailure, TerminationReason: e.terminationReason, DeclaredSpec: e.declaredSpec, ProxyPorts: e.proxyPorts, BackendIP: e.backendIP, SnapshotIDs: e.snapshotIDs, RestoredParent: e.restoredParent, View: view(e), Pod: pod, Slot: e.slot, GuestIP: e.guestIP, Started: e.started, Snapshots: e.snapshots}); err != nil {
 		file.Close()
 		return err
 	}
@@ -285,6 +285,9 @@ func (p *provider) hibernate(ctx context.Context, e *podEntry) error {
 		return err
 	}
 	p.unavailable(e, "Hibernating")
+	if err := p.freezeApplications(ctx, e); err != nil {
+		return p.rollbackFreeze(e, err)
+	}
 	if _, err := p.runner.vm(ctx, "pause", e.vm); err != nil {
 		return p.transitionFailed(e, err)
 	}
@@ -331,8 +334,7 @@ func (p *provider) rollbackPause(e *podEntry, cause error) error {
 	if err := p.requireVMStatus(ctx, e, "Running"); err != nil {
 		return p.transitionFailed(e, errors.Join(cause, err))
 	}
-	e.state = "RUNNING"
-	return errors.Join(cause, p.journal(e))
+	return p.rollbackFreeze(e, cause)
 }
 
 func (p *provider) transitionFailed(e *podEntry, cause error) error {
@@ -404,6 +406,9 @@ func (p *provider) resume(ctx context.Context, e *podEntry) error {
 		return err
 	}
 	if err := p.requireVMStatus(ctx, e, "Stopped"); err != nil {
+		return err
+	}
+	if err := requireFrozenSnapshot(e); err != nil {
 		return err
 	}
 	if err := p.preflightWakeTokens(ctx, e); err != nil {
@@ -485,6 +490,9 @@ func (p *provider) resume(ctx context.Context, e *podEntry) error {
 	// good data on API errors; identity projections must refresh successfully.
 	e.volumeDigests = nil
 	if err := p.refreshVolumeProjections(ctx, e, false, true); err != nil {
+		return p.transitionFailed(e, err)
+	}
+	if err := p.thawApplications(ctx, e); err != nil {
 		return p.transitionFailed(e, err)
 	}
 	e.state = "RUNNING"
