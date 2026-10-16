@@ -102,6 +102,8 @@ func TestRestartRetainsPreviousLogsAndCompletionFailure(t *testing.T) {
 func TestInvalidRequestsDoNotLeakValues(t *testing.T) {
 	for _, request := range []Request{
 		{Action: "start", ID: "../escape", Command: []string{"private"}},
+		{Action: "start", ID: ".invisible", Command: []string{"private"}},
+		{Action: "start", ID: "supervisor.sh", Command: []string{"private"}},
 		{Action: "start", ID: "task", Environment: map[string]string{"INVALID;private": "private"}, Command: []string{"echo"}},
 		{Action: "start", ID: "task", Command: []string{"private\x00"}},
 		{Action: "status", ID: "task", Command: []string{"private"}},

@@ -45,7 +45,7 @@ type Status struct {
 }
 
 func Directory(id string) (string, error) {
-	if len(id) < 1 || len(id) > 128 || id == "." || id == ".." {
+	if len(id) < 1 || len(id) > 128 || strings.HasPrefix(id, ".") || id == path.Base(BootstrapPath) || id == path.Base(BootstrapPath)+".pending" {
 		return "", fmt.Errorf("%w: task ID must be 1..128 safe characters", ErrInvalidArgument)
 	}
 	for _, c := range id {
