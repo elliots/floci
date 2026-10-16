@@ -147,7 +147,7 @@ func (c *Client) executeWithOptions(ctx context.Context, args []string, stdin io
 			if _, exists := req.config.Labels[networkPolicyLabel]; exists {
 				return 0, invalid("network policy label is reserved")
 			}
-			args, err = c.boundary.launchArguments(args, req.config.Network)
+			args, err = c.boundary.launchArguments(args, req.config.Network, c.config.Home)
 			if err != nil {
 				return 0, err
 			}
