@@ -30,6 +30,8 @@ type config struct {
 	clusterName                                             string
 	maxPods, maxActiveMemoryMiB                             int
 	schedulingCPU, schedulingMemory                         string
+	kubeAPIQPS                                              float64
+	kubeAPIBurst                                            int
 	cleanupOnExit                                           bool
 	controlListen, tokenFile                                string
 	listen, nodeIP, cert, key, ca                           string

@@ -33,6 +33,8 @@ func main() {
 func run() error {
 	cfg := config{}
 	flag.StringVar(&cfg.kubeconfig, "kubeconfig", "", "Kubernetes kubeconfig")
+	flag.Float64Var(&cfg.kubeAPIQPS, "kube-api-qps", defaultKubeAPIQPS, "Sustained Kubernetes API request rate shared by the controller")
+	flag.IntVar(&cfg.kubeAPIBurst, "kube-api-burst", defaultKubeAPIBurst, "Maximum burst of Kubernetes API requests shared by the controller")
 	flag.StringVar(&cfg.nodeName, "node", "native-pods", "Owned virtual node name")
 	flag.StringVar(&cfg.msb, "msb", "msb", "Native microsandbox 0.7.8 executable")
 	flag.StringVar(&cfg.home, "msb-home", "", "Native runtime home")
@@ -68,7 +70,7 @@ func run() error {
 	}
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
-	client, err := nodeutil.ClientsetFromEnv(cfg.kubeconfig)
+	client, err := newKubernetesClient(cfg)
 	if err != nil {
 		return err
 	}
@@ -159,6 +161,9 @@ func run() error {
 }
 
 func (c config) validate() error {
+	if err := c.validateKubeAPIThrottle(); err != nil {
+		return err
+	}
 	if c.maxPods < 1 || c.maxPods > 1021 || c.maxActiveMemoryMiB < vmMemoryMiB {
 		return errors.New("max-pods must be 1..1021 and active memory must fit at least one 768 MiB guest")
 	}
