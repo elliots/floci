@@ -30,6 +30,7 @@ public class DbCluster {
     // Set while the cluster is the primary or a secondary of a global cluster.
     private String globalClusterIdentifier;
     private String parameterGroupName;
+    private String kmsKeyId;
     private String dbSubnetGroupName;
     private String vpcId;
     private String availabilityZone;
@@ -139,6 +140,9 @@ public class DbCluster {
 
     public String getGlobalClusterIdentifier() { return globalClusterIdentifier; }
     public void setGlobalClusterIdentifier(String globalClusterIdentifier) { this.globalClusterIdentifier = globalClusterIdentifier; }
+
+    public String getKmsKeyId() { return kmsKeyId; }
+    public void setKmsKeyId(String kmsKeyId) { this.kmsKeyId = kmsKeyId; }
 
     public String getParameterGroupName() { return parameterGroupName; }
     public void setParameterGroupName(String parameterGroupName) { this.parameterGroupName = parameterGroupName; }

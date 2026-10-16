@@ -1,14 +1,14 @@
 package io.github.hectorvent.floci.services.rds;
 
-import com.github.dockerjava.api.DockerClient;
 import io.github.hectorvent.floci.services.iam.IamService;
+import io.github.hectorvent.floci.services.rds.container.RdsRuntimeTestSupport;
 import io.github.hectorvent.floci.testing.IamEnforcementProfile;
+import io.github.hectorvent.floci.testing.RdsRuntimeTestProfile;
 import io.github.hectorvent.floci.testutil.SigV4TokenTestHelper;
 import io.quarkus.test.junit.QuarkusTest;
 import io.quarkus.test.junit.TestProfile;
 import io.restassured.path.xml.XmlPath;
 import jakarta.inject.Inject;
-import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Tag;
 import org.junit.jupiter.api.Test;
 
@@ -19,6 +19,7 @@ import java.sql.SQLException;
 import java.sql.Statement;
 import java.time.Duration;
 import java.time.Instant;
+import java.util.HashMap;
 import java.util.Map;
 import java.util.Properties;
 
@@ -27,13 +28,12 @@ import static org.awaitility.Awaitility.await;
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
-import static org.junit.jupiter.api.Assumptions.assumeTrue;
 
 /** Cluster-scoped IAM policies must work on an Aurora member endpoint. */
 @QuarkusTest
-@Tag("docker")
-@TestProfile(IamEnforcementProfile.class)
-class RdsMemberIamResourceIntegrationTest {
+@Tag("runtime")
+@TestProfile(RdsMemberIamResourceIntegrationTest.Profile.class)
+class RdsMemberIamResourceIntegrationTest extends RdsRuntimeTestSupport {
 
     private static final String ACCOUNT_ID = "000000000000";
     private static final String MASTER_USER = "master";
@@ -43,19 +43,7 @@ class RdsMemberIamResourceIntegrationTest {
     private static final String SESSION_TOKEN = "IQoJb3JpZ2luX2VjEJr+abc/def+ghi/jkl%2Bmno==";
 
     @Inject
-    DockerClient dockerClient;
-
-    @Inject
     IamService iamService;
-
-    @BeforeEach
-    void checkDocker() {
-        try {
-            dockerClient.pingCmd().exec();
-        } catch (Exception e) {
-            assumeTrue(false, "Docker is not available: " + e.getMessage());
-        }
-    }
 
     @Test
     void memberEndpointUsesClusterPolicyBeforeAndAfterReboot() throws Exception {
@@ -153,6 +141,15 @@ class RdsMemberIamResourceIntegrationTest {
         properties.setProperty("sslmode", "disable");
         properties.setProperty("connectTimeout", "5");
         return DriverManager.getConnection("jdbc:postgresql://127.0.0.1:" + port + "/" + DATABASE, properties);
+    }
+
+    public static class Profile extends RdsRuntimeTestProfile {
+        @Override
+        public Map<String, String> getConfigOverrides() {
+            Map<String, String> overrides = new HashMap<>(super.getConfigOverrides());
+            overrides.putAll(new IamEnforcementProfile().getConfigOverrides());
+            return overrides;
+        }
     }
 
 }

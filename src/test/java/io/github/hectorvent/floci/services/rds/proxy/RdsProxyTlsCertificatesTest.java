@@ -1,5 +1,6 @@
 package io.github.hectorvent.floci.services.rds.proxy;
 
+import io.github.hectorvent.floci.config.EmulatorConfig;
 import io.github.hectorvent.floci.config.FlociCertificateAuthority;
 import io.github.hectorvent.floci.core.common.Pem;
 import io.github.hectorvent.floci.services.acm.CertificateGenerator;
@@ -10,17 +11,30 @@ import org.junit.jupiter.params.provider.NullSource;
 import org.junit.jupiter.params.provider.ValueSource;
 
 import javax.net.ssl.SSLContext;
+import javax.net.ssl.SSLParameters;
+import javax.net.ssl.SSLServerSocket;
+import javax.net.ssl.SSLSocket;
+import javax.net.ssl.TrustManagerFactory;
+import java.net.InetAddress;
+import java.net.Socket;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.nio.file.attribute.PosixFileAttributeView;
 import java.nio.file.attribute.PosixFilePermission;
 import java.nio.file.attribute.PosixFilePermissions;
+import java.security.KeyStore;
 import java.security.cert.CertificateExpiredException;
 import java.security.cert.X509Certificate;
 import java.time.Clock;
 import java.time.Instant;
 import java.time.temporal.ChronoUnit;
+import java.util.List;
+import java.util.Optional;
 import java.util.Set;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
+import java.util.concurrent.Future;
+import java.util.concurrent.TimeUnit;
 import java.util.stream.Stream;
 
 import static org.junit.jupiter.api.Assertions.assertDoesNotThrow;
@@ -284,6 +298,78 @@ class RdsProxyTlsCertificatesTest {
         when(clock.instant()).thenReturn(ca.notAfter().plusSeconds(1));
         assertThrows(IllegalStateException.class, certs::sslContext);
         assertEquals(ca.certificatePem(), Files.readString(certFile));
+    }
+
+    @Test
+    void configuredNamesAreAddedToTheServerLeafBeforeHandshakeAndAfterRestart() throws Exception {
+        FlociCertificateAuthority sharedCa = FlociCertificateAuthority.loadOrCreate(tempDir.resolve("tls"));
+        RdsProxyTlsCertificates first = newCertificates("DATABASE.example.test");
+        X509Certificate initial = handshakeCertificate(first, sharedCa, "database.example.test");
+        assertEquals(-1, initial.getBasicConstraints(), "the server presents a leaf, not a CA");
+        assertTrue(initial.getSubjectAlternativeNames().contains(List.of(2, "database.example.test")));
+        initial.verify(sharedCa.certificate().getPublicKey());
+
+        RdsProxyTlsCertificates restarted = newCertificates("reader.example.test");
+        X509Certificate reloaded = handshakeCertificate(restarted, sharedCa, "reader.example.test");
+        assertTrue(reloaded.getSubjectAlternativeNames().contains(List.of(2, "reader.example.test")));
+        assertTrue(reloaded.getSubjectAlternativeNames().contains(List.of(2, "database.example.test")));
+        reloaded.verify(sharedCa.certificate().getPublicKey());
+        handshakeCertificate(restarted, sharedCa, "database.example.test");
+        assertEquals(sharedCa.caPem(), Files.readString(sharedCa.certificatePath()));
+        assertEquals(sharedCa.caPem(), Files.readString(tempDir.resolve("tls/rds-ca.crt")));
+    }
+
+    @Test
+    void malformedConfiguredNamesFailBeforeWritingServerMetadata() {
+        assertThrows(IllegalArgumentException.class, () -> newCertificates("https://db.example.test").sslContext());
+        assertFalse(Files.exists(tempDir.resolve("tls/rds-ca.metadata.json")));
+    }
+
+    private X509Certificate handshakeCertificate(RdsProxyTlsCertificates certificates,
+                                                  FlociCertificateAuthority authority, String hostname) throws Exception {
+        KeyStore trustStore = KeyStore.getInstance(KeyStore.getDefaultType());
+        trustStore.load(null, null);
+        trustStore.setCertificateEntry("floci-ca", authority.certificate());
+        TrustManagerFactory trust = TrustManagerFactory.getInstance(TrustManagerFactory.getDefaultAlgorithm());
+        trust.init(trustStore);
+        SSLContext clientContext = SSLContext.getInstance("TLS");
+        clientContext.init(null, trust.getTrustManagers(), null);
+        try (SSLServerSocket server = (SSLServerSocket) certificates.sslContext().getServerSocketFactory()
+                .createServerSocket(0, 1, InetAddress.getLoopbackAddress());
+                ExecutorService executor = Executors.newVirtualThreadPerTaskExecutor()) {
+            server.setSoTimeout(5_000);
+            Future<Void> handshake = executor.submit(() -> {
+                try (SSLSocket accepted = (SSLSocket) server.accept()) {
+                    accepted.setSoTimeout(5_000);
+                    accepted.startHandshake();
+                }
+                return null;
+            });
+            X509Certificate leaf;
+            try (Socket transport = new Socket(server.getInetAddress(), server.getLocalPort());
+                    SSLSocket client = (SSLSocket) clientContext.getSocketFactory()
+                            .createSocket(transport, hostname, server.getLocalPort(), false)) {
+                client.setSoTimeout(5_000);
+                SSLParameters parameters = client.getSSLParameters();
+                parameters.setEndpointIdentificationAlgorithm("HTTPS");
+                client.setSSLParameters(parameters);
+                client.startHandshake();
+                leaf = (X509Certificate) client.getSession().getPeerCertificates()[0];
+            }
+            handshake.get(5, TimeUnit.SECONDS);
+            return leaf;
+        }
+    }
+
+    private RdsProxyTlsCertificates newCertificates(String... names) {
+        EmulatorConfig config = mock(EmulatorConfig.class);
+        EmulatorConfig.ServicesConfig services = mock(EmulatorConfig.ServicesConfig.class);
+        EmulatorConfig.RdsServiceConfig rds = mock(EmulatorConfig.RdsServiceConfig.class);
+        when(config.services()).thenReturn(services);
+        when(services.rds()).thenReturn(rds);
+        when(rds.tlsHostnames()).thenReturn(Optional.of(List.of(names)));
+        return new RdsProxyTlsCertificates(config, FlociCertificateAuthority.loadOrCreate(tempDir.resolve("tls")),
+                new CertificateGenerator());
     }
 
     private RdsProxyTlsCertificates newCertificates() {

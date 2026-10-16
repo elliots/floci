@@ -1,26 +1,28 @@
 package io.github.hectorvent.floci.services.rds.container;
 
-import com.github.dockerjava.api.DockerClient;
 import io.github.hectorvent.floci.services.rds.RdsService;
 import io.github.hectorvent.floci.services.rds.model.DbCluster;
+import io.github.hectorvent.floci.testing.RdsRuntimeTestProfile;
 import io.github.hectorvent.floci.testing.RestAssuredJsonUtils;
 import io.quarkus.test.junit.QuarkusTest;
+import io.quarkus.test.junit.TestProfile;
 import io.restassured.path.xml.XmlPath;
 import io.restassured.response.Response;
 import io.restassured.specification.RequestSpecification;
 import jakarta.inject.Inject;
 import org.junit.jupiter.api.BeforeAll;
-import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Tag;
 import org.junit.jupiter.api.Test;
+import org.postgresql.Driver;
 
 import java.sql.Connection;
-import java.sql.DriverManager;
 import java.sql.ResultSet;
+import java.sql.SQLException;
 import java.sql.Statement;
 import java.time.Duration;
 import java.time.Instant;
 import java.util.List;
+import java.util.Properties;
 
 import static io.restassured.RestAssured.given;
 import static io.restassured.http.ContentType.URLENC;
@@ -30,18 +32,18 @@ import static org.hamcrest.Matchers.not;
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertTrue;
-import static org.junit.jupiter.api.Assumptions.assumeTrue;
 
 /**
- * Aurora Serverless v2 auto-pause against a real PostgreSQL container: an idle cluster with
- * MinCapacity 0 is frozen with docker pause while it reports "available", zero capacity and the
+ * Aurora Serverless v2 auto-pause against either real PostgreSQL backend: an idle cluster with
+ * MinCapacity 0 pauses while it reports "available", zero capacity and the
  * pause events, and the next connection through its endpoint resumes it and finds its data. The
  * API does not accept a SecondsUntilAutoPause below 300, so the test runs the idle check directly
  * instead of waiting for it.
  */
 @QuarkusTest
-@Tag("docker")
-class RdsAuroraAutoPauseIntegrationTest {
+@Tag("runtime")
+@TestProfile(RdsRuntimeTestProfile.class)
+class RdsAuroraAutoPauseIntegrationTest extends RdsRuntimeTestSupport {
 
     private static final String RDS_AUTH =
             "AWS4-HMAC-SHA256 Credential=test/20260923/us-east-1/rds/aws4_request, "
@@ -55,26 +57,11 @@ class RdsAuroraAutoPauseIntegrationTest {
     private static final String MASTER_PASSWORD = "Master123!";
 
     @Inject
-    DockerClient dockerClient;
-
-    @Inject
     RdsService rdsService;
-
-    @Inject
-    RdsContainerManager containerManager;
 
     @BeforeAll
     static void configureRestAssured() {
         RestAssuredJsonUtils.configureAwsContentTypes();
-    }
-
-    @BeforeEach
-    void checkDocker() {
-        try {
-            dockerClient.pingCmd().exec();
-        } catch (Exception e) {
-            assumeTrue(false, "Docker is not available: " + e.getMessage());
-        }
     }
 
     @Test
@@ -100,18 +87,17 @@ class RdsAuroraAutoPauseIntegrationTest {
                     .formParam("DBInstanceClass", "db.serverless")
             .when().post("/").then().statusCode(200);
             DbCluster cluster = rdsService.getDbCluster(clusterId);
-            String containerId = cluster.getContainerId();
             String jdbcUrl = "jdbc:postgresql://127.0.0.1:" + cluster.getEndpoint().port()
                     + "/appdb?sslmode=disable";
-            try (Connection connection = DriverManager.getConnection(jdbcUrl, MASTER_USER, MASTER_PASSWORD);
+            try (Connection connection = connect(jdbcUrl);
                  Statement statement = connection.createStatement()) {
                 statement.execute("CREATE TABLE marker(v text); INSERT INTO marker VALUES ('before-pause');");
             }
 
             // The proxy lets go of the closed connection on its own thread.
             await().atMost(Duration.ofSeconds(10))
-                    .until(() -> containerManager.pauseIfIdle(cluster.getDbClusterArn()));
-            assertTrue(isPaused(containerId), "the idle cluster's container is frozen");
+                    .until(() -> pauseIfIdle(cluster.getDbClusterArn()));
+            assertBackendPaused(cluster.getDbClusterArn());
             rds("DescribeDBClusters").formParam("DBClusterIdentifier", clusterId)
             .when().post("/").then().statusCode(200)
                     .body(containsString("<Status>available</Status>"));
@@ -130,28 +116,33 @@ class RdsAuroraAutoPauseIntegrationTest {
                 }
             });
 
-            try (Connection connection = DriverManager.getConnection(jdbcUrl, MASTER_USER, MASTER_PASSWORD);
+            try (Connection connection = connect(jdbcUrl);
                  Statement statement = connection.createStatement();
                  ResultSet rows = statement.executeQuery("SELECT v FROM marker")) {
                 assertTrue(rows.next(), "the data written before the pause is still there");
                 assertEquals("before-pause", rows.getString(1));
             }
-            assertFalse(isPaused(containerId), "the connection resumed the container");
+            assertBackendRunning(cluster.getDbClusterArn());
             await().atMost(Duration.ofSeconds(10)).untilAsserted(() ->
                     events(instanceId).then().statusCode(200)
                             .body(containsString("<Message>Initiated resume for the DB instance.</Message>"))
                             .body(containsString("<Message>Successfully resumed the DB instance.</Message>")));
 
             await().atMost(Duration.ofSeconds(10))
-                    .until(() -> containerManager.pauseIfIdle(cluster.getDbClusterArn()));
+                    .until(() -> pauseIfIdle(cluster.getDbClusterArn()));
+            assertBackendPaused(cluster.getDbClusterArn());
             rds("ModifyDBCluster")
                     .formParam("DBClusterIdentifier", clusterId)
                     .formParam("ServerlessV2ScalingConfiguration.MinCapacity", "0.5")
                     .formParam("ServerlessV2ScalingConfiguration.MaxCapacity", "2")
             .when().post("/").then().statusCode(200);
-            await().atMost(Duration.ofSeconds(10)).until(() -> !isPaused(containerId));
-            assertFalse(containerManager.pauseIfIdle(cluster.getDbClusterArn()),
+            await().atMost(Duration.ofMinutes(3)).untilAsserted(() ->
+                    assertBackendRunning(cluster.getDbClusterArn()));
+            assertFalse(pauseIfIdle(cluster.getDbClusterArn()),
                     "a nonzero MinCapacity keeps the cluster running");
+            try (Connection connection = connect(jdbcUrl)) {
+                assertTrue(connection.isValid(5), "Raising MinCapacity resumes the existing database");
+            }
         } finally {
             rds("DeleteDBInstance")
                     .formParam("DBInstanceIdentifier", instanceId)
@@ -189,9 +180,8 @@ class RdsAuroraAutoPauseIntegrationTest {
             .when().post("/").then().statusCode(200);
 
             // The pause and resume events reach RDS on a background thread, outside any request.
-            await().atMost(Duration.ofSeconds(10)).until(() -> containerManager.pauseIfIdle(clusterArn));
-            try (Connection connection = DriverManager.getConnection(
-                    "jdbc:postgresql://127.0.0.1:" + port + "/appdb?sslmode=disable", MASTER_USER, MASTER_PASSWORD)) {
+            await().atMost(Duration.ofSeconds(10)).until(() -> pauseIfIdle(clusterArn));
+            try (Connection connection = connect("jdbc:postgresql://127.0.0.1:" + port + "/appdb?sslmode=disable")) {
                 assertTrue(connection.isValid(5), "the connection resumed the cluster");
             }
             await().atMost(Duration.ofSeconds(10)).untilAsserted(() ->
@@ -212,6 +202,14 @@ class RdsAuroraAutoPauseIntegrationTest {
                     .formParam("SkipFinalSnapshot", "true")
             .when().post("/");
         }
+    }
+
+    private static Connection connect(String url) throws SQLException {
+        Properties credentials = new Properties();
+        credentials.setProperty("user", MASTER_USER);
+        credentials.setProperty("password", MASTER_PASSWORD);
+        // Quarkus test profiles can leave DriverManager holding a different test classloader's driver.
+        return new Driver().connect(url, credentials);
     }
 
     private static RequestSpecification rds(String action) {
@@ -253,7 +251,4 @@ class RdsAuroraAutoPauseIntegrationTest {
                 .extract().jsonPath().getList("Datapoints.Minimum", Float.class);
     }
 
-    private boolean isPaused(String containerId) {
-        return Boolean.TRUE.equals(dockerClient.inspectContainerCmd(containerId).exec().getState().getPaused());
-    }
 }

@@ -1,14 +1,15 @@
 package io.github.hectorvent.floci.services.rds;
 
 import com.fasterxml.jackson.databind.ObjectMapper;
-import com.github.dockerjava.api.DockerClient;
 import io.github.hectorvent.floci.services.iam.IamService;
+import io.github.hectorvent.floci.services.rds.container.RdsRuntimeTestSupport;
+import io.github.hectorvent.floci.testing.RdsRuntimeTestProfile;
 import io.github.hectorvent.floci.testutil.SigV4TokenTestHelper;
 import io.quarkus.test.junit.QuarkusTest;
+import io.quarkus.test.junit.TestProfile;
 import io.restassured.response.Response;
 import io.restassured.specification.RequestSpecification;
 import jakarta.inject.Inject;
-import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Tag;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.params.ParameterizedTest;
@@ -31,18 +32,18 @@ import static org.hamcrest.Matchers.containsString;
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
-import static org.junit.jupiter.api.Assumptions.assumeTrue;
 
 /**
- * IAM database authentication from a Lambda function, against a real PostgreSQL container behind
+ * IAM database authentication from a Lambda function, against a real PostgreSQL backend behind
  * the RDS proxy. A function signs its token with its execution role's session credentials, and
  * that session token carries {@code +}, {@code /} and {@code =}, which the presigner writes
  * percent-encoded once. The proxy has to read the token back as it was signed for the session to
  * be found and the signature to match.
  */
 @QuarkusTest
-@Tag("docker")
-class RdsIamAuthLambdaSessionIntegrationTest {
+@Tag("runtime")
+@TestProfile(RdsRuntimeTestProfile.class)
+class RdsIamAuthLambdaSessionIntegrationTest extends RdsRuntimeTestSupport {
 
     private static final String ACCOUNT_ID = "000000000000";
     private static final String MASTER_USER = "master";
@@ -52,19 +53,7 @@ class RdsIamAuthLambdaSessionIntegrationTest {
     private static final String SESSION_TOKEN = "IQoJb3JpZ2luX2VjEJr+abc/def+ghi/jkl%2Bmno==";
 
     @Inject
-    DockerClient dockerClient;
-
-    @Inject
     IamService iamService;
-
-    @BeforeEach
-    void checkDocker() {
-        try {
-            dockerClient.pingCmd().exec();
-        } catch (Exception e) {
-            assumeTrue(false, "Docker is not available: " + e.getMessage());
-        }
-    }
 
     @Test
     void tokenSignedWithLambdaSessionCredentialsConnects() throws Exception {

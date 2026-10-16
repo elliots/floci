@@ -1,10 +1,9 @@
 package io.github.hectorvent.floci.services.rds.container;
 
-import com.github.dockerjava.api.DockerClient;
 import io.github.hectorvent.floci.services.rds.RdsService;
+import io.github.hectorvent.floci.testing.RdsRuntimeTestProfile;
 import io.github.hectorvent.floci.testing.RestAssuredJsonUtils;
 import io.quarkus.test.junit.QuarkusTest;
-import io.quarkus.test.junit.QuarkusTestProfile;
 import io.quarkus.test.junit.TestProfile;
 import io.restassured.specification.RequestSpecification;
 import jakarta.inject.Inject;
@@ -12,6 +11,7 @@ import org.junit.jupiter.api.Tag;
 import org.junit.jupiter.api.Test;
 
 import java.time.Duration;
+import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
 
@@ -22,24 +22,17 @@ import static org.hamcrest.Matchers.equalTo;
 
 @QuarkusTest
 @TestProfile(RdsDataResumingIntegrationTest.ResumingProfile.class)
-@Tag("docker")
-class RdsDataResumingIntegrationTest {
+@Tag("runtime")
+class RdsDataResumingIntegrationTest extends RdsRuntimeTestSupport {
 
     private static final String RDS_AUTH =
             "AWS4-HMAC-SHA256 Credential=test/20261015/us-east-1/rds/aws4_request";
 
     @Inject
-    DockerClient dockerClient;
-
-    @Inject
     RdsService rdsService;
-
-    @Inject
-    RdsContainerManager containerManager;
 
     @Test
     void pausedAuroraReturnsTypedHttpErrorsAndExecutesTheRetry() {
-        dockerClient.pingCmd().exec();
         RestAssuredJsonUtils.configureAwsContentTypes();
         String clusterId = "data-resuming-" + Long.toString(System.nanoTime(), 36);
         String instanceId = clusterId + "-1";
@@ -60,7 +53,7 @@ class RdsDataResumingIntegrationTest {
                     .formParam("DBClusterIdentifier", clusterId).formParam("Engine", "aurora-postgresql")
                     .formParam("DBInstanceClass", "db.serverless").post("/").then().statusCode(200);
             String clusterArn = rdsService.getDbCluster(clusterId).getDbClusterArn();
-            await().atMost(Duration.ofSeconds(10)).until(() -> containerManager.pauseIfIdle(clusterArn));
+            await().atMost(Duration.ofSeconds(10)).until(() -> pauseIfIdle(clusterArn));
             Map<String, Object> request = Map.of("resourceArn", clusterArn, "secretArn", secretArn,
                     "database", "appdb", "sql", "select 1", "parameterSets", List.of(List.of()));
 
@@ -71,7 +64,7 @@ class RdsDataResumingIntegrationTest {
                         .body("__type", equalTo("DatabaseResumingException"));
             }
 
-            await().atMost(Duration.ofSeconds(20)).untilAsserted(() ->
+            await().atMost(Duration.ofMinutes(3)).untilAsserted(() ->
                     given().contentType("application/json").body(request).post("/Execute")
                             .then().statusCode(200).body("records[0][0].longValue", equalTo(1)));
             given().contentType("application/json").body(request).post("/Execute")
@@ -92,11 +85,13 @@ class RdsDataResumingIntegrationTest {
                 .formParam("Action", action).formParam("Version", "2014-10-31");
     }
 
-    public static class ResumingProfile implements QuarkusTestProfile {
+    public static class ResumingProfile extends RdsRuntimeTestProfile {
         @Override
         public Map<String, String> getConfigOverrides() {
-            return Map.of("floci.services.rds-data.database-resuming-exception-enabled", "true",
-                    "floci.services.rds.aurora-resume-delay-millis", "5000");
+            Map<String, String> overrides = new HashMap<>(super.getConfigOverrides());
+            overrides.put("floci.services.rds-data.database-resuming-exception-enabled", "true");
+            overrides.put("floci.services.rds.aurora-resume-delay-millis", "5000");
+            return overrides;
         }
     }
 }

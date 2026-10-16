@@ -208,6 +208,19 @@ class RdsContainerManagerTest {
     }
 
     @Test
+    void rootPasswordRotationUpdatesRemoteAndSocketAccountsTogether() {
+        String[] mysql = RdsContainerManager.passwordRotationCommand(DatabaseEngine.MYSQL,
+                "root", "old-pass", "new'pass");
+        assertEquals("-uroot", mysql[1]);
+        assertEquals("-pold-pass", mysql[2]);
+        assertEquals("SET PASSWORD FOR 'root'@'%' = 'new\\'pass';SET PASSWORD = 'new\\'pass';", mysql[4]);
+        assertEquals("SET PASSWORD FOR 'root'@'%' = PASSWORD('next');SET PASSWORD = PASSWORD('next');",
+                RdsContainerManager.passwordRotationCommand(DatabaseEngine.MARIADB, "root", "old", "next")[4]);
+        assertEquals("SET PASSWORD FOR 'root'@'%' = 'next';SET PASSWORD = 'next';",
+                RdsContainerManager.passwordRotationCommand(DatabaseEngine.MYSQL, null, "old", "next")[4]);
+    }
+
+    @Test
     void passwordRotationSqlUsesEngineSyntaxAndEscapes() {
         assertEquals("SET PASSWORD = 'a\\'b';",
                 RdsContainerManager.mysqlPasswordRotationSql(DatabaseEngine.MYSQL, "a'b"));

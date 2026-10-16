@@ -2,6 +2,7 @@ package io.github.hectorvent.floci.services.rds.proxy;
 
 import com.fasterxml.jackson.databind.ObjectMapper;
 import io.github.hectorvent.floci.config.CertificateMetadata;
+import io.github.hectorvent.floci.config.EmulatorConfig;
 import io.github.hectorvent.floci.config.FlociCertificateAuthority;
 import io.github.hectorvent.floci.config.FlociVersion;
 import io.github.hectorvent.floci.core.common.Pem;
@@ -13,6 +14,7 @@ import org.jboss.logging.Logger;
 
 import javax.net.ssl.KeyManagerFactory;
 import javax.net.ssl.SSLContext;
+
 import java.io.IOException;
 import java.nio.file.Files;
 import java.nio.file.Path;
@@ -29,6 +31,7 @@ import java.util.ArrayList;
 import java.util.Date;
 import java.util.LinkedHashSet;
 import java.util.List;
+import java.util.Locale;
 import java.util.Set;
 
 /**
@@ -53,6 +56,7 @@ public class RdsProxyTlsCertificates {
     private final FlociCertificateAuthority certificateAuthority;
     private final CertificateGenerator certificateGenerator;
     private final Clock clock;
+    private final List<String> configuredHostnames;
     private final Object lock = new Object();
 
     private volatile ServerCertificate current;
@@ -61,15 +65,27 @@ public class RdsProxyTlsCertificates {
     }
 
     @Inject
+    public RdsProxyTlsCertificates(EmulatorConfig config, FlociCertificateAuthority certificateAuthority,
+                                   CertificateGenerator certificateGenerator) {
+        this(certificateAuthority, certificateGenerator, Clock.systemUTC(),
+                config.services().rds().tlsHostnames().orElse(List.of()));
+    }
+
     public RdsProxyTlsCertificates(FlociCertificateAuthority certificateAuthority, CertificateGenerator certificateGenerator) {
         this(certificateAuthority, certificateGenerator, Clock.systemUTC());
     }
 
     RdsProxyTlsCertificates(FlociCertificateAuthority certificateAuthority, CertificateGenerator certificateGenerator,
                             Clock clock) {
+        this(certificateAuthority, certificateGenerator, clock, List.of());
+    }
+
+    private RdsProxyTlsCertificates(FlociCertificateAuthority certificateAuthority, CertificateGenerator certificateGenerator,
+                                     Clock clock, List<String> configuredHostnames) {
         this.certificateAuthority = certificateAuthority;
         this.certificateGenerator = certificateGenerator;
         this.clock = clock;
+        this.configuredHostnames = List.copyOf(configuredHostnames);
     }
 
     /**
@@ -116,7 +132,7 @@ public class RdsProxyTlsCertificates {
                 return;
             }
             Path tlsDir = tlsDir();
-            Set<String> sans = new LinkedHashSet<>(DEFAULT_SANS);
+            Set<String> sans = configuredSans();
             Path metadataFile = tlsDir.resolve(METADATA_NAME);
             if (Files.exists(metadataFile)) {
                 try {
@@ -153,6 +169,19 @@ public class RdsProxyTlsCertificates {
                 }
             }
         }
+    }
+
+    private Set<String> configuredSans() {
+        Set<String> names = new LinkedHashSet<>(DEFAULT_SANS);
+        for (String configured : configuredHostnames) {
+            String name = configured.toLowerCase(Locale.ROOT);
+            if (name.length() > 253 || !name.matches("[a-z0-9](?:[a-z0-9.-]*[a-z0-9])?")
+                    || name.contains("..")) {
+                throw new IllegalArgumentException("RDS TLS hostnames must be DNS names without schemes or ports");
+            }
+            names.add(name);
+        }
+        return names;
     }
 
     private void regenerate(Set<String> sans) {

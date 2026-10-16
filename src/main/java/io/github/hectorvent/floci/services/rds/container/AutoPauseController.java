@@ -316,18 +316,17 @@ final class AutoPauseController {
             return;
         }
         if (pauseFailure != null) {
-            LOG.warnv(pauseFailure, "Could not auto-pause RDS container {0}; it keeps running", containerId);
-        } else {
-            // A client arrived, the interval changed or the container is being released while it
-            // was freezing: thaw it again rather than let anyone reach it frozen.
-            RuntimeException thawFailure = withoutLock(() -> freezer.unpause(containerId));
-            if (thawFailure != null) {
-                LOG.warnv(thawFailure, "Could not undo the auto-pause of RDS container {0}", containerId);
-                state = State.PAUSED;
-                settled.signalAll();
-                armPausedReport();
-                return;
-            }
+            LOG.warnv(pauseFailure, "Could not auto-pause RDS container {0}; recovering it", containerId);
+        }
+        // A failed runtime call can have taken effect before its response was lost. Also undo
+        // a successful pause canceled by a new client, configuration change, or shutdown.
+        RuntimeException thawFailure = withoutLock(() -> freezer.unpause(containerId));
+        if (thawFailure != null) {
+            LOG.warnv(thawFailure, "Could not undo the auto-pause of RDS container {0}", containerId);
+            state = State.PAUSED;
+            settled.signalAll();
+            armPausedReport();
+            return;
         }
         state = State.RUNNING;
         signal(AutoPauseListener.Event.PAUSE_CANCELED);

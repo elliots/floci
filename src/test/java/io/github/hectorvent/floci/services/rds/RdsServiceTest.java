@@ -19,8 +19,8 @@ import io.github.hectorvent.floci.services.kms.KmsService;
 import io.github.hectorvent.floci.services.kms.model.KmsKey;
 import io.github.hectorvent.floci.services.rds.container.AutoPauseListener;
 import io.github.hectorvent.floci.services.rds.container.RdsBackendGate;
+import io.github.hectorvent.floci.services.rds.container.RdsBackendRuntime;
 import io.github.hectorvent.floci.services.rds.container.RdsContainerHandle;
-import io.github.hectorvent.floci.services.rds.container.RdsContainerManager;
 import io.github.hectorvent.floci.services.rds.export.SnapshotExportSource;
 import io.github.hectorvent.floci.services.rds.model.DatabaseEngine;
 import io.github.hectorvent.floci.services.rds.model.DbCluster;
@@ -141,7 +141,7 @@ class RdsServiceTest {
             "docdb8.0");
 
     private RdsService rdsService;
-    private RdsContainerManager containerManager;
+    private RdsBackendRuntime containerManager;
     private RdsProxyManager proxyManager;
     private Ec2Service ec2Service;
     private RegionResolver regionResolver;
@@ -151,7 +151,7 @@ class RdsServiceTest {
 
     @BeforeEach
     void setUp() {
-        containerManager = mock(RdsContainerManager.class);
+        containerManager = mock(RdsBackendRuntime.class);
         proxyManager = mock(RdsProxyManager.class);
         ec2Service = mock(Ec2Service.class);
         regionResolver = new RegionResolver("us-east-1", "123456789012");
@@ -3944,7 +3944,7 @@ class RdsServiceTest {
                 "admin", "secret", "app", "db.t3.micro",
                 20, false, null, null, null, null, false);
 
-        RdsContainerManager daemonlessContainerManager = mock(RdsContainerManager.class);
+        RdsBackendRuntime daemonlessContainerManager = mock(RdsBackendRuntime.class);
         RdsProxyManager daemonlessProxyManager = mock(RdsProxyManager.class);
         when(daemonlessContainerManager.tryStart(any(), any(), any(), any(), any(), any(), any(), any(), any()))
                 .thenReturn(null);
@@ -3975,7 +3975,7 @@ class RdsServiceTest {
                 null, null, "app", "db.t3.medium",
                 20, false, null, null, "cluster1", null, false);
 
-        RdsContainerManager daemonlessContainerManager = mock(RdsContainerManager.class);
+        RdsBackendRuntime daemonlessContainerManager = mock(RdsBackendRuntime.class);
         RdsProxyManager daemonlessProxyManager = mock(RdsProxyManager.class);
         when(daemonlessContainerManager.tryStart(any(), any(), any(), any(), any(), any(), any(), any(), any()))
                 .thenReturn(null);
@@ -4851,7 +4851,7 @@ class RdsServiceTest {
         created.setContainerStorageResourceId(null);
         created.setDockerVolumeName("floci-rds-" + persistedVolumeId);
 
-        RdsContainerManager restoredContainerManager = mock(RdsContainerManager.class);
+        RdsBackendRuntime restoredContainerManager = mock(RdsBackendRuntime.class);
         RdsProxyManager restoredProxyManager = mock(RdsProxyManager.class);
         when(restoredContainerManager.tryStart(any(), any(), any(), any(), any(), any(), any(), any(), any()))
                 .thenReturn(new RdsContainerHandle("restored-container", "mydb", "127.0.0.1", 15432));
@@ -4903,7 +4903,7 @@ class RdsServiceTest {
                 null, null, "app", "db.t3.medium",
                 20, false, null, null, "cluster1", null, false);
 
-        RdsContainerManager restoredContainerManager = mock(RdsContainerManager.class);
+        RdsBackendRuntime restoredContainerManager = mock(RdsBackendRuntime.class);
         RdsProxyManager restoredProxyManager = mock(RdsProxyManager.class);
         when(restoredContainerManager.tryStart(any(), any(), any(), any(), any(), any(), any(), any(), any()))
                 .thenReturn(new RdsContainerHandle("restored-cluster-container", "cluster1", "127.0.0.1", 15432));
@@ -5764,7 +5764,7 @@ class RdsServiceTest {
     void failedInstanceRestoreClearsRuntimeStateAndKeepsItsEndpointPort() {
         InMemoryStorage<String, DbInstance> instances = new InMemoryStorage<>();
         instances.put("broken", persistedInstance("broken", "123456789012", "secret", 7000));
-        RdsContainerManager restoredContainerManager = mock(RdsContainerManager.class);
+        RdsBackendRuntime restoredContainerManager = mock(RdsBackendRuntime.class);
         RdsProxyManager restoredProxyManager = mock(RdsProxyManager.class);
         String runtimeId = "arn:aws:rds:us-east-1:123456789012:db:broken";
         RdsContainerHandle restoredHandle = new RdsContainerHandle(
@@ -5830,7 +5830,7 @@ class RdsServiceTest {
         instances.put("user", persistedInstance("user", "123456789012", "secret", 7001));
         instances.put("auth", persistedInstance("auth", "123456789012", "secret", 7002));
         instances.put("oms", persistedInstance("oms", "123456789012", "secret", 7003));
-        RdsContainerManager failingContainerManager = mock(RdsContainerManager.class);
+        RdsBackendRuntime failingContainerManager = mock(RdsBackendRuntime.class);
         when(failingContainerManager.tryStart(
                 any(), any(), any(), any(), any(), any(), any(), any(), any()))
                 .thenThrow(new IllegalStateException("Docker start failed"));
@@ -5848,7 +5848,7 @@ class RdsServiceTest {
                 failedBoot.listDbInstances(null).stream().collect(Collectors.toMap(
                         DbInstance::getDbInstanceIdentifier, instance -> instance.getEndpoint().port())));
 
-        RdsContainerManager healthyContainerManager = mock(RdsContainerManager.class);
+        RdsBackendRuntime healthyContainerManager = mock(RdsBackendRuntime.class);
         when(healthyContainerManager.tryStart(
                 any(), any(), any(), any(), any(), any(), any(), any(), any()))
                 .thenAnswer(invocation -> new RdsContainerHandle(
@@ -5875,7 +5875,7 @@ class RdsServiceTest {
         InMemoryStorage<String, DbInstance> instances = new InMemoryStorage<>();
         DbInstance persisted = persistedInstance("broken", "123456789012", "secret", 7005);
         instances.put("broken", persisted);
-        RdsContainerManager restoredContainerManager = mock(RdsContainerManager.class);
+        RdsBackendRuntime restoredContainerManager = mock(RdsBackendRuntime.class);
         RdsProxyManager restoredProxyManager = mock(RdsProxyManager.class);
         when(restoredContainerManager.tryStart(
                 any(), any(), any(), any(), any(), any(), any(), any(), any()))
@@ -5921,7 +5921,7 @@ class RdsServiceTest {
                 "broken", "123456789012", "secret", 7000);
         persisted.setContainerId("persisted-container");
         instances.put("broken", persisted);
-        RdsContainerManager restoredContainerManager = mock(RdsContainerManager.class);
+        RdsBackendRuntime restoredContainerManager = mock(RdsBackendRuntime.class);
         when(restoredContainerManager.tryStart(
                 any(), any(), any(), any(), any(), any(), any(), any(), any()))
                 .thenThrow(new IllegalStateException("Docker start failed"));
@@ -5981,7 +5981,7 @@ class RdsServiceTest {
     void failedStartupBackendRetriesOnItsRetainedEndpoint() {
         InMemoryStorage<String, DbInstance> instances = new InMemoryStorage<>();
         instances.put("broken", persistedInstance("broken", "123456789012", "secret", 7000));
-        RdsContainerManager manager = mock(RdsContainerManager.class);
+        RdsBackendRuntime manager = mock(RdsBackendRuntime.class);
         RdsProxyManager proxies = mock(RdsProxyManager.class);
         RdsContainerHandle recovered = new RdsContainerHandle("recovered-container",
                 "arn:aws:rds:us-east-1:123456789012:db:broken", "broken", "127.0.0.1", 15432);
@@ -6015,7 +6015,7 @@ class RdsServiceTest {
         cluster.setContainerHost(null);
         cluster.setContainerPort(0);
         clusters.put("cluster1", cluster);
-        RdsContainerManager manager = mock(RdsContainerManager.class);
+        RdsBackendRuntime manager = mock(RdsBackendRuntime.class);
         RdsProxyManager proxies = mock(RdsProxyManager.class);
         RdsContainerHandle recovered = new RdsContainerHandle("recovered-container",
                 cluster.getDbClusterArn(), "cluster1", "127.0.0.1", 15432);
@@ -6042,7 +6042,7 @@ class RdsServiceTest {
         InMemoryStorage<String, DbInstance> instances = new InMemoryStorage<>();
         DbInstance persisted = persistedInstance("broken", "123456789012", "secret", 7000);
         instances.put("broken", persisted);
-        RdsContainerManager manager = mock(RdsContainerManager.class);
+        RdsBackendRuntime manager = mock(RdsBackendRuntime.class);
         RdsProxyManager proxies = mock(RdsProxyManager.class);
         RdsContainerHandle recovered = new RdsContainerHandle("recovered-container",
                 persisted.getDbInstanceArn(), "broken", "127.0.0.1", 15432);
@@ -6084,7 +6084,7 @@ class RdsServiceTest {
         persisted.getDbClusterMembers().add("member");
         instances.put("member", member);
         clusters.put("cluster1", persisted);
-        RdsContainerManager manager = mock(RdsContainerManager.class);
+        RdsBackendRuntime manager = mock(RdsBackendRuntime.class);
         RdsProxyManager proxies = mock(RdsProxyManager.class);
         RdsContainerHandle recovered = new RdsContainerHandle("recovered-container",
                 persisted.getDbClusterArn(), "cluster1", "127.0.0.1", 15432);
@@ -6301,7 +6301,7 @@ class RdsServiceTest {
     void failedClusterRestoreClearsRuntimeStateAndKeepsItsEndpointPort() {
         InMemoryStorage<String, DbCluster> clusters = new InMemoryStorage<>();
         clusters.put("cluster1", persistedCluster("123456789012", "secret", 7000));
-        RdsContainerManager restoredContainerManager = mock(RdsContainerManager.class);
+        RdsBackendRuntime restoredContainerManager = mock(RdsBackendRuntime.class);
         RdsProxyManager restoredProxyManager = mock(RdsProxyManager.class);
         String runtimeId = "arn:aws:rds:us-east-1:123456789012:cluster:cluster1";
         RdsContainerHandle restoredHandle = new RdsContainerHandle(
@@ -8490,7 +8490,7 @@ class RdsServiceTest {
                 PROXY_SUBNET_IDS, List.of(), PROXY_AUTH, Map.of());
         initialService.registerDbProxyTargets("app-proxy", null, List.of("cluster1"), List.of(), 0, 0);
 
-        RdsContainerManager restoredContainerManager = mock(RdsContainerManager.class);
+        RdsBackendRuntime restoredContainerManager = mock(RdsBackendRuntime.class);
         RdsProxyManager restoredProxyManager = mock(RdsProxyManager.class);
         when(restoredContainerManager.tryStart(any(), any(), any(), any(), any(), any(), any(), any(), any()))
                 .thenReturn(new RdsContainerHandle("restored-container", "cluster1", "127.0.0.1", 15432));
@@ -8554,7 +8554,7 @@ class RdsServiceTest {
                 "stale-host", 5432)));
         rawTargetGroups.put(targetAccount + "/app-proxy", targetGroup);
 
-        RdsContainerManager restoredContainerManager = mock(RdsContainerManager.class);
+        RdsBackendRuntime restoredContainerManager = mock(RdsBackendRuntime.class);
         RdsProxyManager restoredProxyManager = mock(RdsProxyManager.class);
         when(restoredContainerManager.tryStart(any(), any(), any(), any(), any(), any(), any(), any(), any()))
                 .thenReturn(new RdsContainerHandle("restored-container", "cluster1",
@@ -9143,7 +9143,7 @@ class RdsServiceTest {
                 null, Map.of(), List.of(), optionGroupName, null, true);
     }
 
-    private RdsService newService(RdsContainerManager containerManager,
+    private RdsService newService(RdsBackendRuntime containerManager,
                                   RdsProxyManager proxyManager,
                                   StorageBackend<String, DbInstance> instances,
                                   StorageBackend<String, DbCluster> clusters,
@@ -9156,7 +9156,7 @@ class RdsServiceTest {
                 new InMemoryStorage<>(), null, kmsService);
     }
 
-    private RdsService newService(RdsContainerManager containerManager,
+    private RdsService newService(RdsBackendRuntime containerManager,
                                   RdsProxyManager proxyManager,
                                   StorageBackend<String, DbInstance> instances,
                                   StorageBackend<String, DbCluster> clusters,

@@ -7,7 +7,6 @@ import com.github.dockerjava.api.model.Frame;
 import io.github.hectorvent.floci.config.EmulatorConfig;
 import io.github.hectorvent.floci.core.common.AwsArnUtils;
 import io.github.hectorvent.floci.core.common.RegionResolver;
-import io.github.hectorvent.floci.core.common.Resettable;
 import io.github.hectorvent.floci.core.common.ServiceConfigAccess;
 import io.github.hectorvent.floci.core.common.docker.ContainerBuilder;
 import io.github.hectorvent.floci.core.common.docker.ContainerDetector;
@@ -22,6 +21,7 @@ import io.github.hectorvent.floci.core.common.docker.ContainerStorageHelper;
 import io.github.hectorvent.floci.services.rds.model.DatabaseEngine;
 import jakarta.annotation.PreDestroy;
 import jakarta.enterprise.context.ApplicationScoped;
+import jakarta.enterprise.inject.Typed;
 import jakarta.inject.Inject;
 import org.apache.commons.compress.archivers.tar.TarArchiveEntry;
 import org.apache.commons.compress.archivers.tar.TarArchiveOutputStream;
@@ -56,7 +56,8 @@ import java.util.regex.Pattern;
  * v2 cluster with MinCapacity 0 knows when it is idle enough to pause and when to resume.
  */
 @ApplicationScoped
-public class RdsContainerManager implements RdsBackendGate, Resettable {
+@Typed(RdsContainerManager.class)
+public class RdsContainerManager implements RdsBackendRuntime {
 
     private static final Logger LOG = Logger.getLogger(RdsContainerManager.class);
     private static final Pattern SAFE_STORAGE_COMPONENT = Pattern.compile("[A-Za-z0-9._-]+");
@@ -798,7 +799,16 @@ public class RdsContainerManager implements RdsBackendGate, Resettable {
         // MariaDB images ≥10.4 (Floci's floor is 10.11) ship only the `mariadb` client binary.
         String client = engine == DatabaseEngine.MARIADB ? "mariadb" : "mysql";
         return new String[]{client, "-u" + effectiveUser, "-p" + oldPassword,
-                "-e", mysqlPasswordRotationSql(engine, newPassword)};
+                "-e", mysqlPasswordRotationSql(engine, effectiveUser, newPassword)};
+    }
+
+    static String mysqlPasswordRotationSql(DatabaseEngine engine, String username, String newPassword) {
+        String sql = mysqlPasswordRotationSql(engine, newPassword);
+        // The images create separate socket and remote root accounts. Update both while the
+        // authenticated socket session still holds the old password, so proxies can log in.
+        return "root".equals(username)
+                ? "SET PASSWORD FOR 'root'@'%'" + sql.substring("SET PASSWORD".length()) + sql
+                : sql;
     }
 
     static String mysqlPasswordRotationSql(DatabaseEngine engine, String newPassword) {

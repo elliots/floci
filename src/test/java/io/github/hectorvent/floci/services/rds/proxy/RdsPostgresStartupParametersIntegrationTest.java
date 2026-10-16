@@ -1,10 +1,10 @@
 package io.github.hectorvent.floci.services.rds.proxy;
 
-import com.github.dockerjava.api.DockerClient;
+import io.github.hectorvent.floci.services.rds.container.RdsRuntimeTestSupport;
+import io.github.hectorvent.floci.testing.RdsRuntimeTestProfile;
 import io.github.hectorvent.floci.testutil.SigV4TokenTestHelper;
 import io.quarkus.test.junit.QuarkusTest;
-import jakarta.inject.Inject;
-import org.junit.jupiter.api.BeforeEach;
+import io.quarkus.test.junit.TestProfile;
 import org.junit.jupiter.api.Tag;
 import org.junit.jupiter.api.Test;
 
@@ -20,7 +20,6 @@ import static io.github.hectorvent.floci.testing.RdsRequests.rds;
 import static org.hamcrest.MatcherAssert.assertThat;
 import static org.hamcrest.Matchers.equalTo;
 import static org.junit.jupiter.api.Assertions.assertThrows;
-import static org.junit.jupiter.api.Assumptions.assumeTrue;
 
 /**
  * The parameters a client puts in its PostgreSQL StartupMessage reach the instance through the
@@ -29,23 +28,12 @@ import static org.junit.jupiter.api.Assumptions.assumeTrue;
  * proxy hands over to the token's role.
  */
 @QuarkusTest
-@Tag("docker")
-class RdsPostgresStartupParametersIntegrationTest {
+@Tag("runtime")
+@TestProfile(RdsRuntimeTestProfile.class)
+class RdsPostgresStartupParametersIntegrationTest extends RdsRuntimeTestSupport {
 
     private static final String MASTER_USER = "master";
     private static final String MASTER_PASSWORD = "Master123!";
-
-    @Inject
-    DockerClient dockerClient;
-
-    @BeforeEach
-    void checkDocker() {
-        try {
-            dockerClient.pingCmd().exec();
-        } catch (Exception e) {
-            assumeTrue(false, "Docker is not available: " + e.getMessage());
-        }
-    }
 
     @Test
     void clientStartupParametersApplyToTheSession() throws Exception {

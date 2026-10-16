@@ -36,7 +36,7 @@ import io.github.hectorvent.floci.services.neptune.container.NeptuneContainerMan
 import io.github.hectorvent.floci.services.neptune.proxy.NeptuneProxyManager;
 import io.github.hectorvent.floci.services.pipes.PipesService;
 import io.github.hectorvent.floci.services.rds.RdsService;
-import io.github.hectorvent.floci.services.rds.container.RdsContainerManager;
+import io.github.hectorvent.floci.services.rds.container.RdsBackendRuntime;
 import io.github.hectorvent.floci.services.rds.proxy.RdsProxyManager;
 import io.github.hectorvent.floci.services.redshift.RedshiftDynamoDbZeroEtlConsumer;
 import io.github.hectorvent.floci.services.stepfunctions.StepFunctionsService;
@@ -86,7 +86,7 @@ public class EmulatorLifecycle {
     private final ElastiCacheContainerManager elastiCacheContainerManager;
     private final ElastiCacheMemcachedContainerManager elastiCacheMemcachedContainerManager;
     private final ElastiCacheProxyManager elastiCacheProxyManager;
-    private final RdsContainerManager rdsContainerManager;
+    private final RdsBackendRuntime rdsContainerManager;
     private final RdsProxyManager rdsProxyManager;
     private final MemoryDbContainerManager memoryDbContainerManager;
     private final MemoryDbProxyManager memoryDbProxyManager;
@@ -127,7 +127,7 @@ public class EmulatorLifecycle {
                              ElastiCacheContainerManager elastiCacheContainerManager,
                              ElastiCacheMemcachedContainerManager elastiCacheMemcachedContainerManager,
                              ElastiCacheProxyManager elastiCacheProxyManager,
-                             RdsContainerManager rdsContainerManager,
+                             RdsBackendRuntime rdsContainerManager,
                              RdsProxyManager rdsProxyManager,
                              MemoryDbContainerManager memoryDbContainerManager,
                              MemoryDbProxyManager memoryDbProxyManager,

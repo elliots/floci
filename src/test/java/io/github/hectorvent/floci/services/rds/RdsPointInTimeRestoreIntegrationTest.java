@@ -1,62 +1,42 @@
 package io.github.hectorvent.floci.services.rds;
 
-import com.github.dockerjava.api.DockerClient;
-import com.github.dockerjava.api.model.Frame;
-import com.github.dockerjava.api.model.StreamType;
-import com.github.dockerjava.core.command.ExecStartResultCallback;
+import io.github.hectorvent.floci.services.rds.container.RdsRuntimeTestSupport;
 import io.github.hectorvent.floci.services.rds.model.DbCluster;
 import io.github.hectorvent.floci.services.rds.model.DbInstance;
+import io.github.hectorvent.floci.testing.RdsRuntimeTestProfile;
 import io.quarkus.test.junit.QuarkusTest;
+import io.quarkus.test.junit.TestProfile;
 import io.restassured.path.xml.XmlPath;
 import io.restassured.specification.RequestSpecification;
 import jakarta.inject.Inject;
-import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Tag;
 import org.junit.jupiter.api.Test;
 
-import java.io.ByteArrayOutputStream;
-import java.io.Closeable;
-import java.io.IOException;
-import java.nio.charset.StandardCharsets;
 import java.time.Duration;
 import java.time.Instant;
-import java.util.concurrent.CountDownLatch;
-import java.util.concurrent.TimeUnit;
 
 import static io.restassured.RestAssured.given;
 import static io.restassured.http.ContentType.URLENC;
 import static org.hamcrest.Matchers.containsString;
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertTrue;
-import static org.junit.jupiter.api.Assumptions.assumeTrue;
 
 /**
- * RestoreDBInstanceToPointInTime and RestoreDBClusterToPointInTime against real Postgres
- * containers: a row in the source comes back from the restored target, the describe calls report
+ * RestoreDBInstanceToPointInTime and RestoreDBClusterToPointInTime against real PostgreSQL
+ * backends: a row in the source comes back from the restored target, the describe calls report
  * the restorable window, and each refusal carries the API reference's error.
  */
 @QuarkusTest
-@Tag("docker")
-class RdsPointInTimeRestoreIntegrationTest {
+@Tag("runtime")
+@TestProfile(RdsRuntimeTestProfile.class)
+class RdsPointInTimeRestoreIntegrationTest extends RdsRuntimeTestSupport {
 
     private static final String AUTH =
             "AWS4-HMAC-SHA256 Credential=test/20261002/us-east-1/rds/aws4_request, "
             + "SignedHeaders=content-type;host, Signature=test";
 
     @Inject
-    DockerClient dockerClient;
-
-    @Inject
     RdsService rdsService;
-
-    @BeforeEach
-    void checkDocker() {
-        try {
-            dockerClient.pingCmd().exec();
-        } catch (Exception e) {
-            assumeTrue(false, "Docker is not available: " + e.getMessage());
-        }
-    }
 
     private static RequestSpecification query(String action) {
         return given().header("Authorization", AUTH)
@@ -83,7 +63,7 @@ class RdsPointInTimeRestoreIntegrationTest {
         .when().post("/").then().statusCode(200);
         waitForDb(source);
         DbInstance sourceInstance = rdsService.getDbInstance(source);
-        psql(sourceInstance.getContainerId(), "CREATE TABLE marker(v text); INSERT INTO marker VALUES ('source-row');");
+        postgresSql(sourceInstance.getEndpoint().port(), "CREATE TABLE marker(v text); INSERT INTO marker VALUES ('source-row');");
 
         XmlPath described = query("DescribeDBInstances").formParam("DBInstanceIdentifier", source)
                 .when().post("/").then().statusCode(200).extract().xmlPath();
@@ -108,7 +88,7 @@ class RdsPointInTimeRestoreIntegrationTest {
                 .body(containsString("<MasterUsername>admin</MasterUsername>"))
                 .body(containsString("<DBInstanceClass>db.t3.small</DBInstanceClass>"));
         waitForDb(latest);
-        assertEquals("source-row", psql(rdsService.getDbInstance(latest).getContainerId(),
+        assertEquals("source-row", postgresSql(rdsService.getDbInstance(latest).getEndpoint().port(),
                 "SELECT v FROM marker;").trim());
 
         // A time inside the window, named through the source's DbiResourceId. The copied database
@@ -124,7 +104,7 @@ class RdsPointInTimeRestoreIntegrationTest {
                 .body(containsString("<DBName>otherdb</DBName>"))
                 .body(containsString("<DeletionProtection>true</DeletionProtection>"));
         waitForDb(timed);
-        assertEquals("source-row", psql(rdsService.getDbInstance(timed).getContainerId(), "otherdb",
+        assertEquals("source-row", postgresSql(rdsService.getDbInstance(timed).getEndpoint().port(), "otherdb",
                 "SELECT v FROM marker;").trim());
         query("RestoreDBInstanceToPointInTime")
                 .formParam("SourceDBInstanceIdentifier", source)
@@ -201,7 +181,7 @@ class RdsPointInTimeRestoreIntegrationTest {
                 .formParam("AllocatedStorage", "20")
         .when().post("/").then().statusCode(200);
         waitForDb(source);
-        psql(rdsService.getDbInstance(source).getContainerId(), "admin",
+        postgresSql(rdsService.getDbInstance(source).getEndpoint().port(), "admin",
                 "CREATE TABLE marker(v text); INSERT INTO marker VALUES ('default-db-row');");
 
         query("RestoreDBInstanceToPointInTime")
@@ -212,7 +192,7 @@ class RdsPointInTimeRestoreIntegrationTest {
         .when().post("/").then().statusCode(200)
                 .body(containsString("<DBName>named</DBName>"));
         waitForDb(restored);
-        assertEquals("default-db-row", psql(rdsService.getDbInstance(restored).getContainerId(), "named",
+        assertEquals("default-db-row", postgresSql(rdsService.getDbInstance(restored).getEndpoint().port(), "named",
                 "SELECT v FROM marker;").trim());
 
         for (String id : new String[] {restored, source}) {
@@ -238,7 +218,7 @@ class RdsPointInTimeRestoreIntegrationTest {
         .when().post("/").then().statusCode(200);
         waitForCluster(source);
         DbCluster sourceCluster = rdsService.getDbCluster(source);
-        psql(sourceCluster.getContainerId(), "CREATE TABLE marker(v text); INSERT INTO marker VALUES ('cluster-row');");
+        postgresSql(sourceCluster.getEndpoint().port(), "CREATE TABLE marker(v text); INSERT INTO marker VALUES ('cluster-row');");
 
         XmlPath described = query("DescribeDBClusters").formParam("DBClusterIdentifier", source)
                 .when().post("/").then().statusCode(200).extract().xmlPath();
@@ -263,7 +243,7 @@ class RdsPointInTimeRestoreIntegrationTest {
                 .body(containsString("<Engine>aurora-postgresql</Engine>"))
                 .body(containsString("<DatabaseName>appdb</DatabaseName>"));
         waitForCluster(restored);
-        assertEquals("cluster-row", psql(rdsService.getDbCluster(restored).getContainerId(),
+        assertEquals("cluster-row", postgresSql(rdsService.getDbCluster(restored).getEndpoint().port(),
                 "SELECT v FROM marker;").trim());
 
         query("RestoreDBClusterToPointInTime")
@@ -347,52 +327,4 @@ class RdsPointInTimeRestoreIntegrationTest {
         throw new RuntimeException("DB cluster " + clusterId + " did not become available.");
     }
 
-    private String psql(String containerId, String sql) throws Exception {
-        return psql(containerId, "appdb", sql);
-    }
-
-    private String psql(String containerId, String database, String sql) throws Exception {
-        String[] command = {"psql", "-U", "admin", "-d", database, "-tAc", sql};
-        String execId = dockerClient.execCreateCmd(containerId)
-                .withCmd(command)
-                .withAttachStdout(true)
-                .withAttachStderr(true)
-                .exec()
-                .getId();
-        ByteArrayOutputStream output = new ByteArrayOutputStream();
-        ByteArrayOutputStream errors = new ByteArrayOutputStream();
-        CountDownLatch latch = new CountDownLatch(1);
-        Closeable callback = dockerClient.execStartCmd(execId).exec(new ExecStartResultCallback() {
-            @Override
-            public void onNext(Frame frame) {
-                try {
-                    if (frame.getStreamType() == StreamType.STDOUT) {
-                        output.write(frame.getPayload());
-                    } else if (frame.getStreamType() == StreamType.STDERR) {
-                        errors.write(frame.getPayload());
-                    }
-                } catch (IOException e) {
-                    throw new IllegalStateException("Failed to capture psql output", e);
-                }
-            }
-
-            @Override
-            public void onComplete() {
-                latch.countDown();
-            }
-
-            @Override
-            public void onError(Throwable throwable) {
-                latch.countDown();
-            }
-        });
-        try {
-            assertTrue(latch.await(30, TimeUnit.SECONDS), "Timed out running psql");
-            long exitCode = dockerClient.inspectExecCmd(execId).exec().getExitCodeLong();
-            assertTrue(exitCode == 0, "psql failed with exit code " + exitCode + ": " + errors.toString(StandardCharsets.UTF_8));
-            return output.toString(StandardCharsets.UTF_8);
-        } finally {
-            callback.close();
-        }
-    }
 }

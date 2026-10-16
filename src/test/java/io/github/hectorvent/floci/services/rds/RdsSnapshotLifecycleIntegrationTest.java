@@ -1,59 +1,38 @@
 package io.github.hectorvent.floci.services.rds;
 
-import com.github.dockerjava.api.DockerClient;
-import com.github.dockerjava.api.model.Frame;
-import com.github.dockerjava.api.model.StreamType;
-import com.github.dockerjava.core.command.ExecStartResultCallback;
+import io.github.hectorvent.floci.services.rds.container.RdsRuntimeTestSupport;
 import io.github.hectorvent.floci.services.rds.model.DbInstance;
+import io.github.hectorvent.floci.testing.RdsRuntimeTestProfile;
 import io.quarkus.test.junit.QuarkusTest;
+import io.quarkus.test.junit.TestProfile;
 import io.restassured.specification.RequestSpecification;
 import jakarta.inject.Inject;
-import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Tag;
 import org.junit.jupiter.api.Test;
-
-import java.io.ByteArrayOutputStream;
-import java.io.Closeable;
-import java.io.IOException;
-import java.nio.charset.StandardCharsets;
-import java.util.concurrent.CountDownLatch;
-import java.util.concurrent.TimeUnit;
 
 import static io.restassured.RestAssured.given;
 import static io.restassured.http.ContentType.URLENC;
 import static org.hamcrest.Matchers.containsString;
 import static org.hamcrest.Matchers.not;
 import static org.junit.jupiter.api.Assertions.assertTrue;
-import static org.junit.jupiter.api.Assumptions.assumeTrue;
 
 /**
- * The manual snapshot lifecycle (#4066) against a real Postgres container: a row written
+ * The manual snapshot lifecycle (#4066) against a real PostgreSQL backend: a row written
  * before the snapshot comes back from an instance restored from a copy of that snapshot, the
  * source snapshot can be deleted without touching the copy, and each refusal carries the AWS
  * error. Requested in #4083.
  */
 @QuarkusTest
-@Tag("docker")
-class RdsSnapshotLifecycleIntegrationTest {
+@Tag("runtime")
+@TestProfile(RdsRuntimeTestProfile.class)
+class RdsSnapshotLifecycleIntegrationTest extends RdsRuntimeTestSupport {
 
     private static final String AUTH =
             "AWS4-HMAC-SHA256 Credential=test/20260921/us-east-1/rds/aws4_request, "
             + "SignedHeaders=content-type;host, Signature=test";
 
     @Inject
-    DockerClient dockerClient;
-
-    @Inject
     RdsService rdsService;
-
-    @BeforeEach
-    void checkDocker() {
-        try {
-            dockerClient.pingCmd().exec();
-        } catch (Exception e) {
-            assumeTrue(false, "Docker is not available: " + e.getMessage());
-        }
-    }
 
     private static RequestSpecification query(String action) {
         return given().header("Authorization", AUTH)
@@ -81,7 +60,7 @@ class RdsSnapshotLifecycleIntegrationTest {
         .when().post("/").then().statusCode(200);
         waitForDb(source);
         DbInstance instance = rdsService.getDbInstance(source);
-        psql(instance.getContainerId(), "CREATE TABLE marker(v text); INSERT INTO marker VALUES ('before-snapshot');");
+        postgresSql(instance.getEndpoint().port(), "CREATE TABLE marker(v text); INSERT INTO marker VALUES ('before-snapshot');");
 
         query("CreateDBSnapshot")
                 .formParam("DBInstanceIdentifier", source)
@@ -149,7 +128,7 @@ class RdsSnapshotLifecycleIntegrationTest {
         .when().post("/").then().statusCode(200);
         waitForDb(restored);
         DbInstance restoredInstance = rdsService.getDbInstance(restored);
-        assertTrue(psql(restoredInstance.getContainerId(), "SELECT v FROM marker;").contains("before-snapshot"),
+        assertTrue(postgresSql(restoredInstance.getEndpoint().port(), "SELECT v FROM marker;").contains("before-snapshot"),
                 "the row written before the snapshot must come back from the copy");
 
         query("DeleteDBSnapshot").formParam("DBSnapshotIdentifier", copy)
@@ -175,48 +154,4 @@ class RdsSnapshotLifecycleIntegrationTest {
         throw new RuntimeException("DB instance " + dbId + " did not become available.");
     }
 
-    private String psql(String containerId, String sql) throws Exception {
-        String[] command = {"psql", "-U", "admin", "-d", "appdb", "-tAc", sql};
-        String execId = dockerClient.execCreateCmd(containerId)
-                .withCmd(command)
-                .withAttachStdout(true)
-                .withAttachStderr(true)
-                .exec()
-                .getId();
-        ByteArrayOutputStream output = new ByteArrayOutputStream();
-        ByteArrayOutputStream errors = new ByteArrayOutputStream();
-        CountDownLatch latch = new CountDownLatch(1);
-        Closeable callback = dockerClient.execStartCmd(execId).exec(new ExecStartResultCallback() {
-            @Override
-            public void onNext(Frame frame) {
-                try {
-                    if (frame.getStreamType() == StreamType.STDOUT) {
-                        output.write(frame.getPayload());
-                    } else if (frame.getStreamType() == StreamType.STDERR) {
-                        errors.write(frame.getPayload());
-                    }
-                } catch (IOException e) {
-                    throw new IllegalStateException("Failed to capture psql output", e);
-                }
-            }
-
-            @Override
-            public void onComplete() {
-                latch.countDown();
-            }
-
-            @Override
-            public void onError(Throwable throwable) {
-                latch.countDown();
-            }
-        });
-        try {
-            assertTrue(latch.await(30, TimeUnit.SECONDS), "Timed out running psql");
-            long exitCode = dockerClient.inspectExecCmd(execId).exec().getExitCodeLong();
-            assertTrue(exitCode == 0, "psql failed with exit code " + exitCode + ": " + errors.toString(StandardCharsets.UTF_8));
-            return output.toString(StandardCharsets.UTF_8);
-        } finally {
-            callback.close();
-        }
-    }
 }

@@ -390,6 +390,22 @@ class AutoPauseControllerTest {
     }
 
     @Test
+    void uncertainPauseAndFailedRecoveryKeepTheConnectionGateClosed() {
+        AutoPauseController controller = controller(Duration.ZERO);
+        controller.configure(300, listener);
+        freezer.pauseFailure = new IllegalStateException("pause response was lost");
+        freezer.unpauseFailure = new IllegalStateException("runtime unreachable");
+
+        scheduler.advance(IDLE);
+        assertEquals(State.PAUSED, controller.state());
+        assertThrows(IllegalStateException.class, controller::acquire);
+
+        freezer.unpauseFailure = null;
+        assertDoesNotThrow(() -> controller.acquire().close());
+        assertEquals(State.RUNNING, controller.state());
+    }
+
+    @Test
     void failedResumeFailsTheConnectionAndLeavesTheContainerPaused() throws Exception {
         AutoPauseController controller = pausedController(Duration.ZERO);
         freezer.unpauseFailure = new IllegalStateException("daemon unavailable");
