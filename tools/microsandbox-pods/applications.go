@@ -72,17 +72,7 @@ func applicationRoot(pod *corev1.Pod, index int) string {
 }
 
 func (e *podEntry) progress(index int) *applicationProgress {
-	if !concurrentApplications(e.pod) {
-		return &e.applicationProgress
-	}
-	if e.applications == nil {
-		e.applications = make(map[string]*applicationProgress)
-	}
-	name := e.pod.Spec.Containers[index].Name
-	if e.applications[name] == nil {
-		e.applications[name] = &applicationProgress{}
-	}
-	return e.applications[name]
+	return (managedContainer{index: index}).progress(e)
 }
 
 func (e *podEntry) applicationRecords() map[string]applicationRecord {
@@ -153,16 +143,20 @@ func (p *provider) startApplications(ctx context.Context, e *podEntry) error {
 }
 
 func (p *provider) startNamedApplication(ctx context.Context, e *podEntry, index int) error {
-	container := e.pod.Spec.Containers[index]
-	root := applicationRoot(e.pod, index)
+	return p.startManagedContainer(ctx, e, managedContainer{index: index})
+}
+
+func (p *provider) startManagedContainer(ctx context.Context, e *podEntry, managed managedContainer) error {
+	container := managed.container(e)
+	root := managed.root(e)
 	if _, err := p.runner.guest(ctx, e.vm, "umask 077; mkdir -p "+quote(root)); err != nil {
 		return err
 	}
-	args, oom, err := p.containerLaunch(ctx, e, container, applicationTask(e.pod, index), root)
+	args, oom, err := p.containerLaunch(ctx, e, container, managed.task(e), root)
 	if err != nil {
-		return p.applicationPreparationFailed(e, index, err)
+		return p.managedPreparationFailed(e, managed, err)
 	}
-	request, err := guesttask.StartWithCompletion(guesttask.Request{Action: "start", ID: applicationTask(e.pod, index), Command: args}, oom.Complete)
+	request, err := guesttask.StartWithCompletion(guesttask.Request{Action: "start", ID: managed.task(e), Command: args}, oom.Complete)
 	if err != nil {
 		return err
 	}
@@ -176,14 +170,14 @@ func (p *provider) startNamedApplication(ctx context.Context, e *podEntry, index
 	if _, err := p.runner.nativeOutput(ctx, append([]string{"exec", "--stream", e.vm, "--"}, request.Args...), request.Stdin); err != nil {
 		return fmt.Errorf("submit container %s: %w", container.Name, err)
 	}
-	progress := e.progress(index)
+	progress := managed.progress(e)
 	*progress = applicationProgress{started: time.Now()}
 	e.mu.Lock()
-	status := &e.pod.Status.ContainerStatuses[index]
+	status := managed.status(e)
 	if status.LastTerminationState.Terminated != nil {
 		status.RestartCount++
 	}
-	status.ContainerID = "containerd://" + e.vm + "/" + applicationTask(e.pod, index)
+	status.ContainerID = "containerd://" + e.vm + "/" + managed.task(e)
 	status.Ready, status.Started = false, new(false)
 	status.State = corev1.ContainerState{Waiting: &corev1.ContainerStateWaiting{Reason: "ContainerCreating"}}
 	e.mu.Unlock()
@@ -192,13 +186,17 @@ func (p *provider) startNamedApplication(ctx context.Context, e *podEntry, index
 }
 
 func (p *provider) applicationPreparationFailed(e *podEntry, index int, cause error) error {
+	return p.managedPreparationFailed(e, managedContainer{index: index}, cause)
+}
+
+func (p *provider) managedPreparationFailed(e *podEntry, managed managedContainer, cause error) error {
 	e.mu.Lock()
-	status := &e.pod.Status.ContainerStatuses[index]
+	status := managed.status(e)
 	if status.LastTerminationState.Terminated != nil {
 		status.RestartCount++
 	}
 	e.mu.Unlock()
-	return p.applicationExited(e, index, 128, "StartError", cause.Error())
+	return p.managedContainerExited(e, managed, 128, "StartError", cause.Error())
 }
 
 // Called with e.op held. A backoff for one application never blocks another
@@ -218,8 +216,12 @@ func (p *provider) monitorApplications(ctx context.Context, e *podEntry) error {
 }
 
 func (p *provider) monitorApplication(ctx context.Context, e *podEntry, index int) error {
-	progress := e.progress(index)
-	if e.pod.Status.ContainerStatuses[index].State.Terminated != nil {
+	return p.monitorManagedContainer(ctx, e, managedContainer{index: index})
+}
+
+func (p *provider) monitorManagedContainer(ctx context.Context, e *podEntry, managed managedContainer) error {
+	progress := managed.progress(e)
+	if (*managed.status(e)).State.Terminated != nil {
 		return nil
 	}
 	if !progress.nextRestart.IsZero() {
@@ -227,9 +229,9 @@ func (p *provider) monitorApplication(ctx context.Context, e *podEntry, index in
 			return nil
 		}
 		e.generation++
-		return p.startNamedApplication(ctx, e, index)
+		return p.startManagedContainer(ctx, e, managed)
 	}
-	root := applicationRoot(e.pod, index)
+	root := managed.root(e)
 	read := "if test -f " + quote(root+"/application.exit") + "; then if test -f " + quote(root+"/application.oom-error") +
 		"; then echo OOMERROR; else printf 'EXIT '; cat " + quote(root+"/application.exit") + "; if test -f " + quote(root+"/application.oom") +
 		"; then echo OOMKilled; fi; fi; else " + ctr + " tasks list; fi"
@@ -240,7 +242,7 @@ func (p *provider) monitorApplication(ctx context.Context, e *podEntry, index in
 		return err
 	}
 	if output == "OOMERROR" {
-		return fmt.Errorf("container %s memory accounting could not be verified", e.pod.Spec.Containers[index].Name)
+		return fmt.Errorf("container %s memory accounting could not be verified", managed.container(e).Name)
 	}
 	if codeText, exited := strings.CutPrefix(output, "EXIT "); exited {
 		reason := ""
@@ -251,31 +253,31 @@ func (p *provider) monitorApplication(ctx context.Context, e *podEntry, index in
 		if err != nil || code < 0 || code > 255 {
 			return errors.New("container exit status is invalid")
 		}
-		if err := p.releaseContainerSubpaths(ctx, e, e.pod.Spec.Containers[index]); err != nil {
+		if err := p.releaseContainerSubpaths(ctx, e, managed.container(e)); err != nil {
 			return err
 		}
-		return p.applicationExited(e, index, int32(code), reason, "")
+		return p.managedContainerExited(e, managed, int32(code), reason, "")
 	}
-	if !containerTaskRunning(output, applicationTask(e.pod, index)) {
+	if !containerTaskRunning(output, managed.task(e)) {
 		progress.ready = false
 		if progress.missingSince.IsZero() {
 			progress.missingSince = time.Now()
 		}
 		if time.Since(progress.missingSince) >= applicationMissingGrace {
-			return fmt.Errorf("container %s is absent without a published exit status for 30 seconds", e.pod.Spec.Containers[index].Name)
+			return fmt.Errorf("container %s is absent without a published exit status for 30 seconds", managed.container(e).Name)
 		}
 		e.mu.Lock()
-		e.pod.Status.ContainerStatuses[index].Ready = false
+		(*managed.status(e)).Ready = false
 		e.mu.Unlock()
 		return nil
 	}
 	progress.missingSince = time.Time{}
 	if !progress.nextKill.IsZero() {
 		if progress.killSent && time.Since(progress.nextKill) >= applicationMissingGrace {
-			return fmt.Errorf("container %s did not terminate within 30 seconds of SIGKILL", e.pod.Spec.Containers[index].Name)
+			return fmt.Errorf("container %s did not terminate within 30 seconds of SIGKILL", managed.container(e).Name)
 		}
 		if !progress.killSent && !time.Now().Before(progress.nextKill) {
-			if _, err := p.runner.guest(ctx, e.vm, "test -f "+quote(root+"/application.exit")+" || "+ctr+" tasks kill --signal SIGKILL "+quote(applicationTask(e.pod, index))+" || test -f "+quote(root+"/application.exit")); err != nil {
+			if _, err := p.runner.guest(ctx, e.vm, "test -f "+quote(root+"/application.exit")+" || "+ctr+" tasks kill --signal SIGKILL "+quote(managed.task(e))+" || test -f "+quote(root+"/application.exit")); err != nil {
 				return err
 			}
 			progress.killSent = true
@@ -284,22 +286,22 @@ func (p *provider) monitorApplication(ctx context.Context, e *podEntry, index in
 		}
 		return nil
 	}
-	container := e.pod.Spec.Containers[index]
-	probe, reason, err := p.containerHealthChecks(ctx, e, container, applicationTask(e.pod, index), progress)
+	container := managed.container(e)
+	probe, reason, err := p.containerHealthChecks(ctx, e, container, managed.task(e), progress)
 	if err != nil {
 		return err
 	}
 	if reason != "" {
-		return p.stopNamedUnhealthy(ctx, e, index, probe, reason)
+		return p.stopManagedUnhealthy(ctx, e, managed, probe, reason)
 	}
 	ready := progress.startupComplete
 	if ready && container.ReadinessProbe != nil {
-		p.evaluateContainerProbe(ctx, e, container, applicationTask(e.pod, index), progress.started, container.ReadinessProbe, &progress.readiness)
+		p.evaluateContainerProbe(ctx, e, container, managed.task(e), progress.started, container.ReadinessProbe, &progress.readiness)
 		ready = progress.readiness.passed
 	}
 	progress.ready = ready
 	e.mu.Lock()
-	status := &e.pod.Status.ContainerStatuses[index]
+	status := managed.status(e)
 	status.State = corev1.ContainerState{Running: &corev1.ContainerStateRunning{StartedAt: metav1.NewTime(progress.started)}}
 	status.Ready, status.Started = ready, new(progress.startupComplete)
 	e.mu.Unlock()
@@ -307,7 +309,11 @@ func (p *provider) monitorApplication(ctx context.Context, e *podEntry, index in
 }
 
 func (p *provider) applicationExited(e *podEntry, index int, code int32, reason, message string) error {
-	progress := e.progress(index)
+	return p.managedContainerExited(e, managedContainer{index: index}, code, reason, message)
+}
+
+func (p *provider) managedContainerExited(e *podEntry, managed managedContainer, code int32, reason, message string) error {
+	progress := managed.progress(e)
 	reason = cmp.Or(reason, progress.probeFailure)
 	if reason == "" {
 		reason = "Completed"
@@ -316,7 +322,7 @@ func (p *provider) applicationExited(e *podEntry, index int, code int32, reason,
 		}
 	}
 	e.mu.Lock()
-	status := &e.pod.Status.ContainerStatuses[index]
+	status := managed.status(e)
 	exit := corev1.ContainerState{Terminated: &corev1.ContainerStateTerminated{ExitCode: code, Reason: reason, Message: message,
 		StartedAt: metav1.NewTime(progress.started), FinishedAt: metav1.Now(), ContainerID: status.ContainerID}}
 	status.State, status.Ready, status.Started = exit, false, new(false)
@@ -378,11 +384,15 @@ func (p *provider) publishApplications(ctx context.Context, e *podEntry) error {
 }
 
 func (p *provider) stopNamedUnhealthy(ctx context.Context, e *podEntry, index int, probe *corev1.Probe, reason string) error {
-	progress := e.progress(index)
+	return p.stopManagedUnhealthy(ctx, e, managedContainer{index: index}, probe, reason)
+}
+
+func (p *provider) stopManagedUnhealthy(ctx context.Context, e *podEntry, managed managedContainer, probe *corev1.Probe, reason string) error {
+	progress := managed.progress(e)
 	progress.probeFailure = reason
 	progress.ready = false
 	e.mu.Lock()
-	e.pod.Status.ContainerStatuses[index].Ready = false
+	(*managed.status(e)).Ready = false
 	e.mu.Unlock()
 	if err := p.journal(e); err != nil {
 		return err
@@ -394,7 +404,7 @@ func (p *provider) stopNamedUnhealthy(ctx context.Context, e *podEntry, index in
 	if probe != nil && probe.TerminationGracePeriodSeconds != nil {
 		grace = *probe.TerminationGracePeriodSeconds
 	}
-	root, task := applicationRoot(e.pod, index), applicationTask(e.pod, index)
+	root, task := managed.root(e), managed.task(e)
 	script := "test -f " + quote(root+"/application.exit") + " || " + ctr + " tasks kill --signal SIGTERM " + quote(task) + " || test -f " + quote(root+"/application.exit")
 	if _, err := p.runner.guest(ctx, e.vm, script); err != nil {
 		return err
