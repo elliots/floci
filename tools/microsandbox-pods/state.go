@@ -23,20 +23,32 @@ type stateIdentity struct {
 	Node, ClusterUID, PeerOwner, Peer, PodCIDR, ProxyBackendCIDR string
 }
 type journalRecord struct {
-	StartupComplete bool               `json:"startupComplete,omitzero"`
-	ProbeFailure    string             `json:"probeFailure,omitempty"`
-	ProxyPorts      []proxyPortBinding `json:"proxyPorts,omitempty"`
-	BackendIP       string             `json:"backendIP,omitempty"`
-	SnapshotIDs     map[string]string  `json:"snapshotIDs,omitempty"`
-	RestoredParent  string             `json:"restoredParent,omitempty"`
-	Version         int                `json:"version"`
-	View            lifecycleView      `json:"view"`
-	Pod             *corev1.Pod        `json:"pod"`
-	DeclaredSpec    *corev1.PodSpec    `json:"declaredSpec,omitempty"`
-	Slot            int                `json:"slot"`
-	GuestIP         string             `json:"guestIP"`
-	Started         time.Time          `json:"started"`
-	Snapshots       []string           `json:"snapshots,omitempty"`
+	TerminationReason string             `json:"terminationReason,omitempty"`
+	Allocation        podAllocation      `json:"allocation,omitzero"`
+	StartupComplete   bool               `json:"startupComplete,omitzero"`
+	ProbeFailure      string             `json:"probeFailure,omitempty"`
+	ProxyPorts        []proxyPortBinding `json:"proxyPorts,omitempty"`
+	BackendIP         string             `json:"backendIP,omitempty"`
+	SnapshotIDs       map[string]string  `json:"snapshotIDs,omitempty"`
+	RestoredParent    string             `json:"restoredParent,omitempty"`
+	Version           int                `json:"version"`
+	View              lifecycleView      `json:"view"`
+	Pod               *corev1.Pod        `json:"pod"`
+	DeclaredSpec      *corev1.PodSpec    `json:"declaredSpec,omitempty"`
+	Slot              int                `json:"slot"`
+	GuestIP           string             `json:"guestIP"`
+	Started           time.Time          `json:"started"`
+	Snapshots         []string           `json:"snapshots,omitempty"`
+}
+
+func (record journalRecord) guestAllocation() (podAllocation, error) {
+	if record.Version == 1 && record.Allocation == (podAllocation{}) {
+		return validateStoredAllocation(podAllocation{})
+	}
+	if record.Version != 2 || record.Allocation.Version == 0 {
+		return podAllocation{}, errors.New("pod journal has an invalid version or missing guest allocation")
+	}
+	return validateStoredAllocation(record.Allocation)
 }
 
 func openState(ctx context.Context, cfg config, client kubernetes.Interface) (*os.File, bool, error) {
@@ -96,7 +108,7 @@ func (p *provider) recover(ctx context.Context) error {
 		if err := json.Unmarshal(bytes, &record); err != nil {
 			return err
 		}
-		if record.Version != 1 || record.Pod == nil || string(record.Pod.UID) != record.View.UID || filepath.Base(path) != record.View.UID+".json" {
+		if record.Pod == nil || string(record.Pod.UID) != record.View.UID || filepath.Base(path) != record.View.UID+".json" {
 			return fmt.Errorf("invalid ownership journal %s", filepath.Base(path))
 		}
 		current, err := p.client.CoreV1().Pods(record.View.Namespace).Get(ctx, record.View.Name, metav1.GetOptions{})
@@ -108,8 +120,13 @@ func (p *provider) recover(ctx context.Context) error {
 		e := &podEntry{wake: make(chan struct{}, 1), snapshotIDs: record.SnapshotIDs, restoredParent: record.RestoredParent, pod: record.Pod, vm: record.View.VM, ip: record.View.PodIP, slot: record.Slot, port: record.View.UDPPort,
 			httpPort: record.View.HTTPPort, appPort: record.View.ApplicationPort, guestIP: record.GuestIP, started: record.Started,
 			generation: record.View.Generation, state: record.View.State, snapshots: record.Snapshots, lifetime: lifetime, cancel: cancel, done: make(chan struct{})}
+		e.allocation, err = record.guestAllocation()
+		if err != nil {
+			return fmt.Errorf("invalid allocation for Pod %s: %w", record.View.UID, err)
+		}
 		e.declaredSpec = record.DeclaredSpec
 		e.startupComplete, e.probeFailure = record.StartupComplete, record.ProbeFailure
+		e.terminationReason = record.TerminationReason
 		if !orphan {
 			if err := reconcileDeclaredSpec(e, current); err != nil {
 				return err
@@ -182,13 +199,23 @@ func (p *provider) recover(ctx context.Context) error {
 		e.state = action
 		if exists && (status == "Running" || status == "Paused") && action != "SLEEPING" {
 			e.allocated = true
-			p.activeMemoryMiB += vmMemoryMiB
+			p.activeMemoryMiB += e.allocation.MemoryMiB
 		}
 		if action == "FAILED" {
-			e.pod.Status.Reason = "NativeRuntimeUncertain"
-			e.pod.Status.Message = "Runtime state could not be reconciled; no stale checkpoint or cold replacement was started"
+			e.mu.Lock()
+			e.pod.Status.Phase = corev1.PodFailed
+			if record.View.State != "FAILED" || e.pod.Status.Reason == "" || e.pod.Status.Reason == "ControllerRecovering" {
+				e.pod.Status.Reason = "NativeRuntimeUncertain"
+			}
+			if record.View.State != "FAILED" || e.pod.Status.Message == "" {
+				e.pod.Status.Message = "Runtime state could not be reconciled; no stale checkpoint or cold replacement was started"
+			}
+			reason := e.pod.Status.Reason
+			e.mu.Unlock()
+			p.unavailable(e, reason)
+		} else if e.state != "TERMINATED" {
+			p.unavailable(e, "ControllerRecovering")
 		}
-		p.unavailable(e, "ControllerRecovering")
 		if e.state == "SLEEPING" {
 			p.unavailable(e, "Hibernated")
 		}
@@ -374,6 +401,11 @@ func recoverAction(journalState, runtimeStatus string, exists, verified bool) st
 	}
 	if journalState == "FAILED" || journalState == "TERMINATED" {
 		return journalState
+	}
+	if journalState == "STARTING" || journalState == "RESTARTING" {
+		// A launch can crash before submitting the application, including after
+		// removing an earlier exit marker. VM liveness cannot prove task liveness.
+		return "FAILED"
 	}
 	if journalState == "SLEEPING" {
 		if exists && runtimeStatus == "Stopped" && verified {

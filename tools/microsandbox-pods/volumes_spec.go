@@ -27,12 +27,16 @@ func guestVolumePath(volumeName string) string {
 }
 
 func validateVolumes(pod *corev1.Pod) error {
+	allocation, err := derivePodAllocation(pod)
+	if err != nil {
+		return err
+	}
 	volumes := make(map[string]struct{}, len(pod.Spec.Volumes))
 	for _, volume := range pod.Spec.Volumes {
 		if _, found := volumes[volume.Name]; found {
 			return fmt.Errorf("duplicate volume %q", volume.Name)
 		}
-		if err := validateVolume(volume); err != nil {
+		if err := validateVolume(volume, allocation.MemoryMiB); err != nil {
 			return fmt.Errorf("volume %q: %w", volume.Name, err)
 		}
 		volumes[volume.Name] = struct{}{}
@@ -70,7 +74,7 @@ func validateVolumes(pod *corev1.Pod) error {
 	return nil
 }
 
-func validateVolume(volume corev1.Volume) error {
+func validateVolume(volume corev1.Volume, memoryMiB int) error {
 	if len(validation.IsDNS1123Label(volume.Name)) != 0 {
 		return fmt.Errorf("name must be a DNS label")
 	}
@@ -104,8 +108,8 @@ func validateVolume(volume corev1.Volume) error {
 			if source.Medium != corev1.StorageMediumMemory {
 				return fmt.Errorf("disk emptyDir sizeLimit requires storage quotas, which are not qualified")
 			}
-			if source.SizeLimit.Sign() <= 0 || source.SizeLimit.Cmp(*resource.NewQuantity(vmMemoryMiB*1024*1024, resource.BinarySI)) > 0 {
-				return fmt.Errorf("Memory emptyDir sizeLimit must be positive and at most %d MiB", vmMemoryMiB)
+			if source.SizeLimit.Sign() <= 0 || source.SizeLimit.Cmp(*resource.NewQuantity(int64(memoryMiB)*bytesPerMiB, resource.BinarySI)) > 0 {
+				return fmt.Errorf("Memory emptyDir sizeLimit must be positive and at most the guest's %d MiB allocation", memoryMiB)
 			}
 		}
 		return nil
@@ -168,7 +172,7 @@ func projectionSettings(volume corev1.Volume) (name string, items []corev1.KeyTo
 }
 
 func resolveProjectedVolume(ctx context.Context, client kubernetes.Interface, namespace string, volume corev1.Volume) (map[string]volumeFile, error) {
-	if err := validateVolume(volume); err != nil {
+	if err := validateVolume(volume, maxGuestMemoryMiB); err != nil {
 		return nil, err
 	}
 	if volume.ConfigMap == nil && volume.Secret == nil {

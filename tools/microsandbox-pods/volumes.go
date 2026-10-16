@@ -68,7 +68,11 @@ func mountedVolumes(pod *corev1.Pod) []corev1.Volume {
 // Callers hold e.op, so projections cannot race snapshots or container restarts.
 func (p *provider) prepareVolumes(ctx context.Context, e *podEntry) error {
 	for _, volume := range mountedVolumes(e.pod) {
-		if _, err := p.runner.guest(ctx, e.vm, volumeSetupScript(volume)); err != nil {
+		allocation, err := validateStoredAllocation(e.allocation)
+		if err != nil {
+			return err
+		}
+		if _, err := p.runner.guest(ctx, e.vm, volumeSetupScript(volume, allocation.MemoryMiB)); err != nil {
 			return fmt.Errorf("initialize volume %s: %w", volume.Name, err)
 		}
 	}
@@ -162,7 +166,7 @@ func (p *provider) waitForVolumeSources(ctx context.Context, e *podEntry) error 
 	}
 }
 
-func volumeSetupScript(volume corev1.Volume) string {
+func volumeSetupScript(volume corev1.Volume, memoryMiB int) string {
 	root := quote(guestVolumePath(volume.Name))
 	script := "umask 022; mkdir -p /var/lib/floci-volumes; chmod 0700 /var/lib/floci-volumes; "
 	if volume.EmptyDir != nil && volume.EmptyDir.Medium == corev1.StorageMediumDefault {
@@ -171,7 +175,7 @@ func volumeSetupScript(volume corev1.Volume) string {
 	}
 	script += "mkdir -p " + root + "; "
 	if volume.Secret != nil || volume.EmptyDir != nil {
-		limit, mode := int64(vmMemoryMiB*1024*1024), "0755"
+		limit, mode := int64(memoryMiB)*bytesPerMiB, "0755"
 		if volume.EmptyDir != nil {
 			mode = "0777"
 			if volume.EmptyDir.SizeLimit != nil {

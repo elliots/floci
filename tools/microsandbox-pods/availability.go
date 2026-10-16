@@ -152,7 +152,7 @@ func (p *provider) projectProxyAvailability(e *podEntry) {
 	if !e.proxyAvailability {
 		return
 	}
-	ready := e.proxyRoutesReady && !e.proxyRouteFailed.Load() && !e.deleted && e.lifetime.Err() == nil && e.state != "FAILED" && e.state != "TERMINATED"
+	ready := e.proxyRoutesReady && !e.proxyRouteFailed.Load() && !e.deleted && e.lifetime.Err() == nil && e.state != "FAILED" && e.state != "TERMINATED" && e.applicationMissingSince.IsZero()
 	e.mu.Lock()
 	defer e.mu.Unlock()
 	e.pod.Status.PodIP = e.ip
@@ -260,7 +260,7 @@ func (p *provider) withdrawProxyAvailability(e *podEntry) {
 }
 
 func idleEligible(e *podEntry) bool {
-	return e.idleOwner == "controller" && (e.state == "READY" || e.state == "RUNNING") && e.activeConnections == 0 && time.Since(e.lastActivity) >= e.idleTimeout
+	return e.idleOwner == "controller" && (e.state == "READY" || e.state == "RUNNING") && e.applicationMissingSince.IsZero() && e.activeConnections == 0 && time.Since(e.lastActivity) >= e.idleTimeout
 }
 
 func (p *provider) removeProxy(ctx context.Context, e *podEntry) error {

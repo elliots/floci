@@ -61,6 +61,7 @@ type podEntry struct {
 	snapshotIDs                                      map[string]string
 	restoredParent                                   string
 	allocated                                        bool
+	allocation                                       podAllocation
 	op                                               sync.Mutex
 	lifetime                                         context.Context
 	state                                            string
@@ -80,6 +81,8 @@ type podEntry struct {
 	readiness, startup, liveness                     probeProgress
 	startupComplete                                  bool
 	probeFailure                                     string
+	terminationReason                                string
+	applicationMissingSince                          time.Time
 	volumeDigests                                    map[string][32]byte
 	volumesChecked                                   time.Time
 	initialVolumes                                   map[string]map[string]volumeFile
@@ -156,12 +159,12 @@ func validatePod(pod *corev1.Pod) error {
 	if len(container.EnvFrom) != 0 {
 		return errdefs.InvalidInput("unresolved envFrom source")
 	}
-	if container.Resources.Requests.Memory().Value() > vmMemoryMiB*1024*1024 || container.Resources.Requests.Cpu().MilliValue() > 1000 {
-		return errdefs.InvalidInput("pod requests exceed the fixed one-vCPU, 768 MiB guest")
+	if _, err := derivePodAllocation(pod); err != nil {
+		return errdefs.InvalidInput(err.Error())
 	}
 	if container.RestartPolicy != nil || len(container.RestartPolicyRules) != 0 ||
-		len(container.VolumeDevices) != 0 || len(container.Resources.Limits) != 0 || container.Lifecycle != nil || container.Stdin || container.TTY {
-		return errdefs.InvalidInput("container restart overrides, volume devices, limits, hooks and TTY are not qualified")
+		len(container.VolumeDevices) != 0 || container.Lifecycle != nil || container.Stdin || container.TTY {
+		return errdefs.InvalidInput("container restart overrides, volume devices, hooks and TTY are not qualified")
 	}
 	if err := validateVolumes(pod); err != nil {
 		return errdefs.InvalidInput(err.Error())
@@ -186,6 +189,10 @@ func (p *provider) CreatePod(ctx context.Context, pod *corev1.Pod) error {
 	if err := validatePod(pod); err != nil {
 		return err
 	}
+	allocation, err := derivePodAllocation(pod)
+	if err != nil {
+		return errdefs.InvalidInput(err.Error())
+	}
 	if networkProbes(pod.Spec.Containers[0]) && p.runner.cfg.relayBinary == "" {
 		return errdefs.InvalidInput("HTTP/TCP probes require --network-relay-binary")
 	}
@@ -206,6 +213,10 @@ func (p *provider) CreatePod(ctx context.Context, pod *corev1.Pod) error {
 			return nil
 		}
 		return errdefs.InvalidInput("a previous Pod UID still owns this name")
+	}
+	if allocation.MemoryMiB > p.runner.cfg.maxActiveMemoryMiB {
+		p.mu.Unlock()
+		return errdefs.InvalidInput(fmt.Sprintf("pod requires %d MiB of guest RAM, exceeding --max-active-memory-mib %d", allocation.MemoryMiB, p.runner.cfg.maxActiveMemoryMiB))
 	}
 	used := make(map[int]bool)
 	ports := make(map[int]bool)
@@ -253,6 +264,7 @@ func (p *provider) CreatePod(ctx context.Context, pod *corev1.Pod) error {
 	}
 	lifetime, cancel := context.WithCancel(p.ctx)
 	e := &podEntry{wake: make(chan struct{}, 1), snapshotIDs: make(map[string]string), lifetime: lifetime, state: "WAITINGVOLUMES", httpPort: httpPort, appPort: int(appPort), pod: pod.DeepCopy(), vm: "fvp-" + uid[:20], link: "pv" + uid[:10], ip: p.network.address(slot), slot: slot, port: port, cancel: cancel, done: make(chan struct{})}
+	e.allocation = allocation
 	e.declaredSpec = declared.Spec.DeepCopy()
 	e.pod.Status = corev1.PodStatus{Phase: corev1.PodPending, Reason: "NativeVMStarting", StartTime: new(metav1.Now()),
 		ContainerStatuses: []corev1.ContainerStatus{{Name: pod.Spec.Containers[0].Name, Image: pod.Spec.Containers[0].Image,
@@ -336,7 +348,7 @@ func (p *provider) startAdmitted(ctx context.Context, e *podEntry) error {
 		return err
 	}
 	args := []string{"run", "--detach", "--entrypoint", "/bin/sh", "--name", e.vm, "--label", ownerLabel + "=" + p.runner.cfg.peerOwner,
-		"--label", "kubernetes.io/pod-uid=" + string(e.pod.UID), "--cpus", "1", "--memory", "768M", "--root-disk", "flat:4G", "--net", "host,private,public",
+		"--label", "kubernetes.io/pod-uid=" + string(e.pod.UID), "--cpus", strconv.Itoa(e.allocation.VCPUs), "--memory", strconv.Itoa(e.allocation.MemoryMiB) + "M", "--root-disk", "flat:4G", "--net", "host,private,public",
 		"--port", fmt.Sprintf("127.0.0.1:%d:8472/udp", e.port)}
 	if e.proxyAvailability {
 		for _, binding := range e.proxyPorts {
@@ -345,7 +357,7 @@ func (p *provider) startAdmitted(ctx context.Context, e *podEntry) error {
 	} else if e.httpPort != 0 {
 		args = append(args, "--port", fmt.Sprintf("127.0.0.1:%d:%d", e.httpPort, e.appPort))
 	}
-	args = append(args, guestImage, "--", "-ec", "containerd --log-level=error & while true; do if test -f /tmp/application.request; then mv /tmp/application.request /tmp/application.active; sh /tmp/application.active || true; else sleep 0.2; fi; done")
+	args = append(args, guestImage, "--", "-ec", "containerd --log-level=error & while true; do if test -f /tmp/application.request; then mv /tmp/application.request /tmp/application.active && sh /tmp/application.active || sleep 0.2; else sleep 0.2; fi; done")
 	if _, err := p.runner.vm(ctx, args...); err != nil {
 		return fmt.Errorf("create native pod VM: %w", err)
 	}
@@ -365,7 +377,7 @@ func (p *provider) startAdmitted(ctx context.Context, e *podEntry) error {
 		if err != nil {
 			return err
 		}
-		if strings.Contains(output, "RUNNING") || strings.Contains(output, "EXIT") {
+		if applicationTaskRunning(output) || output == "EXIT" {
 			return nil
 		}
 		select {
@@ -390,15 +402,25 @@ func (p *provider) startApplication(ctx context.Context, e *podEntry) error {
 	if err != nil {
 		return fmt.Errorf("configure application security: %w", err)
 	}
+	resources, err := containerResourceArgs(container)
+	if err != nil {
+		return fmt.Errorf("configure application resources: %w", err)
+	}
 	if err := p.prepareVolumes(ctx, e); err != nil {
 		return err
 	}
 	if _, err := p.runner.guest(ctx, e.vm, "cp /etc/pod-resolv.conf /etc/resolv.conf"); err != nil {
 		return fmt.Errorf("configure application DNS: %w", err)
 	}
+	oom := newApplicationOOMTracking(e.generation)
+	if _, err := p.runner.guest(ctx, e.vm, oom.Setup); err != nil {
+		return fmt.Errorf("initialize application resource accounting: %w", err)
+	}
 	args := []string{"ctr", "--address", "/run/containerd/containerd.sock", "run", "--rm", "--net-host", "--platform", launch.Platform, "--mount", "type=bind,src=/etc/pod-resolv.conf,dst=/etc/resolv.conf,options=rbind:ro"}
 	args = append(args, volumeMountArgs(e.pod)...)
 	args = append(args, security...)
+	args = append(args, resources...)
+	args = append(args, oom.Args...)
 	if launch.WorkingDir != "" {
 		args = append(args, "--cwd", launch.WorkingDir)
 	}
@@ -407,13 +429,15 @@ func (p *provider) startApplication(ctx context.Context, e *podEntry) error {
 	}
 	args = append(args, image, "application")
 	args = append(args, launch.Args...)
-	script := "set +e; " + joinCommand(args) + " >/tmp/application.log 2>&1; code=$?; printf '%s\\n' \"$code\" >/tmp/application.exit; exit \"$code\""
-	if _, err := p.runner.guest(ctx, e.vm, "printf '%s' "+quote(script)+" >/tmp/application.pending; mv /tmp/application.pending /tmp/application.request"); err != nil {
+	script := applicationProcessScript(args, oom.Complete)
+	if _, err := p.runner.guest(ctx, e.vm, applicationRequestScript(script)); err != nil {
 		return fmt.Errorf("submit application process to guest supervisor: %w", err)
 	}
 	e.started = time.Now()
 	e.startupComplete = false
 	e.probeFailure = ""
+	e.terminationReason = ""
+	e.applicationMissingSince = time.Time{}
 	resetProbeProgress(e)
 	e.state = "RUNNING"
 	return p.journal(e)
@@ -436,6 +460,7 @@ func (p *provider) monitor(ctx context.Context, e *podEntry) {
 	for {
 		e.op.Lock()
 		if e.state == "COLD" || e.state == "SLEEPING" || e.state == "FAILED" || e.state == "CHECKPOINTED" || e.state == "RESUMING" || e.deleted {
+			e.applicationMissingSince = time.Time{}
 			e.op.Unlock()
 			select {
 			case <-ctx.Done():
@@ -445,7 +470,7 @@ func (p *provider) monitor(ctx context.Context, e *podEntry) {
 			}
 		}
 		check, cancel := context.WithTimeout(ctx, 15*time.Second)
-		output, err := p.runner.guest(check, e.vm, "if test -f /tmp/application.exit; then printf 'EXIT '; cat /tmp/application.exit; else "+ctr+" tasks list; fi")
+		output, err := p.runner.guest(check, e.vm, "if test -f /tmp/application.exit; then if test -f /tmp/application.oom-error; then echo OOMERROR; else printf 'EXIT '; cat /tmp/application.exit; if test -f /tmp/application.oom; then echo OOMKilled; fi; fi; else "+ctr+" tasks list; fi")
 		cancel()
 		if err != nil {
 			if ctx.Err() == nil {
@@ -454,7 +479,17 @@ func (p *provider) monitor(ctx context.Context, e *podEntry) {
 			e.op.Unlock()
 			return
 		}
+		if output == "OOMERROR" {
+			p.fail(e, errors.New("application terminated but its memory accounting could not be verified"))
+			e.op.Unlock()
+			return
+		}
 		if codeText, exited := strings.CutPrefix(output, "EXIT "); exited {
+			e.terminationReason = ""
+			if trimmed, oom := strings.CutSuffix(codeText, "\nOOMKilled"); oom {
+				codeText = trimmed
+				e.terminationReason = "OOMKilled"
+			}
 			code, err := strconv.Atoi(strings.TrimSpace(codeText))
 			if err != nil {
 				p.fail(e, err)
@@ -476,7 +511,16 @@ func (p *provider) monitor(ctx context.Context, e *podEntry) {
 			e.op.Unlock()
 			return
 		}
-		if strings.Contains(output, "RUNNING") {
+		running, missingExpired := e.observeApplicationTask(output, time.Now())
+		if missingExpired {
+			p.fail(e, errors.New("application task is absent or stopped without a published exit status for 30 seconds"))
+			e.op.Unlock()
+			return
+		}
+		if !running {
+			e.state = "RUNNING"
+			p.unavailable(e, "ApplicationTaskMissing")
+		} else {
 			if time.Since(e.volumesChecked) >= volumeRefreshInterval {
 				check, cancel := context.WithTimeout(ctx, 15*time.Second)
 				_ = p.refreshVolumes(check, e, false)
@@ -548,7 +592,7 @@ func (p *provider) terminated(e *podEntry, code int32) {
 	e.pod.Status.ContainerStatuses[0].Ready = false
 	e.pod.Status.ContainerStatuses[0].Started = new(false)
 	e.pod.Status.ContainerStatuses[0].State = corev1.ContainerState{Terminated: &corev1.ContainerStateTerminated{
-		ExitCode: code, Reason: cmp.Or(e.probeFailure, string(e.pod.Status.Phase)), StartedAt: metav1.NewTime(e.started), FinishedAt: metav1.Now()}}
+		ExitCode: code, Reason: cmp.Or(e.terminationReason, e.probeFailure, string(e.pod.Status.Phase)), StartedAt: metav1.NewTime(e.started), FinishedAt: metav1.Now()}}
 	e.pod.Status.Conditions = podConditions(false)
 	e.mu.Unlock()
 	if err := p.journal(e); err != nil {
@@ -582,6 +626,7 @@ func (p *provider) stopTerminal(ctx context.Context, e *podEntry) error {
 
 func (p *provider) fail(e *podEntry, err error) {
 	e.state = "FAILED"
+	e.actualReady = false
 	e.mu.Lock()
 	e.pod.Status.Phase, e.pod.Status.Reason, e.pod.Status.Message = corev1.PodFailed, "NativeRuntimeFailed", err.Error()
 	e.pod.Status.ContainerStatuses[0].Ready = false
@@ -589,6 +634,9 @@ func (p *provider) fail(e *podEntry, err error) {
 	e.mu.Unlock()
 	if journalErr := p.journal(e); journalErr != nil {
 		slog.Error("cannot persist failed pod", "pod", e.pod.Name, "error", journalErr)
+	}
+	if releaseErr := p.releaseInactiveMemory(context.Background(), e); releaseErr != nil {
+		slog.Error("cannot reconcile failed pod memory", "pod", e.pod.Name, "error", releaseErr)
 	}
 	slog.Error("pod runtime failed", "pod", e.pod.Namespace+"/"+e.pod.Name, "error", err)
 	p.publish(e)

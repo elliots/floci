@@ -97,6 +97,50 @@ func TestProbeThresholdDoesNotReuseProjectedReadiness(t *testing.T) {
 	}
 }
 
+func TestMissingApplicationWithdrawsProxyAvailabilityUntilObservationResumes(t *testing.T) {
+	entry := availabilityEntry(t)
+	entry.state = "RUNNING"
+	entry.applicationMissingSince = time.Now()
+	p := &provider{}
+	p.projectProxyAvailability(entry)
+	if entry.pod.Status.ContainerStatuses[0].Ready {
+		t.Fatal("proxy hid the missing application task")
+	}
+	for _, condition := range entry.pod.Status.Conditions {
+		if condition.Type == corev1.PodReady && condition.Status == corev1.ConditionTrue {
+			t.Fatal("missing application still had a Ready condition")
+		}
+	}
+	entry.applicationMissingSince = time.Time{}
+	p.projectProxyAvailability(entry)
+	if !entry.pod.Status.ContainerStatuses[0].Ready {
+		t.Fatal("availability did not recover after the missing-task observation cleared")
+	}
+}
+
+func TestMissingApplicationCannotHideThroughIdleHibernation(t *testing.T) {
+	entry := availabilityEntry(t)
+	entry.state = "RUNNING"
+	entry.idleOwner = "controller"
+	entry.idleTimeout = time.Second
+	entry.lastActivity = time.Now().Add(-time.Hour)
+	entry.applicationMissingSince = time.Now()
+	if idleEligible(entry) {
+		t.Fatal("missing application was eligible for automatic hibernation")
+	}
+	p := &provider{}
+	if err := p.hibernate(t.Context(), entry); err == nil || !strings.Contains(err.Error(), "missing application task") {
+		t.Fatalf("explicit hibernation did not reject the missing task: %v", err)
+	}
+	if entry.applicationMissingSince.IsZero() || entry.state != "RUNNING" {
+		t.Fatal("hibernation cleared the missing-task evidence")
+	}
+	entry.applicationMissingSince = time.Time{}
+	if !idleEligible(entry) {
+		t.Fatal("normal idle eligibility did not return when the task recovered")
+	}
+}
+
 func TestProxyProjectionPreservesStrictModeAndWithdrawsUnavailableRoutes(t *testing.T) {
 	p := &provider{}
 	strict := availabilityEntry(t)
@@ -318,8 +362,16 @@ func TestDeletionCancelsProxyAdmissionBeforeWaitingForMonitor(t *testing.T) {
 	defer client.Close()
 	deadline := time.Now().Add(time.Second)
 	for {
-		if current := entry.publishedView.Load(); current != nil && current.ActiveConnections == 1 && len(p.starts) == 1 {
-			break
+		p.budgetMu.Lock()
+		// Normalizing the legacy allocation confirms that the wake reached
+		// admission. Waiting for RAM must retain neither RAM nor a start permit.
+		waiting := entry.allocation.Version != 0 && !entry.allocated && p.activeMemoryMiB == vmMemoryMiB && len(p.starts) == 0
+		p.budgetMu.Unlock()
+		if current := entry.publishedView.Load(); waiting && current != nil && current.ActiveConnections == 1 {
+			if !entry.op.TryLock() {
+				break
+			}
+			entry.op.Unlock()
 		}
 		if time.Now().After(deadline) {
 			t.Fatal("proxy request did not enter admission")
@@ -342,8 +394,11 @@ func TestDeletionCancelsProxyAdmissionBeforeWaitingForMonitor(t *testing.T) {
 	if err == nil || !strings.Contains(err.Error(), "uncertain native command") {
 		t.Fatalf("deletion waited on admission instead of cancelling it: %v", err)
 	}
-	if entry.activeConnections != 0 || len(p.starts) != 0 || entry.allocated {
+	if entry.activeConnections != 0 || len(p.starts) != 0 || entry.allocated || p.activeMemoryMiB != vmMemoryMiB {
 		t.Fatal("cancelled proxy admission retained a lease, permit or RAM reservation")
+	}
+	if entry.state != "COLD" || entry.generation != 9 {
+		t.Fatal("cancelled queued wake changed the Pod's cold lifecycle identity")
 	}
 }
 

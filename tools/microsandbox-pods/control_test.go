@@ -135,7 +135,7 @@ func TestSnapshotDeletionIsIdempotentAndRejectsReplacement(t *testing.T) {
 	}
 }
 
-func TestGuestProfileRejectsExcessRequests(t *testing.T) {
+func TestGuestProfileAcceptsLargerCPUAndMemoryRequests(t *testing.T) {
 	for _, name := range []corev1.ResourceName{corev1.ResourceCPU, corev1.ResourceMemory} {
 		pod := validPod()
 		quantity := resource.MustParse("2")
@@ -143,8 +143,8 @@ func TestGuestProfileRejectsExcessRequests(t *testing.T) {
 			quantity = resource.MustParse("1Gi")
 		}
 		pod.Spec.Containers[0].Resources.Requests = corev1.ResourceList{name: quantity}
-		if err := validatePod(pod); err == nil {
-			t.Fatalf("excess %s request accepted", name)
+		if err := validatePod(pod); err != nil {
+			t.Fatalf("supported %s request rejected: %v", name, err)
 		}
 	}
 }

@@ -56,6 +56,19 @@ func TestValidateVolumesAcceptsSupportedSourcesAndDefaultOptions(t *testing.T) {
 	}
 }
 
+func TestMemoryVolumeValidationUsesThePodGuestAllocation(t *testing.T) {
+	pod := volumeSpecPod()
+	pod.Spec.Containers[0].Resources.Requests = corev1.ResourceList{corev1.ResourceMemory: resource.MustParse("1Gi")}
+	pod.Spec.Volumes[3].EmptyDir.SizeLimit = new(resource.MustParse("1Gi"))
+	if err := validateVolumes(pod); err != nil {
+		t.Fatalf("larger guest rejected a fitting memory volume: %v", err)
+	}
+	pod.Spec.Volumes[3].EmptyDir.SizeLimit = new(resource.MustParse("1281Mi"))
+	if err := validateVolumes(pod); err == nil {
+		t.Fatal("memory volume larger than its guest was accepted")
+	}
+}
+
 func TestValidateVolumesRejectsUnsupportedOrUnsafeSpecs(t *testing.T) {
 	scenarios := map[string]func(*corev1.Pod){
 		"invalid volume name":    func(p *corev1.Pod) { p.Spec.Volumes[0].Name = "../outside" },

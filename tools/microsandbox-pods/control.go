@@ -17,6 +17,8 @@ import (
 )
 
 type lifecycleView struct {
+	VCPUs             int    `json:"vcpus,omitzero"`
+	MemoryMiB         int    `json:"memoryMiB,omitzero"`
 	ProxyURL          string `json:"proxyUrl,omitempty"`
 	ProxyAvailability bool   `json:"proxyAvailability"`
 	IdleOwner         string `json:"idleOwner,omitempty"`
@@ -38,6 +40,7 @@ type lifecycleView struct {
 func view(e *podEntry) lifecycleView {
 	v := lifecycleView{ProxyAvailability: e.proxyAvailability, IdleOwner: e.idleOwner, ActiveConnections: e.activeConnections, UID: string(e.pod.UID), Namespace: e.pod.Namespace, Name: e.pod.Name, State: e.state,
 		Generation: e.generation, PodIP: e.ip, VM: e.vm, UDPPort: e.port, HTTPPort: e.httpPort, ApplicationPort: e.appPort}
+	v.VCPUs, v.MemoryMiB = e.allocation.VCPUs, e.allocation.MemoryMiB
 	if e.httpPort != 0 {
 		v.BackendURL = fmt.Sprintf("http://127.0.0.1:%d", e.httpPort)
 	}
@@ -187,7 +190,12 @@ func (p *provider) journal(e *podEntry) error {
 	e.mu.Lock()
 	pod := e.pod.DeepCopy()
 	e.mu.Unlock()
-	if err := json.NewEncoder(file).Encode(journalRecord{Version: 1, StartupComplete: e.startupComplete, ProbeFailure: e.probeFailure, DeclaredSpec: e.declaredSpec, ProxyPorts: e.proxyPorts, BackendIP: e.backendIP, SnapshotIDs: e.snapshotIDs, RestoredParent: e.restoredParent, View: view(e), Pod: pod, Slot: e.slot, GuestIP: e.guestIP, Started: e.started, Snapshots: e.snapshots}); err != nil {
+	allocation, err := validateStoredAllocation(e.allocation)
+	if err != nil {
+		file.Close()
+		return err
+	}
+	if err := json.NewEncoder(file).Encode(journalRecord{Version: 2, Allocation: allocation, StartupComplete: e.startupComplete, ProbeFailure: e.probeFailure, TerminationReason: e.terminationReason, DeclaredSpec: e.declaredSpec, ProxyPorts: e.proxyPorts, BackendIP: e.backendIP, SnapshotIDs: e.snapshotIDs, RestoredParent: e.restoredParent, View: view(e), Pod: pod, Slot: e.slot, GuestIP: e.guestIP, Started: e.started, Snapshots: e.snapshots}); err != nil {
 		file.Close()
 		return err
 	}
@@ -228,6 +236,9 @@ func (p *provider) hibernate(ctx context.Context, e *podEntry) error {
 	if e.probeFailure != "" {
 		return errors.New("cannot hibernate a container awaiting probe-triggered termination")
 	}
+	if !e.applicationMissingSince.IsZero() {
+		return errors.New("cannot hibernate a container with a missing application task")
+	}
 	if e.activeConnections > 0 {
 		return errors.New("proxy connections are active")
 	}
@@ -252,6 +263,7 @@ func (p *provider) hibernate(ctx context.Context, e *podEntry) error {
 	}
 	e.generation++
 	e.state = "HIBERNATING"
+	e.applicationMissingSince = time.Time{}
 	if err := p.journal(e); err != nil {
 		return err
 	}
@@ -430,6 +442,7 @@ func (p *provider) resume(ctx context.Context, e *podEntry) error {
 	_ = p.refreshVolumes(ctx, e, false)
 	e.state = "RUNNING"
 	resetProbeProgress(e)
+	e.applicationMissingSince = time.Time{}
 	if err := p.journal(e); err != nil {
 		return err
 	}

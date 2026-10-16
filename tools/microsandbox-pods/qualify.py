@@ -137,10 +137,12 @@ def qualify(args):
                 with urllib.request.urlopen(request,timeout=30) as response: return json.load(response)
             def crash_and_restart():
                 nonlocal process
+                began = time.monotonic()
                 process.kill()
                 process.wait(timeout=30)
                 process = subprocess.Popen(controller_args,stdout=log,stderr=log)
                 wait("controller journal recovery",lambda:control_get("health"),900)
+                report.setdefault("controller_recovery_seconds", []).append(round(time.monotonic()-began,3))
             def lifecycle(uid, operation=None, generation=None):
                 path = f"http://127.0.0.1:{control_port}/v1/pods/{uid}"
                 data = None
@@ -207,6 +209,84 @@ def qualify(args):
             report["checks"]["image_entrypoint_cmd_and_environment_defaults"] = True
             kubectl("delete","pod","image-default","--wait=true",timeout=90)
             wait("image-default fixture releases RAM",lambda:control_get("health")["activeMemoryMiB"]==0)
+            sized = pod("resource-profile", "exec sleep 600")
+            sized["spec"]["containers"][0]["resources"] = {
+                "requests":{"cpu":"1500m","memory":"769Mi"}, "limits":{"cpu":"2","memory":"1025Mi"}}
+            apply(sized)
+            sized_pod = wait("larger resource profile ready",lambda:ready("resource-profile"),300)
+            sized_uid = sized_pod["metadata"]["uid"]
+            sized_state = lifecycle(sized_uid)
+            assert sized_state["vcpus"] == 2 and sized_state["memoryMiB"] == 1282
+            assert control_get("health")["activeMemoryMiB"] == 1282
+            limits = kubectl("exec","resource-profile","--","sh","-ec",
+                'group=$(awk -F: \'$1 == "0" {print $3}\' /proc/self/cgroup); '
+                'test "$group" = /; root=/sys/fs/cgroup; '
+                'cat "$root/cpu.max" "$root/memory.max"; '
+                'if output=$(echo max >"$root/memory.max" 2>&1); then exit 1; fi; '
+                'test "$(awk \'/^processor/ {n++} END {print n}\' /proc/cpuinfo)" = 2; '
+                'test "$(awk \'/MemTotal/ {print $2}\' /proc/meminfo)" -gt 1049600')
+            assert limits.splitlines() == ["200000 100000", str(1025*1024*1024)], limits
+            lifecycle(sized_uid,"hibernate",sized_state["generation"])
+            assert control_get("health")["activeMemoryMiB"] == 0
+            crash_and_restart()
+            sized_state = lifecycle(sized_uid)
+            assert sized_state["memoryMiB"] == 1282 and sized_state["state"] == "SLEEPING"
+            lifecycle(sized_uid,"resume",sized_state["generation"])
+            wait("larger guest resumes",lambda:ready("resource-profile"),120)
+            assert control_get("health")["activeMemoryMiB"] == 1282
+            report["checks"]["variable_guest_cpu_memory_limits_and_recovered_admission"] = True
+            kubectl("delete","pod","resource-profile","--wait=true",timeout=90)
+            wait("resource profile releases RAM",lambda:control_get("health")["activeMemoryMiB"]==0)
+            for name, script, expected_oom in [
+                ("limit-oom", "sleep 2; exec awk 'BEGIN { value=\"x\"; while (1) value=value value }'", True),
+                ("ordinary-sigkill", "exec sleep 600", False),
+            ]:
+                value = pod(name,script)
+                value["spec"]["containers"][0]["resources"] = {"limits":{"memory":"32Mi", "cpu":"500m"}}
+                apply(value)
+                if not expected_oom:
+                    running = wait("SIGKILL fixture ready",lambda:ready(name),300)
+                    vm = lifecycle(running["metadata"]["uid"])["vm"]
+                    command(args.msb,"exec","--no-stdin",vm,"--","ctr","--address","/run/containerd/containerd.sock",
+                            "tasks","kill","--signal","SIGKILL","application",env=environment)
+                def terminal_status():
+                    current = resource("pod",name)
+                    statuses = current.get("status",{}).get("containerStatuses",[])
+                    return statuses[0]["state"].get("terminated") if statuses else None
+                status = wait(name+" terminated",terminal_status,300)
+                assert status["exitCode"] == 137, status
+                assert (status.get("reason")=="OOMKilled") == expected_oom, status
+                uid = resource("pod",name)["metadata"]["uid"]
+                crash_and_restart()
+                recorded = json.loads((temporary/"state"/(uid+".json")).read_text())
+                assert recorded["pod"]["status"]["containerStatuses"][0]["state"]["terminated"] == status
+                assert lifecycle(uid)["state"] == "TERMINATED"
+                kubectl("delete","pod",name,"--wait=true",timeout=90)
+                wait(name+" releases RAM",lambda:control_get("health")["activeMemoryMiB"]==0)
+            report["checks"]["kernel_oom_attribution_distinguishes_sigkill"] = True
+            apply(pod("lost-exit-status", "exec sleep 600"))
+            lost_exit = wait("exit-publication fixture ready",lambda:ready("lost-exit-status"),300)
+            lost_uid = lost_exit["metadata"]["uid"]
+            lost_vm = lifecycle(lost_uid)["vm"]
+            command(args.msb,"exec","--no-stdin",lost_vm,"--","sh","-ec",
+                    "mkdir /tmp/application.exit.pending; ctr --address /run/containerd/containerd.sock tasks kill --signal SIGKILL application",
+                    env=environment)
+            wait("missing exit status withdraws readiness",lambda:not any(
+                condition.get("type")=="Ready" and condition.get("status")=="True"
+                for condition in resource("pod","lost-exit-status").get("status",{}).get("conditions",[])),30)
+            def missing_task_failed():
+                current = resource("pod","lost-exit-status")
+                return current if current.get("status",{}).get("phase")=="Failed" else None
+            lost_exit = wait("missing exit status fails within bounded grace",missing_task_failed,60)
+            assert lost_exit["status"]["reason"] == "NativeRuntimeFailed", lost_exit["status"]
+            assert lifecycle(lost_uid)["state"] == "FAILED"
+            crash_and_restart()
+            lost_exit = wait("failed missing-task status survives recovery",missing_task_failed,60)
+            assert lost_exit["status"]["reason"] == "NativeRuntimeFailed", lost_exit["status"]
+            assert lifecycle(lost_uid)["state"] == "FAILED"
+            kubectl("delete","pod","lost-exit-status","--wait=true",timeout=90)
+            wait("missing-task fixture releases RAM",lambda:control_get("health")["activeMemoryMiB"]==0)
+            report["checks"]["failed_exit_publication_cannot_leave_pod_ready"] = True
             volume_binary = b"\x00\xffnative-volume\x00\r\n"
             def volume_sources(version, old_key=False):
                 data = {"setting":version,"paired":version}
@@ -352,7 +432,7 @@ def qualify(args):
             server["spec"]["restartPolicy"] = "Always"
             server["spec"]["containers"][0]["envFrom"] = [{"configMapRef":{"name":"native-settings"}},{"secretRef":{"name":"native-secrets"}}]
             command_args = server["spec"]["containers"][0]["command"]
-            command_args[2] = 'test "$1" = configured; test "$2" = \'$(SETTING)\'; test "$3" = \'$(UNDEFINED)\'; ' + command_args[2]
+            command_args[2] = 'test "$1" = configured; test "$2" = \'$$(SETTING)\'; test "$3" = \'$(UNDEFINED)\'; ' + command_args[2]
             server["spec"]["containers"][0]["args"] = ["expansion-check", "$(SETTING)", "$$(SETTING)", "$(UNDEFINED)"]
             apply({"apiVersion":"v1","kind":"ConfigMap","metadata":{"name":"native-settings"},"data":{"SETTING":"configured"}})
             apply({"apiVersion":"v1","kind":"Secret","metadata":{"name":"native-secrets"},"stringData":{"SECRET_SETTING":"private-value"}})
