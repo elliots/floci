@@ -126,7 +126,7 @@ func TestSnapshotDeletionIsIdempotentAndRejectsReplacement(t *testing.T) {
 			if err := os.WriteFile(script, []byte("#!/bin/sh\nif [ \"$1 $2\" != 'snap ls' ]; then exit 77; fi\nprintf '%s' "+quote(string(data))+"\n"), 0700); err != nil {
 				t.Fatal(err)
 			}
-			p := &provider{runner: commandRunner{cfg: config{state: directory, msb: script}}}
+			p := &provider{runner: testCommandRunner(config{state: directory, msb: script})}
 			err := p.deleteSnapshot(t.Context(), &podEntry{snapshotIDs: map[string]string{"owned:sleep": "original"}}, "owned:sleep")
 			if (err != nil) != (currentID != "") {
 				t.Fatalf("unexpected deletion result: %v", err)

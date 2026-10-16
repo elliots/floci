@@ -1,7 +1,6 @@
 package main
 
 import (
-	"bytes"
 	"context"
 	"crypto/sha256"
 	"encoding/json"
@@ -37,7 +36,10 @@ type config struct {
 	listen, nodeIP, cert, key, ca                           string
 }
 
-type commandRunner struct{ cfg config }
+type commandRunner struct {
+	cfg     config
+	runtime nativeRuntime
+}
 
 var nativeMutations sync.Mutex
 
@@ -82,16 +84,17 @@ func (r commandRunner) vm(ctx context.Context, args ...string) (string, error) {
 		if err := syncDirectory(r.cfg.state); err != nil {
 			return "", err
 		}
-		output, err := r.run(ctx, r.cfg.msb, args...)
+		output, err := r.nativeOutput(ctx, args, nil)
 		if err != nil {
 			return "", err
 		}
 		if err := os.Remove(marker); err != nil {
 			return "", err
 		}
-		return output, syncDirectory(r.cfg.state)
+		return strings.TrimSpace(string(output)), syncDirectory(r.cfg.state)
 	}
-	return r.run(ctx, r.cfg.msb, args...)
+	output, err := r.nativeOutput(ctx, args, nil)
+	return strings.TrimSpace(string(output)), err
 }
 
 func nativeMutation(args []string) bool {
@@ -133,9 +136,7 @@ func (r commandRunner) guest(ctx context.Context, name, script string) (string, 
 }
 
 func (r commandRunner) guestInput(ctx context.Context, name, script string, input []byte) error {
-	cmd := r.command(ctx, r.cfg.msb, "exec", "--stream", name, "--", "sh", "-ec", script)
-	cmd.Stdin = bytes.NewReader(input)
-	if err := cmd.Run(); err != nil {
+	if _, err := r.nativeOutput(ctx, []string{"exec", "--stream", name, "--", "sh", "-ec", script}, input); err != nil {
 		return fmt.Errorf("write guest volume data: %w", err)
 	}
 	return nil

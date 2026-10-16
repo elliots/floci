@@ -340,6 +340,7 @@ func inactiveMemoryFixture(t *testing.T, runtimeStatus string) (*provider, *podE
 	}
 	p := admissionProvider(2048)
 	p.runner.cfg.state, p.runner.cfg.msb, p.runner.cfg.peerOwner = directory, binary, "memory-fixture"
+	p.runner = testCommandRunner(p.runner.cfg)
 	p.activeMemoryMiB = 2048 // The other 768 MiB belong to an unrelated guest.
 	return p, entry, binary
 }

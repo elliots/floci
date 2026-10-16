@@ -89,7 +89,7 @@ func recoveryStatusFixture(t *testing.T, record journalRecord, runtimeStatus str
 	p := &provider{
 		ctx: t.Context(), client: fake.NewClientset(current), pods: make(map[string]*podEntry),
 		network: &network{prefix: netip.MustParsePrefix("10.42.200.0/24")},
-		runner:  commandRunner{cfg: config{state: directory, msb: binary, nodeName: current.Spec.NodeName, peerOwner: "recovery-fixture", maxActiveMemoryMiB: 2048}},
+		runner:  testCommandRunner(config{state: directory, msb: binary, nodeName: current.Spec.NodeName, peerOwner: "recovery-fixture", maxActiveMemoryMiB: 2048}),
 	}
 	t.Cleanup(func() {
 		for _, entry := range p.pods {

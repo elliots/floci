@@ -78,7 +78,7 @@ func probeFixture(t *testing.T) (*provider, *podEntry) {
 		t.Fatal(err)
 	}
 	e := &podEntry{pod: validPod(), state: "RUNNING", started: time.Now().Add(-time.Hour)}
-	p := &provider{runner: commandRunner{cfg: config{state: directory, msb: script}}}
+	p := &provider{runner: testCommandRunner(config{state: directory, msb: script})}
 	return p, e
 }
 

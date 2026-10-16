@@ -59,8 +59,7 @@ func (p *provider) initLogOutput(ctx context.Context, e *podEntry, index int) ([
 	script := fmt.Sprintf("tail -c %d %s", maxInitLogBytes, quote(initRoot(index)+"/application.log"))
 	// Logs are bytes, unlike command metadata. Preserve leading/trailing
 	// whitespace and do not merge guest errors into a successful log response.
-	command := p.runner.command(ctx, p.runner.cfg.msb, "exec", "--no-stdin", e.vm, "--", "sh", "-ec", script)
-	data, err := command.Output()
+	data, err := p.runner.nativeOutput(ctx, []string{"exec", "--no-stdin", e.vm, "--", "sh", "-ec", script}, nil)
 	if err != nil {
 		return nil, fmt.Errorf("read init container logs: %w", err)
 	}

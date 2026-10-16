@@ -99,7 +99,10 @@ func newProvider(ctx context.Context, cfg config, client kubernetes.Interface) (
 			stateLock.Close()
 		}
 	}()
-	runner := commandRunner{cfg: cfg}
+	runner, err := newCommandRunner(cfg)
+	if err != nil {
+		return nil, err
+	}
 	if err := runner.checkPending(); err != nil {
 		return nil, err
 	}
@@ -892,9 +895,7 @@ func (p *provider) RunInContainer(ctx context.Context, namespace, name, containe
 	}
 	command := []string{"exec", "--stream", e.vm, "--", "ctr", "--address", "/run/containerd/containerd.sock", "tasks", "exec", "--exec-id", "exec-" + strconv.FormatInt(time.Now().UnixNano(), 10), task}
 	command = append(command, args...)
-	cmd := p.runner.command(ctx, p.runner.cfg.msb, command...)
-	cmd.Stdin, cmd.Stdout, cmd.Stderr = attach.Stdin(), attach.Stdout(), attach.Stderr()
-	return cmd.Run()
+	return p.runner.nativeStream(ctx, command, attach.Stdin(), attach.Stdout(), attach.Stderr())
 }
 func (p *provider) AttachToContainer(context.Context, string, string, string, api.AttachIO) error {
 	return errdefs.InvalidInput("attach is not qualified")

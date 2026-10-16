@@ -90,7 +90,7 @@ func TestProbeThresholdDoesNotReuseProjectedReadiness(t *testing.T) {
 	if err := os.WriteFile(script, []byte("#!/bin/sh\nexit 1\n"), 0700); err != nil {
 		t.Fatal(err)
 	}
-	p := &provider{runner: commandRunner{cfg: config{msb: script}}}
+	p := &provider{runner: testCommandRunner(config{msb: script})}
 	p.projectProxyAvailability(entry)
 	if p.probe(t.Context(), entry) || entry.readiness.failures != 1 {
 		t.Fatal("readiness hysteresis treated proxy availability as a successful app probe")
