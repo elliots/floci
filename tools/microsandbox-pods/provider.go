@@ -81,6 +81,9 @@ type podEntry struct {
 	readiness, startup, liveness                     probeProgress
 	startupComplete                                  bool
 	probeFailure                                     string
+	volumeDigests                                    map[string][32]byte
+	volumesChecked                                   time.Time
+	initialVolumes                                   map[string]map[string]volumeFile
 }
 
 func newProvider(ctx context.Context, cfg config, client kubernetes.Interface) (*provider, error) {
@@ -137,9 +140,9 @@ func validatePod(pod *corev1.Pod) error {
 		return errdefs.InvalidInput("qualification supports exactly one regular container and no init or ephemeral containers")
 	}
 
-	if spec.HostNetwork || spec.HostPID || spec.HostIPC || len(spec.Volumes) != 0 || len(spec.ImagePullSecrets) != 0 ||
+	if spec.HostNetwork || spec.HostPID || spec.HostIPC || len(spec.ImagePullSecrets) != 0 ||
 		spec.ShareProcessNamespace != nil || spec.SecurityContext != nil && !reflect.DeepEqual(*spec.SecurityContext, corev1.PodSecurityContext{}) {
-		return errdefs.InvalidInput("host namespaces, volumes, image pull credentials and security contexts are not qualified")
+		return errdefs.InvalidInput("host namespaces, image pull credentials and security contexts are not qualified")
 	}
 	if spec.DNSPolicy != corev1.DNSClusterFirst || spec.DNSConfig != nil {
 		return errdefs.InvalidInput("qualification supports ClusterFirst DNS without overrides")
@@ -155,8 +158,11 @@ func validatePod(pod *corev1.Pod) error {
 		return errdefs.InvalidInput("pod requests exceed the fixed one-vCPU, 768 MiB guest")
 	}
 	if len(container.Command) == 0 || container.SecurityContext != nil || container.RestartPolicy != nil || len(container.RestartPolicyRules) != 0 ||
-		len(container.VolumeMounts) != 0 || len(container.VolumeDevices) != 0 || len(container.Resources.Limits) != 0 || container.Lifecycle != nil || container.Stdin || container.TTY {
-		return errdefs.InvalidInput("explicit command required; container restart overrides, security contexts, mounts, limits, hooks and TTY are not qualified")
+		len(container.VolumeDevices) != 0 || len(container.Resources.Limits) != 0 || container.Lifecycle != nil || container.Stdin || container.TTY {
+		return errdefs.InvalidInput("explicit command required; container restart overrides, security contexts, volume devices, limits, hooks and TTY are not qualified")
+	}
+	if err := validateVolumes(pod); err != nil {
+		return errdefs.InvalidInput(err.Error())
 	}
 	if err := validateProbes(container); err != nil {
 		return errdefs.InvalidInput(err.Error())
@@ -244,7 +250,7 @@ func (p *provider) CreatePod(ctx context.Context, pod *corev1.Pod) error {
 		}
 	}
 	lifetime, cancel := context.WithCancel(p.ctx)
-	e := &podEntry{wake: make(chan struct{}, 1), snapshotIDs: make(map[string]string), lifetime: lifetime, state: "STARTING", httpPort: httpPort, appPort: int(appPort), pod: pod.DeepCopy(), vm: "fvp-" + uid[:20], link: "pv" + uid[:10], ip: p.network.address(slot), slot: slot, port: port, cancel: cancel, done: make(chan struct{})}
+	e := &podEntry{wake: make(chan struct{}, 1), snapshotIDs: make(map[string]string), lifetime: lifetime, state: "WAITINGVOLUMES", httpPort: httpPort, appPort: int(appPort), pod: pod.DeepCopy(), vm: "fvp-" + uid[:20], link: "pv" + uid[:10], ip: p.network.address(slot), slot: slot, port: port, cancel: cancel, done: make(chan struct{})}
 	e.declaredSpec = declared.Spec.DeepCopy()
 	e.pod.Status = corev1.PodStatus{Phase: corev1.PodPending, Reason: "NativeVMStarting", StartTime: new(metav1.Now()),
 		ContainerStatuses: []corev1.ContainerStatus{{Name: pod.Spec.Containers[0].Name, Image: pod.Spec.Containers[0].Image,
@@ -276,11 +282,11 @@ func (p *provider) CreatePod(ctx context.Context, pod *corev1.Pod) error {
 		e.state = "COLD"
 		e.pod.Status.Reason = "NativeVMCold"
 		e.pod.Status.ContainerStatuses[0].State.Waiting.Reason = "NativeVMCold"
-		if err := p.journal(e); err != nil {
-			cancel()
-			p.mu.Unlock()
-			return err
-		}
+	}
+	if err := p.journal(e); err != nil {
+		cancel()
+		p.mu.Unlock()
+		return err
 	}
 	p.pods[key] = e
 	p.mu.Unlock()
@@ -302,29 +308,12 @@ func (p *provider) CreatePod(ctx context.Context, pod *corev1.Pod) error {
 			p.monitor(lifetime, e)
 			return
 		}
-		startup, stop := boundedContext(lifetime)
-		e.op.Lock()
-		err := p.start(startup, e)
-		if err != nil && lifetime.Err() == nil {
-			p.fail(e, err)
-		}
-		e.op.Unlock()
-		stop()
-		if err != nil {
+		if err := p.startStrictPod(e); err != nil {
 			return
 		}
 		p.monitor(lifetime, e)
 	})
 	return nil
-}
-
-func (p *provider) start(ctx context.Context, e *podEntry) error {
-	release, err := p.acquireStart(ctx, e)
-	if err != nil {
-		return err
-	}
-	defer release()
-	return p.startAdmitted(ctx, e)
 }
 
 func (p *provider) startAdmitted(ctx context.Context, e *podEntry) error {
@@ -391,10 +380,14 @@ func (p *provider) startApplication(ctx context.Context, e *podEntry) error {
 	if err := p.ensureApplicationImage(ctx, e, container); err != nil {
 		return err
 	}
+	if err := p.prepareVolumes(ctx, e); err != nil {
+		return err
+	}
 	if _, err := p.runner.guest(ctx, e.vm, "cp /etc/pod-resolv.conf /etc/resolv.conf"); err != nil {
 		return fmt.Errorf("configure application DNS: %w", err)
 	}
 	args := []string{"ctr", "--address", "/run/containerd/containerd.sock", "run", "--rm", "--net-host", "--mount", "type=bind,src=/etc/pod-resolv.conf,dst=/etc/resolv.conf,options=rbind:ro"}
+	args = append(args, volumeMountArgs(e.pod)...)
 	if container.WorkingDir != "" {
 		args = append(args, "--cwd", container.WorkingDir)
 	}
@@ -474,6 +467,11 @@ func (p *provider) monitor(ctx context.Context, e *podEntry) {
 			return
 		}
 		if strings.Contains(output, "RUNNING") {
+			if time.Since(e.volumesChecked) >= volumeRefreshInterval {
+				check, cancel := context.WithTimeout(ctx, 15*time.Second)
+				_ = p.refreshVolumes(check, e, false)
+				cancel()
+			}
 			failed, reason, err := p.healthChecks(ctx, e)
 			if err == nil && reason != "" {
 				err = p.stopUnhealthy(ctx, e, failed, reason)
@@ -496,7 +494,7 @@ func (p *provider) monitor(ctx context.Context, e *podEntry) {
 				e.state = "READY"
 			}
 			e.mu.Lock()
-			e.pod.Status.Phase, e.pod.Status.Reason, e.pod.Status.PodIP = corev1.PodRunning, "", e.ip
+			e.pod.Status.Phase, e.pod.Status.Reason, e.pod.Status.Message, e.pod.Status.PodIP = corev1.PodRunning, "", "", e.ip
 			e.pod.Status.PodIPs = []corev1.PodIP{{IP: e.ip}}
 			e.pod.Status.HostIP = p.runner.cfg.nodeIP
 			status := &e.pod.Status.ContainerStatuses[0]

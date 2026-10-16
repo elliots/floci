@@ -331,6 +331,12 @@ func (p *provider) resume(ctx context.Context, e *podEntry) error {
 		if err := p.checkCurrentPod(ctx, e); err != nil {
 			return err
 		}
+		projections, err := p.readVolumeSources(ctx, e)
+		if err != nil {
+			return err
+		}
+		e.initialVolumes = projections
+		defer func() { e.initialVolumes = nil }()
 		release, err := p.acquireStart(ctx, e)
 		if err != nil {
 			return err
@@ -418,6 +424,10 @@ func (p *provider) resume(ctx context.Context, e *podEntry) error {
 			return p.transitionFailed(e, err)
 		}
 	}
+	// The snapshot already contains the previous projection. Fetch current
+	// sources before admitting wake traffic, retaining that data on API errors.
+	e.volumeDigests = nil
+	_ = p.refreshVolumes(ctx, e, false)
 	e.state = "RUNNING"
 	resetProbeProgress(e)
 	if err := p.journal(e); err != nil {

@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """Run isolated real Kubernetes-to-native-pod qualification and remove owned resources."""
 import argparse
+import base64
 import json
 import ipaddress
 import os
@@ -190,6 +191,45 @@ def qualify(args):
                 kubectl("delete","pod","-l","qualification=cold","--wait=true",timeout=600)
                 wait("cold fixture releases RAM",lambda:control_get("health")["activeMemoryMiB"]==0)
             server_script = 'mkdir -p /www/cgi-bin; cat >/www/cgi-bin/source <<\'CGI\'\n#!/bin/sh\nprintf \'Content-Type: text/plain\\r\\n\\r\\n\'\nprintf \'%s\\n\' "$REMOTE_ADDR"\nCGI\nchmod +x /www/cgi-bin/source; echo native-pod-executed; exec httpd -f -p 8080 -h /www'
+            volume_binary = b"\x00\xffnative-volume\x00\r\n"
+            def volume_sources(version, old_key=False):
+                data = {"setting":version,"paired":version}
+                if old_key:
+                    data["removed"] = "remove-on-update"
+                apply({"apiVersion":"v1","kind":"ConfigMap","metadata":{"name":"native-volume-settings"},
+                       "data":data,"binaryData":{"binary":base64.b64encode(volume_binary).decode()}})
+                apply({"apiVersion":"v1","kind":"Secret","metadata":{"name":"native-volume-secrets"},
+                       "data":{"token":base64.b64encode(("private-"+version).encode()).decode(),
+                               "binary":base64.b64encode(volume_binary).decode()}})
+            volume_sources("initial", old_key=True)
+            apply({"apiVersion":"v1","kind":"Secret","metadata":{"name":"native-volume-optional"},
+                   "stringData":{"unselected":"the optional requested key is absent"}})
+            def with_volumes(value):
+                value["spec"]["volumes"] = [
+                    {"name":"disk-cache","emptyDir":{}},
+                    {"name":"memory-cache","emptyDir":{"medium":"Memory","sizeLimit":"16Mi"}},
+                    {"name":"settings","configMap":{"name":"native-volume-settings","defaultMode":0o440,
+                        "items":[{"key":"setting","path":"nested/value"},{"key":"binary","path":"binary","mode":0o400}]}},
+                    {"name":"settings-all","configMap":{"name":"native-volume-settings"}},
+                    {"name":"secrets","secret":{"secretName":"native-volume-secrets","defaultMode":0o400,
+                        "items":[{"key":"token","path":"nested/token"},{"key":"binary","path":"binary"}]}},
+                    {"name":"optional-settings","configMap":{"name":"native-volume-optional","optional":True}},
+                    {"name":"optional-secrets","secret":{"secretName":"native-volume-optional","optional":True,
+                        "items":[{"key":"absent","path":"absent"}]}},
+                ]
+                value["spec"]["containers"][0]["volumeMounts"] = [
+                    {"name":name,"mountPath":path} for name,path in (
+                        ("disk-cache","/work/disk"),("memory-cache","/work/memory"),
+                        ("settings","/mounted/settings"),("settings-all","/mounted/all"),
+                        ("secrets","/mounted/secrets"),("optional-settings","/mounted/optional-settings"),
+                        ("optional-secrets","/mounted/optional-secrets"))]
+                return value
+            def volume_version(version):
+                return kubectl("exec","native-server","--","sh","-ec",
+                    'printf "%s/%s" "$(cat /mounted/settings/nested/value)" "$(cat /mounted/secrets/nested/token)"') == version+"/private-"+version
+            def volume_markers():
+                return kubectl("exec","native-server","--","sh","-ec",
+                    'printf "%s/%s" "$(cat /work/disk/marker)" "$(cat /work/memory/marker)"') == "disk-"+owner+"/memory-"+owner
             if args.proxy_pods:
                 if not args.network_relay_binary or not 1 <= args.proxy_pods <= 500:
                     raise ValueError("proxy-pods requires 1..500 and network-relay-binary")
@@ -199,6 +239,9 @@ def qualify(args):
                 lazy["spec"]["containers"][0]["readinessProbe"]={"httpGet":{"path":"/cgi-bin/source","port":"http"},"periodSeconds":1,"timeoutSeconds":5,"failureThreshold":1}
                 lazy["spec"]["containers"][0]["startupProbe"]={"tcpSocket":{"port":"http"},"periodSeconds":1,"timeoutSeconds":5,"failureThreshold":30}
                 lazy["spec"]["containers"][0]["livenessProbe"]={"httpGet":{"path":"/cgi-bin/source","port":"http"},"periodSeconds":1,"timeoutSeconds":5,"failureThreshold":3}
+                lazy["spec"]["volumes"]=[{"name":"cold-settings","configMap":{"name":"native-cold-settings"}}]
+                lazy["spec"]["containers"][0]["volumeMounts"]=[{"name":"cold-settings","mountPath":"/www/settings"}]
+                apply({"apiVersion":"v1","kind":"ConfigMap","metadata":{"name":"native-cold-settings"},"data":{"version":"before-cold"}})
                 lazy_annotations={"microsandbox.dev/availability":"proxy","microsandbox.dev/idle-timeout-seconds":"20"}
                 registration_started=time.monotonic()
                 apply({"apiVersion":"apps/v1","kind":"Deployment","metadata":{"name":"lazy-probe"},"spec":{
@@ -212,6 +255,7 @@ def qualify(args):
                 assert control_get("health")["activeMemoryMiB"]==0
                 lazy_vms={p["vm"] for p in discovery["pods"]}
                 assert not any(v["name"] in lazy_vms for v in json.loads(command(args.msb,"ls","--format","json",env=environment)))
+                apply({"apiVersion":"v1","kind":"ConfigMap","metadata":{"name":"native-cold-settings"},"data":{"version":"after-cold"}})
                 relay_rss=docker("exec",peer,"sh","-ec",r'for probe_pid in $(pidof relay); do awk "/VmRSS/ {print \$2}" /proc/$probe_pid/status; done')
                 report["proxy_declaration"]={"fixture_replicas":args.proxy_pods,"pods":args.proxy_pods,"ready":args.proxy_pods,"registration_seconds":round(time.monotonic()-registration_started,3),"active_memory_mib":0,"native_vms":0,"controller_rss_bytes":int(command("ps","-o","rss=","-p",str(process.pid)))*1024,"relay_rss_bytes":sum(int(value) for value in relay_rss.split())*1024}
                 report["proxy_declaration"]["combined_controller_relay_rss_bytes"]=report["proxy_declaration"]["controller_rss_bytes"]+report["proxy_declaration"]["relay_rss_bytes"]
@@ -237,6 +281,8 @@ def qualify(args):
                 began=time.monotonic()
                 response=kubectl("exec","proxy-docker","--","wget","-T","180","-qO-","http://lazy-probe/cgi-bin/source",timeout=210)
                 assert response
+                assert kubectl("exec","proxy-docker","--","wget","-T","30","-qO-","http://lazy-probe/settings/version")=="after-cold"
+                report["checks"]["cold_volume_reads_latest_config_on_first_wake"]=True
                 report["proxy_declaration"]["first_service_wake_seconds"]=round(time.monotonic()-began,3)
                 assert lifecycle(proxy_uid)["state"]=="READY"
                 assert sum(p["state"]=="COLD" for p in control_get("deployments/default/lazy-probe")["pods"])==args.proxy_pods-1
@@ -274,7 +320,7 @@ def qualify(args):
                 kubectl("delete","deployment","lazy-probe","--wait=true",timeout=900)
                 kubectl("delete","pod","proxy-native","proxy-docker","--wait=true",timeout=120)
                 wait("proxy fixture releases RAM",lambda:control_get("health")["activeMemoryMiB"]==0,180)
-            server = pod("native-server", "mkdir -p /www; httpd -p 9090 -h /www; " + server_script)
+            server = with_volumes(pod("native-server", "mkdir -p /www; httpd -p 9090 -h /www; " + server_script))
             server["spec"]["containers"][0]["ports"] = [{"containerPort":8080}]
             server["spec"]["containers"][0]["readinessProbe"] = {"httpGet":{"path":"/ready","port":9090},"periodSeconds":1,"timeoutSeconds":5,"failureThreshold":1}
             server["spec"]["containers"][0]["startupProbe"] = {"exec":{"command":["test","-f","/tmp/started"]},"periodSeconds":1,"timeoutSeconds":5,"failureThreshold":120}
@@ -283,10 +329,30 @@ def qualify(args):
             server["spec"]["containers"][0]["envFrom"] = [{"configMapRef":{"name":"native-settings"}},{"secretRef":{"name":"native-secrets"}}]
             apply({"apiVersion":"v1","kind":"ConfigMap","metadata":{"name":"native-settings"},"data":{"SETTING":"configured"}})
             apply({"apiVersion":"v1","kind":"Secret","metadata":{"name":"native-secrets"},"stringData":{"SECRET_SETTING":"private-value"}})
+            kubectl("delete","configmap","native-volume-settings","--wait=true")
             apply({"apiVersion":"apps/v1","kind":"Deployment","metadata":{"name":"native-server"},"spec":{
                 "replicas":1,"selector":{"matchLabels":{"app":"native-server"}},"template":{"metadata":{"labels":{"app":"native-server"}},"spec":server["spec"]}}})
             server_name = wait("Deployment pod scheduled",lambda:next((pod["metadata"]["name"] for pod in json.loads(kubectl("get","pods","-l","app=native-server","-o","json"))["items"]),None))
+            def waiting_for_volume():
+                current = resource("pod","native-server")
+                status = current.get("status",{})
+                return current if status.get("phase")=="Pending" and status.get("reason")=="FailedMount" else None
+            pending = wait("missing required volume keeps pod Pending",waiting_for_volume)
+            pending_uid = pending["metadata"]["uid"]
+            pending_state = lifecycle(pending_uid)
+            assert pending_state["state"] == "WAITINGVOLUMES"
+            assert control_get("health")["activeMemoryMiB"] == 0
+            assert not any(vm["name"]==pending_state["vm"] for vm in json.loads(command(args.msb,"ls","--format","json",env=environment)))
+            crash_and_restart()
+            recovered_pending = wait("missing volume remains Pending after controller recovery",waiting_for_volume)
+            assert recovered_pending["metadata"]["uid"] == pending_uid
+            assert lifecycle(pending_uid)["state"] == "WAITINGVOLUMES"
+            assert control_get("health")["activeMemoryMiB"] == 0
+            assert not any(vm["name"]==pending_state["vm"] for vm in json.loads(command(args.msb,"ls","--format","json",env=environment)))
+            volume_sources("initial", old_key=True)
             wait("native task Running", lambda: resource("pod","native-server").get("status",{}).get("phase") == "Running", 300)
+            assert resource("pod","native-server")["metadata"]["uid"] == pending_uid
+            report["checks"]["missing_volume_waits_without_allocation_and_recovers"] = True
             assert not ready("native-server"), "startup must gate readiness"
             time.sleep(4)
             status=resource("pod","native-server")["status"]["containerStatuses"][0]
@@ -305,6 +371,35 @@ def qualify(args):
             report["checks"]["native_oci_logs_exec"] = True
             assert kubectl("exec","native-server","--","sh","-ec",'printf "%s/%s" "$SETTING" "$SECRET_SETTING"') == "configured/private-value"
             report["checks"]["configmap_secret_environment"] = True
+            assert volume_version("initial")
+            for mount_path in ("/mounted/settings/binary","/mounted/secrets/binary"):
+                actual = kubectl("exec","native-server","--","sh","-ec",f"od -An -tx1 {mount_path} | tr -d ' \\n'")
+                assert actual == volume_binary.hex(), f"binary projection changed at {mount_path}"
+            kubectl("exec","native-server","--","sh","-ec",'''
+                test "$(stat -Lc %a /mounted/settings/nested/value)" = 440
+                test "$(stat -Lc %a /mounted/settings/binary)" = 400
+                test "$(stat -Lc %a /mounted/secrets/nested/token)" = 400
+                test "$(stat -f -c %T /work/memory)" = tmpfs
+                test ! -e /work/disk/marker
+                test ! -e /work/memory/marker
+                test -d /mounted/optional-settings
+                test ! -e /mounted/optional-settings/appeared
+                test ! -e /mounted/optional-secrets/absent
+                if (printf changed >/mounted/settings/nested/value) 2>/dev/null; then exit 1; fi
+                if (printf changed >/mounted/secrets/nested/token) 2>/dev/null; then exit 1; fi
+            ''')
+            memory_capacity = kubectl("exec","native-server","--","df","-Pk","/work/memory").splitlines()[-1].split()[1]
+            assert int(memory_capacity) == 16*1024, f"memory emptyDir limit changed: {memory_capacity} KiB"
+            kubectl("exec","native-server","--","sh","-ec",
+                    f"printf '%s' 'disk-{owner}' >/work/disk/marker; printf '%s' 'memory-{owner}' >/work/memory/marker")
+            report["checks"]["volume_binary_modes_readonly_optional_and_memory_limit"] = True
+            volume_sources("awake")
+            apply({"apiVersion":"v1","kind":"ConfigMap","metadata":{"name":"native-volume-optional"},"data":{"appeared":"now-present"}})
+            wait("mounted ConfigMap and Secret refresh while awake",lambda:volume_version("awake"),120)
+            wait("optional missing ConfigMap appears",lambda:kubectl("exec","native-server","--","cat","/mounted/optional-settings/appeared")=="now-present",120)
+            wait("removed ConfigMap key disappears",lambda:kubectl("exec","native-server","--","sh","-ec",
+                 'test ! -e /mounted/all/removed; printf removed')=="removed",120)
+            report["checks"]["awake_volume_updates_and_removed_keys"] = True
             apply({"apiVersion":"v1","kind":"Service","metadata":{"name":"native-server"},"spec":{
                 "selector":{"app":"native-server"},"ports":[{"port":80,"targetPort":8080}]}})
             apply(pod("docker-client", "exec sleep 600", False))
@@ -330,6 +425,7 @@ def qualify(args):
                 began = time.monotonic()
                 state = lifecycle(uid,"hibernate",state["generation"])
                 assert state["state"] == "SLEEPING"
+                volume_sources(f"sleep-{cycle}")
                 hibernate_time = time.monotonic()-began
                 health = control_get("health")
                 snapshot = next(s for s in json.loads(command(args.msb,"snap","ls","--format","json",env=environment)) if s["group"]+":"+s["name"]==state["snapshot"])
@@ -348,6 +444,8 @@ def qualify(args):
                 assert resource("pod","native-server")["metadata"]["uid"] == uid
                 assert kubectl("exec","native-server","--","cat","/dev/shm/marker") == marker
                 assert kubectl("exec","native-server","--","cat","/proc/sys/kernel/random/boot_id") == initial_boot
+                assert volume_markers(), "emptyDir data changed across RAM resume"
+                assert volume_version(f"sleep-{cycle}"), "mounted sources were not refreshed on resume"
                 response = kubectl("exec","docker-client","--","wget","-T","10","-qO-",f"http://{native_ip}:8080/cgi-bin/source")
                 assert source_ip(response) == client["status"]["podIP"]
                 with urllib.request.urlopen(state["backendUrl"]+"/cgi-bin/source",timeout=10) as response:
@@ -361,6 +459,7 @@ def qualify(args):
                     report["checks"]["restored_controller_crash_recovery"] = True
             report["checks"]["two_ram_preserving_resumes_and_live_node_lease"] = True
             report["checks"]["startup_success_retained_across_sleep_and_controller_recovery"] = True
+            report["checks"]["emptydir_ram_sleep_and_source_refresh"] = True
             kubectl("exec","native-server","--","rm","/www/ready")
             wait("readiness removal", lambda: not ready("native-server"))
             report["checks"]["readiness_loss_observed"] = True
@@ -371,13 +470,20 @@ def qualify(args):
             assert resource("pod","native-server")["status"]["containerStatuses"][0]["lastState"]["terminated"]["reason"]=="LivenessProbeFailed"
             kubectl("exec","native-server","--","touch","/tmp/started","/tmp/live","/www/ready")
             wait("liveness replacement ready",lambda:ready("native-server"))
+            assert volume_markers(), "emptyDir data changed after liveness restart"
             report["checks"]["liveness_restarts_container_without_replacing_pod"] = True
+            kubectl("delete","secret","native-volume-secrets","--wait=true")
             command(args.msb,"exec","--no-stdin",lifecycle(uid)["vm"],"--","sh","-ec","printf 'nameserver 127.0.0.1\\n' >/etc/resolv.conf; ctr --address /run/containerd/containerd.sock tasks kill --signal SIGKILL application",env=environment)
             wait("Always restart observed",lambda:resource("pod","native-server")["status"]["containerStatuses"][0].get("restartCount",0)>=2)
             wait("restarted task running",lambda:resource("pod","native-server")["status"]["containerStatuses"][0].get("state",{}).get("running"))
             kubectl("exec","native-server","--","touch","/tmp/started","/tmp/live","/www/ready")
             wait("restarted application Ready",lambda:ready("native-server"))
             assert resource("pod","native-server")["metadata"]["uid"] == uid
+            assert volume_markers(), "emptyDir data changed after container crash"
+            assert volume_version("sleep-2")
+            report["checks"]["emptydir_preserved_across_container_restarts"] = True
+            report["checks"]["last_good_volume_survives_missing_source_and_restart"] = True
+            volume_sources("sleep-2")
             report["checks"]["deployment_always_restart_preserves_pod_uid"] = True
             report["checks"]["cached_image_restart_without_registry_dns"] = True
             request = urllib.request.Request(f"http://127.0.0.1:{control_port}/v1/deployments/default/native-server",headers={"Authorization":"Bearer "+token})
@@ -418,6 +524,9 @@ def qualify(args):
                     cwd=args.floci_checkout,env=java_env,stdout=log,stderr=log,timeout=900)
                 if completed.returncode: raise RuntimeError("Java native workload integration test failed; see controller log")
                 report["checks"]["java_on_demand_http_wake"] = True
+                cold_name = cold_deployment["pods"][0]["name"]
+                kubectl("exec",cold_name,"--","sh","-ec","test ! -e /work/disk/marker; test ! -e /work/memory/marker")
+                report["checks"]["new_pod_emptydir_starts_empty"] = True
                 kubectl("delete","deployment","native-cold","--wait=true",timeout=90)
             kubectl("delete","deployment","native-server","--wait=true",timeout=90)
             kubectl("delete","pod","native-client","--wait=true",timeout=90)

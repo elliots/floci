@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bytes"
 	"context"
 	"crypto/sha256"
 	"encoding/json"
@@ -126,6 +127,15 @@ func syncDirectory(path string) error {
 
 func (r commandRunner) guest(ctx context.Context, name, script string) (string, error) {
 	return r.vm(ctx, "exec", "--no-stdin", name, "--", "sh", "-ec", script)
+}
+
+func (r commandRunner) guestInput(ctx context.Context, name, script string, input []byte) error {
+	cmd := r.command(ctx, r.cfg.msb, "exec", "--stream", name, "--", "sh", "-ec", script)
+	cmd.Stdin = bytes.NewReader(input)
+	if err := cmd.Run(); err != nil {
+		return fmt.Errorf("write guest volume data: %w", err)
+	}
+	return nil
 }
 
 func (r commandRunner) peer(ctx context.Context, script string) (string, error) {

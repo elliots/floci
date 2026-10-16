@@ -13,6 +13,9 @@ func TestRecoveryNeverReplaysAnAbsentOrUncommittedSource(t *testing.T) {
 		want             string
 	}{
 		{"COLD", "", false, false, "COLD"},
+		{"WAITINGVOLUMES", "", false, false, "WAITINGVOLUMES"},
+		{"WAITINGVOLUMES", "Running", true, false, "FAILED"},
+		{"STARTING", "", false, false, "FAILED"},
 		{"COLD", "Running", true, false, "FAILED"},
 		{"SLEEPING", "", false, true, "FAILED"},
 		{"SLEEPING", "Stopped", true, true, "SLEEPING"},

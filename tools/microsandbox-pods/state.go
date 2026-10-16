@@ -195,6 +195,9 @@ func (p *provider) recover(ctx context.Context) error {
 		if e.state == "COLD" {
 			p.unavailable(e, "NativeVMCold")
 		}
+		if e.state == "WAITINGVOLUMES" {
+			p.unavailable(e, "WaitingForVolumes")
+		}
 		if err := p.journal(e); err != nil {
 			return err
 		}
@@ -217,7 +220,16 @@ func (p *provider) recover(ctx context.Context) error {
 		if err != nil {
 			return err
 		}
-		p.jobs.Go(func() { defer close(e.done); p.monitor(e.lifetime, e) })
+		waiting := e.state == "WAITINGVOLUMES"
+		p.jobs.Go(func() {
+			defer close(e.done)
+			if waiting {
+				if err := p.startStrictPod(e); err != nil {
+					return
+				}
+			}
+			p.monitor(e.lifetime, e)
+		})
 	}
 	return nil
 }
@@ -354,9 +366,9 @@ func (p *provider) deleteSnapshot(ctx context.Context, e *podEntry, selector str
 }
 
 func recoverAction(journalState, runtimeStatus string, exists, verified bool) string {
-	if journalState == "COLD" {
+	if journalState == "COLD" || journalState == "WAITINGVOLUMES" {
 		if !exists {
-			return "COLD"
+			return journalState
 		}
 		return "FAILED"
 	}
