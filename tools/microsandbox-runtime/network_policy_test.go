@@ -40,19 +40,19 @@ func TestNetworkBoundaryIntersectsCIDRsProtocolsAndPorts(t *testing.T) {
 	if policy.DefaultEgress != msb.PolicyActionDeny || policy.DefaultIngress != msb.PolicyActionDeny {
 		t.Fatal("defaults widened")
 	}
-	if len(policy.Rules) != 5 {
+	if len(policy.Rules) != 6 {
 		t.Fatalf("rules %#v", policy.Rules)
 	}
-	if !reflect.DeepEqual(policy.Rules[1], requested.Rules[0]) {
+	if !reflect.DeepEqual(policy.Rules[2], requested.Rules[0]) {
 		t.Fatal("ingress changed")
 	}
-	if policy.Rules[2].Action != msb.PolicyActionDeny {
+	if policy.Rules[3].Action != msb.PolicyActionDeny {
 		t.Fatal("deny precedence lost")
 	}
-	if rule := policy.Rules[3]; rule.Destination != "172.24.0.0/20" || rule.Port != "400-443" || rule.Protocol != msb.PolicyProtocolTCP {
+	if rule := policy.Rules[4]; rule.Destination != "172.24.0.0/20" || rule.Port != "400-443" || rule.Protocol != msb.PolicyProtocolTCP {
 		t.Fatalf("intersection %#v", rule)
 	}
-	if rule := policy.Rules[4]; rule.Destination != "host" || rule.Port != "31000" || rule.Protocol != msb.PolicyProtocolUDP {
+	if rule := policy.Rules[5]; rule.Destination != "host" || rule.Port != "31000" || rule.Protocol != msb.PolicyProtocolUDP {
 		t.Fatalf("host exception %#v", rule)
 	}
 	if !slices.Equal(policy.DNS.Nameservers, boundary.Nameservers) || policy.DNS.RebindProtection == nil || *policy.DNS.RebindProtection {
@@ -65,7 +65,7 @@ func TestNetworkBoundaryDefaultAllowStillHasOnlyExplicitLocalEgress(t *testing.T
 	if err != nil {
 		t.Fatal(err)
 	}
-	if policy.DefaultEgress != msb.PolicyActionDeny || len(policy.Rules) != 3 {
+	if policy.DefaultEgress != msb.PolicyActionDeny || len(policy.Rules) != 4 {
 		t.Fatalf("unsafe default policy %#v", policy)
 	}
 	for _, rule := range policy.Rules {
@@ -140,6 +140,10 @@ func TestBoundaryConfigurationRequiresExplicitLocalDestinationsAndDNS(t *testing
 		strings.Replace(good, "172.24.0.0/16", "0.0.0.0/0", 1),
 		strings.Replace(good, "172.24.0.0/16", "8.8.8.8/32", 1),
 		strings.Replace(good, "127.0.0.1:5300", "8.8.8.8:53", 1),
+		strings.Replace(good, "127.0.0.1:5300", "127.0.0.1:53", 1),
+		strings.Replace(good, "127.0.0.1:5300", "172.24.0.10:53", 1),
+		strings.Replace(good, "127.0.0.1:5300", "172.24.0.10:5353", 1),
+		strings.Replace(good, "127.0.0.1:5300", "[::1]:5300", 1),
 		strings.Replace(good, "ports: '443'", "ports: '0'", 1),
 		strings.Replace(good, "allowed-egress:", "allow-egress:", 1),
 		"network: {isolation: {enabled: true}}",

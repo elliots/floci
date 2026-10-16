@@ -105,7 +105,7 @@ func lockMutation(ctx context.Context, r command) (func(), error) {
 	}
 }
 
-func (b *sdkBackend) execute(ctx context.Context, r command, stdin io.Reader, stdout, stderr io.Writer) (int, error) {
+func (b *sdkBackend) execute(ctx context.Context, r command, stdin io.Reader, stdout, stderr io.Writer) (code int, resultErr error) {
 	if err := ctx.Err(); err != nil {
 		return 0, err
 	}
@@ -129,8 +129,10 @@ func (b *sdkBackend) execute(ctx context.Context, r command, stdin io.Reader, st
 			return 0, err
 		}
 		var labels map[string]string
+		var boundaryRecord restoredBoundary
 		if r.boundary != nil {
-			if err := r.boundary.requireGuest(h, b.config.Home); err != nil {
+			boundaryRecord, err = r.boundary.guestRecord(h, b.config.Home)
+			if err != nil {
 				return 0, err
 			}
 			labels = map[string]string{networkPolicyLabel: r.boundary.fingerprint}
@@ -141,6 +143,11 @@ func (b *sdkBackend) execute(ctx context.Context, r command, stdin io.Reader, st
 		}
 		if _, err = h.Refresh(ctx); err != nil {
 			return 0, err
+		}
+		if r.boundary != nil {
+			if err := r.boundary.recordSnapshot(b.config.Home, artifact.ID(), boundaryRecord); err != nil {
+				return 0, err
+			}
 		}
 		_, err = io.WriteString(stdout, artifact.ID()+"\n")
 		return 0, err
@@ -157,9 +164,28 @@ func (b *sdkBackend) execute(ctx context.Context, r command, stdin io.Reader, st
 	case "snap ls":
 		return 0, listSnapshots(ctx, stdout)
 	case "snap rm":
-		return 0, msb.Snapshot.Remove(ctx, r.selector, r.force)
+		var recordPath string
+		if r.boundary != nil {
+			artifact, openErr := msb.Snapshot.Open(ctx, r.selector)
+			if openErr == nil {
+				recordPath = snapshotBoundaryPath(b.config.Home, artifact.ID())
+			}
+			// Removing a broken checkpoint must still work when its parent or
+			// manifest cannot be opened. An orphan record cannot authorize a VM.
+		}
+		if err := msb.Snapshot.Remove(ctx, r.selector, r.force); err != nil {
+			return 0, err
+		}
+		if recordPath != "" {
+			if err := os.Remove(recordPath); err != nil && !errors.Is(err, os.ErrNotExist) {
+				return 0, err
+			}
+		}
+		return 0, nil
 	case "snap restore":
 		var policyParent string
+		var verifiedArtifact *msb.SnapshotArtifact
+		policy := r.config.Network
 		if r.boundary != nil {
 			artifact, err := msb.Snapshot.Open(ctx, r.selector)
 			if err != nil {
@@ -169,16 +195,43 @@ func (b *sdkBackend) execute(ctx context.Context, r command, stdin io.Reader, st
 				return 0, err
 			}
 			policyParent = artifact.ID()
+			verifiedArtifact = artifact
+			stored, err := r.boundary.snapshotPolicy(b.config.Home, policyParent)
+			if err != nil {
+				return 0, err
+			}
+			if policy == nil {
+				policy = stored
+			}
+			policy, err = r.boundary.restorePolicy(policy)
+			if err != nil {
+				return 0, err
+			}
 		}
-		policy := r.config.Network
 		if policy != nil {
-			// Restore can override rules only. DNS and public CA settings are
-			// retained from the fingerprint-verified captured configuration.
+			// Restore accepts rules only. Guest DNS routing survives in RAM and
+			// the policy denies the SDK's unconfigured default DNS gateway.
 			policy = &msb.NetworkConfig{Rules: policy.Rules, DefaultEgress: policy.DefaultEgress, DefaultIngress: policy.DefaultIngress}
 		}
-		sandbox, err := msb.RestoreSandbox(ctx, r.selector, r.name, msb.WithRestoreConfig(msb.RestoreConfig{Ports: r.config.PortBindings, NetworkPolicy: policy}))
+		options := msb.WithRestoreConfig(msb.RestoreConfig{
+			Ports: r.config.PortBindings, NetworkPolicy: policy,
+		})
+		var sandbox *msb.Sandbox
+		if verifiedArtifact != nil {
+			sandbox, err = msb.RestoreSandbox(ctx, verifiedArtifact, r.name, options)
+		} else {
+			sandbox, err = msb.RestoreSandbox(ctx, r.selector, r.name, options)
+		}
 		if err != nil {
 			return 0, err
+		}
+		if r.boundary != nil {
+			ownedID := sandbox.ID()
+			defer func() {
+				if resultErr != nil {
+					resultErr = errors.Join(resultErr, stopFailedNetworkBoot(ctx, r.name, ownedID, b.config.Home))
+				}
+			}()
 		}
 		// Restore returns a borrowed detached handle. Releasing it never stops
 		// the restored workload, which is already running from captured RAM.
@@ -190,7 +243,11 @@ func (b *sdkBackend) execute(ctx context.Context, r command, stdin io.Reader, st
 			if err != nil {
 				return 0, err
 			}
-			if err := r.boundary.recordRestore(handle, b.config.Home, policyParent); err != nil {
+			parent, err := snapshotParent(handle.ConfigJSON())
+			if err != nil || parent != policyParent {
+				return 0, errors.Join(errors.New("restored network source differs"), err)
+			}
+			if err := r.boundary.completeBoot(ctx, r.name, b.config.Home, policy); err != nil {
 				return 0, err
 			}
 		}
@@ -208,11 +265,33 @@ func (b *sdkBackend) execute(ctx context.Context, r command, stdin io.Reader, st
 	}
 	switch r.op {
 	case "start":
+		var network *msb.NetworkConfig
+		if r.boundary != nil {
+			record, err := r.boundary.guestRecord(h, b.config.Home)
+			if err != nil {
+				return 0, err
+			}
+			network = record.Network
+		}
+		if r.boundary != nil {
+			ownedID := h.ID()
+			defer func() {
+				if resultErr != nil {
+					resultErr = errors.Join(resultErr, stopFailedNetworkBoot(ctx, r.name, ownedID, b.config.Home))
+				}
+			}()
+		}
 		sandbox, err := h.StartDetached(ctx)
 		if err != nil {
 			return 0, err
 		}
-		return 0, sandbox.Detach(ctx)
+		if err := sandbox.Detach(ctx); err != nil {
+			return 0, err
+		}
+		if r.boundary != nil {
+			return 0, r.boundary.completeBoot(ctx, r.name, b.config.Home, network)
+		}
+		return 0, nil
 	case "stop":
 		if r.force {
 			return 0, h.Kill(ctx)

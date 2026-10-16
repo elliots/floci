@@ -6,7 +6,6 @@ import (
 	"crypto/sha256"
 	"crypto/x509"
 	"encoding/hex"
-	"encoding/json"
 	"encoding/pem"
 	"errors"
 	"fmt"
@@ -31,6 +30,7 @@ type nativeNetworkBoundary struct {
 	CAFile      string            `yaml:"ca-file"`
 	fingerprint string
 	caBytes     []byte
+	guestAgent  []byte
 }
 
 type networkEndpoint struct {
@@ -85,8 +85,8 @@ func readNetworkBoundary(file string) (*nativeNetworkBoundary, error) {
 	if err := reader.Decode(boundary); err != nil {
 		return nil, errors.New("invalid native network configuration fields")
 	}
-	if len(boundary.Nameservers) == 0 {
-		return nil, errors.New("native isolation requires network.native and a controlled DNS nameserver")
+	if len(boundary.Nameservers) == 0 || len(boundary.Nameservers) > 3 {
+		return nil, errors.New("native isolation requires one to three controlled DNS nameservers")
 	}
 	for _, endpoint := range boundary.Allowed {
 		if endpoint.Destination != "host" {
@@ -104,8 +104,11 @@ func readNetworkBoundary(file string) (*nativeNetworkBoundary, error) {
 	}
 	for _, server := range boundary.Nameservers {
 		address, err := netip.ParseAddrPort(server)
-		if err != nil || address.Port() == 0 || !(address.Addr().IsPrivate() || address.Addr().IsLoopback()) {
-			return nil, errors.New("native DNS nameservers must be local IP:port endpoints")
+		if err != nil || address.Port() == 0 || !address.Addr().Is4() || !(address.Addr().IsPrivate() || address.Addr().IsLoopback()) {
+			return nil, errors.New("native DNS nameservers must be local IPv4:port endpoints")
+		}
+		if slices.Contains([]uint16{53, 137, 853, 5353, 5355}, address.Port()) {
+			return nil, errors.New("native DNS needs a direct resolver port; 53, 137, 853, 5353 and 5355 are intercepted or blocked by the SDK")
 		}
 	}
 	if boundary.CAFile != "" {
@@ -162,6 +165,7 @@ func (b *nativeNetworkBoundary) restrict(original *msb.NetworkConfig) (*msb.Netw
 	}
 	result := *original
 	result.Rules = []msb.PolicyRule{msb.Rule.AllowDNS()}
+	result.Rules = append(result.Rules, b.dnsRules()...)
 	result.DefaultEgress = msb.PolicyActionDeny
 	result.DNS = &msb.DNSConfig{Nameservers: slices.Clone(b.Nameservers), RebindProtection: new(false)}
 	for _, rule := range original.Rules {
@@ -194,7 +198,21 @@ func (b *nativeNetworkBoundary) restrict(original *msb.NetworkConfig) (*msb.Netw
 			result.Rules = append(result.Rules, msb.PolicyRule{Action: msb.PolicyActionAllow, Direction: msb.PolicyDirectionEgress, Destination: endpoint.Destination, Protocol: msb.PolicyProtocol(endpoint.Protocol), Port: endpoint.Ports})
 		}
 	}
+	result.Rules = uniquePolicyRules(result.Rules)
 	return &result, nil
+}
+
+func uniquePolicyRules(rules []msb.PolicyRule) []msb.PolicyRule {
+	result := make([]msb.PolicyRule, 0, len(rules))
+	for _, rule := range rules {
+		if !slices.ContainsFunc(result, func(existing msb.PolicyRule) bool {
+			return existing.Action == rule.Action && existing.Direction == rule.Direction && existing.Destination == rule.Destination &&
+				existing.Protocol == rule.Protocol && existing.Port == rule.Port && slices.Equal(existing.Protocols, rule.Protocols) && slices.Equal(existing.Ports, rule.Ports)
+		}) {
+			result = append(result, rule)
+		}
+	}
+	return result
 }
 
 func intersectEndpoint(rule msb.PolicyRule, endpoint networkEndpoint) (msb.PolicyRule, bool, error) {
@@ -322,91 +340,6 @@ func (c *Client) VerifyNetworkBoundary(ctx context.Context) error {
 		}
 		seen[cursor] = true
 	}
-}
-
-type restoredBoundary struct {
-	ID     string `json:"id"`
-	Name   string `json:"name"`
-	Parent string `json:"parent"`
-	Policy string `json:"policy"`
-}
-
-func boundaryRecordPath(home, id string) string {
-	digest := sha256.Sum256([]byte(id))
-	return filepath.Join(home, "floci-network-boundaries", hex.EncodeToString(digest[:])+".json")
-}
-
-func snapshotParent(config string) (string, error) {
-	var stored struct {
-		Parent string `json:"snapshot_parent"`
-	}
-	if err := json.Unmarshal([]byte(config), &stored); err != nil {
-		return "", err
-	}
-	return stored.Parent, nil
-}
-
-func (b *nativeNetworkBoundary) requireGuest(handle *msb.SandboxHandle, home string) error {
-	config, err := handle.Config()
-	if err != nil {
-		return err
-	}
-	if b.requireIdentity(config.Labels) == nil {
-		return nil
-	}
-	data, err := os.ReadFile(boundaryRecordPath(home, handle.ID()))
-	if err != nil {
-		return b.requireIdentity(nil)
-	}
-	var record restoredBoundary
-	if json.Unmarshal(data, &record) != nil {
-		return errors.New("invalid restored network boundary record")
-	}
-	parent, err := snapshotParent(handle.ConfigJSON())
-	if err != nil {
-		return err
-	}
-	return b.verifyRestoredIdentity(record, handle.ID(), handle.Name(), parent)
-}
-
-func (b *nativeNetworkBoundary) verifyRestoredIdentity(record restoredBoundary, id, name, parent string) error {
-	if parent == "" || record.ID != id || record.Name != name || record.Parent != parent || record.Policy != b.fingerprint {
-		return b.requireIdentity(nil)
-	}
-	return nil
-}
-
-// The SDK omits labels when restoring and cannot update them without restarting
-// the guest. Retain a private immutable-ID record after a verified restore instead
-// of discarding restored process memory merely to attach a metadata label.
-func (b *nativeNetworkBoundary) recordRestore(handle *msb.SandboxHandle, home, parent string) error {
-	actual, err := snapshotParent(handle.ConfigJSON())
-	if err != nil {
-		return err
-	}
-	if actual != parent || parent == "" {
-		return errors.New("restored network boundary source does not match")
-	}
-	path := boundaryRecordPath(home, handle.ID())
-	if err := os.MkdirAll(filepath.Dir(path), 0700); err != nil {
-		return err
-	}
-	file, err := os.CreateTemp(filepath.Dir(path), ".pending-")
-	if err != nil {
-		return err
-	}
-	defer os.Remove(file.Name())
-	defer file.Close()
-	if err := json.NewEncoder(file).Encode(restoredBoundary{ID: handle.ID(), Name: handle.Name(), Parent: parent, Policy: b.fingerprint}); err != nil {
-		return err
-	}
-	if err := file.Sync(); err != nil {
-		return err
-	}
-	if err := file.Close(); err != nil {
-		return err
-	}
-	return os.Rename(file.Name(), path)
 }
 
 func portRange(value string) (int, int, error) {

@@ -26,6 +26,7 @@ type Config struct {
 	Executable        string
 	Home              string
 	NetworkConfigFile string
+	GuestAgentPath    string
 }
 
 type Result struct {
@@ -40,10 +41,11 @@ type backend interface {
 }
 
 type Client struct {
-	config   Config
-	core     backend
-	cli      func(context.Context, []string, io.Writer, io.Writer) (int, error)
-	boundary *nativeNetworkBoundary
+	config      Config
+	core        backend
+	cli         func(context.Context, []string, io.Writer, io.Writer) (int, error)
+	boundary    *nativeNetworkBoundary
+	bootNetwork func(context.Context, command) error
 }
 
 // New validates configuration without loading the SDK or running a subprocess.
@@ -78,8 +80,20 @@ func New(config Config) (*Client, error) {
 	if err != nil {
 		return nil, err
 	}
+	if config.GuestAgentPath == "" {
+		config.GuestAgentPath = os.Getenv("FLOCI_MICROSANDBOX_GUEST_AGENT_PATH")
+	}
+	if boundary != nil {
+		boundary.guestAgent, err = readGuestNetworkAgent(config.GuestAgentPath)
+		if err != nil {
+			return nil, err
+		}
+	}
 	c := &Client{config: config, core: &sdkBackend{config: config}, boundary: boundary}
 	c.cli = c.executeCLI
+	c.bootNetwork = func(ctx context.Context, request command) error {
+		return boundary.completeBoot(ctx, request.name, config.Home, request.config.Network)
+	}
 	return c, nil
 }
 
@@ -176,6 +190,9 @@ func (c *Client) executeWithOptions(ctx context.Context, args []string, stdin io
 		code, err := c.cli(ctx, args, stdout, stderr)
 		if req.op == "run" && err == nil && code != 0 {
 			err = errors.New("detached launch failed with unknown runtime outcome")
+		}
+		if req.op == "run" && c.boundary != nil && err == nil && c.bootNetwork != nil {
+			err = c.bootNetwork(ctx, req)
 		}
 		return code, safeError(req.op, err)
 	}
