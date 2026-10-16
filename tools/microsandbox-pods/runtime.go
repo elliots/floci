@@ -25,6 +25,7 @@ const bridgeName = "pvkb0"
 const ctr = "ctr --address /run/containerd/containerd.sock"
 
 type config struct {
+	guestFSBinary                                           string
 	relayBinary, proxyBackendCIDR                           string
 	kubeconfig, nodeName, msb, home, state, peer, peerOwner string
 	podCIDR, clusterCIDR, serviceCIDR, clusterDNS           string

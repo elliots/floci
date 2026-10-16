@@ -197,6 +197,7 @@ func (p *provider) startManagedContainer(ctx context.Context, e *podEntry, manag
 		status.RestartCount++
 	}
 	status.ContainerID = "containerd://" + e.vm + "/" + managed.task(e)
+	status.User = nil
 	status.Ready, status.Started = false, new(false)
 	status.State = corev1.ContainerState{Waiting: &corev1.ContainerStateWaiting{Reason: "ContainerCreating"}}
 	e.mu.Unlock()
@@ -265,6 +266,11 @@ func (p *provider) monitorManagedContainer(ctx context.Context, e *podEntry, man
 	}
 	if output == "OOMERROR" {
 		return fmt.Errorf("container %s memory accounting could not be verified", managed.container(e).Name)
+	}
+	if strings.HasPrefix(output, "EXIT ") || containerTaskRunning(output, managed.task(e)) {
+		if err := p.observeContainerGroups(ctx, e, managed.task(e), managed.status(e)); err != nil {
+			return err
+		}
 	}
 	if codeText, exited := strings.CutPrefix(output, "EXIT "); exited {
 		reason := ""

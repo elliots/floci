@@ -201,6 +201,11 @@ func (p *provider) CreatePod(ctx context.Context, pod *corev1.Pod) error {
 	if podNetworkProbes(pod) && p.runner.cfg.relayBinary == "" {
 		return errdefs.InvalidInput("HTTP/TCP/gRPC probes require --network-relay-binary")
 	}
+	if requiresGuestFS(pod) {
+		if _, err := readGuestFS(p.runner.cfg.guestFSBinary); err != nil {
+			return errdefs.InvalidInput(err.Error())
+		}
+	}
 	if p.client != nil {
 		if err := p.checkNetworkPolicy(ctx, pod); err != nil {
 			return err
@@ -426,6 +431,9 @@ func (p *provider) startApplication(ctx context.Context, e *podEntry) error {
 		return fmt.Errorf("submit application process to guest supervisor: %w", err)
 	}
 	e.started = time.Now()
+	e.mu.Lock()
+	e.pod.Status.ContainerStatuses[0].User = nil
+	e.mu.Unlock()
 	e.startupComplete = false
 	e.probeFailure = ""
 	e.terminationReason = ""
@@ -449,6 +457,11 @@ func (p *provider) containerLaunch(ctx context.Context, e *podEntry, container c
 	if err != nil {
 		return nil, empty, fmt.Errorf("configure container security: %w", err)
 	}
+	groupArgs, err := p.prepareContainerGroups(ctx, e, task)
+	if err != nil {
+		return nil, empty, fmt.Errorf("configure supplemental groups: %w", err)
+	}
+	security = append(security, groupArgs...)
 	resources, err := containerResourceArgs(container)
 	if err != nil {
 		return nil, empty, fmt.Errorf("configure container resources: %w", err)
@@ -574,6 +587,13 @@ func (p *provider) monitor(ctx context.Context, e *podEntry) {
 			p.fail(e, errors.New("application terminated but its memory accounting could not be verified"))
 			e.op.Unlock()
 			return
+		}
+		if strings.HasPrefix(output, "EXIT ") || containerTaskRunning(output, "application") {
+			if err := p.observeContainerGroups(ctx, e, "application", &e.pod.Status.ContainerStatuses[0]); err != nil {
+				p.fail(e, err)
+				e.op.Unlock()
+				return
+			}
 		}
 		if codeText, exited := strings.CutPrefix(output, "EXIT "); exited {
 			e.terminationReason = ""

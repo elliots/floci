@@ -256,6 +256,7 @@ func (p *provider) advanceInit(ctx context.Context, e *podEntry) error {
 		current.RestartCount++
 	}
 	current.ContainerID = "containerd://" + e.vm + "/" + initTask(index)
+	current.User = nil
 	current.State = corev1.ContainerState{Running: &corev1.ContainerStateRunning{StartedAt: metav1.Now()}}
 	current.Started, current.Ready = new(true), false
 	e.pod.Status.Phase, e.pod.Status.Reason, e.pod.Status.Message = corev1.PodPending, "PodInitializing", ""
@@ -302,6 +303,11 @@ func (p *provider) monitorInit(ctx context.Context, e *podEntry) error {
 	}
 	if output == "OOMERROR" {
 		return errors.New("init container terminated but its memory accounting could not be verified")
+	}
+	if strings.HasPrefix(output, "EXIT ") || containerTaskRunning(output, initTask(index)) {
+		if err := p.observeContainerGroups(ctx, e, initTask(index), &e.pod.Status.InitContainerStatuses[index]); err != nil {
+			return err
+		}
 	}
 	if codeText, exited := strings.CutPrefix(output, "EXIT "); exited {
 		reason := ""

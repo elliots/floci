@@ -47,6 +47,7 @@ func run() error {
 	flag.StringVar(&cfg.clusterDNS, "cluster-dns", "10.43.0.10", "Cluster DNS service address")
 	flag.StringVar(&cfg.proxyBackendCIDR, "proxy-backend-cidr", "10.42.204.0/22", "Reserved private guest CIDR for proxy availability")
 	flag.StringVar(&cfg.relayBinary, "network-relay-binary", "", "Linux network-relay executable matching the owned Docker peer architecture")
+	flag.StringVar(&cfg.guestFSBinary, "guest-fs-binary", "", "Linux guestfs executable for fsGroup and supplemental group policies")
 	flag.StringVar(&cfg.listen, "listen", "127.0.0.1:10250", "TLS kubelet listen address")
 	flag.StringVar(&cfg.nodeIP, "node-ip", "", "Host IPv4 address reachable from the API server")
 	flag.StringVar(&cfg.cert, "tls-cert", "", "Kubelet TLS serving certificate")
@@ -129,6 +130,7 @@ func run() error {
 			Key: "microsandbox.dev/runtime", Value: "native", Effect: corev1.TaintEffectNoSchedule,
 		}}},
 		Status: corev1.NodeStatus{
+			Features: &corev1.NodeFeatures{SupplementalGroupsPolicy: new(cfg.guestFSBinary != "")},
 			Capacity: capacity, Allocatable: capacity.DeepCopy(), Phase: corev1.NodeRunning,
 			Addresses:       []corev1.NodeAddress{{Type: corev1.NodeInternalIP, Address: cfg.nodeIP}},
 			DaemonEndpoints: corev1.NodeDaemonEndpoints{KubeletEndpoint: corev1.DaemonEndpoint{Port: int32(port)}},
@@ -161,6 +163,11 @@ func run() error {
 }
 
 func (c config) validate() error {
+	if c.guestFSBinary != "" {
+		if _, err := readGuestFS(c.guestFSBinary); err != nil {
+			return err
+		}
+	}
 	if err := c.validateKubeAPIThrottle(); err != nil {
 		return err
 	}

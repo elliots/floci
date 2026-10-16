@@ -175,11 +175,13 @@ func TestSecurityRejectsUnsupportedSettings(t *testing.T) {
 		"pod oversized GID":       func(p *corev1.Pod) { p.Spec.SecurityContext.RunAsGroup = new(int64(math.MaxInt32 + 1)) },
 		"container negative GID":  func(p *corev1.Pod) { p.Spec.Containers[0].SecurityContext.RunAsGroup = new(int64(-1)) },
 		"container oversized UID": func(p *corev1.Pod) { p.Spec.Containers[0].SecurityContext.RunAsUser = new(int64(math.MaxInt32 + 1)) },
-		"fsGroup":                 func(p *corev1.Pod) { p.Spec.SecurityContext.FSGroup = new(int64(1000)) },
-		"fsGroup policy":          func(p *corev1.Pod) { p.Spec.SecurityContext.FSGroupChangePolicy = new(corev1.FSGroupChangeAlways) },
-		"supplemental groups":     func(p *corev1.Pod) { p.Spec.SecurityContext.SupplementalGroups = []int64{1000} },
+		"fsGroup":                 func(p *corev1.Pod) { p.Spec.SecurityContext.FSGroup = new(int64(-1)) },
+		"fsGroup policy": func(p *corev1.Pod) {
+			p.Spec.SecurityContext.FSGroupChangePolicy = new(corev1.PodFSGroupChangePolicy("Unknown"))
+		},
+		"supplemental groups": func(p *corev1.Pod) { p.Spec.SecurityContext.SupplementalGroups = []int64{math.MaxInt32 + 1} },
 		"supplemental groups policy": func(p *corev1.Pod) {
-			p.Spec.SecurityContext.SupplementalGroupsPolicy = new(corev1.SupplementalGroupsPolicyStrict)
+			p.Spec.SecurityContext.SupplementalGroupsPolicy = new(corev1.SupplementalGroupsPolicy("Unknown"))
 		},
 		"sysctls": func(p *corev1.Pod) {
 			p.Spec.SecurityContext.Sysctls = []corev1.Sysctl{{Name: "net.ipv4.ip_forward", Value: "1"}}

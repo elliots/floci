@@ -94,7 +94,7 @@ func (p *provider) prepareVolumes(ctx context.Context, e *podEntry) error {
 		if err != nil {
 			return err
 		}
-		if _, err := p.runner.guest(ctx, e.vm, volumeSetupScript(volume, allocation.MemoryMiB)); err != nil {
+		if _, err := p.runner.guest(ctx, e.vm, volumeSetupWithOwnership(e.pod, volume, allocation.MemoryMiB)); err != nil {
 			return fmt.Errorf("initialize volume %s: %w", volume.Name, err)
 		}
 	}
@@ -231,6 +231,10 @@ func (p *provider) waitForVolumeSources(ctx context.Context, e *podEntry) error 
 }
 
 func volumeSetupScript(volume corev1.Volume, memoryMiB int) string {
+	return volumeSetupWithOwnership(nil, volume, memoryMiB)
+}
+
+func volumeSetupWithOwnership(pod *corev1.Pod, volume corev1.Volume, memoryMiB int) string {
 	if volume.HostPath != nil {
 		return "test -f " + quote(reservedCAPath) + "; test ! -L " + quote(reservedCAPath) + "; chmod 0444 " + quote(reservedCAPath)
 	}
@@ -238,7 +242,7 @@ func volumeSetupScript(volume corev1.Volume, memoryMiB int) string {
 	script := "umask 022; mkdir -p /var/lib/floci-volumes; chmod 0700 /var/lib/floci-volumes; "
 	if volume.EmptyDir != nil && volume.EmptyDir.Medium == corev1.StorageMediumDefault {
 		// Only set the initial mode: apps may change permissions between restarts.
-		return script + "if ! test -d " + root + "; then mkdir " + root + "; chmod 0777 " + root + "; fi"
+		return script + "if ! test -d " + root + "; then mkdir " + root + "; chmod 0777 " + root + "; " + volumeOwnership(pod, guestVolumePath(volume.Name), false, false) + "fi"
 	}
 	script += "mkdir -p " + root + "; "
 	if volume.Secret != nil || volume.Projected != nil || volume.EmptyDir != nil {
@@ -249,7 +253,14 @@ func volumeSetupScript(volume corev1.Volume, memoryMiB int) string {
 				limit = volume.EmptyDir.SizeLimit.Value()
 			}
 		}
-		script += fmt.Sprintf("if ! mountpoint -q %s; then mount -t tmpfs -o size=%d,mode=%s,nosuid,nodev tmpfs %s; fi", root, limit, mode, root)
+		ownership := ""
+		if volume.EmptyDir != nil {
+			ownership = volumeOwnership(pod, guestVolumePath(volume.Name), false, false)
+		}
+		script += fmt.Sprintf("if ! mountpoint -q %s; then mount -t tmpfs -o size=%d,mode=%s,nosuid,nodev tmpfs %s; %sfi; ", root, limit, mode, root, ownership)
+	}
+	if projectedData(volume) {
+		script += volumeOwnership(pod, guestVolumePath(volume.Name), true, true)
 	}
 	return script
 }
@@ -291,7 +302,7 @@ func (p *provider) writeProjection(ctx context.Context, e *podEntry, name string
 	if previous, ok := e.volumeDigests[name]; ok && previous == digest {
 		return nil
 	}
-	script := projectionScript(guestVolumePath(name), "..floci-"+rand.Text(), files)
+	script := projectionScriptWithOwnership(e.pod, guestVolumePath(name), "..floci-"+rand.Text(), files)
 	if err := p.runner.guestInput(ctx, e.vm, script, archive); err != nil {
 		return err
 	}
@@ -342,6 +353,10 @@ func projectionArchive(files map[string]volumeFile) ([]byte, error) {
 // Like kubelet's atomic writer, stable top-level links follow a single ..data
 // link. Replacing it switches all existing keys without rewriting open files.
 func projectionScript(root, generation string, files map[string]volumeFile) string {
+	return projectionScriptWithOwnership(nil, root, generation, files)
+}
+
+func projectionScriptWithOwnership(pod *corev1.Pod, root, generation string, files map[string]volumeFile) string {
 	tops := make(map[string]bool)
 	for name := range files {
 		top, _, _ := strings.Cut(name, "/")
@@ -351,6 +366,7 @@ func projectionScript(root, generation string, files map[string]volumeFile) stri
 		"mkdir \"$generation\"; committed=0; " +
 		"trap 'if test \"$committed\" = 0; then rm -rf -- \"$generation\"; fi; rm -f ..data_tmp' EXIT; " +
 		"tar -xf - -C \"$generation\"; chmod 0755 \"$generation\"; " +
+		volumeOwnership(pod, path.Join(root, generation), true, false) +
 		"ln -s \"$generation\" ..data_tmp; mv -Tf ..data_tmp ..data; committed=1; "
 	for _, top := range slices.Sorted(maps.Keys(tops)) {
 		script += "if ! test -L " + quote(top) + "; then ln -s -- " + quote("..data/"+top) + " " + quote(top) + "; fi; "

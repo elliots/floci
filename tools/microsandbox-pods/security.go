@@ -33,17 +33,19 @@ func validateSecurityContexts(pod *corev1.Pod) error {
 		if err := validateSeccompProfile(sc.SeccompProfile); err != nil {
 			return fmt.Errorf("pod securityContext: %w", err)
 		}
+		if err := validatePodGroups(sc); err != nil {
+			return fmt.Errorf("pod securityContext: %w", err)
+		}
 		remaining := *sc
 		remaining.RunAsUser, remaining.RunAsGroup, remaining.RunAsNonRoot = nil, nil, nil
 		remaining.SeccompProfile = nil
-		if len(remaining.SupplementalGroups) == 0 {
-			remaining.SupplementalGroups = nil
-		}
+		remaining.FSGroup, remaining.FSGroupChangePolicy = nil, nil
+		remaining.SupplementalGroups, remaining.SupplementalGroupsPolicy = nil, nil
 		if len(remaining.Sysctls) == 0 {
 			remaining.Sysctls = nil
 		}
 		if !reflect.DeepEqual(remaining, corev1.PodSecurityContext{}) {
-			return fmt.Errorf("pod securityContext supports only runAsUser, runAsGroup, runAsNonRoot and RuntimeDefault/Unconfined seccomp; volume ownership, supplemental groups, SELinux, AppArmor, sysctls and Windows options are not qualified")
+			return fmt.Errorf("pod securityContext supports runAsUser, runAsGroup, runAsNonRoot, fsGroup, fsGroupChangePolicy, supplementalGroups, supplementalGroupsPolicy and RuntimeDefault/Unconfined seccomp; SELinux, AppArmor, sysctls and Windows options are not qualified")
 		}
 	}
 	for container := range podContainers(pod) {

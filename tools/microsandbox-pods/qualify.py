@@ -19,6 +19,7 @@ from qualification_applications import qualify_applications
 from qualification_operations import qualify_operations
 from qualification_sidecars import qualify_sidecars
 from qualification_identity import qualify_identity
+from qualification_groups import qualify_groups
 
 LABEL = "io.floci.pod-probe"
 
@@ -144,6 +145,8 @@ def qualify(args):
                 "--client-ca", str(temporary/"client-ca.crt"), "--control-listen", f"127.0.0.1:{control_port}", "--control-token-file", str(token_path), "--cleanup-on-exit", "--cluster-name", "qualification"]
             if args.network_relay_binary:
                 controller_args.extend(["--network-relay-binary",args.network_relay_binary])
+            if args.guest_fs_binary:
+                controller_args.extend(["--guest-fs-binary",args.guest_fs_binary])
             if args.scheduling_cpu:
                 controller_args.extend(["--scheduling-cpu", args.scheduling_cpu])
             if args.scheduling_memory:
@@ -183,6 +186,13 @@ def qualify(args):
                     "tolerations":[{"key":"microsandbox.dev/runtime","operator":"Equal","value":"native","effect":"NoSchedule"}],
                     "automountServiceAccountToken":False, "restartPolicy":"Never",
                     "containers":[{"name":"app","image":"public.ecr.aws/docker/library/busybox:1.37.0","command":["sh","-ec",script]}]}}
+            if args.groups_only:
+                if not args.guest_fs_binary:
+                    raise RuntimeError("group qualification requires --guest-fs-binary")
+                qualify_groups(pod=pod, apply=apply, resource=resource, kubectl=kubectl,
+                    ready=ready, lifecycle=lifecycle, control_get=control_get,
+                    crash_and_restart=crash_and_restart, wait=wait, report=report)
+                raise QualificationComplete()
             if not getattr(args, "operations_only", False) and not getattr(args, "sidecars_only", False) and not getattr(args, "identity_only", False):
                 qualify_applications(pod=pod, apply=apply, resource=resource, kubectl=kubectl,
                     ready=ready, lifecycle=lifecycle, control_get=control_get,
@@ -999,6 +1009,8 @@ if __name__ == "__main__":
     parser.add_argument("--sidecars-only", action="store_true", help="qualify restartable init sidecars and ordered Job completion using the shared owned fixture")
     parser.add_argument("--identity-only", action="store_true", help="qualify real Pod-bound service-account projection, TLS/RBAC and RAM wake")
     parser.add_argument("--network-relay-binary")
+    parser.add_argument("--guest-fs-binary")
+    parser.add_argument("--groups-only", action="store_true", help="run the same group and volume permission fixture on Docker and native pods")
     parser.add_argument("--scheduling-cpu", help="virtual CPU capacity advertised to the Kubernetes scheduler")
     parser.add_argument("--scheduling-memory", help="virtual memory capacity advertised to the Kubernetes scheduler")
     raise SystemExit(0 if qualify(parser.parse_args()) else 1)
