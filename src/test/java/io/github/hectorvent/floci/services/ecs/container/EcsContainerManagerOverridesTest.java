@@ -1,5 +1,6 @@
 package io.github.hectorvent.floci.services.ecs.container;
 
+import com.github.dockerjava.api.model.HealthCheck;
 import io.github.hectorvent.floci.config.EmulatorConfig;
 import io.github.hectorvent.floci.core.common.RegionResolver;
 import io.github.hectorvent.floci.core.common.docker.ContainerBuilder;
@@ -22,6 +23,7 @@ import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
 import org.mockito.ArgumentCaptor;
 
+import java.time.Duration;
 import java.util.List;
 import java.util.Map;
 
@@ -33,6 +35,7 @@ import static org.mockito.ArgumentMatchers.anyString;
 import static org.mockito.Mockito.RETURNS_DEEP_STUBS;
 import static org.mockito.Mockito.RETURNS_SELF;
 import static org.mockito.Mockito.mock;
+import static org.mockito.Mockito.verify;
 import static org.mockito.Mockito.when;
 
 /**
@@ -137,6 +140,27 @@ class EcsContainerManagerOverridesTest {
                 "unmatched container should keep its task-def command");
         assertEquals(List.of("SIDE_ONLY=s"), envs.get(1),
                 "unmatched container should keep its task-def environment");
+    }
+
+    @Test
+    void taskDefinitionHealthCheckReachesContainerConfigurationWithAwsDefaults() {
+        ContainerDefinition app = containerDef("app", "app:1", List.of("sleep", "60"), List.of());
+        // Both the ECS model and Docker model are named HealthCheck; import the captured Docker type.
+        app.setHealthCheck(new io.github.hectorvent.floci.services.ecs.model.HealthCheck(
+                List.of("CMD-SHELL", "test -f /ready"), null, null, null, null));
+        TaskDefinition definition = new TaskDefinition();
+        definition.setFamily("health");
+        definition.setContainerDefinitions(List.of(app));
+        EcsTask task = new EcsTask();
+        task.setTaskArn("arn:aws:ecs:us-east-1:000000000000:task/test/health");
+        manager.startTask(task, definition, List.of(), "us-east-1");
+        ArgumentCaptor<HealthCheck> health = ArgumentCaptor.forClass(HealthCheck.class);
+        verify(builder).withHealthCheck(health.capture());
+        assertEquals(List.of("CMD-SHELL", "test -f /ready"), health.getValue().getTest());
+        assertEquals(Duration.ofSeconds(30).toNanos(), health.getValue().getInterval());
+        assertEquals(Duration.ofSeconds(5).toNanos(), health.getValue().getTimeout());
+        assertEquals(3, health.getValue().getRetries());
+        assertEquals(0L, health.getValue().getStartPeriod());
     }
 
     private static ContainerDefinition containerDef(String name, String image,

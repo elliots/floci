@@ -8,7 +8,7 @@ import java.util.List;
  * The {@code healthCheck} of an ECS container definition:
  * {@code {"command": [...], "interval": ..., "timeout": ..., "retries": ..., "startPeriod": ...}}.
  *
- * <p>Modelled for RegisterTaskDefinition/DescribeTaskDefinition round-trip fidelity.
+ * <p>Round-trips through the task-definition APIs and configures Docker-backed task health checks.
  */
 @RegisterForReflection
 public record HealthCheck(

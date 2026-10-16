@@ -2,6 +2,7 @@ package io.github.hectorvent.floci.services.ecs;
 
 import com.fasterxml.jackson.core.type.TypeReference;
 import io.github.hectorvent.floci.config.EmulatorConfig;
+import io.github.hectorvent.floci.core.common.AwsException;
 import io.github.hectorvent.floci.core.common.RegionResolver;
 import io.github.hectorvent.floci.core.storage.AccountAwareStorageBackend;
 import io.github.hectorvent.floci.core.storage.StorageBackend;
@@ -12,7 +13,10 @@ import io.github.hectorvent.floci.services.ecs.model.ContainerInstance;
 import io.github.hectorvent.floci.services.ecs.model.EcsTask;
 import io.github.hectorvent.floci.services.ecs.model.LaunchType;
 import org.junit.jupiter.api.Test;
+import org.junit.jupiter.params.ParameterizedTest;
+import org.junit.jupiter.params.provider.ValueSource;
 
+import java.time.Instant;
 import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
@@ -20,6 +24,7 @@ import java.util.Map;
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertNotEquals;
 import static org.junit.jupiter.api.Assertions.assertNotNull;
+import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 import static org.mockito.Mockito.RETURNS_DEEP_STUBS;
 import static org.mockito.Mockito.mock;
@@ -37,6 +42,78 @@ class EcsServiceTaskOwnershipTest {
 
     private static final String REGION = "us-east-1";
     private static final String OTHER_REGION = "us-west-2";
+
+    @ParameterizedTest
+    @ValueSource(booleans = {true, false})
+    void deletingServiceStopsProtectedTasksIncludingAfterScaleToZero(boolean force) {
+        EcsService service = newMockModeService();
+        service.createCluster("protected-delete", REGION);
+        registerTaskDef(service);
+        service.createService("protected-delete", "api", "own-fam", 1, LaunchType.FARGATE, List.of(), null, REGION);
+        service.reconcileServices();
+        EcsTask task = ownedTasks(service, "protected-delete", "api").getFirst();
+        service.updateTaskProtection("protected-delete", List.of(task.getTaskArn()), true, 120, REGION);
+        if (!force) {
+            service.updateService("protected-delete", "api", null, 0, null, REGION);
+            service.reconcileServices();
+            assertEquals("RUNNING", task.getLastStatus());
+        }
+        assertEquals("INACTIVE", service.deleteService("protected-delete", "api", force, REGION).getStatus());
+        assertEquals("STOPPED", task.getLastStatus());
+        assertEquals("STOPPED", task.getDesiredStatus());
+        assertEquals("Service deleted", task.getStoppedReason());
+        assertEquals(EcsService.STOP_CODE_SERVICE_SCHEDULER_INITIATED, task.getStopCode());
+        service.reconcileServices();
+        assertTrue(ownedTasks(service, "protected-delete", "api").isEmpty());
+    }
+
+    @Test
+    void protectedServiceTasksSurviveScaleInUntilProtectionExpiresOrIsCleared() {
+        EcsService service = newMockModeService();
+        service.createCluster("protected-cluster", REGION);
+        registerTaskDef(service);
+        service.createService("protected-cluster", "api", "own-fam", 2, LaunchType.FARGATE, List.of(), null, REGION);
+        service.reconcileServices();
+        EcsTask protectedTask = ownedTasks(service, "protected-cluster", "api").getFirst();
+        Instant before = Instant.now();
+        assertThrows(AwsException.class, () -> service.updateTaskProtection(
+                "protected-cluster", List.of(protectedTask.getTaskArn()), true, 0, REGION));
+        service.updateTaskProtection("protected-cluster", List.of(protectedTask.getTaskArn()), true, null, REGION);
+        assertTrue(protectedTask.getProtectedUntil().isAfter(before.plusSeconds(7199)),
+                "AWS task protection defaults to two hours");
+        service.updateService("protected-cluster", "api", null, 0, null, REGION);
+        service.reconcileServices();
+        assertEquals(1, ownedTasks(service, "protected-cluster", "api").size());
+        assertEquals("RUNNING", protectedTask.getLastStatus());
+        protectedTask.setProtectedUntil(Instant.now().minusSeconds(1));
+        assertTrue(!service.getTaskProtection("protected-cluster", List.of(protectedTask.getTaskArn()), REGION)
+                .getFirst().protectionEnabled());
+        service.reconcileServices();
+        assertEquals("STOPPED", protectedTask.getLastStatus());
+    }
+
+    @Test
+    void clearingTaskProtectionAllowsScaleInAndExplicitStopStillStopsProtectedTasks() {
+        EcsService service = newMockModeService();
+        service.createCluster("clear-protection", REGION);
+        registerTaskDef(service);
+        service.createService("clear-protection", "api", "own-fam", 1, LaunchType.FARGATE, List.of(), null, REGION);
+        service.reconcileServices();
+        EcsTask task = ownedTasks(service, "clear-protection", "api").getFirst();
+        service.updateTaskProtection("clear-protection", List.of(task.getTaskArn()), true, 1, REGION);
+        service.updateService("clear-protection", "api", null, 0, null, REGION);
+        service.reconcileServices();
+        assertEquals("RUNNING", task.getLastStatus());
+        service.updateTaskProtection("clear-protection", List.of(task.getTaskArn()), false, null, REGION);
+        service.reconcileServices();
+        assertEquals("STOPPED", task.getLastStatus());
+        service.updateService("clear-protection", "api", null, 1, null, REGION);
+        service.reconcileServices();
+        EcsTask next = ownedTasks(service, "clear-protection", "api").getFirst();
+        service.updateTaskProtection("clear-protection", List.of(next.getTaskArn()), true, null, REGION);
+        service.stopTask("clear-protection", next.getTaskArn(), "manual stop", REGION);
+        assertEquals("STOPPED", next.getLastStatus());
+    }
 
     @Test
     void spoofedGroupIsNotCountedTowardTheServiceAndIsNotStopped() {
