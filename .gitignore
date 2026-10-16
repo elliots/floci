@@ -27,6 +27,9 @@ local
 
 .terraform.lock.hcl
 go.sum
+!tools/microsandbox-runtime/go.sum
+!tools/microsandbox-host/go.sum
+!tools/microsandbox-pods/go.sum
 package-lock.json
 test-results.xml
 

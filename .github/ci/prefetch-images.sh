@@ -112,7 +112,7 @@ grep -qE '/appsync/|AppSyncCfnIntegrationTest' "$SHARD_FILE" && [ -n "$GRAPHQL_I
 JS_RUNTIME_IMAGE="$(grep -oE 'image: *"node:[^"]+"' src/main/resources/application.yml | grep -oE '"[^"]+"' | tr -d '"')"
 grep -q 'AppSyncJsResolverDockerIntegrationTest' "$SHARD_FILE" && [ -n "$JS_RUNTIME_IMAGE" ] && pull "$JS_RUNTIME_IMAGE"
 # RdsAwsIntegrationTest is the one class that starts SQL Server (about 1.5 GB); the pin lives in
-# application.yml. The other services/rds classes mock the container layer.
+# application.yml. Shared RDS runtime contracts also start PostgreSQL and MySQL below.
 SQLSERVER_IMAGE="$(grep -oE 'default-sql-server-image: *"[^"]+"' src/main/resources/application.yml | grep -oE '"[^"]+"' | tr -d '"')"
 grep -q 'RdsAwsIntegrationTest' "$SHARD_FILE" && [ -n "$SQLSERVER_IMAGE" ] && pull "$SQLSERVER_IMAGE"
 # Postgres is the most-pulled image in CI: Redshift pins it in application.yml, RDS adapts
@@ -121,6 +121,13 @@ grep -q 'RdsAwsIntegrationTest' "$SHARD_FILE" && [ -n "$SQLSERVER_IMAGE" ] && pu
 REDSHIFT_PG_IMAGE="$(grep -oE 'image-version: *postgres:[^ ]+' src/main/resources/application.yml | awk '{print $2}')"
 grep -qE '/redshift/|/cloudformation/' "$SHARD_FILE" && [ -n "$REDSHIFT_PG_IMAGE" ] && pull "$REDSHIFT_PG_IMAGE"
 grep -q '/rds/' "$SHARD_FILE" && pull postgres:16.3-alpine
+# Shared runtime contracts pin identical images for Docker and native fixtures. Read their
+# profile rather than copy the pins here; MySQL is only needed by its workload suite.
+RUNTIME_PROFILE=src/test/java/io/github/hectorvent/floci/testing/RdsRuntimeTestProfile.java
+RUNTIME_PG_IMAGE="$(grep -oE '"postgres:[^"]+"' "$RUNTIME_PROFILE" | tr -d '"')"
+RUNTIME_MYSQL_IMAGE="$(grep -oE '"mysql:[^"]+"' "$RUNTIME_PROFILE" | tr -d '"')"
+grep -q '/rds/' "$SHARD_FILE" && [ -n "$RUNTIME_PG_IMAGE" ] && pull "$RUNTIME_PG_IMAGE"
+starts RdsMysqlRuntimeIntegrationTest && [ -n "$RUNTIME_MYSQL_IMAGE" ] && pull "$RUNTIME_MYSQL_IMAGE"
 # The InfluxDB and k3s pins live in application.yml like the sidecars above.
 INFLUX_IMAGE="$(grep -oE 'default-image: *"influxdb:[^"]+"' src/main/resources/application.yml | grep -oE '"[^"]+"' | tr -d '"')"
 grep -q '/timestreaminfluxdb/' "$SHARD_FILE" && [ -n "$INFLUX_IMAGE" ] && pull "$INFLUX_IMAGE"

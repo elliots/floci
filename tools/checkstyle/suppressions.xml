@@ -321,7 +321,6 @@
     <suppress id="NoFqcn" files="/floci/services/rds/RdsQueryHandler\.java$"/>
     <suppress id="NoFqcn" files="/floci/services/rds/RdsServiceTest\.java$"/>
     <suppress id="NoFqcn" files="/floci/services/rds/RdsService\.java$"/>
-    <suppress id="NoFqcn" files="/floci/services/rds/container/RdsContainerManagerPostgresTest\.java$"/>
     <suppress id="NoFqcn" files="/floci/services/rds/container/RdsContainerManagerTest\.java$"/>
     <suppress id="NoFqcn" files="/floci/services/rds/container/RdsContainerManager\.java$"/>
     <suppress id="NoFqcn" files="/floci/services/rds/proxy/RdsProxyTlsCertificates\.java$"/>

@@ -1,0 +1,55 @@
+name: Microsandbox Go Runtimes
+
+# Native VM qualification remains separate from these unit and contract tests.
+
+on:
+  pull_request:
+    paths:
+      - 'tools/microsandbox-pods/**'
+      - 'tools/microsandbox-host/**'
+      - 'tools/microsandbox-runtime/**'
+      - '.github/workflows/microsandbox-pods.yml'
+  push:
+    branches:
+      - main
+    paths:
+      - 'tools/microsandbox-pods/**'
+      - 'tools/microsandbox-host/**'
+      - 'tools/microsandbox-runtime/**'
+      - '.github/workflows/microsandbox-pods.yml'
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+jobs:
+  test:
+    name: ${{ matrix.module }} race tests and vet
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    strategy:
+      fail-fast: false
+      matrix:
+        module: [microsandbox-runtime, microsandbox-host, microsandbox-pods]
+    defaults:
+      run:
+        working-directory: tools/${{ matrix.module }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version-file: tools/${{ matrix.module }}/go.mod
+          cache-dependency-path: |
+            tools/microsandbox-pods/go.sum
+            tools/microsandbox-host/go.sum
+            tools/microsandbox-runtime/go.sum
+
+      - name: Run unit tests with the race detector
+        run: go test -race ./...
+
+      - name: Run Go vet
+        run: go vet ./...
