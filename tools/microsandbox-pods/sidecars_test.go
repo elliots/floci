@@ -313,7 +313,7 @@ func TestSidecarShutdownRecoveryKeepsDeadlineAndEscalates(t *testing.T) {
 	if err := f.p.drainSidecars(t.Context(), f.e); err != nil {
 		t.Fatal(err)
 	}
-	if len(f.signals) != 2 || !strings.Contains(f.signals[1], "SIGKILL 'init-0'") || !managed.progress(f.e).killSent {
+	if len(f.signals) != 1 || f.e.state != "TERMINATED" || f.e.pod.Status.Phase != corev1.PodSucceeded || managed.status(f.e).State.Terminated.Reason != "ContainerStatusUnknown" {
 		t.Fatalf("recovered sidecar did not use the original termination deadline: %v", f.signals)
 	}
 }
@@ -406,5 +406,57 @@ func TestSidecarStatusPublishesWhileLaterOrdinaryInitRuns(t *testing.T) {
 	}
 	if published == nil || published.Status.InitContainerStatuses[0].State.Waiting == nil || published.Status.InitContainerStatuses[0].State.Waiting.Reason != "CrashLoopBackOff" || published.Status.InitContainerStatuses[1].State.Running == nil {
 		t.Fatal("sidecar status became invisible while an ordinary init remained active")
+	}
+}
+
+func TestSidecarDeletionWaitsForQueuedApplicationsBeforeSignaling(t *testing.T) {
+	f := newSidecarFixture(t)
+	f.initialize(t)
+	f.e.pod.Status.ContainerStatuses[0].State = corev1.ContainerState{Waiting: &corev1.ContainerStateWaiting{Reason: "ContainerCreating"}}
+	f.observations["app-0"] = ""
+	observed := 0
+	base := f.p.runner.runtime
+	f.p.runner.runtime = stubNativeRuntime{execute: func(ctx context.Context, args []string, input []byte) (msbruntime.Result, error) {
+		joined := strings.Join(args, " ")
+		if strings.Contains(joined, "if test -f") && strings.Contains(joined, "/app-0/") {
+			observed++
+			if observed == 2 {
+				f.observations["app-0"] = "app-0 20 RUNNING"
+			}
+		}
+		if strings.Contains(joined, "tasks kill --signal SIGTERM 'app-0'") && observed < 2 {
+			t.Error("application signaled before its queued task became observable")
+			return msbruntime.Result{ExitCode: 1}, nil
+		}
+		result, err := base.Execute(ctx, args, input)
+		for _, task := range []string{"app-0", "init-0"} {
+			if strings.Contains(joined, "tasks kill --signal SIGTERM '"+task+"'") {
+				f.observations[task] = "EXIT 143"
+			}
+		}
+		return result, err
+	}}
+	if err := f.p.drainBeforeDeletion(t.Context(), f.e, f.e.pod); err != nil {
+		t.Fatal(err)
+	}
+	if len(f.signals) != 2 || f.e.state != "TERMINATED" {
+		t.Fatal("queued application prevented ordered sidecar shutdown")
+	}
+}
+
+func TestSidecarMissingExitCannotExtendJobShutdownDeadline(t *testing.T) {
+	f := newSidecarFixture(t)
+	f.initialize(t)
+	if err := f.p.beginSidecarShutdown(f.e, corev1.PodSucceeded); err != nil {
+		t.Fatal(err)
+	}
+	f.e.shutdownDeadline = time.Now().Add(-time.Second)
+	f.observations["init-0"] = ""
+	if err := f.p.drainSidecars(t.Context(), f.e); err != nil {
+		t.Fatal(err)
+	}
+	status := f.e.pod.Status.InitContainerStatuses[0]
+	if f.e.state != "TERMINATED" || f.e.pod.Status.Phase != corev1.PodSucceeded || status.State.Terminated == nil || status.State.Terminated.Reason != "ContainerStatusUnknown" {
+		t.Fatal("missing sidecar completion status failed or prolonged a completed Job")
 	}
 }

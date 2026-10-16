@@ -6,6 +6,7 @@ import (
 	"time"
 
 	corev1 "k8s.io/api/core/v1"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 )
 
 func nextInitForEntry(e *podEntry) int {
@@ -143,7 +144,7 @@ func (p *provider) drainBeforeDeletion(ctx context.Context, e *podEntry, request
 	for index := range e.pod.Spec.Containers {
 		managed := managedContainer{index: index}
 		progress := managed.progress(e)
-		if progress.started.IsZero() || !progress.nextRestart.IsZero() || managed.status(e).State.Terminated != nil {
+		if progress.started.IsZero() || !progress.nextRestart.IsZero() || managed.status(e).State.Running == nil {
 			continue
 		}
 		if err := p.stopManagedUnhealthy(ctx, e, managed, nil, "PodDeleted"); err != nil {
@@ -167,6 +168,12 @@ func (p *provider) drainBeforeDeletion(ctx context.Context, e *podEntry, request
 			}
 			if err := p.monitorManagedContainer(ctx, e, managed); err != nil {
 				return err
+			}
+			if managed.status(e).State.Running != nil && progress.nextKill.IsZero() {
+				grace := max(int64(0), int64(time.Until(e.shutdownDeadline).Seconds()))
+				if err := p.stopManagedUnhealthy(ctx, e, managed, &corev1.Probe{TerminationGracePeriodSeconds: new(grace)}, "PodDeleted"); err != nil {
+					return err
+				}
 			}
 			applicationsStopped = applicationsStopped && managed.status(e).State.Terminated != nil
 		}
@@ -207,6 +214,9 @@ func minTime(first, second time.Time) time.Time {
 // Stop sidecars in reverse declaration order. A single Pod grace deadline is
 // journaled so controller recovery cannot grant a fresh grace period per task.
 func (p *provider) drainSidecars(ctx context.Context, e *podEntry) error {
+	if !time.Now().Before(e.shutdownDeadline) {
+		return p.finishSidecarShutdown(ctx, e, true)
+	}
 	for index := len(e.pod.Spec.InitContainers) - 1; index >= 0; index-- {
 		if !restartableInit(e.pod.Spec.InitContainers[index]) {
 			continue
@@ -242,14 +252,39 @@ func (p *provider) drainSidecars(ctx context.Context, e *podEntry) error {
 		}
 		return nil
 	}
+	return p.finishSidecarShutdown(ctx, e, false)
+}
+
+func (p *provider) finishSidecarShutdown(ctx context.Context, e *podEntry, forced bool) error {
 	e.state, e.actualReady = "TERMINATED", false
 	e.mu.Lock()
+	if forced {
+		for index, container := range e.pod.Spec.InitContainers {
+			if !restartableInit(container) {
+				continue
+			}
+			managed := managedContainer{index: index, init: true}
+			status, progress := managed.status(e), managed.progress(e)
+			if status.State.Terminated != nil || progress.started.IsZero() && status.LastTerminationState.Terminated == nil {
+				continue
+			}
+			status.Ready, status.Started = false, new(false)
+			status.State = corev1.ContainerState{Terminated: &corev1.ContainerStateTerminated{
+				ExitCode: 137, Reason: "ContainerStatusUnknown", ContainerID: status.ContainerID,
+				StartedAt: metav1.NewTime(progress.started), FinishedAt: metav1.Now(),
+				Message: "Pod VM stopped after termination grace expired; container exit status was not observed"}}
+			progress.nextRestart, progress.nextKill, progress.ready = time.Time{}, time.Time{}, false
+		}
+	}
 	e.pod.Status.Phase = e.completionPhase
 	e.pod.Status.Conditions = podConditionsFor(e.pod, false)
 	e.mu.Unlock()
 	if err := p.journal(e); err != nil {
 		return err
 	}
+	// Persist completion intent before stopping, so recovery finishes the
+	// owned VM cleanup. Publish only after its observed stop proves that even
+	// queued tasks are gone; unobserved individual exit codes stay explicit.
 	if err := p.stopTerminal(ctx, e); err != nil {
 		return err
 	}
