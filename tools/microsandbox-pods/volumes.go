@@ -77,8 +77,17 @@ func (p *provider) prepareVolumes(ctx context.Context, e *podEntry) error {
 		}
 	}
 	if e.started.IsZero() && e.initialVolumes != nil {
-		// Use the snapshot fetched before admission. A source/API outage during
-		// image pull must not turn a successful mount preflight into Pod failure.
+		// Configuration keeps its pre-admission snapshot across image pulls.
+		// Identity must still be fresh when a potentially long pull completes.
+		for _, volume := range mountedVolumes(e.pod) {
+			if projectedToken(volume) {
+				files, err := p.resolvePodProjection(ctx, e, volume)
+				if err != nil {
+					return fmt.Errorf("refresh initial identity volume %s: %w", volume.Name, err)
+				}
+				e.initialVolumes[volume.Name] = files
+			}
+		}
 		for name, files := range e.initialVolumes {
 			if err := p.writeProjection(ctx, e, name, files); err != nil {
 				return fmt.Errorf("populate volume %s: %w", name, err)
@@ -117,18 +126,22 @@ func volumeSourcesRequired(e *podEntry) bool {
 }
 
 func (p *provider) refreshVolumes(ctx context.Context, e *podEntry, required bool) error {
+	return p.refreshVolumeProjections(ctx, e, required, false)
+}
+
+func (p *provider) refreshVolumeProjections(ctx context.Context, e *podEntry, required, requireTokens bool) error {
 	e.volumesChecked = time.Now()
 	for _, volume := range mountedVolumes(e.pod) {
-		if volume.ConfigMap == nil && volume.Secret == nil {
+		if !projectedData(volume) {
 			continue
 		}
-		files, err := resolveProjectedVolume(ctx, p.client, e.pod.Namespace, volume)
+		files, err := p.resolvePodProjection(ctx, e, volume)
 		if err == nil {
 			err = p.writeProjection(ctx, e, volume.Name, files)
 		}
 		if err != nil {
 			_, alreadyProjected := e.volumeDigests[volume.Name]
-			if required && !alreadyProjected {
+			if required && !alreadyProjected || requireTokens && projectedToken(volume) {
 				return fmt.Errorf("populate volume %s: %w", volume.Name, err)
 			}
 			// Kubernetes retains the last good mounted data if a source cannot be
@@ -142,8 +155,8 @@ func (p *provider) refreshVolumes(ctx context.Context, e *podEntry, required boo
 func (p *provider) readVolumeSources(ctx context.Context, e *podEntry) (map[string]map[string]volumeFile, error) {
 	projections := make(map[string]map[string]volumeFile)
 	for _, volume := range mountedVolumes(e.pod) {
-		if volume.ConfigMap != nil || volume.Secret != nil {
-			files, err := resolveProjectedVolume(ctx, p.client, e.pod.Namespace, volume)
+		if projectedData(volume) {
+			files, err := p.resolvePodProjection(ctx, e, volume)
 			if err != nil {
 				return nil, fmt.Errorf("resolve volume %s: %w", volume.Name, err)
 			}
@@ -206,7 +219,7 @@ func volumeSetupScript(volume corev1.Volume, memoryMiB int) string {
 		return script + "if ! test -d " + root + "; then mkdir " + root + "; chmod 0777 " + root + "; fi"
 	}
 	script += "mkdir -p " + root + "; "
-	if volume.Secret != nil || volume.EmptyDir != nil {
+	if volume.Secret != nil || volume.Projected != nil || volume.EmptyDir != nil {
 		limit, mode := int64(memoryMiB)*bytesPerMiB, "0755"
 		if volume.EmptyDir != nil {
 			mode = "0777"
@@ -232,7 +245,7 @@ func volumeMountArgsForContainer(pod *corev1.Pod, container corev1.Container) []
 	for index, mount := range container.VolumeMounts {
 		volume := volumes[mount.Name]
 		mode := "rw"
-		if mount.ReadOnly || volume.ConfigMap != nil || volume.Secret != nil || volume.HostPath != nil {
+		if mount.ReadOnly || projectedData(volume) || volume.HostPath != nil {
 			mode = "ro"
 		}
 		source := guestVolumePath(mount.Name)

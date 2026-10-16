@@ -261,7 +261,10 @@ func (p *provider) recover(ctx context.Context) error {
 	// All journals and active allocations are accounted before any listener can wake a Pod.
 	for _, e := range recovered {
 		e.op.Lock()
-		err := p.prepareProxy(ctx, e)
+		err := p.refreshRecoveredTokens(ctx, e)
+		if err == nil {
+			err = p.prepareProxy(ctx, e)
+		}
 		e.op.Unlock()
 		if err != nil {
 			return err

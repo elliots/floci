@@ -274,6 +274,9 @@ func (p *provider) advanceInit(ctx context.Context, e *podEntry) error {
 }
 
 func (p *provider) monitorInit(ctx context.Context, e *podEntry) error {
+	if time.Since(e.volumesChecked) >= volumeRefreshInterval {
+		_ = p.refreshVolumes(ctx, e, false)
+	}
 	if err := p.monitorSidecars(ctx, e); err != nil {
 		return err
 	}
@@ -322,9 +325,6 @@ func (p *provider) monitorInit(ctx context.Context, e *podEntry) error {
 		e.applicationMissingSince = time.Time{}
 		if missing {
 			p.publish(e)
-		}
-		if time.Since(e.volumesChecked) >= volumeRefreshInterval {
-			_ = p.refreshVolumes(ctx, e, false)
 		}
 		return nil
 	}

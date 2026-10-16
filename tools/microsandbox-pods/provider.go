@@ -52,6 +52,7 @@ type podEntry struct {
 	completionPhase                                  corev1.PodPhase
 	shutdownDeadline                                 time.Time
 	applications                                     map[string]*applicationProgress
+	tokens                                           serviceAccountTokens
 	idleScheduled                                    bool
 	proxyAvailability, proxyRoutesReady, actualReady bool
 	proxyRouteFailed                                 atomic.Bool
@@ -808,6 +809,8 @@ func (p *provider) DeletePod(ctx context.Context, pod *corev1.Pod) error {
 		return err
 	}
 	e.deleted = true
+	e.tokens.clear()
+	e.initialVolumes = nil
 	var errs []error
 	if err := p.removeProxy(ctx, e); err != nil {
 		errs = append(errs, err)

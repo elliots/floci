@@ -103,6 +103,14 @@ func validateVolumeWithCA(volume corev1.Volume, memoryMiB int, caPath string) er
 		}
 		return nil
 	}
+	if volume.Projected != nil {
+		remaining := volume.VolumeSource
+		remaining.Projected = nil
+		if !reflect.DeepEqual(remaining, corev1.VolumeSource{}) {
+			return fmt.Errorf("exactly one supported volume source is required")
+		}
+		return validateCombinedProjection(volume)
+	}
 	remaining := volume.VolumeSource
 	remaining.EmptyDir, remaining.ConfigMap, remaining.Secret = nil, nil, nil
 	if !reflect.DeepEqual(remaining, corev1.VolumeSource{}) {

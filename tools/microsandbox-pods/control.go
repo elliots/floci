@@ -393,6 +393,9 @@ func (p *provider) resume(ctx context.Context, e *podEntry) error {
 	if err := p.requireVMStatus(ctx, e, "Stopped"); err != nil {
 		return err
 	}
+	if err := p.preflightWakeTokens(ctx, e); err != nil {
+		return err
+	}
 	selector := e.snapshots[len(e.snapshots)-1]
 	if err := p.checkSnapshot(ctx, e, selector); err != nil {
 		return err
@@ -453,9 +456,12 @@ func (p *provider) resume(ctx context.Context, e *podEntry) error {
 		}
 	}
 	// The snapshot already contains the previous projection. Fetch current
-	// sources before admitting wake traffic, retaining that data on API errors.
+	// sources before admitting wake traffic. Configuration may retain its last
+	// good data on API errors; identity projections must refresh successfully.
 	e.volumeDigests = nil
-	_ = p.refreshVolumes(ctx, e, false)
+	if err := p.refreshVolumeProjections(ctx, e, false, true); err != nil {
+		return p.transitionFailed(e, err)
+	}
 	e.state = "RUNNING"
 	resetProbeProgress(e)
 	for _, progress := range e.applications {
