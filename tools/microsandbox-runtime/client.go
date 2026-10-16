@@ -95,17 +95,39 @@ func (c *Client) Execute(ctx context.Context, args []string, input []byte) (Resu
 // The reader should be cancellable by its owner when ctx ends (as Kubernetes
 // remote-command streams are). Streaming does not impose a total-output limit.
 func (c *Client) ExecuteStream(ctx context.Context, args []string, stdin io.Reader, stdout, stderr io.Writer) (int, error) {
+	return c.ExecuteStreamWithOptions(ctx, args, stdin, stdout, stderr, StreamOptions{})
+}
+
+// ExecuteStreamWithOptions supports interactive terminals without changing the
+// command contract used by buffered lifecycle operations. Cancellation kills
+// this attached exec session, not the sandbox or its application processes.
+func (c *Client) ExecuteStreamWithOptions(ctx context.Context, args []string, stdin io.Reader, stdout, stderr io.Writer, options StreamOptions) (int, error) {
 	if len(args) == 0 || args[0] != "exec" {
 		return 0, invalid("streaming requires exec")
 	}
-	return c.execute(ctx, args, stdin, stdin != nil, stdout, stderr)
+	request, err := parse(args)
+	if err != nil {
+		return 0, err
+	}
+	if request.detached {
+		return 0, invalid("streaming requires attached exec")
+	}
+	return c.executeWithOptions(ctx, args, stdin, stdin != nil, stdout, stderr, options)
 }
 
 func (c *Client) execute(ctx context.Context, args []string, stdin io.Reader, hasInput bool, stdout, stderr io.Writer) (int, error) {
+	return c.executeWithOptions(ctx, args, stdin, hasInput, stdout, stderr, StreamOptions{})
+}
+
+func (c *Client) executeWithOptions(ctx context.Context, args []string, stdin io.Reader, hasInput bool, stdout, stderr io.Writer, options StreamOptions) (int, error) {
 	req, err := parse(args)
 	if err != nil {
 		return 0, err
 	}
+	if err := options.validate(req); err != nil {
+		return 0, err
+	}
+	req.stream = options
 	if hasInput && (req.op != "exec" || req.noStdin || req.detached) {
 		return 0, invalid("stdin is only supported for attached exec")
 	}

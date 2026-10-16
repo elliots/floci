@@ -41,12 +41,15 @@ func newHandler(config hostConfig, runtime executor) http.Handler {
 	mux.HandleFunc("GET /health", h.health)
 	mux.HandleFunc("POST /v1/command", h.command)
 	mux.HandleFunc("POST /v1/port", h.port)
+	mux.HandleFunc("POST /v1/guest-task/plan", h.guestTaskPlan)
+	mux.HandleFunc("POST /v1/guest-task", h.guestTask)
+	mux.HandleFunc("GET /v1/exec", h.execStream)
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		_, pattern := mux.Handler(r)
 		if pattern == "" {
-			if r.URL.Path == "/health" || r.URL.Path == "/v1/command" || r.URL.Path == "/v1/port" {
+			if r.URL.Path == "/health" || r.URL.Path == "/v1/command" || r.URL.Path == "/v1/port" || r.URL.Path == "/v1/guest-task/plan" || r.URL.Path == "/v1/guest-task" || r.URL.Path == "/v1/exec" {
 				allow := "POST"
-				if r.URL.Path == "/health" {
+				if r.URL.Path == "/health" || r.URL.Path == "/v1/exec" {
 					allow = "GET, HEAD"
 				}
 				w.Header().Set("Allow", allow)

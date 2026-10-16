@@ -16,8 +16,56 @@ type eventStream interface {
 	Kill(context.Context) error
 }
 
+// TerminalSize uses rows then columns, matching the native SDK's Resize API.
+type TerminalSize struct {
+	Rows uint16 `json:"rows"`
+	Cols uint16 `json:"cols"`
+}
+
+type StreamOptions struct {
+	TTY    bool
+	Size   TerminalSize
+	Resize <-chan TerminalSize
+}
+
+func (o StreamOptions) validate(r command) error {
+	if !o.TTY && (o.Size != (TerminalSize{}) || o.Resize != nil) {
+		return invalid("terminal dimensions require TTY")
+	}
+	if o.TTY && (r.op != "exec" || r.detached) {
+		return invalid("TTY requires attached exec")
+	}
+	if (o.Size.Rows == 0) != (o.Size.Cols == 0) {
+		return invalid("terminal rows and columns must both be positive")
+	}
+	return nil
+}
+
+type terminalResizer interface {
+	Resize(context.Context, uint16, uint16) error
+}
+
+func forwardResizes(ctx context.Context, stream terminalResizer, sizes <-chan TerminalSize) error {
+	for {
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case size, ok := <-sizes:
+			if !ok {
+				return nil
+			}
+			if size.Rows == 0 || size.Cols == 0 {
+				return invalid("terminal rows and columns must both be positive")
+			}
+			if err := stream.Resize(ctx, size.Rows, size.Cols); err != nil {
+				return err
+			}
+		}
+	}
+}
+
 func streamExec(ctx context.Context, sandbox *msb.Sandbox, r command, input io.Reader, stdout, stderr io.Writer) (code int, resultErr error) {
-	opts := []msb.ExecOption{msb.WithExecUser(r.user), msb.WithExecTTY(false)}
+	opts := []msb.ExecOption{msb.WithExecUser(r.user), msb.WithExecTTY(r.stream.TTY)}
 	if input != nil {
 		opts = append(opts, msb.WithExecStdinPipe())
 	}
@@ -25,8 +73,12 @@ func streamExec(ctx context.Context, sandbox *msb.Sandbox, r command, input io.R
 	if err != nil {
 		return 0, err
 	}
-	ctx, cancel := context.WithCancel(ctx)
+	ctx, cancelCause := context.WithCancelCause(ctx)
+	cancel := func() { cancelCause(context.Canceled) }
 	defer func() {
+		if resultErr != nil {
+			resultErr = errors.Join(resultErr, context.Cause(ctx))
+		}
 		cancel()
 		if resultErr != nil {
 			// Close only releases the transport. Kill a failed attached session
@@ -37,6 +89,18 @@ func streamExec(ctx context.Context, sandbox *msb.Sandbox, r command, input io.R
 		}
 		resultErr = errors.Join(resultErr, stream.Close())
 	}()
+	if r.stream.Size != (TerminalSize{}) {
+		if err := stream.Resize(ctx, r.stream.Size.Rows, r.stream.Size.Cols); err != nil {
+			return 0, err
+		}
+	}
+	if r.stream.Resize != nil {
+		go func() {
+			if err := forwardResizes(ctx, stream, r.stream.Resize); err != nil {
+				cancelCause(err)
+			}
+		}()
+	}
 	var inputErr <-chan error
 	if input != nil {
 		sink := stream.TakeStdin()

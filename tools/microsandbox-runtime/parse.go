@@ -17,6 +17,7 @@ type command struct {
 	fallback, detached, noStdin, force, full, integrity bool
 	timeout                                             *time.Duration
 	config                                              msb.SandboxConfig
+	stream                                              StreamOptions
 }
 
 func parse(args []string) (command, error) {
