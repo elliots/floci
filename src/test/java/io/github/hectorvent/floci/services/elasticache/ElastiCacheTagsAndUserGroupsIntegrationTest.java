@@ -1,16 +1,61 @@
 package io.github.hectorvent.floci.services.elasticache;
 
+import io.quarkus.test.common.http.TestHTTPResource;
 import io.quarkus.test.junit.QuarkusTest;
 import io.restassured.response.ValidatableResponse;
 import io.restassured.specification.RequestSpecification;
 import org.junit.jupiter.api.Test;
+import software.amazon.awssdk.auth.credentials.AwsBasicCredentials;
+import software.amazon.awssdk.auth.credentials.StaticCredentialsProvider;
+import software.amazon.awssdk.regions.Region;
+import software.amazon.awssdk.services.elasticache.ElastiCacheClient;
+import software.amazon.awssdk.services.elasticache.model.DescribeUserGroupsResponse;
+import software.amazon.awssdk.services.elasticache.model.Tag;
+
+import java.net.URI;
 
 import static io.restassured.RestAssured.given;
 import static org.hamcrest.Matchers.equalTo;
 import static org.hamcrest.Matchers.hasItems;
+import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertTrue;
 
 @QuarkusTest
 class ElastiCacheTagsAndUserGroupsIntegrationTest {
+    @TestHTTPResource
+    URI endpoint;
+
+    @Test
+    void sdkReadsPagedGroupsAndPersistedResourceTags() {
+        try (ElastiCacheClient client = ElastiCacheClient.builder().endpointOverride(endpoint)
+                .region(Region.US_EAST_1).credentialsProvider(StaticCredentialsProvider.create(
+                        AwsBasicCredentials.create("test", "test"))).build()) {
+            String first = "sdk-page-group-a";
+            String second = "sdk-page-group-b";
+            String arn = client.createUserGroup(request -> request.userGroupId(first).engine("valkey")
+                    .tags(Tag.builder().key("environment").value("test").build())).arn();
+            client.createUserGroup(request -> request.userGroupId(second).engine("valkey"));
+            try {
+                DescribeUserGroupsResponse page = client.describeUserGroups(request -> request.maxRecords(1));
+                assertEquals(1, page.userGroups().size());
+                assertTrue(page.marker() != null && !page.marker().isEmpty());
+                DescribeUserGroupsResponse next = client.describeUserGroups(request -> request.maxRecords(1)
+                        .marker(page.marker()));
+                assertEquals(1, next.userGroups().size());
+                assertTrue(!page.userGroups().getFirst().userGroupId().equals(next.userGroups().getFirst().userGroupId()));
+                assertEquals("test", client.listTagsForResource(request -> request.resourceName(arn))
+                        .tagList().getFirst().value());
+                client.addTagsToResource(request -> request.resourceName(arn)
+                        .tags(Tag.builder().key("environment").value("updated").build()));
+                assertEquals("updated", client.listTagsForResource(request -> request.resourceName(arn))
+                        .tagList().getFirst().value());
+            } finally {
+                client.deleteUserGroup(request -> request.userGroupId(first));
+                client.deleteUserGroup(request -> request.userGroupId(second));
+            }
+        }
+    }
+
 
     private ValidatableResponse call(String action, String... params) {
         RequestSpecification request = given().header("Authorization",
