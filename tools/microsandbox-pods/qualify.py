@@ -14,7 +14,13 @@ import time
 import urllib.request
 import urllib.error
 
+from qualification_registry import QualificationRegistry
+
 LABEL = "io.floci.pod-probe"
+
+
+class QualificationFailure(RuntimeError):
+    pass
 
 
 def command(*args, timeout=60, input_text=None, env=None):
@@ -32,6 +38,8 @@ def wait(description, operation, timeout=180):
             value = operation()
             if value:
                 return value
+        except QualificationFailure:
+            raise
         except Exception as failure:
             error = str(failure)
         time.sleep(1)
@@ -56,6 +64,7 @@ def qualify(args):
     environment = dict(os.environ, MSB_HOME=args.msb_home)
     report = {"owner": owner, "peer": peer, "node": node, "checks": {}}
     process = None
+    registry = None
     server_name = "native-server"
     log_path = Path(args.report).with_suffix(".controller.log")
     log = log_path.open("w")
@@ -75,7 +84,7 @@ def qualify(args):
     def ready(name):
         pod = resource("pod", name)
         if pod.get("status", {}).get("phase") == "Failed":
-            raise RuntimeError(json.dumps(pod["status"]))
+            raise QualificationFailure(json.dumps(pod["status"]))
         return pod if any(c.get("type") == "Ready" and c.get("status") == "True"
                           for c in pod.get("status", {}).get("conditions", [])) else None
     try:
@@ -320,6 +329,196 @@ def qualify(args):
                         ("secrets","/mounted/secrets"),("optional-settings","/mounted/optional-settings"),
                         ("optional-secrets","/mounted/optional-secrets"))]
                 return value
+            initialized = pod("native-init", "test \"$(cat /work/order)\" = first-second; exec sleep 900")
+            initialized["spec"]["restartPolicy"] = "Always"
+            initialized["spec"]["volumes"] = [
+                {"name":"work","emptyDir":{}},
+                {"name":"settings","configMap":{"name":"native-volume-settings",
+                    "items":[{"key":"setting","path":"nested/value"}]}},
+                {"name":"credentials","secret":{"secretName":"native-volume-secrets"}},
+            ]
+            initialized["spec"]["containers"][0]["env"] = [{"name":"DIRECTORY","value":"nested"}]
+            initialized["spec"]["containers"][0]["volumeMounts"] = [
+                {"name":"work","mountPath":"/work"},
+                {"name":"work","mountPath":"/single-file","subPath":"nested/value"},
+                {"name":"work","mountPath":"/expanded","subPathExpr":"$(DIRECTORY)"},
+                {"name":"work","mountPath":"/created","subPathExpr":"fresh/$(DIRECTORY)"},
+                {"name":"settings","mountPath":"/pinned-config","subPath":"nested/value"},
+                {"name":"settings","mountPath":"/pinned-directory","subPath":"nested"},
+                {"name":"credentials","mountPath":"/pinned-secret","subPath":"token"},
+                {"name":"settings","mountPath":"/settings"},
+            ]
+            init_image = initialized["spec"]["containers"][0]["image"]
+            initialized["spec"]["initContainers"] = [
+                {"name":"prepare","image":init_image,
+                 "command":["sh","-ec",'mkdir -p /work/nested; chmod 777 /work/nested; printf first >/work/order; echo "$SETTING" >/work/nested/value; echo prepare-completed'],
+                 "env":[{"name":"SETTING","valueFrom":{"configMapKeyRef":{"name":"native-volume-settings","key":"setting"}}}],
+                 "resources":{"requests":{"cpu":"1500m","memory":"769Mi"},"limits":{"cpu":"2","memory":"1025Mi"}},
+                 "volumeMounts":[{"name":"work","mountPath":"/work"}]},
+                {"name":"finish","image":init_image,
+                 "command":["sh","-ec",'test "$(cat /work/order)" = first; test "$(cat /input)" = initial; printf -- -second >>/work/order; echo finish-completed'],
+                 "volumeMounts":[{"name":"work","mountPath":"/work"},
+                                 {"name":"work","mountPath":"/input","subPath":"nested/value","readOnly":True}]},
+            ]
+            apply(initialized)
+            init_pod = wait("sequential init containers finish before application",lambda:ready("native-init"),360)
+            init_uid = init_pod["metadata"]["uid"]
+            init_statuses = init_pod["status"]["initContainerStatuses"]
+            assert [value["name"] for value in init_statuses] == ["prepare","finish"], init_statuses
+            assert all(value["state"]["terminated"]["exitCode"] == 0 for value in init_statuses), init_statuses
+            assert any(value["type"] == "Initialized" and value["status"] == "True"
+                       for value in init_pod["status"]["conditions"])
+            assert "prepare-completed" in kubectl("logs","native-init","-c","prepare")
+            assert "finish-completed" in kubectl("logs","native-init","-c","finish")
+            init_state = lifecycle(init_uid)
+            assert init_state["vcpus"] == 2 and init_state["memoryMiB"] == 1282, init_state
+            assert control_get("health")["activeMemoryMiB"] == 1282
+            report["checks"]["sequential_init_status_logs_environment_and_resource_maximum"] = True
+            assert kubectl("exec","native-init","--","sh","-ec",
+                'test "$(cat /single-file)" = initial; test "$(cat /expanded/value)" = initial; '
+                'echo shared >/expanded/value; cat /single-file') == "shared"
+            kubectl("exec","native-init","--","sh","-ec",
+                'test -d /created; echo created >/created/value; test "$(cat /work/fresh/nested/value)" = created')
+            assert kubectl("exec","native-init","--","sh","-ec",
+                "if echo forbidden >/pinned-config 2>/dev/null; then exit 1; fi; echo read-only") == "read-only"
+            volume_sources("subpath-updated")
+            wait("whole projection updates beside pinned subPath",lambda:
+                kubectl("exec","native-init","--","cat","/settings/nested/value") == "subpath-updated",120)
+            assert kubectl("exec","native-init","--","cat","/pinned-config") == "initial"
+            assert kubectl("exec","native-init","--","cat","/pinned-directory/value") == "initial"
+            assert kubectl("exec","native-init","--","cat","/pinned-secret") == "private-initial"
+            report["checks"]["subpath_file_directory_expression_and_pinned_projection"] = True
+            lifecycle(init_uid,"hibernate",init_state["generation"])
+            crash_and_restart()
+            init_state = lifecycle(init_uid)
+            assert init_state["state"] == "SLEEPING"
+            lifecycle(init_uid,"resume",init_state["generation"])
+            wait("initialized pod resumes after controller recovery",lambda:ready("native-init"),180)
+            assert kubectl("exec","native-init","--","cat","/work/order") == "first-second"
+            assert kubectl("exec","native-init","--","cat","/single-file") == "shared"
+            assert kubectl("exec","native-init","--","cat","/pinned-config") == "initial"
+            assert kubectl("exec","native-init","--","cat","/pinned-directory/value") == "initial"
+            previous_restarts = resource("pod","native-init")["status"]["containerStatuses"][0]["restartCount"]
+            command(args.msb,"exec","--no-stdin",lifecycle(init_uid)["vm"],"--","sh","-ec",
+                "ctr --address /run/containerd/containerd.sock tasks kill --signal SIGKILL application",env=environment)
+            wait("application restarts after init completion",lambda:
+                resource("pod","native-init")["status"]["containerStatuses"][0]["restartCount"] > previous_restarts,120)
+            wait("restarted application ready",lambda:ready("native-init"),180)
+            assert kubectl("exec","native-init","--","cat","/work/order") == "first-second"
+            assert kubectl("exec","native-init","--","cat","/single-file") == "shared"
+            assert kubectl("exec","native-init","--","cat","/pinned-config") == "subpath-updated"
+            assert kubectl("exec","native-init","--","cat","/pinned-directory/value") == "subpath-updated"
+            assert kubectl("exec","native-init","--","cat","/pinned-secret") == "private-subpath-updated"
+            assert all(value["restartCount"] == 0 for value in resource("pod","native-init")["status"]["initContainerStatuses"])
+            report["checks"]["init_completion_and_subpath_survive_resume_recovery_and_app_restart"] = True
+            kubectl("delete","pod","native-init","--wait=true",timeout=120)
+            wait("init fixture releases RAM",lambda:control_get("health")["activeMemoryMiB"]==0)
+            for policy in ("Never", "OnFailure"):
+                name = "init-failure-" + policy.lower()
+                retry = pod(name, "exec sleep 900")
+                retry["spec"]["restartPolicy"] = policy
+                retry["spec"]["volumes"] = [{"name":"work","emptyDir":{}}]
+                retry["spec"]["initContainers"] = [{"name":"retry","image":init_image,
+                    "command":["sh","-ec",'if test ! -f /work/attempt; then touch /work/attempt; exit 7; fi; echo retry-succeeded'],
+                    "volumeMounts":[{"name":"work","mountPath":"/work"}]}]
+                apply(retry)
+                if policy == "Never":
+                    def failed_init():
+                        value = resource("pod",name)
+                        return value if value.get("status",{}).get("phase") == "Failed" else None
+                    failed = wait("Never init failure terminates pod",failed_init,240)
+                    assert failed["status"]["initContainerStatuses"][0]["state"]["terminated"]["exitCode"] == 7
+                    assert not any(value["state"].get("running") for value in failed["status"]["containerStatuses"])
+                    report["checks"]["init_never_failure_prevents_application"] = True
+                else:
+                    retried = wait("OnFailure retries init and starts app",lambda:ready(name),300)
+                    status = retried["status"]["initContainerStatuses"][0]
+                    assert status["restartCount"] == 1 and status["state"]["terminated"]["exitCode"] == 0, status
+                    assert status["lastState"]["terminated"]["exitCode"] == 7, status
+                    report["checks"]["init_onfailure_retries_before_application"] = True
+                kubectl("delete","pod",name,"--wait=true",timeout=120)
+                wait("failed init fixture releases RAM",lambda:control_get("health")["activeMemoryMiB"]==0)
+            escaped = pod("subpath-escape", "exec sleep 900")
+            escaped["spec"]["volumes"] = [{"name":"work","emptyDir":{}}]
+            escaped["spec"]["containers"][0]["volumeMounts"] = [
+                {"name":"work","mountPath":"/escaped","subPath":"escape/passwd"}]
+            escaped["spec"]["initContainers"] = [{"name":"prepare","image":init_image,
+                "command":["sh","-ec","ln -s /etc /work/escape"],
+                "volumeMounts":[{"name":"work","mountPath":"/work"}]}]
+            apply(escaped)
+            def rejected_escape():
+                value = resource("pod","subpath-escape")
+                return value if value.get("status",{}).get("phase") == "Failed" else None
+            rejected = wait("escaping subPath symlink rejects app launch",rejected_escape,240)
+            assert "subPath" in rejected["status"]["message"], rejected["status"]
+            assert not any(value["state"].get("running") for value in rejected["status"]["containerStatuses"])
+            report["checks"]["subpath_symlink_escape_rejected_before_application"] = True
+            kubectl("delete","pod","subpath-escape","--wait=true",timeout=120)
+            wait("subPath escape fixture releases RAM",lambda:control_get("health")["activeMemoryMiB"]==0)
+            volume_sources("initial", old_key=True)
+            registry = QualificationRegistry(command, temporary, owner)
+            registry.start()
+            apply(registry.secret())
+            private = pod("native-private-image", "echo private-registry-executed; exec sleep 900")
+            private["spec"]["restartPolicy"] = "Always"
+            private["spec"]["imagePullSecrets"] = [{"name":"native-registry"}]
+            private["spec"]["containers"][0]["image"] = registry.image
+            private["spec"]["containers"][0]["imagePullPolicy"] = "Always"
+            private["spec"]["volumes"] = [{"name":"registry-gate","emptyDir":{}}]
+            private["spec"]["initContainers"] = [{"name":"registry-gate","image":init_image,
+                "command":["sh","-ec","echo once >>/gate/runs; while test ! -f /gate/release; do sleep 1; done"],
+                "volumeMounts":[{"name":"registry-gate","mountPath":"/gate"}]}]
+            apply(private)
+            private_uid = resource("pod","native-private-image")["metadata"]["uid"]
+            def registry_gate_ready():
+                value = resource("pod","native-private-image")
+                statuses = value.get("status",{}).get("initContainerStatuses",[])
+                return statuses and statuses[0].get("state",{}).get("running")
+            wait("registry fixture waits for its private test CA",registry_gate_ready,300)
+            init_started = resource("pod","native-private-image")["status"]["initContainerStatuses"][0]["state"]["running"]["startedAt"]
+            private_state = lifecycle(private_uid)
+            def running_init_identity():
+                return command(args.msb,"exec","--no-stdin",private_state["vm"],"--","sh","-ec",
+                    "cat /proc/sys/kernel/random/boot_id; "
+                    "ctr --address /run/containerd/containerd.sock tasks list | "
+                    "awk '$1 == \"init-0\" && $3 == \"RUNNING\" {print $1, $2, $3}'",env=environment)
+            init_identity = running_init_identity()
+            assert len(init_identity.splitlines()) == 2, init_identity
+            crash_and_restart()
+            wait("running init survives controller recovery",registry_gate_ready,120)
+            recovered_init = resource("pod","native-private-image")["status"]["initContainerStatuses"][0]
+            assert recovered_init["restartCount"] == 0
+            assert recovered_init["state"]["running"]["startedAt"] == init_started
+            private_state = lifecycle(private_uid)
+            assert private_state["state"] == "INITIALIZING", private_state
+            assert running_init_identity() == init_identity
+            assert command(args.msb,"exec","--no-stdin",private_state["vm"],"--","cat",
+                "/var/lib/floci-volumes/registry-gate/runs",env=environment) == "once"
+            report["checks"]["controller_recovery_retains_running_init"] = True
+            command(args.msb,"exec","--stream",private_state["vm"],"--","sh","-ec",
+                "cat >>/etc/ssl/certs/ca-certificates.crt; "
+                + "printf '%s\\n' '" + host_ip + " host.microsandbox.internal' >>/etc/hosts; "
+                + "touch /var/lib/floci-volumes/registry-gate/release",
+                input_text="\n"+registry.certificate.read_text(), env=environment)
+            wait("private registry image authenticates and runs",lambda:ready("native-private-image"),300)
+            assert "private-registry-executed" in kubectl("logs","native-private-image")
+            assert registry.authenticated_requests > 0
+            report["checks"]["private_registry_secret_real_tls_authenticated_pull"] = True
+            authenticated_before = registry.authenticated_requests
+            private_restarts = resource("pod","native-private-image")["status"]["containerStatuses"][0]["restartCount"]
+            registry.password = secrets.token_hex(24)
+            apply(registry.secret())
+            command(args.msb,"exec","--no-stdin",lifecycle(private_uid)["vm"],"--","sh","-ec",
+                "ctr --address /run/containerd/containerd.sock tasks kill --signal SIGKILL application",env=environment)
+            wait("private application restarts using rotated registry secret",lambda:
+                resource("pod","native-private-image")["status"]["containerStatuses"][0]["restartCount"] > private_restarts,120)
+            wait("rotated registry credentials permit Always pull",lambda:ready("native-private-image"),180)
+            assert registry.authenticated_requests > authenticated_before
+            report["checks"]["private_registry_secret_rotation_on_always_restart"] = True
+            kubectl("delete","pod","native-private-image","--wait=true",timeout=120)
+            wait("registry fixture releases RAM",lambda:control_get("health")["activeMemoryMiB"]==0)
+            registry.close()
+            registry = None
             def volume_version(version):
                 return kubectl("exec","native-server","--","sh","-ec",
                     'printf "%s/%s" "$(cat /mounted/settings/nested/value)" "$(cat /mounted/secrets/nested/token)"') == version+"/private-"+version
@@ -336,8 +535,13 @@ def qualify(args):
                 lazy["spec"]["containers"][0]["readinessProbe"]={"httpGet":{"path":"/cgi-bin/source","port":"http"},"periodSeconds":1,"timeoutSeconds":5,"failureThreshold":1}
                 lazy["spec"]["containers"][0]["startupProbe"]={"tcpSocket":{"port":"http"},"periodSeconds":1,"timeoutSeconds":5,"failureThreshold":30}
                 lazy["spec"]["containers"][0]["livenessProbe"]={"httpGet":{"path":"/cgi-bin/source","port":"http"},"periodSeconds":1,"timeoutSeconds":5,"failureThreshold":3}
-                lazy["spec"]["volumes"]=[{"name":"cold-settings","configMap":{"name":"native-cold-settings"}}]
-                lazy["spec"]["containers"][0]["volumeMounts"]=[{"name":"cold-settings","mountPath":"/www/settings"}]
+                lazy["spec"]["volumes"]=[{"name":"cold-settings","configMap":{"name":"native-cold-settings"}},
+                    {"name":"initialization","emptyDir":{}}]
+                lazy["spec"]["containers"][0]["volumeMounts"]=[{"name":"cold-settings","mountPath":"/www/settings"},
+                    {"name":"initialization","mountPath":"/www/initialization"}]
+                lazy["spec"]["initContainers"]=[{"name":"initialize","image":init_image,
+                    "command":["sh","-ec","echo once >>/initialize/runs"],
+                    "volumeMounts":[{"name":"initialization","mountPath":"/initialize"}]}]
                 apply({"apiVersion":"v1","kind":"ConfigMap","metadata":{"name":"native-cold-settings"},"data":{"version":"before-cold"}})
                 lazy_annotations={"microsandbox.dev/availability":"proxy","microsandbox.dev/idle-timeout-seconds":"20"}
                 registration_started=time.monotonic()
@@ -351,7 +555,10 @@ def qualify(args):
                 assert len(discovery["pods"])==args.proxy_pods and all(p["state"]=="COLD" for p in discovery["pods"])
                 assert control_get("health")["activeMemoryMiB"]==0
                 scheduled=json.loads(kubectl("get","pods","-l","app=lazy-probe","-o","json"))["items"]
+                assert len(scheduled) == args.proxy_pods
                 assert all(value["spec"]["nodeName"]==node for value in scheduled)
+                assert all(any(condition["type"] == "Initialized" and condition["status"] == "False"
+                               for condition in value["status"]["conditions"]) for value in scheduled)
                 assert all(value["spec"]["containers"][0]["resources"]["requests"]=={"cpu":"1", "memory":"768Mi"} for value in scheduled)
                 report["scheduling"]={"capacity":resource("node",node)["status"]["allocatable"],
                     "requested_cpu":args.proxy_pods,"requested_memory_mib":args.proxy_pods*768,
@@ -386,6 +593,8 @@ def qualify(args):
                 response=kubectl("exec","proxy-docker","--","wget","-T","180","-qO-","http://lazy-probe/cgi-bin/source",timeout=210)
                 assert response
                 assert kubectl("exec","proxy-docker","--","wget","-T","30","-qO-","http://lazy-probe/settings/version")=="after-cold"
+                assert kubectl("exec","proxy-docker","--","wget","-T","30","-qO-","http://lazy-probe/initialization/runs")=="once"
+                report["checks"]["proxy_ready_defers_init_until_first_request"]=True
                 report["checks"]["cold_volume_reads_latest_config_on_first_wake"]=True
                 report["proxy_declaration"]["first_service_wake_seconds"]=round(time.monotonic()-began,3)
                 assert lifecycle(proxy_uid)["state"]=="READY"
@@ -420,6 +629,7 @@ def qualify(args):
                 report["proxy_declaration"]["service_ram_resume_seconds"]=round(time.monotonic()-began,3)
                 assert kubectl("exec",chosen["name"],"--","cat","/dev/shm/marker")==marker
                 assert kubectl("exec",chosen["name"],"--","cat","/proc/sys/kernel/random/boot_id")==boot
+                assert kubectl("exec",chosen["name"],"--","cat","/www/initialization/runs")=="once"
                 report["checks"]["proxy_activity_guard_autoidle_and_ram_resume"]=True
                 kubectl("delete","deployment","lazy-probe","--wait=true",timeout=900)
                 kubectl("delete","pod","proxy-native","proxy-docker","--wait=true",timeout=120)
@@ -627,6 +837,9 @@ def qualify(args):
             kubectl("delete","pod","startup-failure","--wait=true",timeout=180)
             if args.floci_checkout:
                 cold_spec=json.loads(json.dumps(server["spec"]))
+                cold_spec["initContainers"]=[{"name":"initialize","image":init_image,
+                    "command":["sh","-ec","sleep 2; echo initialized >/work/initialized"],
+                    "volumeMounts":[{"name":"disk-cache","mountPath":"/work"}]}]
                 cold_spec["containers"][0]["command"]=["sh","-ec","mkdir -p /www; touch /www/ready /tmp/started /tmp/live; httpd -p 9090 -h /www; "+server_script]
                 cold_annotations={"microsandbox.dev/on-demand":"true"}
                 if args.proxy_pods:
@@ -651,6 +864,7 @@ def qualify(args):
                 if completed.returncode: raise RuntimeError("Java native workload integration test failed; see controller log")
                 report["checks"]["java_on_demand_http_wake"] = True
                 cold_name = cold_deployment["pods"][0]["name"]
+                assert kubectl("exec",cold_name,"--","cat","/work/disk/initialized")=="initialized"
                 kubectl("exec",cold_name,"--","sh","-ec","test ! -e /work/disk/marker; test ! -e /work/memory/marker")
                 report["checks"]["new_pod_emptydir_starts_empty"] = True
                 kubectl("delete","deployment","native-cold","--wait=true",timeout=90)
@@ -660,9 +874,9 @@ def qualify(args):
             wait("native VM removal",lambda: not [v for v in json.loads(command(args.msb,"ls","--format","json",env=environment)) if v["name"] in owned_vms])
             report["checks"]["pod_deletion_removes_vms"] = True
             report["result"] = "passed"
-    except Exception as error:
+    except (Exception, KeyboardInterrupt) as error:
         report["result"] = "failed"
-        report["error"] = str(error)
+        report["error"] = str(error) or type(error).__name__
         try:
             report["peer_network"] = docker("exec", peer, "sh", "-c", "ip -d link show; ip route; ip neigh; iptables-save -c")
             report["pods"] = json.loads(kubectl("get","pods","-o","json"))
@@ -683,6 +897,11 @@ def qualify(args):
             except subprocess.TimeoutExpired:
                 process.kill(); process.wait(); report["controller_forced_exit"] = True
         cleanup_errors = []
+        if registry:
+            try:
+                registry.close()
+            except Exception as error:
+                cleanup_errors.append(str(error))
         try:
             records={}
             if "temporary" in locals():
@@ -713,7 +932,7 @@ def qualify(args):
             try:
                 inspection = json.loads(docker("inspect",peer))[0]
                 if inspection["Config"]["Labels"].get(LABEL) != owner: raise RuntimeError("Docker owner changed")
-                docker("rm","-f",peer)
+                docker("rm","-fv",peer)
             except Exception as error: cleanup_errors.append(str(error))
         log.close()
         if "directory" in locals():
