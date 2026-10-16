@@ -58,8 +58,14 @@ func validateProbes(container corev1.Container) error {
 				return err
 			}
 		}
-		if handlers != 1 || probe.GRPC != nil {
-			return fmt.Errorf("%s probe requires exactly one exec, HTTP or TCP handler; gRPC is not supported", kind)
+		if probe.GRPC != nil {
+			handlers++
+			if probe.GRPC.Port < 1 || probe.GRPC.Port > 65535 {
+				return errors.New("gRPC probes require a numeric TCP port between 1 and 65535")
+			}
+		}
+		if handlers != 1 {
+			return fmt.Errorf("%s probe requires exactly one exec, HTTP, TCP or gRPC handler", kind)
 		}
 	}
 	return nil
@@ -84,7 +90,7 @@ func probePort(port intstr.IntOrString, container corev1.Container) (int, error)
 
 func networkProbes(container corev1.Container) bool {
 	for _, probe := range []*corev1.Probe{container.ReadinessProbe, container.StartupProbe, container.LivenessProbe} {
-		if probe != nil && (probe.HTTPGet != nil || probe.TCPSocket != nil) {
+		if probe != nil && (probe.HTTPGet != nil || probe.TCPSocket != nil || probe.GRPC != nil) {
 			return true
 		}
 	}
@@ -119,6 +125,11 @@ func (p *provider) executeContainerProbe(ctx context.Context, e *podEntry, conta
 	} else if action := probe.TCPSocket; action != nil {
 		spec.Scheme = "TCP"
 		spec.Port, err = probePort(action.Port, container)
+	} else if action := probe.GRPC; action != nil {
+		spec.Scheme, spec.Port = "GRPC", int(action.Port)
+		if action.Service != nil {
+			spec.Service = *action.Service
+		}
 	} else {
 		return false, errors.New("missing supported probe handler")
 	}

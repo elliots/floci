@@ -156,7 +156,7 @@ func (r *networkRelay) health(ctx context.Context, owner string) error {
 	if err := json.Unmarshal(data, &health); err != nil {
 		return err
 	}
-	if health.Owner != owner || health.Status != "ok" || health.Contract != 1 || health.ProbeContract != 1 {
+	if health.Owner != owner || health.Status != "ok" || health.Contract != 1 || health.ProbeContract != 2 {
 		return errors.New("network relay ownership or contract mismatch")
 	}
 	return nil

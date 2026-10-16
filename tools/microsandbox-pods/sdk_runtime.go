@@ -16,6 +16,10 @@ type nativeRuntime interface {
 	ExecuteStream(context.Context, []string, io.Reader, io.Writer, io.Writer) (int, error)
 }
 
+type interactiveRuntime interface {
+	ExecuteStreamWithOptions(context.Context, []string, io.Reader, io.Writer, io.Writer, msbruntime.StreamOptions) (int, error)
+}
+
 func newCommandRunner(cfg config) (commandRunner, error) {
 	client, err := msbruntime.New(msbruntime.Config{Executable: cfg.msb, Home: cfg.home})
 	if err != nil {
@@ -40,6 +44,18 @@ func (r commandRunner) nativeStream(ctx context.Context, args []string, stdin io
 		return errors.New("native SDK runtime is not configured")
 	}
 	exitCode, err := r.runtime.ExecuteStream(ctx, args, stdin, stdout, stderr)
+	if err != nil || exitCode != 0 {
+		return nativeFailure(args, exitCode, err)
+	}
+	return nil
+}
+
+func (r commandRunner) nativeTerminal(ctx context.Context, args []string, stdin io.Reader, stdout, stderr io.Writer, options msbruntime.StreamOptions) error {
+	runtime, ok := r.runtime.(interactiveRuntime)
+	if !ok {
+		return errors.New("native SDK terminal transport is not configured")
+	}
+	exitCode, err := runtime.ExecuteStreamWithOptions(ctx, args, stdin, stdout, stderr, options)
 	if err != nil || exitCode != 0 {
 		return nativeFailure(args, exitCode, err)
 	}

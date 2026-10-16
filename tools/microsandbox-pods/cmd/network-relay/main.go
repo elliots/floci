@@ -26,9 +26,11 @@ func main() {
 
 func run(args []string, input io.Reader, output io.Writer) error {
 	if len(args) == 0 {
-		return errors.New("usage: network-relay serve|client|probe [flags]")
+		return errors.New("usage: network-relay serve|client|probe|connect [flags]")
 	}
 	switch args[0] {
+	case "connect":
+		return connectStdio(args[1:], input, output)
 	case "probe":
 		if len(args) != 1 {
 			return errors.New("probe accepts its request on stdin only")
@@ -39,7 +41,7 @@ func run(args []string, input io.Reader, output io.Writer) error {
 	case "client":
 		return client(args[1:], input, output)
 	default:
-		return errors.New("expected serve, client or probe")
+		return errors.New("expected serve, client, probe or connect")
 	}
 }
 

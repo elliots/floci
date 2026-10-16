@@ -922,24 +922,6 @@ func (p *provider) GetContainerLogs(ctx context.Context, namespace, name, contai
 	}
 	return io.NopCloser(bytes.NewReader(data)), nil
 }
-func (p *provider) RunInContainer(ctx context.Context, namespace, name, container string, args []string, attach api.AttachIO) error {
-	e, err := p.entry(namespace, name)
-	if err != nil {
-		return err
-	}
-	e.op.Lock()
-	defer e.op.Unlock()
-	task, err := executingContainerTask(e, container)
-	if err != nil {
-		return err
-	}
-	if attach.TTY() {
-		return errdefs.InvalidInput("interactive TTY is not qualified")
-	}
-	command := []string{"exec", "--stream", e.vm, "--", "ctr", "--address", "/run/containerd/containerd.sock", "tasks", "exec", "--exec-id", "exec-" + strconv.FormatInt(time.Now().UnixNano(), 10), task}
-	command = append(command, args...)
-	return p.runner.nativeStream(ctx, command, attach.Stdin(), attach.Stdout(), attach.Stderr())
-}
 func (p *provider) AttachToContainer(context.Context, string, string, string, api.AttachIO) error {
 	return errdefs.InvalidInput("attach is not qualified")
 }
@@ -948,9 +930,6 @@ func (p *provider) GetStatsSummary(context.Context) (*stats.Summary, error) {
 }
 func (p *provider) GetMetricsResource(context.Context) ([]*dto.MetricFamily, error) {
 	return nil, errdefs.InvalidInput("metrics are not qualified")
-}
-func (p *provider) PortForward(context.Context, string, string, int32, io.ReadWriteCloser) error {
-	return errdefs.InvalidInput("port-forward is not qualified")
 }
 func (p *provider) Ping(ctx context.Context) error {
 	check, cancel := context.WithTimeout(ctx, 5*time.Second)

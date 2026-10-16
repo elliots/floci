@@ -180,6 +180,8 @@ func TestNativeSDKReadOnlyRequestsKeepCancellation(t *testing.T) {
 type sdkAttachIO struct {
 	stdin          io.Reader
 	stdout, stderr bytes.Buffer
+	tty            bool
+	resize         <-chan api.TermSize
 }
 
 type sdkWriteCloser struct{ io.Writer }
@@ -188,9 +190,9 @@ func (sdkWriteCloser) Close() error           { return nil }
 func (a *sdkAttachIO) Stdin() io.Reader       { return a.stdin }
 func (a *sdkAttachIO) Stdout() io.WriteCloser { return sdkWriteCloser{&a.stdout} }
 func (a *sdkAttachIO) Stderr() io.WriteCloser { return sdkWriteCloser{&a.stderr} }
-func (a *sdkAttachIO) TTY() bool              { return false }
+func (a *sdkAttachIO) TTY() bool              { return a.tty }
 func (a *sdkAttachIO) Resize() <-chan api.TermSize {
-	return nil
+	return a.resize
 }
 
 func TestNativeSDKContainerExecPassesLiveStreamsAndExitStatus(t *testing.T) {

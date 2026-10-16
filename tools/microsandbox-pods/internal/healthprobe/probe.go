@@ -12,6 +12,10 @@ import (
 	"strconv"
 	"strings"
 	"time"
+
+	"google.golang.org/grpc"
+	"google.golang.org/grpc/credentials/insecure"
+	healthpb "google.golang.org/grpc/health/grpc_health_v1"
 )
 
 type Request struct {
@@ -19,6 +23,7 @@ type Request struct {
 	Port           int         `json:"port"`
 	Scheme         string      `json:"scheme"`
 	Path           string      `json:"path,omitempty"`
+	Service        string      `json:"service,omitempty"`
 	Headers        http.Header `json:"headers,omitempty"`
 	TimeoutSeconds int32       `json:"timeoutSeconds"`
 }
@@ -37,6 +42,19 @@ func Check(ctx context.Context, spec Request) (Result, error) {
 	defer cancel()
 	target := net.JoinHostPort(spec.Address, strconv.Itoa(spec.Port))
 	dialer := net.Dialer{}
+	if spec.Scheme == "GRPC" {
+		client, err := grpc.NewClient("passthrough:///"+target,
+			grpc.WithTransportCredentials(insecure.NewCredentials()),
+			grpc.WithContextDialer(func(ctx context.Context, _ string) (net.Conn, error) {
+				return dialer.DialContext(ctx, "tcp4", target)
+			}))
+		if err != nil {
+			return Result{}, err
+		}
+		defer client.Close()
+		response, err := healthpb.NewHealthClient(client).Check(ctx, &healthpb.HealthCheckRequest{Service: spec.Service})
+		return Result{Success: err == nil && response.GetStatus() == healthpb.HealthCheckResponse_SERVING}, nil
+	}
 	if spec.Scheme == "TCP" {
 		connection, err := dialer.DialContext(ctx, "tcp4", target)
 		if err != nil {

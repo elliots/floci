@@ -1,6 +1,7 @@
 package healthprobe
 
 import (
+	"context"
 	"net"
 	"net/http"
 	"net/http/httptest"
@@ -9,7 +10,65 @@ import (
 	"sync/atomic"
 	"testing"
 	"time"
+
+	"google.golang.org/grpc"
+	"google.golang.org/grpc/health"
+	healthpb "google.golang.org/grpc/health/grpc_health_v1"
 )
+
+func TestGRPCProbeChecksNamedServiceAndIgnoresEnvironmentProxy(t *testing.T) {
+	t.Setenv("HTTP_PROXY", "http://127.0.0.1:1")
+	t.Setenv("HTTPS_PROXY", "http://127.0.0.1:1")
+	listener, err := net.Listen("tcp4", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	server := grpc.NewServer()
+	checks := health.NewServer()
+	checks.SetServingStatus("ready", healthpb.HealthCheckResponse_SERVING)
+	checks.SetServingStatus("unhealthy", healthpb.HealthCheckResponse_NOT_SERVING)
+	healthpb.RegisterHealthServer(server, checks)
+	go server.Serve(listener)
+	t.Cleanup(server.Stop)
+	spec := Request{Address: "127.0.0.1", Port: listener.Addr().(*net.TCPAddr).Port, Scheme: "GRPC", TimeoutSeconds: 1}
+	for _, service := range []string{"", "ready", "unhealthy", "missing"} {
+		spec.Service = service
+		result, err := Check(t.Context(), spec)
+		if err != nil || result.Success != (service == "" || service == "ready") {
+			t.Fatalf("gRPC service %q: %+v %v", service, result, err)
+		}
+	}
+	server.Stop()
+	result, err := Check(t.Context(), spec)
+	if err != nil || result.Success {
+		t.Fatalf("stopped gRPC listener: %+v %v", result, err)
+	}
+}
+
+type blockingHealthServer struct {
+	healthpb.UnimplementedHealthServer
+}
+
+func (blockingHealthServer) Check(ctx context.Context, _ *healthpb.HealthCheckRequest) (*healthpb.HealthCheckResponse, error) {
+	<-ctx.Done()
+	return nil, ctx.Err()
+}
+
+func TestGRPCProbeEnforcesRPCDeadline(t *testing.T) {
+	listener, err := net.Listen("tcp4", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	server := grpc.NewServer()
+	healthpb.RegisterHealthServer(server, blockingHealthServer{})
+	go server.Serve(listener)
+	t.Cleanup(server.Stop)
+	start := time.Now()
+	result, err := Check(t.Context(), Request{Address: "127.0.0.1", Port: listener.Addr().(*net.TCPAddr).Port, Scheme: "GRPC", TimeoutSeconds: 1})
+	if err != nil || result.Success || time.Since(start) > 3*time.Second {
+		t.Fatalf("gRPC deadline: %+v %v after %s", result, err, time.Since(start))
+	}
+}
 
 func serverRequest(server *httptest.Server) Request {
 	address := netip.MustParseAddrPort(strings.TrimPrefix(strings.TrimPrefix(server.URL, "http://"), "https://"))

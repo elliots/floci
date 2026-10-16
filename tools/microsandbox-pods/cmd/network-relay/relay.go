@@ -70,7 +70,7 @@ func (r *relay) handler() http.Handler {
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /health", func(w http.ResponseWriter, req *http.Request) {
 		reply(w, http.StatusOK, map[string]any{"status": "ok", "name": "network-relay", "contract": 1,
-			"probeContract": 1, "owner": r.owner, "maxListeners": r.maxListeners, "maxConnections": cap(r.slots)})
+			"probeContract": 2, "owner": r.owner, "maxListeners": r.maxListeners, "maxConnections": cap(r.slots)})
 	})
 	mux.HandleFunc("GET /listeners", func(w http.ResponseWriter, req *http.Request) {
 		r.mu.Lock()

@@ -31,8 +31,8 @@ func TestProbeValidationAndNamedPorts(t *testing.T) {
 		"TCP host override":         func(c *corev1.Container) { c.StartupProbe.TCPSocket.Host = "127.0.0.1" },
 		"invalid startup threshold": func(c *corev1.Container) { c.StartupProbe.SuccessThreshold = 2 },
 		"multiple handlers":         func(c *corev1.Container) { c.ReadinessProbe.Exec = &corev1.ExecAction{Command: []string{"true"}} },
-		"gRPC": func(c *corev1.Container) {
-			c.LivenessProbe = &corev1.Probe{ProbeHandler: corev1.ProbeHandler{GRPC: &corev1.GRPCAction{Port: 9090}}}
+		"invalid gRPC port": func(c *corev1.Container) {
+			c.LivenessProbe = &corev1.Probe{ProbeHandler: corev1.ProbeHandler{GRPC: &corev1.GRPCAction{Port: 65536}}}
 		},
 	} {
 		t.Run(name, func(t *testing.T) {
