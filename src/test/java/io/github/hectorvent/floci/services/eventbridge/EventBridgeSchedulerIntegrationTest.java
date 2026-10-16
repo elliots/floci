@@ -315,6 +315,10 @@ class EventBridgeSchedulerIntegrationTest {
             @Override
             public NetworkConfig network() { return null; }
             @Override
+            public OnDemandConfig onDemand() { return null; }
+            @Override
+            public MicrosandboxConfig microsandbox() { return null; }
+            @Override
             public DnsConfig dns() {
                 return new DnsConfig() {
                     @Override

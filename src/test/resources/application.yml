@@ -14,8 +14,27 @@ quarkus:
     parent-first-artifacts: org.apache.groovy:groovy
 
 floci:
+  microsandbox:
+    max-active-memory-mib: 8192
+
+  on-demand:
+    enabled: false
+    gateway-host: 127.0.0.1
+    gateway-port: 0
+    reconcile-interval-millis: 1000
+    max-concurrent-starts: 4
+    max-pending-requests: 1024
+    max-pending-requests-per-workload: 64
+    # config-file:
+    # pod-controller-url:                  # FLOCI_ON_DEMAND_POD_CONTROLLER_URL; native Kubernetes controller
+    # pod-controller-token:                # FLOCI_ON_DEMAND_POD_CONTROLLER_TOKEN; controller bearer token
+    # microsandbox-url:
+    # microsandbox-token:
+    microsandbox-backend-host: 127.0.0.1
+    microsandbox-bind-host: 127.0.0.1
   base-url: "http://localhost:4566"
   network:
+    # config-file:                         # network YAML/JSON; isolation defaults to disabled
     security-group-enforcement:
       enabled: true
       helper-image: floci/network-helper:local
@@ -212,8 +231,15 @@ floci:
       proxy-max-connections: 100
       spectrum-max-rows: 1000000
     rds:
+      runtime: docker
+      microsandbox-url: ${FLOCI_SERVICES_RDS_MICROSANDBOX_URL:}
+      microsandbox-token: ${FLOCI_SERVICES_RDS_MICROSANDBOX_TOKEN:}
+      microsandbox-backend-host: 127.0.0.1
+      microsandbox-bind-host: 127.0.0.1
+      microsandbox-memory-mib: 512
       enabled: true
       mock: false
+      tls-hostnames: ${FLOCI_SERVICES_RDS_TLS_HOSTNAMES:}
       proxy-base-port: 7001
       proxy-max-port: 7099
       default-sql-server-image: "mcr.microsoft.com/mssql/server:2022-latest"

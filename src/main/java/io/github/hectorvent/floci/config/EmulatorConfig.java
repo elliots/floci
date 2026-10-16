@@ -126,7 +126,59 @@ public interface EmulatorConfig {
 
     ProtocolsConfig protocols();
 
+    OnDemandConfig onDemand();
+
+    MicrosandboxConfig microsandbox();
+
+    interface MicrosandboxConfig {
+        /** Aggregate configured guest RAM, with zero disabling the admission limit. */
+        @WithDefault("8192")
+        int maxActiveMemoryMib();
+    }
+
+    interface OnDemandConfig {
+        @WithDefault("false")
+        boolean enabled();
+
+        Optional<String> configFile();
+
+        @WithDefault("127.0.0.1")
+        String gatewayHost();
+
+        @WithDefault("8080")
+        int gatewayPort();
+
+        @WithDefault("1000")
+        long reconcileIntervalMillis();
+
+        @WithDefault("4")
+        int maxConcurrentStarts();
+
+        @WithDefault("1024")
+        int maxPendingRequests();
+
+        @WithDefault("64")
+        int maxPendingRequestsPerWorkload();
+
+        Optional<String> podControllerUrl();
+
+        Optional<String> podControllerToken();
+
+        Optional<String> microsandboxUrl();
+
+        Optional<String> microsandboxToken();
+
+        @WithDefault("127.0.0.1")
+        String microsandboxBackendHost();
+
+        @WithDefault("127.0.0.1")
+        String microsandboxBindHost();
+    }
+
     interface NetworkConfig {
+        /** Path to the network isolation and origin-routing YAML/JSON file. */
+        Optional<String> configFile();
+
         SecurityGroupEnforcementConfig securityGroupEnforcement();
     }
 
@@ -1688,6 +1740,26 @@ public interface EmulatorConfig {
         @WithDefault("false")
         boolean mock();
 
+        /** Database execution provider: docker or microsandbox. */
+        @WithDefault("docker")
+        String runtime();
+
+        /** External native host helper; required for the microsandbox provider. */
+        Optional<String> microsandboxUrl();
+
+        Optional<String> microsandboxToken();
+
+        /** Address of the helper host reachable from Floci's database proxies. */
+        @WithDefault("127.0.0.1")
+        String microsandboxBackendHost();
+
+        /** Interface on the helper host where guest database ports are published. */
+        @WithDefault("127.0.0.1")
+        String microsandboxBindHost();
+
+        @WithDefault("512")
+        int microsandboxMemoryMib();
+
         @WithDefault("7000")
         int proxyBasePort();
 
@@ -1709,6 +1781,10 @@ public interface EmulatorConfig {
 
         /** Hostname advertised for RDS endpoints. Uses published Docker ports when configured. */
         Optional<String> endpointHost();
+
+        /** Additional DNS names covered by the local RDS proxy certificate.
+         *  Env: FLOCI_SERVICES_RDS_TLS_HOSTNAMES */
+        Optional<List<String>> tlsHostnames();
 
         /** Whether a PostgreSQL IAM auth token must have been generated for the endpoint the
          *  instance publishes (hostname, port and region), as on RDS. On by default; turn it off

@@ -154,9 +154,28 @@ quarkus:
 
 
 floci:
+  microsandbox:
+    max-active-memory-mib: 8192 # FLOCI_MICROSANDBOX_MAX_ACTIVE_MEMORY_MIB; guest RAM admission budget, 0 disables
+
+  on-demand:
+    enabled: false                         # FLOCI_ON_DEMAND_ENABLED
+    # config-file:                         # FLOCI_ON_DEMAND_CONFIG_FILE; on-demand YAML/JSON
+    gateway-host: 127.0.0.1                # FLOCI_ON_DEMAND_GATEWAY_HOST
+    gateway-port: 8080                     # FLOCI_ON_DEMAND_GATEWAY_PORT; application traffic only
+    reconcile-interval-millis: 1000
+    max-concurrent-starts: 4
+    max-pending-requests: 1024
+    max-pending-requests-per-workload: 64
+    # pod-controller-url:                  # FLOCI_ON_DEMAND_POD_CONTROLLER_URL; native Kubernetes controller
+    # pod-controller-token:                # FLOCI_ON_DEMAND_POD_CONTROLLER_TOKEN; controller bearer token
+    # microsandbox-url:                    # FLOCI_ON_DEMAND_MICROSANDBOX_URL; native host helper URL
+    # microsandbox-token:                  # FLOCI_ON_DEMAND_MICROSANDBOX_TOKEN; helper bearer token
+    microsandbox-backend-host: 127.0.0.1   # FLOCI_ON_DEMAND_MICROSANDBOX_BACKEND_HOST
+    microsandbox-bind-host: 127.0.0.1      # FLOCI_ON_DEMAND_MICROSANDBOX_BIND_HOST
   port: 4566
   base-url: "http://localhost:4566"
   network:
+    # config-file:                         # FLOCI_NETWORK_CONFIG_FILE; network YAML/JSON
     security-group-enforcement:
       enabled: false
       helper-image: floci/network-helper:local
@@ -505,6 +524,13 @@ floci:
       proxy-max-connections: 100                  # Max concurrent proxy connections before new ones are refused
       spectrum-max-rows: 1000000                  # FLOCI_SERVICES_REDSHIFT_SPECTRUM_MAX_ROWS; rows loaded per external table per query
     rds:
+      runtime: docker
+      tls-hostnames: ${FLOCI_SERVICES_RDS_TLS_HOSTNAMES:}
+      microsandbox-url: ${FLOCI_SERVICES_RDS_MICROSANDBOX_URL:}
+      microsandbox-token: ${FLOCI_SERVICES_RDS_MICROSANDBOX_TOKEN:}
+      microsandbox-backend-host: 127.0.0.1
+      microsandbox-bind-host: 127.0.0.1
+      microsandbox-memory-mib: 512
       enabled: true
       mock: false                                 # FLOCI_SERVICES_RDS_MOCK — true = metadata only, no Docker (useful for CI)
       proxy-base-port: 7001
