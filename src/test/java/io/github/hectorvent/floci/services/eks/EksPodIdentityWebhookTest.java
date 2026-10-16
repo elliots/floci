@@ -36,6 +36,7 @@ class EksPodIdentityWebhookTest {
     private EksService eks;
     private EksAddonService addons;
     private EksPodIdentityAssociationService associations;
+    private EksIrsaWebhook irsa;
     private EksPodIdentityWebhook webhook;
 
     @BeforeEach
@@ -43,7 +44,8 @@ class EksPodIdentityWebhookTest {
         eks = Mockito.mock(EksService.class);
         addons = Mockito.mock(EksAddonService.class);
         associations = Mockito.mock(EksPodIdentityAssociationService.class);
-        webhook = new EksPodIdentityWebhook(eks, addons, associations);
+        irsa = Mockito.mock(EksIrsaWebhook.class);
+        webhook = new EksPodIdentityWebhook(eks, addons, associations, irsa);
 
         Cluster cluster = new Cluster();
         cluster.setName(CLUSTER_NAME);
@@ -90,6 +92,21 @@ class EksPodIdentityWebhookTest {
         assertEquals("JSONPatch", response(review).get("patchType"));
         assertEquals(3, patchOf(review).size());
         Mockito.verify(associations).list(any(), eq("payments"), eq("checkout"), any(), any());
+        Mockito.verifyNoInteractions(irsa);
+    }
+
+    @Test
+    void irsaIsConsideredWithoutThePodIdentityAddonOrAssociation() throws Exception {
+        when(addons.describe(any(), anyString())).thenThrow(new AwsException("ResourceNotFoundException", "gone", 404));
+        List<Map<String, Object>> irsaPatch = List.of(Map.of("op", "add", "path", "/spec/volumes", "value", List.of()));
+        when(irsa.patch(any(), eq("payments"), eq("checkout"), any())).thenReturn(irsaPatch);
+
+        JsonNode actual = patchOf(webhook.review(CLUSTER_NAME, ACCOUNT_ID,
+                admissionReview(pod("checkout", List.of(Map.of("name", "app"))))));
+
+        assertEquals(MAPPER.valueToTree(irsaPatch), actual);
+        Mockito.verify(irsa).patch(any(), eq("payments"), eq("checkout"), any());
+        Mockito.verifyNoInteractions(associations);
     }
 
     /**

@@ -27,6 +27,10 @@ import static org.junit.jupiter.api.Assertions.assertTrue;
 @QuarkusTest
 class EksPodIdentityAccountIntegrationTest {
 
+    private static final String POD_IDENTITY_TRUST = """
+            {"Version":"2012-10-17","Statement":[{"Effect":"Allow",
+              "Principal":{"Service":"pods.eks.amazonaws.com"},"Action":["sts:AssumeRole","sts:TagSession"]}]}
+            """;
     private static final String DEFAULT_ACCOUNT = "000000000000";
     private static final String OTHER_ACCOUNT = "123456789012";
     private static final String NAMESPACE = "payments";
@@ -93,7 +97,7 @@ class EksPodIdentityAccountIntegrationTest {
 
     private void createPodIdentityResources(String account, Cluster cluster, String roleName) {
         String roleArn = RequestScopes.callAs(account,
-                () -> iamService.createRole(roleName, "/", "{}", null, 3600, null).getArn());
+                () -> iamService.createRole(roleName, "/", POD_IDENTITY_TRUST, null, 3600, null).getArn());
         createPodIdentityResourcesForRole(account, cluster, roleArn);
     }
 

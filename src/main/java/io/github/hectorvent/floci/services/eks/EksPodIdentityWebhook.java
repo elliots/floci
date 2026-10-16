@@ -25,8 +25,8 @@ import java.util.Optional;
  * variables the AWS SDKs read, so the SDK credential chain reaches the container credentials
  * provider instead of falling through. Floci reproduces exactly that mutation.
  *
- * <p>Nothing answers {@link #CREDENTIALS_FULL_URI} yet: this class injects the plumbing only, so an
- * injected pod still cannot obtain credentials.
+ * <p>Pods without a Pod Identity association may instead use IRSA annotations on their service
+ * account. Pod Identity takes precedence, as it does in the upstream EKS admission webhook.
  *
  * <p>Every path here admits the pod. A cluster that is gone, an addon that is not installed, a
  * malformed review and an internal error all return {@code allowed: true} with no patch, which is
@@ -59,13 +59,15 @@ public class EksPodIdentityWebhook {
     private final EksService eks;
     private final EksAddonService addons;
     private final EksPodIdentityAssociationService associations;
+    private final EksIrsaWebhook irsa;
 
     @Inject
     public EksPodIdentityWebhook(EksService eks, EksAddonService addons,
-                                 EksPodIdentityAssociationService associations) {
+                                 EksPodIdentityAssociationService associations, EksIrsaWebhook irsa) {
         this.eks = eks;
         this.addons = addons;
         this.associations = associations;
+        this.irsa = irsa;
     }
 
     /**
@@ -105,11 +107,11 @@ public class EksPodIdentityWebhook {
             return List.of();
         }
         return RequestScopes.callAs(accountId, () -> {
-            if (!podIdentityAgentInstalled(cluster.get())
-                    || !hasAssociation(cluster.get(), namespace, serviceAccountOf(pod))) {
-                return List.of();
+            if (podIdentityAgentInstalled(cluster.get())
+                    && hasAssociation(cluster.get(), namespace, serviceAccountOf(pod))) {
+                return buildPatch(pod);
             }
-            return buildPatch(pod);
+            return irsa.patch(cluster.get(), namespace, serviceAccountOf(pod), pod);
         });
     }
 
