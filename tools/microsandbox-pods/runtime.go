@@ -281,10 +281,11 @@ func (n *network) attach(ctx context.Context, e *podEntry) error {
 	script = fmt.Sprintf("ip link add pod0 type vxlan id %d local %s remote %s dev eth0 dstport 8472 nolearning; "+
 		"ip addr add %s/22 dev pod0; ip link set pod0 mtu 1450 up; "+
 		"ip route add %s via %s dev pod0; ip route add %s via %s dev pod0; "+
+		"ip route add 169.254.170.23/32 via %s dev pod0; "+
 		"iptables -t nat -A OUTPUT -p udp -d %s --dport 8472 -j DNAT --to-destination %s:%d; "+
 		"printf 'nameserver %s\\nsearch %s.svc.cluster.local svc.cluster.local cluster.local\\noptions ndots:5\\n' >/etc/pod-resolv.conf",
 		vni, guestIP, n.peerIP, podIP, n.runner.cfg.clusterCIDR, podGateway,
-		n.runner.cfg.serviceCIDR, podGateway, n.peerIP, gateway, n.peerPort,
+		n.runner.cfg.serviceCIDR, podGateway, podGateway, n.peerIP, gateway, n.peerPort,
 		n.runner.cfg.clusterDNS, e.pod.Namespace)
 	_, err = n.runner.guest(ctx, e.vm, script)
 	return err
