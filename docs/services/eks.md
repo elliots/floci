@@ -93,7 +93,7 @@ Floci supports the EKS Pod Identity association management plane. You can map a 
 
 ### Credential injection at admission
 
-Floci registers a `MutatingWebhookConfiguration` in every real-mode cluster, scoped to pod `CREATE`. When a pod is created, Floci looks up an association matching the pod's namespace and its `spec.serviceAccountName`. A pod that matches nothing is admitted unchanged.
+Floci registers a `MutatingWebhookConfiguration` in every real-mode cluster, scoped to pod `CREATE`. When a pod is created, Floci looks up an association matching the pod's namespace and its `spec.serviceAccountName`. Without an association, it checks the ServiceAccount's IRSA annotations.
 
 Injection happens only when the `eks-pod-identity-agent` addon is installed on the cluster, which is what real EKS requires too. Install it with `CreateAddon` before expecting pods to be mutated.
 
@@ -107,6 +107,30 @@ A matching pod is patched exactly the way real EKS patches it. Every init contai
 
 The volume is a projected service account token with audience `pods.eks.amazonaws.com`, `expirationSeconds: 86400` and path `eks-pod-identity-token`. A name the pod already carries (a volume, a mount, or either environment variable) is left as the workload set it.
 
+### IAM roles for service accounts (IRSA)
+
+Annotating a ServiceAccount with `eks.amazonaws.com/role-arn` injects `AWS_ROLE_ARN`,
+`AWS_WEB_IDENTITY_TOKEN_FILE` and a read-only `aws-iam-token` projected volume into
+regular and init containers, including restartable init sidecars. The default audience
+is `sts.amazonaws.com`; the token is issued by the real Kubernetes TokenRequest API and
+verified by STS against the cluster's OIDC issuer and the IAM role's trust policy.
+The OIDC provider and role trust must be configured as they are on AWS. A Pod Identity
+association takes precedence over IRSA, following the
+[upstream EKS webhook](https://github.com/aws/amazon-eks-pod-identity-webhook).
+
+The webhook reads the current, namespaced ServiceAccount at admission. It supports
+`eks.amazonaws.com/audience`, `eks.amazonaws.com/token-expiration` and
+`eks.amazonaws.com/sts-regional-endpoints` on the ServiceAccount. A Pod's
+`eks.amazonaws.com/token-expiration` overrides the ServiceAccount value;
+`eks.amazonaws.com/skip-containers` excludes named containers. Explicit AWS credential,
+region and STS endpoint environment variables are preserved. The webhook adds no static
+AWS access keys. IRSA uses the same TLS admission setup described below and does not
+require the Pod Identity agent addon.
+
+Native Pods route the Pod Identity address `169.254.170.23/32` through the cluster's
+existing relay. This route does not expose the node's EC2 instance metadata address.
+Both ordinary Docker Pods and native Pods use the same admission and credential services.
+
 ### Credential endpoint
 
 Floci serves pod identity credentials through a link-local relay bound to `169.254.170.23:80` inside the cluster container, forwarding requests to Floci's credentials endpoint (`GET /v1/credentials`). Workloads reach this endpoint using the injected `AWS_CONTAINER_CREDENTIALS_FULL_URI` environment variable, passing their projected token in the `Authorization` header (`Authorization: <token>` or `Authorization: Bearer <token>`).
@@ -117,7 +141,15 @@ The credentials endpoint performs the following validations:
 3. Validates the token signature against the cluster OIDC public key, confirming the token is unexpired and carries audience `pods.eks.amazonaws.com`.
 4. Extracts the subject claim (`system:serviceaccount:<namespace>:<serviceAccount>`) and looks up the pod identity association for the cluster, namespace, and service account.
 5. Confirms the associated IAM role still exists under the ARN the association names. A role that was deleted, or recreated under another path, gets `400 AccessDeniedException` and no credentials.
-6. Issues temporary session credentials (`ASIA...`) for the associated IAM role and returns them in standard AWS container credentials format (`AccessKeyId`, `SecretAccessKey`, `Token`, `AccountId`, `Expiration`).
+6. Evaluates the role trust for the `pods.eks` service principal, `sts:AssumeRole` and, when session tags are enabled, `sts:TagSession`. Explicit Deny wins. Conditions can restrict the source account/cluster and the requested cluster name/ARN, Kubernetes namespace and ServiceAccount tags.
+7. Issues temporary session credentials (`ASIA...`) for the associated IAM role and returns them in standard AWS container credentials format (`AccessKeyId`, `SecretAccessKey`, `Token`, `AccountId`, `Expiration`).
+
+The role needs the [Pod Identity trust policy documented by AWS](https://docs.aws.amazon.com/eks/latest/userguide/pod-id-role.html).
+An empty trust policy no longer issues credentials. Trust conditions on Pod name/UID
+are not populated yet and therefore do not match. `targetRoleArn` remains management
+metadata: the credential endpoint does not chain into a target role. Session tags are
+used for the supported trust conditions, but are not yet attached to the issued IAM
+session for downstream `aws:PrincipalTag` ABAC or transitive role chaining.
 
 #### TLS is required
 

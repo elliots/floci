@@ -19,6 +19,24 @@ Floci is configured exclusively through environment variables. Every option belo
 
 ---
 
+## Experimental native runtimes
+
+`FLOCI_MICROSANDBOX_GUEST_AGENT_PATH` points to the static Linux guest transport
+binary used for one-shot isolated DNS routing. Set it on the native host helper
+and pod controller when isolation is enabled. Build it for the guest architecture using
+the [guest helper instructions](../../tools/microsandbox-runtime/guestnet/README.md).
+
+`FLOCI_NETWORK_CONFIG_FILE` selects an optional workload isolation and simulator
+routing file. The native host helper and pod controller must read the same file
+when native isolation is enabled. See [workload networking](workload-network.md).
+
+The shared guest RAM budget is `FLOCI_MICROSANDBOX_MAX_ACTIVE_MEMORY_MIB`,
+defaulting to 8192 MiB. Zero disables the limit. See
+[RDS](../services/rds.md#experimental-microsandbox-runtime) for database provider settings
+and [Kubernetes](microsandbox-kubernetes.md) for the separate pod controller.
+For the experimental native workload gateway and its `FLOCI_ON_DEMAND_*`
+settings, see [Microsandbox workloads](microsandbox-workloads.md#settings).
+
 ## Authentication
 
 | Variable | Default | Description |

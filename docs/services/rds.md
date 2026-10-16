@@ -38,6 +38,108 @@ Floci manages real PostgreSQL, MySQL, MariaDB, and SQL Server Docker containers 
 
 RDS Data API (`rds-data`) is documented separately because it uses REST JSON routes instead of the RDS Query protocol. See [RDS Data API](rds-data.md).
 
+## Experimental microsandbox runtime
+
+Docker remains the default. `floci.services.rds.runtime=microsandbox` selects a
+PostgreSQL and MySQL provider behind the same RDS runtime interface. Aurora
+PostgreSQL and Aurora MySQL Serverless v2 auto-pause capture guest RAM and disks
+and terminate the VM;
+its next connection restores the saved process. Existing AWS pause eligibility,
+idle intervals, events, endpoints, and activity leases still apply. An ordinary
+`StopDBInstance` or `StopDBCluster` shuts the database down and preserves its disk;
+start boots fresh processes. Other database engines are explicitly rejected by
+this experimental provider.
+
+The provider requires microsandbox **0.7.8** and the external host helper in the
+[`tools/microsandbox-host`](../../tools/microsandbox-host/API.md) module in this checkout.
+The helper runs natively on the hypervisor host, including macOS; it is not
+launched inside Floci's Docker container. This development version has no
+published helper image or managed-image default. Build and run the matching
+helper source using its `microsandbox/API.md` instructions.
+
+Configure Floci after starting the helper:
+
+```sh
+export FLOCI_SERVICES_RDS_RUNTIME=microsandbox
+export FLOCI_SERVICES_RDS_MICROSANDBOX_URL=http://127.0.0.1:8186
+export FLOCI_SERVICES_RDS_MICROSANDBOX_TOKEN=your-local-runtime-token
+export FLOCI_STORAGE_MODE=persistent
+```
+
+Use a fresh Floci storage directory and a dedicated, durable helper `MSB_HOME`.
+Keep that home path short because macOS Unix socket paths have a small length
+limit. Persist Floci metadata and the helper's guest disks together. Memory-only
+Floci storage intentionally does not retain the runtime journal across restart.
+
+| Setting under `floci.services.rds` | Default | Purpose |
+| --- | --- | --- |
+| `runtime` | `docker` | Select `docker` or `microsandbox` |
+| `microsandbox-url` | unset | External helper URL |
+| `microsandbox-token` | unset | Bearer credential matching the helper |
+| `microsandbox-backend-host` | `127.0.0.1` | Helper host address reachable from Floci |
+| `microsandbox-bind-host` | `127.0.0.1` | Helper host interface publishing database ports |
+| `microsandbox-memory-mib` | `512` | Guest RAM per database runtime |
+
+Each setting has the corresponding `FLOCI_SERVICES_RDS_*` environment variable.
+If Floci runs in Docker on a Mac, the URL and backend host usually need
+`host.docker.internal`; the helper's HTTP listener and database bind interface
+must also be reachable from that container. Use the helper token and host network
+controls when exposing those listeners beyond loopback.
+
+Native guests also use the shared `FLOCI_MICROSANDBOX_MAX_ACTIVE_MEMORY_MIB`
+admission budget, which defaults to 8192 MiB. Zero disables the limit. A resume
+waits for sufficient capacity, and confirmed hibernation releases the guest's
+allocation. Unknown operation outcomes retain their reservation. This counts
+configured guest RAM, so leave additional memory for the host and emulator.
+Existing journals retain their guest's original RAM size even if the default
+changes. Older journals recover that size from the owned VM configuration;
+missing runtime state requires recovery rather than guessing a new allocation.
+
+Native helper mutations also have an opaque completion journal in
+`microsandbox-commands.json`. A lost response can leave a command running after
+its caller times out. Floci waits for known requests before deletion and refuses
+mutation or reset when an earlier completion cannot be established. Recover with
+Floci and the helper stopped: confirm that no helper-launched command remains,
+reconcile the owned guests and checkpoints, then remove only confirmed stale
+entries using the configured storage backend. Do not discard pending records
+while commands may still be running.
+
+### Migration and current limits
+
+This does not convert Docker volumes. Starting the microsandbox provider against
+existing RDS resources without its runtime journal is refused, preventing an
+empty database from silently replacing existing data. Export logical SQL backups,
+create resources in a fresh microsandbox-backed installation, and import the
+data. Keep the original Docker installation until migration has been checked.
+Do not switch a microsandbox installation back to Docker in place.
+
+The provider uses official PostgreSQL and MySQL OCI image conventions, one vCPU,
+a 4 GiB root disk, and the configured RAM. PostgreSQL SQL backups and restores,
+password rotation, and ordinary stop/start use the same service operations as Docker.
+MySQL AWS database snapshots remain unsupported, as with the Docker provider;
+internal hibernation checkpoints do preserve MySQL memory and disk state.
+MySQL startup preserves the same image-version-specific authentication options
+and master-user grants as Docker. Those startup options are retained in the
+runtime journal across cold starts. Existing PostgreSQL journals remain readable.
+Guest CloudWatch log forwarding is not implemented. The helper's command
+transport limits SQL input/output to 64 MiB and operations to 180 seconds.
+Large database backups need a streaming transport before this provider can
+replace Docker for those workloads. Provisioning can exceed an SDK's default
+read timeout on the first image pull; allow a longer timeout for local tests.
+
+The runtime journal is created through `StorageFactory` as
+`rds-microsandbox.json`. It tracks stable resource identities separately from
+guest generations. A missing guest disk causes an explicit failure rather than
+creation of an empty database. On resume, the stopped source is removed before
+clients can write to the new generation, so stale recovery state cannot replay
+old memory over newer writes. Retired checkpoint cleanup is retried independently.
+Use one Floci process and one helper for each runtime home.
+
+Apple Silicon JVM integration is tested with real AWS SDK requests and PostgreSQL/MySQL
+connections. Linux/KVM workload testing and native Floci qualification are still
+required before treating this provider as production-ready. This runtime does
+not yet implement EC2 or Kubernetes execution.
+
 ## Supported Management Actions
 
 <!-- floci:actions:start -->
@@ -236,6 +338,7 @@ they belong to, as the model requires. An omitted `Enabled` activates the subscr
 | `FLOCI_SERVICES_RDS_PROXY_BASE_PORT` | `7001` | First host port in the RDS proxy range |
 | `FLOCI_SERVICES_RDS_PROXY_MAX_PORT` | `7099` | Last host port in the RDS proxy range |
 | `FLOCI_SERVICES_RDS_ENDPOINT_HOST` | _(auto-detected)_ | Hostname advertised in RDS endpoints; when set in Docker, Floci advertises each proxy's published host port |
+| `FLOCI_SERVICES_RDS_TLS_HOSTNAMES` | _(empty)_ | Additional DNS names in the local database certificate, comma-separated |
 | `FLOCI_SERVICES_RDS_IAM_TOKEN_ENDPOINT_BINDING` | `true` | Refuse a PostgreSQL IAM auth token generated for another hostname, port or region than the endpoint publishes, as RDS does; set `false` to accept such tokens. MySQL and MariaDB always refuse them |
 | `FLOCI_SERVICES_RDS_DEFAULT_POSTGRES_IMAGE` | `postgres:16-alpine` | Docker image for PostgreSQL instances |
 | `FLOCI_SERVICES_RDS_DEFAULT_MYSQL_IMAGE` | `mysql:8.0` | Docker image for MySQL instances |
@@ -340,6 +443,37 @@ services:
     is rejected with `InvalidParameterValue` unless the proxy's VPC and every subnet in
     `VpcSubnetIds` already carry an associated IPv6 CIDR block, matching AWS's own network
     prerequisites for RDS Proxy.
+
+## Aurora metadata and MySQL discovery
+
+Cluster responses include the configured KMS key ARN, cluster parameter group and
+`DBClusterMember` entries. Aurora orderable instance options report `StorageType=aurora`.
+The MySQL proxy answers the AWS Advanced JDBC Wrapper's instance identity, writer
+check and topology discovery statements, plus `SHOW VARIABLES LIKE 'aurora_version'`
+and `SELECT AURORA_VERSION()`. This describes Floci's single backing writer; it does
+not simulate independent reader engines, replica lag or Aurora failover. Other SQL,
+including different queries against `information_schema.replica_host_status`, is
+forwarded unchanged to MySQL. Server-side prepared Aurora discovery statements are
+not emulated.
+
+## Local database TLS names
+
+PostgreSQL and MySQL proxies persist their public certificate at
+`<persistent-path>/tls/rds-ca.crt`. Copy that file into your client's trust store or
+use it as PostgreSQL's `sslrootcert`. Copy only the public `.crt` file. A containerized
+Floci can export it with `docker cp <container>:<persistent-path>/tls/rds-ca.crt ./rds-ca.crt`.
+This database certificate is separate from Floci's HTTP and ElastiCache root CA.
+
+Set `FLOCI_SERVICES_RDS_TLS_HOSTNAMES=writer.example.test,reader.example.test` before
+starting Floci to include extra DNS names in the database certificate. Advertised
+endpoint names are still added automatically. Restart after changing the configured
+names; existing learned names and the signing key are preserved. DNS routing and IAM
+token endpoint validation remain separate from certificate names.
+
+The former on-demand branch's `GET /_aws/rds/tls/ca` and
+`POST /_aws/rds/tls/hosts` routes are replaced by the public file and this configuration.
+Project setup scripts should set the hostnames before launch and copy the certificate
+after the first database proxy starts. No additional AWS management endpoint is needed.
 
 ## Aurora Serverless v2 scaling
 

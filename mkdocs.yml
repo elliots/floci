@@ -84,6 +84,9 @@ nav:
     - Docker Images: configuration/docker-images.md
     - Docker Compose: configuration/docker-compose.md
     - Docker Configuration: configuration/docker.md
+    - Microsandbox Workloads: configuration/microsandbox-workloads.md
+    - Microsandbox Kubernetes: configuration/microsandbox-kubernetes.md
+    - Workload Network: configuration/workload-network.md
     - Ports Reference: configuration/ports.md
     - Multi-Account Isolation: configuration/multi-account.md
     - AWS Partitions: configuration/partitions.md
