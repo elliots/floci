@@ -51,7 +51,7 @@ func (p *provider) startStrictPod(e *podEntry) error {
 
 func mountedVolumes(pod *corev1.Pod) []corev1.Volume {
 	mounted := make(map[string]bool)
-	for _, container := range pod.Spec.Containers {
+	for _, container := range slices.Concat(pod.Spec.InitContainers, pod.Spec.Containers) {
 		for _, mount := range container.VolumeMounts {
 			mounted[mount.Name] = true
 		}
@@ -124,6 +124,9 @@ func (p *provider) readVolumeSources(ctx context.Context, e *podEntry) (map[stri
 			projections[volume.Name] = files
 		}
 	}
+	if err := validateProjectedSubpaths(e.pod, projections); err != nil {
+		return nil, err
+	}
 	return projections, nil
 }
 
@@ -188,18 +191,26 @@ func volumeSetupScript(volume corev1.Volume, memoryMiB int) string {
 }
 
 func volumeMountArgs(pod *corev1.Pod) []string {
+	return volumeMountArgsForContainer(pod, pod.Spec.Containers[0])
+}
+
+func volumeMountArgsForContainer(pod *corev1.Pod, container corev1.Container) []string {
 	volumes := make(map[string]corev1.Volume, len(pod.Spec.Volumes))
 	for _, volume := range pod.Spec.Volumes {
 		volumes[volume.Name] = volume
 	}
 	var args []string
-	for _, mount := range pod.Spec.Containers[0].VolumeMounts {
+	for index, mount := range container.VolumeMounts {
 		volume := volumes[mount.Name]
 		mode := "rw"
 		if mount.ReadOnly || volume.ConfigMap != nil || volume.Secret != nil {
 			mode = "ro"
 		}
-		args = append(args, "--mount", "type=bind,src="+guestVolumePath(mount.Name)+",dst="+mount.MountPath+",options=rbind:rprivate:"+mode)
+		source := guestVolumePath(mount.Name)
+		if mount.SubPath != "" || mount.SubPathExpr != "" {
+			source = guestSubpathPath(container.Name, index)
+		}
+		args = append(args, "--mount", "type=bind,src="+source+",dst="+mount.MountPath+",options=rbind:rprivate:"+mode)
 	}
 	return args
 }
@@ -280,6 +291,6 @@ func projectionScript(root, generation string, files map[string]volumeFile) stri
 	script += "for entry in * .[!.]* ..?*; do " +
 		"case \"$entry\" in ..data|..data_tmp|..floci-*) continue;; esac; " +
 		"if test -L \"$entry\" && ! test -e \"$generation/$entry\"; then rm -- \"$entry\"; fi; done; " +
-		"for old in ..floci-*; do if test \"$old\" != \"$generation\"; then rm -rf -- \"$old\"; fi; done"
+		projectionGenerationCleanupScript(root, guestSubpathsRoot)
 	return script
 }

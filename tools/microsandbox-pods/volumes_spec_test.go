@@ -91,7 +91,7 @@ func TestValidateVolumesRejectsUnsupportedOrUnsafeSpecs(t *testing.T) {
 		"negative mode":          func(p *corev1.Pod) { p.Spec.Volumes[0].ConfigMap.DefaultMode = new(int32(-1)) },
 		"setuid mode":            func(p *corev1.Pod) { p.Spec.Volumes[1].Secret.DefaultMode = new(int32(0o4755)) },
 		"missing mounted volume": func(p *corev1.Pod) { p.Spec.Containers[0].VolumeMounts[0].Name = "missing" },
-		"subPath":                func(p *corev1.Pod) { p.Spec.Containers[0].VolumeMounts[0].SubPath = "app.conf" },
+		"unsafe subPath":         func(p *corev1.Pod) { p.Spec.Containers[0].VolumeMounts[0].SubPath = "../app.conf" },
 		"subPathExpr":            func(p *corev1.Pod) { p.Spec.Containers[0].VolumeMounts[0].SubPathExpr = "$(POD_NAME)" },
 		"mount propagation": func(p *corev1.Pod) {
 			p.Spec.Containers[0].VolumeMounts[0].MountPropagation = new(corev1.MountPropagationBidirectional)

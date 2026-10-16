@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"path"
 	"reflect"
+	"slices"
 	"strings"
 	"unicode"
 
@@ -41,7 +42,7 @@ func validateVolumes(pod *corev1.Pod) error {
 		}
 		volumes[volume.Name] = struct{}{}
 	}
-	for _, container := range pod.Spec.Containers {
+	for _, container := range slices.Concat(pod.Spec.InitContainers, pod.Spec.Containers) {
 		if len(container.VolumeDevices) != 0 {
 			return fmt.Errorf("volume devices are not qualified")
 		}
@@ -50,10 +51,13 @@ func validateVolumes(pod *corev1.Pod) error {
 			if _, found := volumes[mount.Name]; !found {
 				return fmt.Errorf("mount references undefined volume %q", mount.Name)
 			}
-			if mount.SubPath != "" || mount.SubPathExpr != "" || len(mount.BindMountOptions) != 0 ||
+			if len(mount.BindMountOptions) != 0 ||
 				mount.MountPropagation != nil && *mount.MountPropagation != corev1.MountPropagationNone ||
 				mount.RecursiveReadOnly != nil && *mount.RecursiveReadOnly != corev1.RecursiveReadOnlyDisabled {
-				return fmt.Errorf("volume %q: subPath, mount propagation, recursive read-only and bind mount options are not qualified", mount.Name)
+				return fmt.Errorf("volume %q: mount propagation, recursive read-only and bind mount options are not qualified", mount.Name)
+			}
+			if _, err := resolveMountSubpath(mount, container); err != nil {
+				return fmt.Errorf("volume %q: %w", mount.Name, err)
 			}
 			if !path.IsAbs(mount.MountPath) || path.Clean(mount.MountPath) != mount.MountPath || mount.MountPath == "/" || unsafeMountCharacters(mount.MountPath) {
 				return fmt.Errorf("volume %q: mountPath must be a clean absolute path without control characters, commas or double quotes", mount.Name)
