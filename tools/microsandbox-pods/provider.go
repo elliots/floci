@@ -16,6 +16,7 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/floci-io/floci/tools/microsandbox-runtime/guesttask"
 	dto "github.com/prometheus/client_model/go"
 	"github.com/virtual-kubelet/virtual-kubelet/errdefs"
 	"github.com/virtual-kubelet/virtual-kubelet/node/api"
@@ -47,6 +48,8 @@ type provider struct {
 }
 
 type podEntry struct {
+	applicationProgress
+	applications                                     map[string]*applicationProgress
 	idleScheduled                                    bool
 	proxyAvailability, proxyRoutesReady, actualReady bool
 	proxyRouteFailed                                 atomic.Bool
@@ -77,11 +80,6 @@ type podEntry struct {
 	cancel                                           context.CancelFunc
 	done                                             chan struct{}
 	created                                          bool
-	started                                          time.Time
-	readiness, startup, liveness                     probeProgress
-	startupComplete                                  bool
-	probeFailure                                     string
-	terminationReason                                string
 	applicationMissingSince                          time.Time
 	volumeDigests                                    map[string][32]byte
 	volumesChecked                                   time.Time
@@ -141,8 +139,8 @@ func newProvider(ctx context.Context, cfg config, client kubernetes.Interface) (
 
 func validatePod(pod *corev1.Pod) error {
 	spec := pod.Spec
-	if len(spec.Containers) != 1 || len(spec.EphemeralContainers) != 0 {
-		return errdefs.InvalidInput("qualification supports exactly one regular container and no ephemeral containers")
+	if len(spec.Containers) == 0 || len(spec.EphemeralContainers) != 0 {
+		return errdefs.InvalidInput("at least one regular container is required; ephemeral containers are not yet supported")
 	}
 
 	if spec.HostNetwork || spec.HostPID || spec.HostIPC ||
@@ -155,24 +153,25 @@ func validatePod(pod *corev1.Pod) error {
 	if spec.DNSPolicy != corev1.DNSClusterFirst || spec.DNSConfig != nil {
 		return errdefs.InvalidInput("qualification supports ClusterFirst DNS without overrides")
 	}
-	container := spec.Containers[0]
 	if _, _, _, err := proxySettings(pod); err != nil {
 		return err
-	}
-	if len(container.EnvFrom) != 0 {
-		return errdefs.InvalidInput("unresolved envFrom source")
 	}
 	if _, err := derivePodAllocation(pod); err != nil {
 		return errdefs.InvalidInput(err.Error())
 	}
-	if container.RestartPolicy != nil || len(container.RestartPolicyRules) != 0 ||
-		len(container.VolumeDevices) != 0 || container.Lifecycle != nil || container.Stdin || container.TTY {
-		return errdefs.InvalidInput("container restart overrides, volume devices, hooks and TTY are not qualified")
+	for _, container := range spec.Containers {
+		if len(container.EnvFrom) != 0 {
+			return errdefs.InvalidInput("unresolved envFrom source")
+		}
+		if container.RestartPolicy != nil || len(container.RestartPolicyRules) != 0 ||
+			len(container.VolumeDevices) != 0 || container.Lifecycle != nil || container.Stdin || container.TTY {
+			return errdefs.InvalidInput("container restart overrides, volume devices, hooks and TTY are not qualified")
+		}
+		if err := validateProbes(container); err != nil {
+			return errdefs.InvalidInput(err.Error())
+		}
 	}
 	if err := validateVolumes(pod); err != nil {
-		return errdefs.InvalidInput(err.Error())
-	}
-	if err := validateProbes(container); err != nil {
 		return errdefs.InvalidInput(err.Error())
 	}
 	if err := validateInitContainers(pod); err != nil {
@@ -189,7 +188,7 @@ func (p *provider) CreatePod(ctx context.Context, pod *corev1.Pod) error {
 	if err != nil {
 		return errdefs.InvalidInput(err.Error())
 	}
-	if networkProbes(pod.Spec.Containers[0]) && p.runner.cfg.relayBinary == "" {
+	if podNetworkProbes(pod) && p.runner.cfg.relayBinary == "" {
 		return errdefs.InvalidInput("HTTP/TCP probes require --network-relay-binary")
 	}
 	if p.client != nil {
@@ -245,7 +244,7 @@ func (p *provider) CreatePod(ctx context.Context, pod *corev1.Pod) error {
 	}
 	httpPort := 0
 	appPort := int32(0)
-	for _, port := range pod.Spec.Containers[0].Ports {
+	for _, port := range applicationPorts(pod) {
 		if port.Protocol == "" || port.Protocol == corev1.ProtocolTCP {
 			appPort = port.ContainerPort
 			break
@@ -262,15 +261,17 @@ func (p *provider) CreatePod(ctx context.Context, pod *corev1.Pod) error {
 	e := &podEntry{wake: make(chan struct{}, 1), snapshotIDs: make(map[string]string), lifetime: lifetime, state: "WAITINGVOLUMES", httpPort: httpPort, appPort: int(appPort), pod: pod.DeepCopy(), vm: "fvp-" + uid[:20], link: "pv" + uid[:10], ip: p.network.address(slot), slot: slot, port: port, cancel: cancel, done: make(chan struct{})}
 	e.allocation = allocation
 	e.declaredSpec = declared.Spec.DeepCopy()
-	e.pod.Status = corev1.PodStatus{Phase: corev1.PodPending, Reason: "NativeVMStarting", StartTime: new(metav1.Now()),
-		ContainerStatuses: []corev1.ContainerStatus{{Name: pod.Spec.Containers[0].Name, Image: pod.Spec.Containers[0].Image,
-			State: corev1.ContainerState{Waiting: &corev1.ContainerStateWaiting{Reason: "ContainerCreating"}}}}}
+	e.pod.Status = corev1.PodStatus{Phase: corev1.PodPending, Reason: "NativeVMStarting", StartTime: new(metav1.Now())}
+	for _, container := range pod.Spec.Containers {
+		e.pod.Status.ContainerStatuses = append(e.pod.Status.ContainerStatuses, corev1.ContainerStatus{Name: container.Name, Image: container.Image,
+			State: corev1.ContainerState{Waiting: &corev1.ContainerStateWaiting{Reason: "ContainerCreating"}}})
+	}
 	initializeInitStatuses(e.pod)
 	e.pod.Status.Conditions = podConditionsFor(e.pod, false)
 	e.proxyAvailability, e.idleOwner, e.idleTimeout, _ = proxySettings(pod)
 	if e.proxyAvailability {
 		e.backendIP = addressAt(p.network.backendPrefix, slot)
-		for _, declared := range pod.Spec.Containers[0].Ports {
+		for _, declared := range applicationPorts(pod) {
 			backend := httpPort
 			if int(declared.ContainerPort) != e.appPort {
 				backend, err = uniquePort(ports, availableTCPPort)
@@ -293,7 +294,9 @@ func (p *provider) CreatePod(ctx context.Context, pod *corev1.Pod) error {
 	if cold {
 		e.state = "COLD"
 		e.pod.Status.Reason = "NativeVMCold"
-		e.pod.Status.ContainerStatuses[0].State.Waiting.Reason = "NativeVMCold"
+		for i := range e.pod.Status.ContainerStatuses {
+			e.pod.Status.ContainerStatuses[i].State.Waiting.Reason = "NativeVMCold"
+		}
 	}
 	if err := p.journal(e); err != nil {
 		cancel()
@@ -329,7 +332,7 @@ func (p *provider) CreatePod(ctx context.Context, pod *corev1.Pod) error {
 }
 
 func (p *provider) startAdmitted(ctx context.Context, e *podEntry) error {
-	if networkProbes(e.pod.Spec.Containers[0]) {
+	if podNetworkProbes(e.pod) {
 		if _, err := p.ensureRelay(ctx); err != nil {
 			return err
 		}
@@ -355,7 +358,13 @@ func (p *provider) startAdmitted(ctx context.Context, e *podEntry) error {
 	} else if e.httpPort != 0 {
 		args = append(args, "--port", fmt.Sprintf("127.0.0.1:%d:%d", e.httpPort, e.appPort))
 	}
-	args = append(args, guestImage, "--", "-ec", "containerd --log-level=error & while true; do if test -f /tmp/application.request; then mv /tmp/application.request /tmp/application.active && sh /tmp/application.active || sleep 0.2; else sleep 0.2; fi; done")
+	bootstrap := "containerd --log-level=error & while true; do if test -f /tmp/application.request; then mv /tmp/application.request /tmp/application.active && sh /tmp/application.active || sleep 0.2; else sleep 0.2; fi; done"
+	if concurrentApplications(e.pod) {
+		// The legacy queue still runs ordinary sequential init containers. The
+		// shared supervisor owns independent regular application processes.
+		bootstrap = "(" + bootstrap + ") &\n" + guesttask.SupervisorScript()
+	}
+	args = append(args, guestImage, "--", "-ec", bootstrap)
 	if _, err := p.runner.vm(ctx, args...); err != nil {
 		return fmt.Errorf("create native pod VM: %w", err)
 	}
@@ -374,6 +383,9 @@ func (p *provider) startAdmitted(ctx context.Context, e *podEntry) error {
 	if err := p.startApplication(ctx, e); err != nil {
 		return err
 	}
+	if concurrentApplications(e.pod) {
+		return nil
+	}
 	for {
 		output, err := p.runner.guest(ctx, e.vm, "if test -f /tmp/application.exit; then echo EXIT; else "+ctr+" tasks list; fi")
 		if err != nil {
@@ -391,6 +403,9 @@ func (p *provider) startAdmitted(ctx context.Context, e *podEntry) error {
 }
 
 func (p *provider) startApplication(ctx context.Context, e *podEntry) error {
+	if concurrentApplications(e.pod) {
+		return p.startApplications(ctx, e)
+	}
 	container := e.pod.Spec.Containers[0]
 	args, oom, err := p.containerLaunch(ctx, e, container, "application", "/tmp")
 	if err != nil {
@@ -506,6 +521,23 @@ func (p *provider) monitor(ctx context.Context, e *podEntry) {
 				return
 			}
 			e.op.Unlock()
+			select {
+			case <-ctx.Done():
+				return
+			case <-time.After(time.Second):
+				continue
+			}
+		}
+		if concurrentApplications(e.pod) {
+			err := p.monitorApplications(ctx, e)
+			if err != nil && ctx.Err() == nil {
+				p.fail(e, err)
+			}
+			terminal := e.state == "TERMINATED"
+			e.op.Unlock()
+			if err != nil || terminal {
+				return
+			}
 			select {
 			case <-ctx.Done():
 				return
@@ -633,7 +665,9 @@ func (p *provider) terminated(e *podEntry, code int32) {
 		e.pod.Status.Phase = corev1.PodFailed
 	}
 	e.actualReady = false
-	e.pod.Status.ContainerStatuses[0].Ready = false
+	for i := range e.pod.Status.ContainerStatuses {
+		e.pod.Status.ContainerStatuses[i].Ready = false
+	}
 	e.pod.Status.ContainerStatuses[0].Started = new(false)
 	e.pod.Status.ContainerStatuses[0].State = corev1.ContainerState{Terminated: &corev1.ContainerStateTerminated{
 		ExitCode: code, Reason: cmp.Or(e.terminationReason, e.probeFailure, string(e.pod.Status.Phase)), StartedAt: metav1.NewTime(e.started), FinishedAt: metav1.Now()}}
@@ -673,7 +707,9 @@ func (p *provider) fail(e *podEntry, err error) {
 	e.actualReady = false
 	e.mu.Lock()
 	e.pod.Status.Phase, e.pod.Status.Reason, e.pod.Status.Message = corev1.PodFailed, "NativeRuntimeFailed", err.Error()
-	e.pod.Status.ContainerStatuses[0].Ready = false
+	for i := range e.pod.Status.ContainerStatuses {
+		e.pod.Status.ContainerStatuses[i].Ready = false
+	}
 	e.pod.Status.Conditions = podConditionsFor(e.pod, false)
 	e.mu.Unlock()
 	if journalErr := p.journal(e); journalErr != nil {
@@ -862,18 +898,25 @@ func (p *provider) GetContainerLogs(ctx context.Context, namespace, name, contai
 	if e.state != "READY" && e.state != "RUNNING" {
 		return nil, errdefs.InvalidInput("pod is not executing")
 	}
-	if container != e.pod.Spec.Containers[0].Name {
+	index := -1
+	for i, declared := range e.pod.Spec.Containers {
+		if container == declared.Name {
+			index = i
+			break
+		}
+	}
+	if index < 0 {
 		return nil, errdefs.NotFound("container not found")
 	}
-	script := "cat /tmp/application.log"
+	log := quote(applicationRoot(e.pod, index) + "/application.log")
+	script := "cat " + log
 	if opts.Tail > 0 {
-		script = fmt.Sprintf("tail -n %d /tmp/application.log", opts.Tail)
+		script = fmt.Sprintf("tail -n %d %s", opts.Tail, log)
 	}
-	output, err := p.runner.guest(ctx, e.vm, script)
+	data, err := p.runner.nativeOutput(ctx, []string{"exec", "--no-stdin", e.vm, "--", "sh", "-ec", script}, nil)
 	if err != nil {
 		return nil, err
 	}
-	data := []byte(output + "\n")
 	if opts.LimitBytes > 0 && len(data) > opts.LimitBytes {
 		data = data[:opts.LimitBytes]
 	}

@@ -18,7 +18,7 @@ func validPod() *corev1.Pod {
 
 func TestUnsupportedFeaturesAreRejectedBeforeVMCreation(t *testing.T) {
 	cases := map[string]func(*corev1.Pod){
-		"multiple containers": func(p *corev1.Pod) { p.Spec.Containers = append(p.Spec.Containers, p.Spec.Containers[0]) },
+		"duplicate container names": func(p *corev1.Pod) { p.Spec.Containers = append(p.Spec.Containers, p.Spec.Containers[0]) },
 
 		"projected volume": func(p *corev1.Pod) { p.Spec.Volumes = []corev1.Volume{{Name: "token"}} },
 		"host network":     func(p *corev1.Pod) { p.Spec.HostNetwork = true },

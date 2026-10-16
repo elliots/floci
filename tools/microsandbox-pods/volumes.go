@@ -98,6 +98,11 @@ func volumeSourcesRequired(e *podEntry) bool {
 	if !e.started.IsZero() {
 		return false
 	}
+	for _, progress := range e.applications {
+		if !progress.started.IsZero() {
+			return false
+		}
+	}
 	for _, status := range e.pod.Status.InitContainerStatuses {
 		if running := status.State.Running; running != nil && !running.StartedAt.IsZero() {
 			return false

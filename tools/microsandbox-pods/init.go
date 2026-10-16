@@ -94,6 +94,9 @@ func podConditionsFor(pod *corev1.Pod, ready bool) []corev1.PodCondition {
 }
 
 func podJournalVersion(pod *corev1.Pod) int {
+	if concurrentApplications(pod) {
+		return 4
+	}
 	if len(pod.Spec.InitContainers) > 0 {
 		return 3
 	}
@@ -104,8 +107,8 @@ func validateInitJournal(record journalRecord) error {
 	if len(record.Pod.Spec.InitContainers) == 0 {
 		return nil
 	}
-	if record.Version != 3 || len(record.Pod.Spec.InitContainers) != len(record.Pod.Status.InitContainerStatuses) {
-		return errors.New("init containers require a version 3 journal with complete statuses")
+	if record.Version < 3 || record.Version > 4 || len(record.Pod.Spec.InitContainers) != len(record.Pod.Status.InitContainerStatuses) {
+		return errors.New("init containers require a supported journal with complete statuses")
 	}
 	completed := true
 	for index, container := range record.Pod.Spec.InitContainers {
@@ -160,13 +163,15 @@ func executingContainerTask(e *podEntry, name string) (string, error) {
 			return initTask(index), nil
 		}
 	}
-	if name != e.pod.Spec.Containers[0].Name {
-		return "", errdefs.NotFound("container not found")
+	for index, container := range e.pod.Spec.Containers {
+		if name == container.Name {
+			if e.state != "READY" && e.state != "RUNNING" || concurrentApplications(e.pod) && e.pod.Status.ContainerStatuses[index].State.Running == nil {
+				return "", errdefs.InvalidInput("application container is not executing")
+			}
+			return applicationTask(e.pod, index), nil
+		}
 	}
-	if e.state != "READY" && e.state != "RUNNING" {
-		return "", errdefs.InvalidInput("application container is not executing")
-	}
-	return "application", nil
+	return "", errdefs.NotFound("container not found")
 }
 
 // Called under e.op. A single guest supervisor executes init tasks in order.
@@ -220,7 +225,9 @@ func (p *provider) advanceInit(ctx context.Context, e *podEntry) error {
 	current.State = corev1.ContainerState{Running: &corev1.ContainerStateRunning{StartedAt: metav1.Now()}}
 	current.Started, current.Ready = new(true), false
 	e.pod.Status.Phase, e.pod.Status.Reason, e.pod.Status.Message = corev1.PodPending, "PodInitializing", ""
-	e.pod.Status.ContainerStatuses[0].State = corev1.ContainerState{Waiting: &corev1.ContainerStateWaiting{Reason: "PodInitializing"}}
+	for i := range e.pod.Status.ContainerStatuses {
+		e.pod.Status.ContainerStatuses[i].State = corev1.ContainerState{Waiting: &corev1.ContainerStateWaiting{Reason: "PodInitializing"}}
+	}
 	e.pod.Status.Conditions = podConditionsFor(e.pod, false)
 	e.mu.Unlock()
 	e.state = "INITIALIZING"
@@ -329,7 +336,9 @@ func (p *provider) finishInitAttempt(e *podEntry, index int, exit corev1.Contain
 	if terminal {
 		e.state = "TERMINATED"
 		e.pod.Status.Phase, e.pod.Status.Reason, e.pod.Status.Message = corev1.PodFailed, "InitContainerFailed", "Init container "+status.Name+" failed: "+exit.Reason
-		e.pod.Status.ContainerStatuses[0].State = corev1.ContainerState{Waiting: &corev1.ContainerStateWaiting{Reason: "PodInitializing"}}
+		for i := range e.pod.Status.ContainerStatuses {
+			e.pod.Status.ContainerStatuses[i].State = corev1.ContainerState{Waiting: &corev1.ContainerStateWaiting{Reason: "PodInitializing"}}
+		}
 	}
 	e.mu.Unlock()
 	if err := p.journal(e); err != nil {

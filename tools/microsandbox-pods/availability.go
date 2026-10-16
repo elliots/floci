@@ -42,7 +42,7 @@ func proxySettings(pod *corev1.Pod) (bool, string, time.Duration, error) {
 		seconds = parsed
 	}
 	ports := map[int32]bool{}
-	for _, port := range pod.Spec.Containers[0].Ports {
+	for _, port := range applicationPorts(pod) {
 		if port.Protocol != "" && port.Protocol != corev1.ProtocolTCP {
 			return false, "", 0, errors.New("proxy availability requires TCP ports only")
 		}
@@ -162,7 +162,9 @@ func (p *provider) projectProxyAvailability(e *podEntry) {
 		e.pod.Status.Phase = corev1.PodRunning
 	}
 	e.pod.Status.Conditions = podConditionsFor(e.pod, ready)
-	e.pod.Status.ContainerStatuses[0].Ready = ready
+	for i := range e.pod.Status.ContainerStatuses {
+		e.pod.Status.ContainerStatuses[i].Ready = ready
+	}
 }
 
 func (p *provider) watchAvailability(ctx context.Context) {
@@ -252,7 +254,9 @@ func (p *provider) withdrawProxyAvailability(e *podEntry) {
 	e.publication.Lock()
 	defer e.publication.Unlock()
 	e.mu.Lock()
-	e.pod.Status.ContainerStatuses[0].Ready = false
+	for i := range e.pod.Status.ContainerStatuses {
+		e.pod.Status.ContainerStatuses[i].Ready = false
+	}
 	e.pod.Status.Conditions = podConditionsFor(e.pod, false)
 	pod := e.pod.DeepCopy()
 	e.mu.Unlock()
@@ -260,6 +264,11 @@ func (p *provider) withdrawProxyAvailability(e *podEntry) {
 }
 
 func idleEligible(e *podEntry) bool {
+	for _, progress := range e.applications {
+		if !progress.nextKill.IsZero() {
+			return false
+		}
+	}
 	return e.idleOwner == "controller" && (e.state == "READY" || e.state == "RUNNING") && e.applicationMissingSince.IsZero() && e.activeConnections == 0 && time.Since(e.lastActivity) >= e.idleTimeout
 }
 

@@ -15,12 +15,17 @@ import urllib.request
 import urllib.error
 
 from qualification_registry import QualificationRegistry
+from qualification_applications import qualify_applications
 
 LABEL = "io.floci.pod-probe"
 
 
 class QualificationFailure(RuntimeError):
     pass
+
+
+class QualificationComplete(Exception):
+    """A selected qualification subset completed; still run shared cleanup."""
 
 
 def command(*args, timeout=60, input_text=None, env=None):
@@ -175,6 +180,12 @@ def qualify(args):
                     "tolerations":[{"key":"microsandbox.dev/runtime","operator":"Equal","value":"native","effect":"NoSchedule"}],
                     "automountServiceAccountToken":False, "restartPolicy":"Never",
                     "containers":[{"name":"app","image":"public.ecr.aws/docker/library/busybox:1.37.0","command":["sh","-ec",script]}]}}
+            qualify_applications(pod=pod, apply=apply, resource=resource, kubectl=kubectl,
+                ready=ready, lifecycle=lifecycle, control_get=control_get,
+                crash_and_restart=crash_and_restart, wait=wait, command=command,
+                msb=args.msb, environment=environment, report=report)
+            if getattr(args, "applications_only", False):
+                raise QualificationComplete()
             if args.cold_pods:
                 if args.cold_pods < 1 or args.cold_pods > 500: raise ValueError("cold-pods must be 0..500")
                 cold_pods = [pod(f"cold-{number}","exec sleep 600") for number in range(args.cold_pods)]
@@ -874,6 +885,8 @@ def qualify(args):
             wait("native VM removal",lambda: not [v for v in json.loads(command(args.msb,"ls","--format","json",env=environment)) if v["name"] in owned_vms])
             report["checks"]["pod_deletion_removes_vms"] = True
             report["result"] = "passed"
+    except QualificationComplete:
+        report["result"] = "passed"
     except (Exception, KeyboardInterrupt) as error:
         report["result"] = "failed"
         report["error"] = str(error) or type(error).__name__
@@ -958,6 +971,7 @@ if __name__ == "__main__":
     parser.add_argument("--maven-ready-file")
     parser.add_argument("--cold-pods",type=int,default=2)
     parser.add_argument("--proxy-pods",type=int,default=0)
+    parser.add_argument("--applications-only", action="store_true", help="qualify multiple regular containers using the shared owned fixture")
     parser.add_argument("--network-relay-binary")
     parser.add_argument("--scheduling-cpu", help="virtual CPU capacity advertised to the Kubernetes scheduler")
     parser.add_argument("--scheduling-memory", help="virtual memory capacity advertised to the Kubernetes scheduler")

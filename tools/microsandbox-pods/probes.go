@@ -92,11 +92,15 @@ func networkProbes(container corev1.Container) bool {
 }
 
 func (p *provider) executeProbe(ctx context.Context, e *podEntry, probe *corev1.Probe) (bool, error) {
+	return p.executeContainerProbe(ctx, e, e.pod.Spec.Containers[0], "application", probe)
+}
+
+func (p *provider) executeContainerProbe(ctx context.Context, e *podEntry, container corev1.Container, task string, probe *corev1.Probe) (bool, error) {
 	timeout := max(probe.TimeoutSeconds, 1)
 	check, cancel := context.WithTimeout(ctx, time.Duration(timeout)*time.Second)
 	defer cancel()
 	if probe.Exec != nil {
-		_, err := p.runner.guest(check, e.vm, ctr+" tasks exec --exec-id probe-"+strconv.FormatInt(time.Now().UnixNano(), 10)+" application "+joinCommand(probe.Exec.Command))
+		_, err := p.runner.guest(check, e.vm, ctr+" tasks exec --exec-id probe-"+strconv.FormatInt(time.Now().UnixNano(), 10)+" "+quote(task)+" "+joinCommand(probe.Exec.Command))
 		return err == nil, nil
 	}
 	address := e.ip
@@ -107,14 +111,14 @@ func (p *provider) executeProbe(ctx context.Context, e *podEntry, probe *corev1.
 	var err error
 	if action := probe.HTTPGet; action != nil {
 		spec.Scheme, spec.Path = string(cmp.Or(action.Scheme, corev1.URISchemeHTTP)), action.Path
-		spec.Port, err = probePort(action.Port, e.pod.Spec.Containers[0])
+		spec.Port, err = probePort(action.Port, container)
 		spec.Headers = make(http.Header)
 		for _, header := range action.HTTPHeaders {
 			spec.Headers.Add(header.Name, header.Value)
 		}
 	} else if action := probe.TCPSocket; action != nil {
 		spec.Scheme = "TCP"
-		spec.Port, err = probePort(action.Port, e.pod.Spec.Containers[0])
+		spec.Port, err = probePort(action.Port, container)
 	} else {
 		return false, errors.New("missing supported probe handler")
 	}
@@ -166,11 +170,15 @@ func (s *probeProgress) observe(success bool, probe *corev1.Probe) {
 }
 
 func (p *provider) evaluateProbe(ctx context.Context, e *podEntry, probe *corev1.Probe, progress *probeProgress) {
-	if time.Since(e.started) < time.Duration(probe.InitialDelaySeconds)*time.Second || time.Since(progress.at) < time.Duration(cmp.Or(probe.PeriodSeconds, 10))*time.Second {
+	p.evaluateContainerProbe(ctx, e, e.pod.Spec.Containers[0], "application", e.started, probe, progress)
+}
+
+func (p *provider) evaluateContainerProbe(ctx context.Context, e *podEntry, container corev1.Container, task string, started time.Time, probe *corev1.Probe, progress *probeProgress) {
+	if time.Since(started) < time.Duration(probe.InitialDelaySeconds)*time.Second || time.Since(progress.at) < time.Duration(cmp.Or(probe.PeriodSeconds, 10))*time.Second {
 		return
 	}
 	progress.at = time.Now()
-	success, err := p.executeProbe(ctx, e, probe)
+	success, err := p.executeContainerProbe(ctx, e, container, task, probe)
 	if ctx.Err() != nil {
 		return
 	}
@@ -196,31 +204,34 @@ func (p *provider) probe(ctx context.Context, e *podEntry) bool {
 }
 
 func (p *provider) healthChecks(ctx context.Context, e *podEntry) (*corev1.Probe, string, error) {
-	container := e.pod.Spec.Containers[0]
-	if e.probeFailure != "" {
-		if e.probeFailure == "StartupProbeFailed" {
-			return container.StartupProbe, e.probeFailure, nil
+	return p.containerHealthChecks(ctx, e, e.pod.Spec.Containers[0], "application", &e.applicationProgress)
+}
+
+func (p *provider) containerHealthChecks(ctx context.Context, e *podEntry, container corev1.Container, task string, progress *applicationProgress) (*corev1.Probe, string, error) {
+	if progress.probeFailure != "" {
+		if progress.probeFailure == "StartupProbeFailed" {
+			return container.StartupProbe, progress.probeFailure, nil
 		}
-		return container.LivenessProbe, e.probeFailure, nil
+		return container.LivenessProbe, progress.probeFailure, nil
 	}
-	if !e.startupComplete {
+	if !progress.startupComplete {
 		if probe := container.StartupProbe; probe != nil {
-			p.evaluateProbe(ctx, e, probe, &e.startup)
-			if e.startup.failures >= cmp.Or(probe.FailureThreshold, 3) {
+			p.evaluateContainerProbe(ctx, e, container, task, progress.started, probe, &progress.startup)
+			if progress.startup.failures >= cmp.Or(probe.FailureThreshold, 3) {
 				return probe, "StartupProbeFailed", nil
 			}
-			if !e.startup.passed {
+			if !progress.startup.passed {
 				return nil, "", nil
 			}
 		}
-		e.startupComplete = true
+		progress.startupComplete = true
 		if err := p.journal(e); err != nil {
 			return nil, "", err
 		}
 	}
 	if probe := container.LivenessProbe; probe != nil {
-		p.evaluateProbe(ctx, e, probe, &e.liveness)
-		if e.liveness.failures >= cmp.Or(probe.FailureThreshold, 3) {
+		p.evaluateContainerProbe(ctx, e, container, task, progress.started, probe, &progress.liveness)
+		if progress.liveness.failures >= cmp.Or(probe.FailureThreshold, 3) {
 			return probe, "LivenessProbeFailed", nil
 		}
 	}

@@ -25,8 +25,8 @@ type podAllocation struct {
 }
 
 func derivePodAllocation(pod *corev1.Pod) (podAllocation, error) {
-	if pod == nil || len(pod.Spec.Containers) != 1 {
-		return podAllocation{}, fmt.Errorf("resource allocation requires exactly one regular container")
+	if pod == nil || len(pod.Spec.Containers) == 0 {
+		return podAllocation{}, fmt.Errorf("resource allocation requires at least one regular container")
 	}
 	if pod.Spec.Resources != nil || len(pod.Spec.ResourceClaims) != 0 || len(pod.Spec.Overhead) != 0 {
 		return podAllocation{}, fmt.Errorf("pod-level resources, resource claims and RuntimeClass overhead are not qualified")
@@ -36,8 +36,17 @@ func derivePodAllocation(pod *corev1.Pod) (podAllocation, error) {
 		if err := validateContainerResources(container); err != nil {
 			return podAllocation{}, fmt.Errorf("container %s: %w", container.Name, err)
 		}
-		// Ordinary init containers run sequentially, before the single app.
-		// The VM must accommodate each stage, rather than their sum.
+	}
+	// Regular containers execute concurrently. Sequential init containers need
+	// only their own peak, before the applications start.
+	for _, container := range pod.Spec.Containers {
+		cpuMilli += max(container.Resources.Requests.Cpu().MilliValue(), container.Resources.Limits.Cpu().MilliValue())
+		memoryBytes += max(container.Resources.Requests.Memory().Value(), container.Resources.Limits.Memory().Value())
+		if cpuMilli > maxGuestVCPUs*1000 || memoryBytes > int64(maxGuestMemoryMiB-guestMemoryHeadroomMiB)*bytesPerMiB {
+			return podAllocation{}, fmt.Errorf("concurrent application resources exceed native VM capacity")
+		}
+	}
+	for _, container := range pod.Spec.InitContainers {
 		cpuMilli = max(cpuMilli, container.Resources.Requests.Cpu().MilliValue(), container.Resources.Limits.Cpu().MilliValue())
 		memoryBytes = max(memoryBytes, container.Resources.Requests.Memory().Value(), container.Resources.Limits.Memory().Value())
 	}

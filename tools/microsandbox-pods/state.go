@@ -23,29 +23,30 @@ type stateIdentity struct {
 	Node, ClusterUID, PeerOwner, Peer, PodCIDR, ProxyBackendCIDR string
 }
 type journalRecord struct {
-	TerminationReason string             `json:"terminationReason,omitempty"`
-	Allocation        podAllocation      `json:"allocation,omitzero"`
-	StartupComplete   bool               `json:"startupComplete,omitzero"`
-	ProbeFailure      string             `json:"probeFailure,omitempty"`
-	ProxyPorts        []proxyPortBinding `json:"proxyPorts,omitempty"`
-	BackendIP         string             `json:"backendIP,omitempty"`
-	SnapshotIDs       map[string]string  `json:"snapshotIDs,omitempty"`
-	RestoredParent    string             `json:"restoredParent,omitempty"`
-	Version           int                `json:"version"`
-	View              lifecycleView      `json:"view"`
-	Pod               *corev1.Pod        `json:"pod"`
-	DeclaredSpec      *corev1.PodSpec    `json:"declaredSpec,omitempty"`
-	Slot              int                `json:"slot"`
-	GuestIP           string             `json:"guestIP"`
-	Started           time.Time          `json:"started"`
-	Snapshots         []string           `json:"snapshots,omitempty"`
+	Applications      map[string]applicationRecord `json:"applications,omitempty"`
+	TerminationReason string                       `json:"terminationReason,omitempty"`
+	Allocation        podAllocation                `json:"allocation,omitzero"`
+	StartupComplete   bool                         `json:"startupComplete,omitzero"`
+	ProbeFailure      string                       `json:"probeFailure,omitempty"`
+	ProxyPorts        []proxyPortBinding           `json:"proxyPorts,omitempty"`
+	BackendIP         string                       `json:"backendIP,omitempty"`
+	SnapshotIDs       map[string]string            `json:"snapshotIDs,omitempty"`
+	RestoredParent    string                       `json:"restoredParent,omitempty"`
+	Version           int                          `json:"version"`
+	View              lifecycleView                `json:"view"`
+	Pod               *corev1.Pod                  `json:"pod"`
+	DeclaredSpec      *corev1.PodSpec              `json:"declaredSpec,omitempty"`
+	Slot              int                          `json:"slot"`
+	GuestIP           string                       `json:"guestIP"`
+	Started           time.Time                    `json:"started"`
+	Snapshots         []string                     `json:"snapshots,omitempty"`
 }
 
 func (record journalRecord) guestAllocation() (podAllocation, error) {
 	if record.Version == 1 && record.Allocation == (podAllocation{}) {
 		return validateStoredAllocation(podAllocation{})
 	}
-	if (record.Version != 2 && record.Version != 3) || record.Allocation.Version == 0 {
+	if (record.Version != 2 && record.Version != 3 && record.Version != 4) || record.Allocation.Version == 0 {
 		return podAllocation{}, errors.New("pod journal has an invalid version or missing guest allocation")
 	}
 	if record.Version == 3 && (record.Pod == nil || len(record.Pod.Spec.InitContainers) == 0) {
@@ -121,7 +122,7 @@ func (p *provider) recover(ctx context.Context) error {
 		}
 		lifetime, cancel := context.WithCancel(p.ctx)
 		e := &podEntry{wake: make(chan struct{}, 1), snapshotIDs: record.SnapshotIDs, restoredParent: record.RestoredParent, pod: record.Pod, vm: record.View.VM, ip: record.View.PodIP, slot: record.Slot, port: record.View.UDPPort,
-			httpPort: record.View.HTTPPort, appPort: record.View.ApplicationPort, guestIP: record.GuestIP, started: record.Started,
+			httpPort: record.View.HTTPPort, appPort: record.View.ApplicationPort, guestIP: record.GuestIP, applicationProgress: applicationProgress{started: record.Started},
 			generation: record.View.Generation, state: record.View.State, snapshots: record.Snapshots, lifetime: lifetime, cancel: cancel, done: make(chan struct{})}
 		e.allocation, err = record.guestAllocation()
 		if err != nil {
@@ -129,6 +130,9 @@ func (p *provider) recover(ctx context.Context) error {
 		}
 		if err := validateInitJournal(record); err != nil {
 			return fmt.Errorf("invalid init state for Pod %s: %w", record.View.UID, err)
+		}
+		if err := restoreApplicationRecords(e, record); err != nil {
+			return fmt.Errorf("invalid application state for Pod %s: %w", record.View.UID, err)
 		}
 		e.declaredSpec = record.DeclaredSpec
 		e.startupComplete, e.probeFailure = record.StartupComplete, record.ProbeFailure
@@ -145,7 +149,7 @@ func (p *provider) recover(ctx context.Context) error {
 		}
 		e.proxyPorts = record.ProxyPorts
 		e.backendIP = record.BackendIP
-		if e.proxyAvailability && (e.backendIP != addressAt(p.network.backendPrefix, e.slot) || len(e.proxyPorts) != len(e.pod.Spec.Containers[0].Ports)) {
+		if e.proxyAvailability && (e.backendIP != addressAt(p.network.backendPrefix, e.slot) || len(e.proxyPorts) != len(applicationPorts(e.pod))) {
 			return errors.New("proxy runtime journal does not match Pod network identity")
 		}
 		if len(uidText) < 20 || e.vm != "fvp-"+uidText[:20] || e.ip != p.network.address(e.slot) {
@@ -408,7 +412,7 @@ func recoverAction(journalState, runtimeStatus string, exists, verified bool) st
 	if journalState == "FAILED" || journalState == "TERMINATED" {
 		return journalState
 	}
-	if journalState == "STARTING" || journalState == "RESTARTING" || journalState == "INITSTARTING" {
+	if journalState == "STARTING" || journalState == "RESTARTING" || journalState == "INITSTARTING" || journalState == "APPSTARTING" {
 		// A launch can crash before submitting the application, including after
 		// removing an earlier exit marker. VM liveness cannot prove task liveness.
 		return "FAILED"
@@ -455,7 +459,7 @@ func validateJournalPorts(e *podEntry, used map[int]bool) error {
 		return nil
 	}
 	for i, binding := range e.proxyPorts {
-		if binding.ContainerPort != int(e.pod.Spec.Containers[0].Ports[i].ContainerPort) || (i == 0 && (binding.BackendPort != e.httpPort || binding.ContainerPort != e.appPort)) {
+		if binding.ContainerPort != int(applicationPorts(e.pod)[i].ContainerPort) || (i == 0 && (binding.BackendPort != e.httpPort || binding.ContainerPort != e.appPort)) {
 			return errors.New("proxy journal ports do not match Pod declaration")
 		}
 		if err := claim(binding.BackendPort); err != nil {

@@ -195,7 +195,7 @@ func (p *provider) journal(e *podEntry) error {
 		file.Close()
 		return err
 	}
-	if err := json.NewEncoder(file).Encode(journalRecord{Version: podJournalVersion(e.pod), Allocation: allocation, StartupComplete: e.startupComplete, ProbeFailure: e.probeFailure, TerminationReason: e.terminationReason, DeclaredSpec: e.declaredSpec, ProxyPorts: e.proxyPorts, BackendIP: e.backendIP, SnapshotIDs: e.snapshotIDs, RestoredParent: e.restoredParent, View: view(e), Pod: pod, Slot: e.slot, GuestIP: e.guestIP, Started: e.started, Snapshots: e.snapshots}); err != nil {
+	if err := json.NewEncoder(file).Encode(journalRecord{Version: podJournalVersion(e.pod), Applications: e.applicationRecords(), Allocation: allocation, StartupComplete: e.startupComplete, ProbeFailure: e.probeFailure, TerminationReason: e.terminationReason, DeclaredSpec: e.declaredSpec, ProxyPorts: e.proxyPorts, BackendIP: e.backendIP, SnapshotIDs: e.snapshotIDs, RestoredParent: e.restoredParent, View: view(e), Pod: pod, Slot: e.slot, GuestIP: e.guestIP, Started: e.started, Snapshots: e.snapshots}); err != nil {
 		file.Close()
 		return err
 	}
@@ -221,9 +221,14 @@ func (p *provider) unavailable(e *podEntry, reason string) {
 	e.actualReady = false
 	e.mu.Lock()
 	e.pod.Status.Reason = reason
-	e.pod.Status.ContainerStatuses[0].Ready = false
-	e.pod.Status.ContainerStatuses[0].Started = new(false)
-	e.pod.Status.ContainerStatuses[0].State = corev1.ContainerState{Waiting: &corev1.ContainerStateWaiting{Reason: reason}}
+	for i := range e.pod.Status.ContainerStatuses {
+		status := &e.pod.Status.ContainerStatuses[i]
+		status.Ready = false
+		if !concurrentApplications(e.pod) {
+			status.Started = new(false)
+			status.State = corev1.ContainerState{Waiting: &corev1.ContainerStateWaiting{Reason: reason}}
+		}
+	}
 	e.pod.Status.Conditions = podConditionsFor(e.pod, false)
 	e.mu.Unlock()
 	p.publish(e)
@@ -235,6 +240,11 @@ func (p *provider) hibernate(ctx context.Context, e *podEntry) error {
 	}
 	if e.probeFailure != "" {
 		return errors.New("cannot hibernate a container awaiting probe-triggered termination")
+	}
+	for _, progress := range e.applications {
+		if !progress.nextKill.IsZero() {
+			return errors.New("cannot hibernate a container awaiting probe-triggered termination")
+		}
 	}
 	if !e.applicationMissingSince.IsZero() {
 		return errors.New("cannot hibernate a container with a missing application task")
@@ -442,6 +452,10 @@ func (p *provider) resume(ctx context.Context, e *podEntry) error {
 	_ = p.refreshVolumes(ctx, e, false)
 	e.state = "RUNNING"
 	resetProbeProgress(e)
+	for _, progress := range e.applications {
+		progress.readiness, progress.startup, progress.liveness = probeProgress{}, probeProgress{}, probeProgress{}
+		progress.missingSince = time.Time{}
+	}
 	e.applicationMissingSince = time.Time{}
 	if err := p.journal(e); err != nil {
 		return err
