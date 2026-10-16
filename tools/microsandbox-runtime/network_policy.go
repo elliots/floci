@@ -358,21 +358,29 @@ func portRange(value string) (int, int, error) {
 func (b *nativeNetworkBoundary) launchArguments(args []string, network *msb.NetworkConfig, home string) ([]string, error) {
 	result := []string{args[0]}
 	for i := 1; i < len(args); i++ {
-		if args[i] == "--" {
+		flag := args[i]
+		if flag == "--" {
 			result = append(result, args[i:]...)
 			break
 		}
-		if b.CAFile != "" && (args[i] == "--env" || args[i] == "-e") {
-			key, _, _ := strings.Cut(args[i+1], "=")
+		if !strings.HasPrefix(flag, "-") || flag == "-d" || flag == "--detach" {
+			result = append(result, flag)
+			continue
+		}
+		// parse has validated every launch option. Consume its value together
+		// with the flag so literal init arguments cannot become host options.
+		i++
+		value := args[i]
+		if flag == "--net" || flag == "--net-rule" || flag == "--net-default" {
+			continue
+		}
+		if b.CAFile != "" && (flag == "--env" || flag == "-e") {
+			key, _, _ := strings.Cut(value, "=")
 			if key == "FLOCI_CA_BUNDLE" {
 				return nil, invalid("FLOCI_CA_BUNDLE is reserved for the native public CA")
 			}
 		}
-		if args[i] == "--net" || args[i] == "--net-rule" || args[i] == "--net-default" {
-			i++
-			continue
-		}
-		result = append(result, args[i])
+		result = append(result, flag, value)
 	}
 	options := []string{"--net-default-egress", "deny", "--net-default-ingress", string(network.DefaultIngress), "--label", networkPolicyLabel + "=" + b.fingerprint, "--no-dns-rebind-protection"}
 	for _, rule := range network.Rules {

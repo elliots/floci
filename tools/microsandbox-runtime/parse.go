@@ -4,6 +4,7 @@ import (
 	"math"
 	"net"
 	"net/netip"
+	"path"
 	"strconv"
 	"strings"
 	"time"
@@ -43,7 +44,7 @@ func parse(args []string) (command, error) {
 	allowed := map[string]map[string]bool{
 		"--version": {}, "doctor": {},
 		"inspect": {"--format": true}, "ls": {"--format": true}, "metrics": {"--format": true},
-		"run":   {"--detach": false, "--name": true, "--cpus": true, "--memory": true, "--root-disk": true, "--label": true, "--env": true, "--port": true, "--entrypoint": true, "--net": true, "--net-rule": true, "--net-default": true},
+		"run":   {"--detach": false, "--name": true, "--cpus": true, "--memory": true, "--root-disk": true, "--label": true, "--env": true, "--port": true, "--entrypoint": true, "--init": true, "--init-arg": true, "--init-env": true, "--net": true, "--net-rule": true, "--net-default": true},
 		"exec":  {"--detach": false, "--no-tty": false, "--no-stdin": false, "--stream": false, "--user": true},
 		"start": {}, "pause": {}, "resume": {},
 		"stop": {"--force": false, "--timeout": true}, "rm": {"--force": false},
@@ -89,7 +90,7 @@ func parse(args []string) (command, error) {
 		if !ok {
 			return r, invalid("unsupported option")
 		}
-		if seen[flag] && flag != "--env" && flag != "--label" && flag != "--port" && flag != "--net-rule" && flag != "--net" {
+		if seen[flag] && flag != "--env" && flag != "--label" && flag != "--port" && flag != "--net-rule" && flag != "--net" && flag != "--init-arg" && flag != "--init-env" {
 			return r, invalid("duplicate option")
 		}
 		seen[flag] = true
@@ -156,6 +157,28 @@ func parse(args []string) (command, error) {
 			r.config.RootDisk = &d
 		case "--entrypoint":
 			r.config.Entrypoint = []string{value}
+		case "--init", "--init-arg", "--init-env":
+			if r.config.Init == nil {
+				r.config.Init = &msb.InitConfig{}
+			}
+			switch flag {
+			case "--init":
+				if value != "auto" && (!path.IsAbs(value) || path.Clean(value) != value) {
+					return r, invalid("init must be auto or a clean absolute guest path")
+				}
+				r.config.Init.Cmd = value
+			case "--init-arg":
+				r.config.Init.Args = append(r.config.Init.Args, value)
+			case "--init-env":
+				key, setting, ok := strings.Cut(value, "=")
+				if !ok || key == "" || strings.ContainsAny(key, " \t\r\n") {
+					return r, invalid("init environment requires key=value")
+				}
+				if r.config.Init.Env == nil {
+					r.config.Init.Env = map[string]string{}
+				}
+				r.config.Init.Env[key] = setting
+			}
 		case "--env", "--label":
 			k, v, ok := strings.Cut(value, "=")
 			if !ok || k == "" {
@@ -195,6 +218,9 @@ func parse(args []string) (command, error) {
 	case "run":
 		if !r.detached || r.name == "" || len(positional) != 1 {
 			return r, invalid("run requires detached mode, name and image")
+		}
+		if r.config.Init != nil && r.config.Init.Cmd == "" {
+			return r, invalid("init arguments require --init")
 		}
 		r.image = positional[0]
 		r.config.Image = r.image
