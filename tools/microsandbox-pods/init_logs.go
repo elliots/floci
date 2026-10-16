@@ -56,7 +56,11 @@ func (p *provider) captureInitLogs(ctx context.Context, e *podEntry, index int) 
 }
 
 func (p *provider) initLogOutput(ctx context.Context, e *podEntry, index int) ([]byte, error) {
-	script := fmt.Sprintf("tail -c %d %s", maxInitLogBytes, quote(initRoot(index)+"/application.log"))
+	root := initRoot(index)
+	if restartableInit(e.pod.Spec.InitContainers[index]) {
+		root = (managedContainer{index: index, init: true}).root(e)
+	}
+	script := fmt.Sprintf("tail -c %d %s", maxInitLogBytes, quote(root+"/application.log"))
 	// Logs are bytes, unlike command metadata. Preserve leading/trailing
 	// whitespace and do not merge guest errors into a successful log response.
 	data, err := p.runner.nativeOutput(ctx, []string{"exec", "--no-stdin", e.vm, "--", "sh", "-ec", script}, nil)
@@ -69,7 +73,7 @@ func (p *provider) initLogOutput(ctx context.Context, e *podEntry, index int) ([
 func (p *provider) readInitLogs(ctx context.Context, e *podEntry, index int, opts api.ContainerLogOpts) ([]byte, error) {
 	status := e.pod.Status.InitContainerStatuses[index]
 	var data []byte
-	if e.state == "INITIALIZING" && status.State.Running != nil {
+	if (e.state == "INITIALIZING" || restartableInit(e.pod.Spec.InitContainers[index]) && (e.state == "RUNNING" || e.state == "READY" || e.state == "DRAINING")) && status.State.Running != nil {
 		var err error
 		data, err = p.initLogOutput(ctx, e, index)
 		if err != nil {

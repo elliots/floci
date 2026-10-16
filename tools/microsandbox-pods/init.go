@@ -30,6 +30,10 @@ func podContainers(pod *corev1.Pod) iter.Seq[corev1.Container] {
 
 func validateInitContainers(pod *corev1.Pod) error {
 	names := make(map[string]bool)
+	initNames := make(map[string]bool)
+	for _, container := range pod.Spec.InitContainers {
+		initNames[container.Name] = true
+	}
 	for container := range podContainers(pod) {
 		if names[container.Name] {
 			return fmt.Errorf("duplicate container name %q", container.Name)
@@ -38,9 +42,9 @@ func validateInitContainers(pod *corev1.Pod) error {
 		if len(container.EnvFrom) != 0 {
 			return errors.New("unresolved envFrom source")
 		}
-		if container.RestartPolicy != nil || len(container.RestartPolicyRules) != 0 ||
+		if container.RestartPolicy != nil && (!initNames[container.Name] || !restartableInit(container)) || len(container.RestartPolicyRules) != 0 ||
 			len(container.VolumeDevices) != 0 || container.Lifecycle != nil || container.Stdin || container.TTY {
-			return errors.New("restartable init containers, container restart overrides, volume devices, hooks and TTY are not qualified")
+			return errors.New("container restart overrides other than Always init sidecars, volume devices, hooks and TTY are not qualified")
 		}
 		for _, env := range container.Env {
 			if env.ValueFrom != nil {
@@ -54,6 +58,12 @@ func validateInitContainers(pod *corev1.Pod) error {
 		}
 	}
 	for _, container := range pod.Spec.InitContainers {
+		if restartableInit(container) {
+			if err := validateProbes(container); err != nil {
+				return err
+			}
+			continue
+		}
 		if container.ReadinessProbe != nil || container.StartupProbe != nil || container.LivenessProbe != nil {
 			return fmt.Errorf("ordinary init container %s cannot have probes", container.Name)
 		}
@@ -76,6 +86,9 @@ func nextInitContainer(pod *corev1.Pod) int {
 			return index
 		}
 		status := pod.Status.InitContainerStatuses[index]
+		if restartableInit(container) && status.Started != nil && *status.Started {
+			continue
+		}
 		if status.Name != container.Name || status.State.Terminated == nil || status.State.Terminated.ExitCode != 0 {
 			return index
 		}
@@ -85,7 +98,11 @@ func nextInitContainer(pod *corev1.Pod) int {
 
 func podConditionsFor(pod *corev1.Pod, ready bool) []corev1.PodCondition {
 	conditions := podConditions(ready)
-	if nextInitContainer(pod) >= 0 {
+	initialized := false
+	for _, condition := range pod.Status.Conditions {
+		initialized = initialized || condition.Type == corev1.PodInitialized && condition.Status == corev1.ConditionTrue
+	}
+	if nextInitContainer(pod) >= 0 && !(hasRestartableInit(pod) && initialized) {
 		conditions[0].Status = corev1.ConditionFalse
 		conditions[0].Reason = "ContainersNotInitialized"
 		conditions[0].Message = "Init containers have not all completed successfully"
@@ -94,6 +111,9 @@ func podConditionsFor(pod *corev1.Pod, ready bool) []corev1.PodCondition {
 }
 
 func podJournalVersion(pod *corev1.Pod) int {
+	if hasRestartableInit(pod) {
+		return 5
+	}
 	if concurrentApplications(pod) {
 		return 4
 	}
@@ -106,6 +126,9 @@ func podJournalVersion(pod *corev1.Pod) int {
 func validateInitJournal(record journalRecord) error {
 	if len(record.Pod.Spec.InitContainers) == 0 {
 		return nil
+	}
+	if hasRestartableInit(record.Pod) {
+		return validateSidecarInitJournal(record)
 	}
 	if record.Version < 3 || record.Version > 4 || len(record.Pod.Spec.InitContainers) != len(record.Pod.Status.InitContainerStatuses) {
 		return errors.New("init containers require a supported journal with complete statuses")
@@ -157,7 +180,8 @@ func initRoot(index int) string { return "/tmp/floci-" + initTask(index) }
 func executingContainerTask(e *podEntry, name string) (string, error) {
 	for index, container := range e.pod.Spec.InitContainers {
 		if container.Name == name {
-			if e.state != "INITIALIZING" || e.pod.Status.InitContainerStatuses[index].State.Running == nil {
+			available := e.state == "INITIALIZING" || restartableInit(container) && (e.state == "READY" || e.state == "RUNNING" || e.state == "DRAINING")
+			if !available || e.pod.Status.InitContainerStatuses[index].State.Running == nil {
 				return "", errdefs.InvalidInput("init container is not executing")
 			}
 			return initTask(index), nil
@@ -178,13 +202,23 @@ func executingContainerTask(e *podEntry, name string) (string, error) {
 // Initialization continues in the monitor, without holding a VM-start slot or
 // tying a long-running init container to the wake request's deadline.
 func (p *provider) advanceInit(ctx context.Context, e *podEntry) error {
-	index := nextInitContainer(e.pod)
+	index := nextInitForEntry(e)
 	if index < 0 {
+		e.mu.Lock()
+		e.pod.Status.Conditions = podConditions(false)
+		e.mu.Unlock()
 		e.state = "STARTING"
 		if err := p.journal(e); err != nil {
 			return err
 		}
 		return p.startApplication(ctx, e)
+	}
+	if restartableInit(e.pod.Spec.InitContainers[index]) {
+		managed := managedContainer{index: index, init: true}
+		if !managed.progress(e).started.IsZero() || !managed.progress(e).nextRestart.IsZero() {
+			return nil
+		}
+		return p.startManagedContainer(ctx, e, managed)
 	}
 	status := e.pod.Status.InitContainerStatuses[index]
 	if status.State.Running != nil {
@@ -240,7 +274,16 @@ func (p *provider) advanceInit(ctx context.Context, e *podEntry) error {
 }
 
 func (p *provider) monitorInit(ctx context.Context, e *podEntry) error {
-	index := nextInitContainer(e.pod)
+	if err := p.monitorSidecars(ctx, e); err != nil {
+		return err
+	}
+	if hasRestartableInit(e.pod) {
+		p.publish(e)
+	}
+	index := nextInitForEntry(e)
+	if index >= 0 && restartableInit(e.pod.Spec.InitContainers[index]) {
+		return p.advanceInit(ctx, e)
+	}
 	if index < 0 || e.pod.Status.InitContainerStatuses[index].State.Running == nil {
 		return p.advanceInit(ctx, e)
 	}
@@ -341,6 +384,9 @@ func (p *provider) finishInitAttempt(e *podEntry, index int, exit corev1.Contain
 		}
 	}
 	e.mu.Unlock()
+	if terminal && hasRestartableInit(e.pod) {
+		return p.beginSidecarShutdown(e, corev1.PodFailed)
+	}
 	if err := p.journal(e); err != nil {
 		return err
 	}

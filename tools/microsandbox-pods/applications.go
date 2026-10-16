@@ -18,6 +18,7 @@ type applicationProgress struct {
 	started                      time.Time
 	readiness, startup, liveness probeProgress
 	startupComplete              bool
+	admitted                     bool
 	probeFailure                 string
 	terminationReason            string
 	missingSince                 time.Time
@@ -30,6 +31,7 @@ type applicationProgress struct {
 type applicationRecord struct {
 	Started           time.Time `json:"started"`
 	StartupComplete   bool      `json:"startupComplete,omitzero"`
+	Admitted          bool      `json:"admitted,omitzero"`
 	ProbeFailure      string    `json:"probeFailure,omitempty"`
 	TerminationReason string    `json:"terminationReason,omitempty"`
 	NextRestart       time.Time `json:"nextRestart,omitzero"`
@@ -37,12 +39,19 @@ type applicationRecord struct {
 	KillSent          bool      `json:"killSent,omitzero"`
 }
 
-func concurrentApplications(pod *corev1.Pod) bool { return len(pod.Spec.Containers) > 1 }
+func concurrentApplications(pod *corev1.Pod) bool {
+	return len(pod.Spec.Containers) > 1 || hasRestartableInit(pod)
+}
 
 func applicationPorts(pod *corev1.Pod) []corev1.ContainerPort {
 	var ports []corev1.ContainerPort
 	for _, container := range pod.Spec.Containers {
 		ports = append(ports, container.Ports...)
+	}
+	for _, container := range pod.Spec.InitContainers {
+		if restartableInit(container) {
+			ports = append(ports, container.Ports...)
+		}
 	}
 	return ports
 }
@@ -80,9 +89,10 @@ func (e *podEntry) applicationRecords() map[string]applicationRecord {
 		return nil
 	}
 	records := make(map[string]applicationRecord, len(e.pod.Spec.Containers))
-	for i, container := range e.pod.Spec.Containers {
-		progress := e.progress(i)
+	for managed := range managedContainers(e.pod) {
+		container, progress := managed.container(e), managed.progress(e)
 		records[container.Name] = applicationRecord{Started: progress.started, StartupComplete: progress.startupComplete,
+			Admitted:     progress.admitted,
 			ProbeFailure: progress.probeFailure, TerminationReason: progress.terminationReason, NextRestart: progress.nextRestart,
 			NextKill: progress.nextKill, KillSent: progress.killSent}
 	}
@@ -91,17 +101,22 @@ func (e *podEntry) applicationRecords() map[string]applicationRecord {
 
 func restoreApplicationRecords(e *podEntry, record journalRecord) error {
 	if !concurrentApplications(e.pod) {
-		if record.Version == 4 || len(record.Applications) != 0 {
+		if record.Version >= 4 || len(record.Applications) != 0 {
 			return errors.New("concurrent application journal does not match Pod containers")
 		}
 		return nil
 	}
-	if record.Version != 4 || len(record.Applications) != len(e.pod.Spec.Containers) || len(e.pod.Status.ContainerStatuses) != len(e.pod.Spec.Containers) {
-		return errors.New("multiple applications require a version 4 journal with complete statuses")
+	count := 0
+	for range managedContainers(e.pod) {
+		count++
 	}
-	for index, container := range e.pod.Spec.Containers {
+	if record.Version != podJournalVersion(e.pod) || len(record.Applications) != count || len(e.pod.Status.ContainerStatuses) != len(e.pod.Spec.Containers) {
+		return errors.New("concurrent containers require a matching journal version with complete statuses")
+	}
+	for managed := range managedContainers(e.pod) {
+		container := managed.container(e)
 		stored, found := record.Applications[container.Name]
-		status := e.pod.Status.ContainerStatuses[index]
+		status := managed.status(e)
 		if !found || status.Name != container.Name || status.Image != container.Image || status.RestartCount < 0 {
 			return errors.New("application status does not match its declared container")
 		}
@@ -124,8 +139,12 @@ func restoreApplicationRecords(e *podEntry, record journalRecord) error {
 		if !stored.NextRestart.IsZero() && (status.State.Waiting == nil || status.State.Waiting.Reason != "CrashLoopBackOff" || status.LastTerminationState.Terminated == nil) {
 			return errors.New("application backoff has no matching termination")
 		}
-		progress := e.progress(index)
+		if stored.Admitted && (!managed.init || stored.Started.IsZero()) {
+			return errors.New("sidecar admission has no matching start")
+		}
+		progress := managed.progress(e)
 		*progress = applicationProgress{started: stored.Started, startupComplete: stored.StartupComplete,
+			admitted:     stored.Admitted,
 			probeFailure: stored.ProbeFailure, terminationReason: stored.TerminationReason, nextRestart: stored.NextRestart,
 			nextKill: stored.NextKill, killSent: stored.KillSent}
 	}
@@ -171,7 +190,7 @@ func (p *provider) startManagedContainer(ctx context.Context, e *podEntry, manag
 		return fmt.Errorf("submit container %s: %w", container.Name, err)
 	}
 	progress := managed.progress(e)
-	*progress = applicationProgress{started: time.Now()}
+	*progress = applicationProgress{started: time.Now(), admitted: progress.admitted}
 	e.mu.Lock()
 	status := managed.status(e)
 	if status.LastTerminationState.Terminated != nil {
@@ -202,6 +221,9 @@ func (p *provider) managedPreparationFailed(e *podEntry, managed managedContaine
 // Called with e.op held. A backoff for one application never blocks another
 // application's probes, restart, logging, or final completion observation.
 func (p *provider) monitorApplications(ctx context.Context, e *podEntry) error {
+	if err := p.monitorSidecars(ctx, e); err != nil {
+		return err
+	}
 	for index := range e.pod.Spec.Containers {
 		if err := p.monitorApplication(ctx, e, index); err != nil {
 			return err
@@ -256,6 +278,11 @@ func (p *provider) monitorManagedContainer(ctx context.Context, e *podEntry, man
 		if err := p.releaseContainerSubpaths(ctx, e, managed.container(e)); err != nil {
 			return err
 		}
+		if managed.init {
+			if err := p.captureInitLogs(ctx, e, managed.index); err != nil {
+				return err
+			}
+		}
 		return p.managedContainerExited(e, managed, int32(code), reason, "")
 	}
 	if !containerTaskRunning(output, managed.task(e)) {
@@ -272,6 +299,12 @@ func (p *provider) monitorManagedContainer(ctx context.Context, e *podEntry, man
 		return nil
 	}
 	progress.missingSince = time.Time{}
+	if e.state == "DRAINING" && progress.nextKill.IsZero() {
+		e.mu.Lock()
+		managed.status(e).State = corev1.ContainerState{Running: &corev1.ContainerStateRunning{StartedAt: metav1.NewTime(progress.started)}}
+		e.mu.Unlock()
+		return nil
+	}
 	if !progress.nextKill.IsZero() {
 		if progress.killSent && time.Since(progress.nextKill) >= applicationMissingGrace {
 			return fmt.Errorf("container %s did not terminate within 30 seconds of SIGKILL", managed.container(e).Name)
@@ -295,6 +328,12 @@ func (p *provider) monitorManagedContainer(ctx context.Context, e *podEntry, man
 		return p.stopManagedUnhealthy(ctx, e, managed, probe, reason)
 	}
 	ready := progress.startupComplete
+	if managed.init && progress.startupComplete && !progress.admitted {
+		progress.admitted = true
+		if err := p.journal(e); err != nil {
+			return err
+		}
+	}
 	if ready && container.ReadinessProbe != nil {
 		p.evaluateContainerProbe(ctx, e, container, managed.task(e), progress.started, container.ReadinessProbe, &progress.readiness)
 		ready = progress.readiness.passed
@@ -326,7 +365,7 @@ func (p *provider) managedContainerExited(e *podEntry, managed managedContainer,
 	exit := corev1.ContainerState{Terminated: &corev1.ContainerStateTerminated{ExitCode: code, Reason: reason, Message: message,
 		StartedAt: metav1.NewTime(progress.started), FinishedAt: metav1.Now(), ContainerID: status.ContainerID}}
 	status.State, status.Ready, status.Started = exit, false, new(false)
-	if e.pod.Spec.RestartPolicy == corev1.RestartPolicyAlways || e.pod.Spec.RestartPolicy == corev1.RestartPolicyOnFailure && (code != 0 || progress.probeFailure != "") {
+	if e.state != "DRAINING" && (managed.init || e.pod.Spec.RestartPolicy == corev1.RestartPolicyAlways || e.pod.Spec.RestartPolicy == corev1.RestartPolicyOnFailure && (code != 0 || progress.probeFailure != "")) {
 		status.LastTerminationState = exit
 		status.State = corev1.ContainerState{Waiting: &corev1.ContainerStateWaiting{Reason: "CrashLoopBackOff", Message: "Container will restart after backoff"}}
 		progress.nextRestart = time.Now().Add(min(10*time.Second*time.Duration(1<<min(status.RestartCount, 5)), 300*time.Second))
@@ -354,6 +393,15 @@ func (p *provider) publishApplications(ctx context.Context, e *podEntry) error {
 			e.applicationMissingSince = progress.missingSince
 		}
 	}
+	for index, container := range e.pod.Spec.InitContainers {
+		if restartableInit(container) {
+			progress := (managedContainer{index: index, init: true}).progress(e)
+			ready = ready && progress.ready
+			if !progress.missingSince.IsZero() && (e.applicationMissingSince.IsZero() || progress.missingSince.Before(e.applicationMissingSince)) {
+				e.applicationMissingSince = progress.missingSince
+			}
+		}
+	}
 	e.pod.Status.Phase, e.pod.Status.Reason, e.pod.Status.Message, e.pod.Status.PodIP = corev1.PodRunning, "", "", e.ip
 	e.pod.Status.PodIPs, e.pod.Status.HostIP = []corev1.PodIP{{IP: e.ip}}, p.runner.cfg.nodeIP
 	if waiting {
@@ -371,6 +419,9 @@ func (p *provider) publishApplications(ctx context.Context, e *podEntry) error {
 	}
 	e.pod.Status.Conditions = podConditionsFor(e.pod, ready)
 	e.mu.Unlock()
+	if complete && hasRestartableInit(e.pod) {
+		return p.beginSidecarShutdown(e, e.pod.Status.Phase)
+	}
 	if err := p.journal(e); err != nil {
 		return err
 	}

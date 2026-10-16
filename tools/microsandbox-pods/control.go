@@ -196,7 +196,7 @@ func (p *provider) journal(e *podEntry) error {
 		file.Close()
 		return err
 	}
-	if err := json.NewEncoder(file).Encode(journalRecord{Version: podJournalVersion(e.pod), Applications: e.applicationRecords(), Allocation: allocation, StartupComplete: e.startupComplete, ProbeFailure: e.probeFailure, TerminationReason: e.terminationReason, DeclaredSpec: e.declaredSpec, ProxyPorts: e.proxyPorts, BackendIP: e.backendIP, SnapshotIDs: e.snapshotIDs, RestoredParent: e.restoredParent, View: view(e), Pod: pod, Slot: e.slot, GuestIP: e.guestIP, Started: e.started, Snapshots: e.snapshots}); err != nil {
+	if err := json.NewEncoder(file).Encode(journalRecord{Version: podJournalVersion(e.pod), CompletionPhase: e.completionPhase, ShutdownDeadline: e.shutdownDeadline, Applications: e.applicationRecords(), Allocation: allocation, StartupComplete: e.startupComplete, ProbeFailure: e.probeFailure, TerminationReason: e.terminationReason, DeclaredSpec: e.declaredSpec, ProxyPorts: e.proxyPorts, BackendIP: e.backendIP, SnapshotIDs: e.snapshotIDs, RestoredParent: e.restoredParent, View: view(e), Pod: pod, Slot: e.slot, GuestIP: e.guestIP, Started: e.started, Snapshots: e.snapshots}); err != nil {
 		file.Close()
 		return err
 	}
@@ -228,6 +228,11 @@ func (p *provider) unavailable(e *podEntry, reason string) {
 		if !concurrentApplications(e.pod) {
 			status.Started = new(false)
 			status.State = corev1.ContainerState{Waiting: &corev1.ContainerStateWaiting{Reason: reason}}
+		}
+	}
+	for i := range e.pod.Status.InitContainerStatuses {
+		if restartableInit(e.pod.Spec.InitContainers[i]) {
+			e.pod.Status.InitContainerStatuses[i].Ready = false
 		}
 	}
 	e.pod.Status.Conditions = podConditionsFor(e.pod, false)

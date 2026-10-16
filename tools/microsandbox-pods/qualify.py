@@ -17,6 +17,7 @@ import urllib.error
 from qualification_registry import QualificationRegistry
 from qualification_applications import qualify_applications
 from qualification_operations import qualify_operations
+from qualification_sidecars import qualify_sidecars
 
 LABEL = "io.floci.pod-probe"
 
@@ -181,12 +182,19 @@ def qualify(args):
                     "tolerations":[{"key":"microsandbox.dev/runtime","operator":"Equal","value":"native","effect":"NoSchedule"}],
                     "automountServiceAccountToken":False, "restartPolicy":"Never",
                     "containers":[{"name":"app","image":"public.ecr.aws/docker/library/busybox:1.37.0","command":["sh","-ec",script]}]}}
-            if not getattr(args, "operations_only", False):
+            if not getattr(args, "operations_only", False) and not getattr(args, "sidecars_only", False):
                 qualify_applications(pod=pod, apply=apply, resource=resource, kubectl=kubectl,
                     ready=ready, lifecycle=lifecycle, control_get=control_get,
                     crash_and_restart=crash_and_restart, wait=wait, command=command,
                     msb=args.msb, environment=environment, report=report)
             if getattr(args, "applications_only", False):
+                raise QualificationComplete()
+            if not getattr(args, "operations_only", False):
+                qualify_sidecars(pod=pod, apply=apply, resource=resource, kubectl=kubectl,
+                    ready=ready, lifecycle=lifecycle, control_get=control_get,
+                    crash_and_restart=crash_and_restart, wait=wait, command=command,
+                    msb=args.msb, environment=environment, report=report)
+            if getattr(args, "sidecars_only", False):
                 raise QualificationComplete()
             qualify_operations(peer=peer, temporary=temporary, pod=pod, apply=apply,
                 resource=resource, kubectl=kubectl, ready=ready, lifecycle=lifecycle,
@@ -980,6 +988,7 @@ if __name__ == "__main__":
     parser.add_argument("--proxy-pods",type=int,default=0)
     parser.add_argument("--applications-only", action="store_true", help="qualify multiple regular containers using the shared owned fixture")
     parser.add_argument("--operations-only", action="store_true", help="qualify TTY, port forwarding and gRPC probes using the shared owned fixture")
+    parser.add_argument("--sidecars-only", action="store_true", help="qualify restartable init sidecars and ordered Job completion using the shared owned fixture")
     parser.add_argument("--network-relay-binary")
     parser.add_argument("--scheduling-cpu", help="virtual CPU capacity advertised to the Kubernetes scheduler")
     parser.add_argument("--scheduling-memory", help="virtual memory capacity advertised to the Kubernetes scheduler")

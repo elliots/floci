@@ -18,6 +18,15 @@ func restartableInit(container corev1.Container) bool {
 	return container.RestartPolicy != nil && *container.RestartPolicy == corev1.ContainerRestartPolicyAlways
 }
 
+func hasRestartableInit(pod *corev1.Pod) bool {
+	for _, container := range pod.Spec.InitContainers {
+		if restartableInit(container) {
+			return true
+		}
+	}
+	return false
+}
+
 func managedContainers(pod *corev1.Pod) iter.Seq[managedContainer] {
 	return func(yield func(managedContainer) bool) {
 		for index := range pod.Spec.Containers {

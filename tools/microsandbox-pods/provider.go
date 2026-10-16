@@ -49,6 +49,8 @@ type provider struct {
 
 type podEntry struct {
 	applicationProgress
+	completionPhase                                  corev1.PodPhase
+	shutdownDeadline                                 time.Time
 	applications                                     map[string]*applicationProgress
 	idleScheduled                                    bool
 	proxyAvailability, proxyRoutesReady, actualReady bool
@@ -512,9 +514,14 @@ func (p *provider) monitor(ctx context.Context, e *podEntry) {
 				continue
 			}
 		}
-		if e.state == "INITIALIZING" {
+		if e.state == "INITIALIZING" || e.state == "DRAINING" {
 			check, cancel := boundedContext(ctx)
-			err := p.monitorInit(check, e)
+			var err error
+			if e.state == "DRAINING" {
+				err = p.drainSidecars(check, e)
+			} else {
+				err = p.monitorInit(check, e)
+			}
 			cancel()
 			if err != nil {
 				if ctx.Err() == nil {
@@ -717,6 +724,11 @@ func (p *provider) fail(e *podEntry, err error) {
 	for i := range e.pod.Status.ContainerStatuses {
 		e.pod.Status.ContainerStatuses[i].Ready = false
 	}
+	for i := range e.pod.Status.InitContainerStatuses {
+		if restartableInit(e.pod.Spec.InitContainers[i]) {
+			e.pod.Status.InitContainerStatuses[i].Ready = false
+		}
+	}
 	e.pod.Status.Conditions = podConditionsFor(e.pod, false)
 	e.mu.Unlock()
 	if journalErr := p.journal(e); journalErr != nil {
@@ -800,9 +812,14 @@ func (p *provider) DeletePod(ctx context.Context, pod *corev1.Pod) error {
 	if err := p.removeProxy(ctx, e); err != nil {
 		errs = append(errs, err)
 	}
-	if _, exists, err := p.inspectOwned(ctx, e); err != nil {
+	if status, exists, err := p.inspectOwned(ctx, e); err != nil {
 		errs = append(errs, err)
 	} else if exists {
+		if status == "Running" && hasRestartableInit(e.pod) {
+			if err := p.drainBeforeDeletion(ctx, e, pod); err != nil {
+				errs = append(errs, err)
+			}
+		}
 		if _, err := p.runner.vm(ctx, "rm", "--force", e.vm); err != nil {
 			errs = append(errs, err)
 		}

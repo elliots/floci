@@ -135,7 +135,7 @@ func (p *provider) acquireProxy(ctx context.Context, e *podEntry, backendPort in
 			e.op.Unlock()
 			return fmt.Sprintf("127.0.0.1:%d", backendPort), release, nil
 		}
-		if e.state == "FAILED" || e.state == "TERMINATED" {
+		if e.state == "FAILED" || e.state == "TERMINATED" || e.state == "DRAINING" {
 			e.op.Unlock()
 			return "", release, errors.New("application is unavailable")
 		}
@@ -152,7 +152,7 @@ func (p *provider) projectProxyAvailability(e *podEntry) {
 	if !e.proxyAvailability {
 		return
 	}
-	ready := e.proxyRoutesReady && !e.proxyRouteFailed.Load() && !e.deleted && e.lifetime.Err() == nil && e.state != "FAILED" && e.state != "TERMINATED" && e.applicationMissingSince.IsZero()
+	ready := e.proxyRoutesReady && !e.proxyRouteFailed.Load() && !e.deleted && e.lifetime.Err() == nil && e.state != "FAILED" && e.state != "TERMINATED" && e.state != "DRAINING" && e.applicationMissingSince.IsZero()
 	e.mu.Lock()
 	defer e.mu.Unlock()
 	e.pod.Status.PodIP = e.ip

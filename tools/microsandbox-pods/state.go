@@ -23,6 +23,8 @@ type stateIdentity struct {
 	Node, ClusterUID, PeerOwner, Peer, PodCIDR, ProxyBackendCIDR string
 }
 type journalRecord struct {
+	CompletionPhase   corev1.PodPhase              `json:"completionPhase,omitempty"`
+	ShutdownDeadline  time.Time                    `json:"shutdownDeadline,omitzero"`
 	Applications      map[string]applicationRecord `json:"applications,omitempty"`
 	TerminationReason string                       `json:"terminationReason,omitempty"`
 	Allocation        podAllocation                `json:"allocation,omitzero"`
@@ -46,7 +48,7 @@ func (record journalRecord) guestAllocation() (podAllocation, error) {
 	if record.Version == 1 && record.Allocation == (podAllocation{}) {
 		return validateStoredAllocation(podAllocation{})
 	}
-	if (record.Version != 2 && record.Version != 3 && record.Version != 4) || record.Allocation.Version == 0 {
+	if (record.Version < 2 || record.Version > 5) || record.Allocation.Version == 0 {
 		return podAllocation{}, errors.New("pod journal has an invalid version or missing guest allocation")
 	}
 	if record.Version == 3 && (record.Pod == nil || len(record.Pod.Spec.InitContainers) == 0) {
@@ -135,6 +137,10 @@ func (p *provider) recover(ctx context.Context) error {
 			return fmt.Errorf("invalid application state for Pod %s: %w", record.View.UID, err)
 		}
 		e.declaredSpec = record.DeclaredSpec
+		e.completionPhase, e.shutdownDeadline = record.CompletionPhase, record.ShutdownDeadline
+		if e.state == "DRAINING" && (!hasRestartableInit(e.pod) || e.shutdownDeadline.IsZero() || e.completionPhase != corev1.PodSucceeded && e.completionPhase != corev1.PodFailed) {
+			return errors.New("sidecar shutdown journal has no valid completion phase or deadline")
+		}
 		e.startupComplete, e.probeFailure = record.StartupComplete, record.ProbeFailure
 		e.terminationReason = record.TerminationReason
 		if !orphan {
@@ -433,8 +439,8 @@ func recoverAction(journalState, runtimeStatus string, exists, verified bool) st
 		return "ROLLBACK"
 	}
 	if exists && runtimeStatus == "Running" {
-		if journalState == "INITIALIZING" {
-			return "INITIALIZING"
+		if journalState == "INITIALIZING" || journalState == "DRAINING" {
+			return journalState
 		}
 		return "RUNNING"
 	}

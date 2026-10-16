@@ -187,9 +187,9 @@ func TestInitAllocationUsesMaximumOfSequentialStagesAndValidatesSecurity(t *test
 		t.Fatal(err)
 	}
 	for name, mutate := range map[string]func(*corev1.Container){
-		"restartable sidecar": func(c *corev1.Container) { c.RestartPolicy = new(corev1.ContainerRestartPolicyAlways) },
-		"probe":               func(c *corev1.Container) { c.ReadinessProbe = &corev1.Probe{} },
-		"privileged":          func(c *corev1.Container) { c.SecurityContext = &corev1.SecurityContext{Privileged: new(true)} },
+		"unsupported init restart override": func(c *corev1.Container) { c.RestartPolicy = new(corev1.ContainerRestartPolicy("Never")) },
+		"probe":                             func(c *corev1.Container) { c.ReadinessProbe = &corev1.Probe{} },
+		"privileged":                        func(c *corev1.Container) { c.SecurityContext = &corev1.SecurityContext{Privileged: new(true)} },
 		"unresolved env": func(c *corev1.Container) {
 			c.Env = []corev1.EnvVar{{Name: "SECRET", ValueFrom: &corev1.EnvVarSource{}}}
 		},

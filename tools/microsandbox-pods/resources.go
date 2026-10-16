@@ -37,8 +37,8 @@ func derivePodAllocation(pod *corev1.Pod) (podAllocation, error) {
 			return podAllocation{}, fmt.Errorf("container %s: %w", container.Name, err)
 		}
 	}
-	// Regular containers execute concurrently. Sequential init containers need
-	// only their own peak, before the applications start.
+	// Each sequential init stage overlaps previously started sidecars. Regular
+	// applications overlap all sidecars after initialization completes.
 	for _, container := range pod.Spec.Containers {
 		cpuMilli += max(container.Resources.Requests.Cpu().MilliValue(), container.Resources.Limits.Cpu().MilliValue())
 		memoryBytes += max(container.Resources.Requests.Memory().Value(), container.Resources.Limits.Memory().Value())
@@ -46,10 +46,20 @@ func derivePodAllocation(pod *corev1.Pod) (podAllocation, error) {
 			return podAllocation{}, fmt.Errorf("concurrent application resources exceed native VM capacity")
 		}
 	}
+	applicationCPU, applicationMemory := cpuMilli, memoryBytes
+	var sidecarCPU, sidecarMemory int64
 	for _, container := range pod.Spec.InitContainers {
-		cpuMilli = max(cpuMilli, container.Resources.Requests.Cpu().MilliValue(), container.Resources.Limits.Cpu().MilliValue())
-		memoryBytes = max(memoryBytes, container.Resources.Requests.Memory().Value(), container.Resources.Limits.Memory().Value())
+		cpu := max(container.Resources.Requests.Cpu().MilliValue(), container.Resources.Limits.Cpu().MilliValue())
+		memory := max(container.Resources.Requests.Memory().Value(), container.Resources.Limits.Memory().Value())
+		cpuMilli, memoryBytes = max(cpuMilli, sidecarCPU+cpu), max(memoryBytes, sidecarMemory+memory)
+		if restartableInit(container) {
+			sidecarCPU, sidecarMemory = sidecarCPU+cpu, sidecarMemory+memory
+			if sidecarCPU > maxGuestVCPUs*1000 || sidecarMemory > int64(maxGuestMemoryMiB-guestMemoryHeadroomMiB)*bytesPerMiB {
+				return podAllocation{}, fmt.Errorf("concurrent sidecar resources exceed native VM capacity")
+			}
+		}
 	}
+	cpuMilli, memoryBytes = max(cpuMilli, applicationCPU+sidecarCPU), max(memoryBytes, applicationMemory+sidecarMemory)
 	memoryMiB := int64(0)
 	if memoryBytes > 0 {
 		memoryMiB = (memoryBytes-1)/bytesPerMiB + 1
