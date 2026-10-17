@@ -17,13 +17,11 @@ import (
 	"time"
 
 	"github.com/floci-io/floci/tools/microsandbox-runtime/guesttask"
-	dto "github.com/prometheus/client_model/go"
 	"github.com/virtual-kubelet/virtual-kubelet/errdefs"
 	"github.com/virtual-kubelet/virtual-kubelet/node/api"
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/client-go/kubernetes"
-	stats "k8s.io/kubelet/pkg/apis/stats/v1alpha1"
 )
 
 type provider struct {
@@ -1028,12 +1026,6 @@ func (p *provider) GetContainerLogs(ctx context.Context, namespace, name, contai
 }
 func (p *provider) AttachToContainer(context.Context, string, string, string, api.AttachIO) error {
 	return errdefs.InvalidInput("attach is not qualified")
-}
-func (p *provider) GetStatsSummary(context.Context) (*stats.Summary, error) {
-	return nil, errdefs.InvalidInput("metrics are not qualified")
-}
-func (p *provider) GetMetricsResource(context.Context) ([]*dto.MetricFamily, error) {
-	return nil, errdefs.InvalidInput("metrics are not qualified")
 }
 func (p *provider) Ping(ctx context.Context) error {
 	check, cancel := context.WithTimeout(ctx, 5*time.Second)
