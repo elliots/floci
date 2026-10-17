@@ -61,6 +61,33 @@ def wait(description, operation, timeout=180):
     raise RuntimeError(f"{description}: {error}")
 
 
+def persistent_cleanup_reason(state):
+    """Keep guest RAM, checkpoints and Kubernetes metadata if PVC cleanup is unproven."""
+    state = Path(state)
+    for path in sorted((state/"persistent-volumes").glob("*.json")):
+        try:
+            if path.is_symlink():
+                return "persistent volume intent is not a regular owned record"
+            intent = json.loads(path.read_text())
+            if not isinstance(intent, dict) or intent.get("version") != 1 or intent.get("phase") != "deleted":
+                return "persistent volume allocations remain"
+        except (OSError, ValueError):
+            return "persistent volume intent cannot be verified"
+    for path in sorted(state.glob("*.json")):
+        try:
+            if path.is_symlink():
+                return "Pod ownership record cannot be verified for persistent storage"
+            record = json.loads(path.read_text())
+            if not isinstance(record, dict):
+                return "Pod ownership record cannot be verified for persistent storage"
+            volumes = record.get("pod", {}).get("spec", {}).get("volumes", [])
+            if record.get("persistentVolumes") or record.get("persistentWriteback") or any("persistentVolumeClaim" in volume for volume in volumes):
+                return "persistent Pod ownership or writeback records remain"
+        except (OSError, ValueError, AttributeError, TypeError):
+            return "Pod ownership record cannot be verified for persistent storage"
+    return None
+
+
 def source_ip(value):
     address = ipaddress.ip_address(value.strip("[]"))
     return str(getattr(address, "ipv4_mapped", None) or address)
@@ -962,7 +989,12 @@ def qualify(args):
             report["pods"] = json.loads(kubectl("get","pods","-o","json"))
             if args.proxy_pods:
                 report["relay_inventory"] = json.loads(docker("exec",peer,f"/tmp/fvp-relay-{owner}/relay","client","--socket",f"/tmp/fvp-relay-{owner}/control.sock","--token-file",f"/tmp/fvp-relay-{owner}/token","--method","GET","--path","/listeners"))
+            storage_guard = persistent_cleanup_reason(temporary/"state") if "temporary" in locals() else None
+            if storage_guard:
+                report["diagnostic_preserved_storage"] = storage_guard
             for vm in json.loads(command(args.msb,"ls","--format","json",env=environment)):
+                if storage_guard:
+                    continue  # exec may boot a stopped guest and invalidate writeback evidence.
                 if vm["name"].startswith("fvp-"):
                     inspection = json.loads(command(args.msb,"inspect","--format","json",vm["name"],env=environment))
                     if inspection.get("config",{}).get("labels",{}).get(LABEL) != owner and vm["name"] not in {"fvp-"+p.stem.replace("-","")[:20] for p in (temporary/"state").glob("*.json")}: continue
@@ -984,6 +1016,11 @@ def qualify(args):
             except Exception as error:
                 cleanup_errors.append(str(error))
         try:
+            storage_guard = persistent_cleanup_reason(temporary/"state") if "temporary" in locals() else None
+            if storage_guard:
+                preserve_cluster = True
+                report["retained_peer"] = peer
+                raise RuntimeError(storage_guard+"; retained guest RAM, checkpoints, Kubernetes cluster and private ownership records")
             records={}
             if "temporary" in locals():
                 for path in (temporary/"state").glob("*.json"):
@@ -1008,13 +1045,6 @@ def qualify(args):
                         command(args.msb,"snap","rm",selector,env=environment)
             if "temporary" in locals() and (temporary/"state"/"native-command.pending").exists():
                 raise RuntimeError("native operation outcome uncertain; retained private state for reconciliation")
-            if "temporary" in locals():
-                for path in (temporary/"state"/"persistent-volumes").glob("*.json"):
-                    if json.loads(path.read_text()).get("phase") != "deleted":
-                        preserve_cluster = True
-                if preserve_cluster:
-                    report["retained_peer"] = peer
-                    raise RuntimeError("persistent allocations remain; retained their Kubernetes cluster and private ownership records")
         except Exception as error: cleanup_errors.append(str(error))
         if created and not preserve_cluster:
             try:
