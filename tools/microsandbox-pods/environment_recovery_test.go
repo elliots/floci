@@ -142,6 +142,48 @@ func TestEnvironmentRecoveryMissingLiveTupleCannotReportHealthy(t *testing.T) {
 	}
 }
 
+func TestEnvironmentRecoveryUnchangedDirtyRequestVerifiesIdentityBeforeRetry(t *testing.T) {
+	f, boundary := newEnvironmentRecoveryFixture(t)
+	added := environmentPort{Protocol: "tcp", Port: 47003}
+	f.change(t, func(state *environmentRecoveryDocker) { state.Fail = "grant" })
+	if err := boundary.changePorts(t.Context(), []environmentPort{added}, true); err == nil {
+		t.Fatal("fixture did not interrupt the first grant")
+	}
+	before := f.record(t)
+	f.change(t, func(state *environmentRecoveryDocker) {
+		state.Fail, state.Calls = "", nil
+		state.Responses["contract"] = strings.ReplaceAll(state.Responses["contract"], f.identity.Fingerprint, strings.Repeat("b", 64))
+	})
+	if err := boundary.changePorts(t.Context(), []environmentPort{added}, true); err == nil {
+		t.Fatal("unchanged dirty request mutated a changed live environment")
+	}
+	if !boundary.dirty || boundary.healthy.Load() || !reflect.DeepEqual(before, f.record(t)) {
+		t.Fatal("rejected retry changed the pending transaction or availability")
+	}
+	for _, call := range f.read(t).Calls {
+		if call.Intent != nil {
+			t.Fatal("dirty request dispatched a mutation before identity verification", call.Operation)
+		}
+	}
+	f.change(t, func(state *environmentRecoveryDocker) {
+		state.Responses["contract"] = strings.ReplaceAll(state.Responses["contract"], strings.Repeat("b", 64), f.identity.Fingerprint)
+		state.Calls = nil
+	})
+	if err := boundary.changePorts(t.Context(), []environmentPort{added}, true); err != nil {
+		t.Fatal("unchanged dirty request did not recover after restoring identity", err)
+	}
+	if boundary.dirty {
+		t.Fatal("successful identity-checked transaction stayed dirty")
+	}
+	if calls := f.read(t).Calls; len(calls) == 0 || calls[0].Operation != "inspect-peer" {
+		t.Fatal("dirty request did not inspect identity before replay", calls)
+	}
+	if err := boundary.verify(t.Context()); err != nil || !boundary.healthy.Load() {
+		t.Fatal("reconciled exact grants did not verify", err)
+	}
+	f.assertTransports(t, f.kubelet, added)
+}
+
 type environmentRecoveryFixture struct {
 	file     string
 	runner   commandRunner
