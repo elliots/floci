@@ -64,7 +64,7 @@ func (n *network) pinHostIdentity(ctx context.Context) error {
 			return err
 		}
 		var record journalRecord
-		if json.Unmarshal(data, &record) != nil || record.Version < 1 || record.Version > 6 || record.Pod == nil || record.View.UID != string(record.Pod.UID) || filepath.Base(file) != record.View.UID+".json" {
+		if json.Unmarshal(data, &record) != nil || record.Version < 1 || record.Version > 7 || record.Pod == nil || record.View.UID != string(record.Pod.UID) || filepath.Base(file) != record.View.UID+".json" {
 			return errors.New("invalid Pod ownership while adopting peer host identity")
 		}
 		uid := stringsWithoutHyphens(record.View.UID)

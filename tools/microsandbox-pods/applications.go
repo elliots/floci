@@ -101,7 +101,7 @@ func (e *podEntry) applicationRecords() map[string]applicationRecord {
 
 func restoreApplicationRecords(e *podEntry, record journalRecord) error {
 	if !concurrentApplications(e.pod) {
-		if record.Version >= 4 && record.Version != 6 || len(record.Applications) != 0 {
+		if record.Version >= 4 && record.Version != 6 && record.Version != 7 || len(record.Applications) != 0 {
 			return errors.New("concurrent application journal does not match Pod containers")
 		}
 		return nil
@@ -110,7 +110,7 @@ func restoreApplicationRecords(e *podEntry, record journalRecord) error {
 	for range managedContainers(e.pod) {
 		count++
 	}
-	if record.Version != 6 && record.Version != legacyPodJournalVersion(e.pod) || len(record.Applications) != count || len(e.pod.Status.ContainerStatuses) != len(e.pod.Spec.Containers) {
+	if record.Version != 6 && record.Version != 7 && record.Version != legacyPodJournalVersion(e.pod) || len(record.Applications) != count || len(e.pod.Status.ContainerStatuses) != len(e.pod.Spec.Containers) {
 		return errors.New("concurrent containers require a matching journal version with complete statuses")
 	}
 	for managed := range managedContainers(e.pod) {

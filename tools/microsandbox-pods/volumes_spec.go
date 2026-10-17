@@ -111,6 +111,14 @@ func validateVolumeWithCA(volume corev1.Volume, memoryMiB int, caPath string) er
 		}
 		return validateCombinedProjection(volume)
 	}
+	if volume.PersistentVolumeClaim != nil {
+		remaining := volume.VolumeSource
+		remaining.PersistentVolumeClaim = nil
+		if !reflect.DeepEqual(remaining, corev1.VolumeSource{}) || len(validation.IsDNS1123Subdomain(volume.PersistentVolumeClaim.ClaimName)) != 0 {
+			return fmt.Errorf("persistent volume requires exactly one PVC source and a valid claimName")
+		}
+		return nil
+	}
 	remaining := volume.VolumeSource
 	remaining.EmptyDir, remaining.ConfigMap, remaining.Secret = nil, nil, nil
 	if !reflect.DeepEqual(remaining, corev1.VolumeSource{}) {

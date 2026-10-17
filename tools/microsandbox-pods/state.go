@@ -23,6 +23,8 @@ type stateIdentity struct {
 	Node, ClusterUID, PeerOwner, Peer, PodCIDR, ProxyBackendCIDR string
 }
 type journalRecord struct {
+	Writeback         *persistentWriteback         `json:"persistentWriteback,omitempty"`
+	PersistentVolumes []podPersistentVolume        `json:"persistentVolumes,omitempty"`
 	Freeze            *applicationFreeze           `json:"freeze,omitempty"`
 	CompletionPhase   corev1.PodPhase              `json:"completionPhase,omitempty"`
 	ShutdownDeadline  time.Time                    `json:"shutdownDeadline,omitzero"`
@@ -46,10 +48,13 @@ type journalRecord struct {
 }
 
 func (record journalRecord) guestAllocation() (podAllocation, error) {
+	if hasPersistentVolumes(record.Pod) != (record.Version == 7) {
+		return podAllocation{}, errors.New("persistent-volume Pods require journal version 7; older cleanup must not discard unflushed disks")
+	}
 	if record.Version == 1 && record.Allocation == (podAllocation{}) {
 		return validateStoredAllocation(podAllocation{})
 	}
-	if (record.Version < 2 || record.Version > 6) || record.Allocation.Version == 0 {
+	if (record.Version < 2 || record.Version > 7) || record.Allocation.Version == 0 {
 		return podAllocation{}, errors.New("pod journal has an invalid version or missing guest allocation")
 	}
 	if record.Version == 3 && (record.Pod == nil || len(record.Pod.Spec.InitContainers) == 0) {
@@ -124,7 +129,7 @@ func (p *provider) recover(ctx context.Context) error {
 			return err
 		}
 		lifetime, cancel := context.WithCancel(p.ctx)
-		e := &podEntry{freeze: record.Freeze, wake: make(chan struct{}, 1), snapshotIDs: record.SnapshotIDs, restoredParent: record.RestoredParent, pod: record.Pod, vm: record.View.VM, ip: record.View.PodIP, slot: record.Slot, port: record.View.UDPPort,
+		e := &podEntry{writeback: record.Writeback, freeze: record.Freeze, wake: make(chan struct{}, 1), snapshotIDs: record.SnapshotIDs, restoredParent: record.RestoredParent, pod: record.Pod, vm: record.View.VM, ip: record.View.PodIP, slot: record.Slot, port: record.View.UDPPort,
 			httpPort: record.View.HTTPPort, appPort: record.View.ApplicationPort, guestIP: record.GuestIP, applicationProgress: applicationProgress{started: record.Started},
 			generation: record.View.Generation, state: record.View.State, snapshots: record.Snapshots, lifetime: lifetime, cancel: cancel, done: make(chan struct{})}
 		e.allocation, err = record.guestAllocation()
@@ -141,8 +146,15 @@ func (p *provider) recover(ctx context.Context) error {
 			return err
 		}
 		e.declaredSpec = record.DeclaredSpec
+		e.persistentVolumes = record.PersistentVolumes
+		if err := validatePersistentWriteback(e); err != nil {
+			return err
+		}
+		if e.writeback != nil && e.writeback.Purpose == "delete" {
+			orphan = true
+		}
 		e.completionPhase, e.shutdownDeadline = record.CompletionPhase, record.ShutdownDeadline
-		if e.state == "DRAINING" && (!hasRestartableInit(e.pod) || e.shutdownDeadline.IsZero() || e.completionPhase != corev1.PodSucceeded && e.completionPhase != corev1.PodFailed) {
+		if e.state == "DRAINING" && (!hasRestartableInit(e.pod) && len(e.persistentVolumes) == 0 || e.shutdownDeadline.IsZero() || e.completionPhase != corev1.PodSucceeded && e.completionPhase != corev1.PodFailed) {
 			return errors.New("sidecar shutdown journal has no valid completion phase or deadline")
 		}
 		e.startupComplete, e.probeFailure = record.StartupComplete, record.ProbeFailure
@@ -177,6 +189,9 @@ func (p *provider) recover(ctx context.Context) error {
 			return err
 		}
 		e.created = exists
+		if err := validatePersistentVolumeJournal(e); err != nil {
+			return fmt.Errorf("verify persistent disk attachment for Pod %s: %w", record.View.UID, err)
+		}
 		p.pods[e.pod.Namespace+"/"+e.pod.Name] = e
 		// Fence older controllers before changing the owned peer transport.
 		if err := p.journal(e); err != nil {
@@ -193,6 +208,9 @@ func (p *provider) recover(ctx context.Context) error {
 				return err
 			}
 			continue
+		}
+		if err := p.verifyPersistentAttachments(ctx, e); err != nil {
+			return fmt.Errorf("verify persistent disk attachment for Pod %s: %w", record.View.UID, err)
 		}
 		if e.guestIP != "" {
 			if err := p.network.reconcilePeerVXLAN(ctx, e); err != nil {
@@ -218,6 +236,9 @@ func (p *provider) recover(ctx context.Context) error {
 			action = "RUNNING"
 		}
 		if action == "FINISH_SLEEP" {
+			if err := requirePersistentWriteback(e); err != nil {
+				return err
+			}
 			if status == "Paused" {
 				if _, err := p.runner.vm(ctx, "stop", "--force", e.vm); err != nil {
 					return err

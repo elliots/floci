@@ -131,7 +131,8 @@ func (p *provider) prepareContainerSubpaths(ctx context.Context, e *podEntry, co
 		if !found {
 			return fmt.Errorf("subPath references undefined volume %q", mount.Name)
 		}
-		script := subpathSetupScript(guestVolumePath(volume.Name), guestSubpathPath(container.Name, index), subpath, volume.EmptyDir != nil)
+		createDirectories := volume.EmptyDir != nil || volume.PersistentVolumeClaim != nil && !volume.PersistentVolumeClaim.ReadOnly
+		script := subpathSetupScript(guestVolumePath(volume.Name), guestSubpathPath(container.Name, index), subpath, createDirectories)
 		if _, err := p.runner.guest(ctx, e.vm, script); err != nil {
 			return fmt.Errorf("prepare subPath for container %s volume %s: %w", container.Name, mount.Name, err)
 		}

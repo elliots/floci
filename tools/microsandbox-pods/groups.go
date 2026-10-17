@@ -41,13 +41,16 @@ func validatePodGroups(sc *corev1.PodSecurityContext) error {
 }
 
 func requiresGuestFS(pod *corev1.Pod) bool {
+	if hasPersistentVolumes(pod) {
+		return true
+	}
 	sc := pod.Spec.SecurityContext
 	return sc != nil && (sc.FSGroup != nil || len(sc.SupplementalGroups) != 0 || sc.SupplementalGroupsPolicy != nil && *sc.SupplementalGroupsPolicy == corev1.SupplementalGroupsPolicyStrict)
 }
 
 func readGuestFS(name string) ([]byte, error) {
 	if name == "" {
-		return nil, errors.New("fsGroup and supplemental groups require --guest-fs-binary")
+		return nil, errors.New("persistent volumes, fsGroup and supplemental groups require --guest-fs-binary")
 	}
 	file, err := os.Open(name)
 	if err != nil {
@@ -146,6 +149,10 @@ func (p *provider) observeContainerGroups(ctx context.Context, e *podEntry, task
 }
 
 func volumeOwnership(pod *corev1.Pod, root string, readonly, rootOnly bool) string {
+	return volumeOwnershipPolicy(pod, root, readonly, rootOnly, false)
+}
+
+func volumeOwnershipPolicy(pod *corev1.Pod, root string, readonly, rootOnly, persistent bool) string {
 	if pod == nil || pod.Spec.SecurityContext == nil || pod.Spec.SecurityContext.FSGroup == nil {
 		return ""
 	}
@@ -155,6 +162,9 @@ func volumeOwnership(pod *corev1.Pod, root string, readonly, rootOnly bool) stri
 	}
 	if rootOnly {
 		args = append(args, "--root-only")
+	}
+	if persistent && pod.Spec.SecurityContext.FSGroupChangePolicy != nil && *pod.Spec.SecurityContext.FSGroupChangePolicy == corev1.FSGroupChangeOnRootMismatch {
+		args = append(args, "--on-root-mismatch")
 	}
 	return joinCommand(append(args, "--", root)) + "; "
 }

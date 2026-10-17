@@ -25,6 +25,7 @@ from qualification_sidecars import qualify_sidecars
 from qualification_identity import qualify_identity
 from qualification_groups import qualify_groups
 from qualification_http_activity import qualify_http_activity, verify_http_activity
+from qualification_persistent import qualify_persistent
 
 LABEL = "io.floci.pod-probe"
 
@@ -216,6 +217,14 @@ def qualify(args):
                 qualify_groups(pod=pod, apply=apply, resource=resource, kubectl=kubectl,
                     ready=ready, lifecycle=lifecycle, control_get=control_get,
                     crash_and_restart=crash_and_restart, wait=wait, report=report)
+                raise QualificationComplete()
+            if args.persistent_only:
+                if not args.guest_fs_binary:
+                    raise RuntimeError("persistent volume qualification requires --guest-fs-binary")
+                qualify_persistent(pod=pod, apply=apply, resource=resource, kubectl=kubectl,
+                    ready=ready, lifecycle=lifecycle, control_get=control_get,
+                    crash_and_restart=crash_and_restart, wait=wait, command=command,
+                    msb=args.msb, environment=environment, report=report)
                 raise QualificationComplete()
             if not getattr(args, "operations_only", False) and not getattr(args, "sidecars_only", False) and not getattr(args, "identity_only", False):
                 qualify_applications(pod=pod, apply=apply, resource=resource, kubectl=kubectl,
@@ -968,6 +977,7 @@ def qualify(args):
             except subprocess.TimeoutExpired:
                 process.kill(); process.wait(); report["controller_forced_exit"] = True
         cleanup_errors = []
+        preserve_cluster = False
         if registry:
             try:
                 registry.close()
@@ -998,8 +1008,15 @@ def qualify(args):
                         command(args.msb,"snap","rm",selector,env=environment)
             if "temporary" in locals() and (temporary/"state"/"native-command.pending").exists():
                 raise RuntimeError("native operation outcome uncertain; retained private state for reconciliation")
+            if "temporary" in locals():
+                for path in (temporary/"state"/"persistent-volumes").glob("*.json"):
+                    if json.loads(path.read_text()).get("phase") != "deleted":
+                        preserve_cluster = True
+                if preserve_cluster:
+                    report["retained_peer"] = peer
+                    raise RuntimeError("persistent allocations remain; retained their Kubernetes cluster and private ownership records")
         except Exception as error: cleanup_errors.append(str(error))
-        if created:
+        if created and not preserve_cluster:
             try:
                 inspection = json.loads(docker("inspect",peer))[0]
                 if inspection["Config"]["Labels"].get(LABEL) != owner: raise RuntimeError("Docker owner changed")
@@ -1036,6 +1053,7 @@ if __name__ == "__main__":
     parser.add_argument("--network-relay-binary")
     parser.add_argument("--guest-fs-binary")
     parser.add_argument("--groups-only", action="store_true", help="run the same group and volume permission fixture on Docker and native pods")
+    parser.add_argument("--persistent-only", action="store_true", help="qualify PVC replacement/reclaim on Docker and native, plus native RAM restore and attachment fencing")
     parser.add_argument("--activation-only", action="store_true", help="qualify Java HTTP/queue wake of one replica with a single-guest memory budget")
     parser.add_argument("--aws-identity-only", action="store_true", help="qualify real AWS SDK IRSA and Pod Identity on both worker backends")
     parser.add_argument("--node-ip", help="explicit host IPv4 address reachable from the disposable Docker peer")

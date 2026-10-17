@@ -213,7 +213,7 @@ func (p *provider) journal(e *podEntry) error {
 		file.Close()
 		return err
 	}
-	if err := json.NewEncoder(file).Encode(journalRecord{Freeze: e.freeze, Version: podJournalVersion(e.pod), CompletionPhase: e.completionPhase, ShutdownDeadline: e.shutdownDeadline, Applications: e.applicationRecords(), Allocation: allocation, StartupComplete: e.startupComplete, ProbeFailure: e.probeFailure, TerminationReason: e.terminationReason, DeclaredSpec: e.declaredSpec, ProxyPorts: e.proxyPorts, BackendIP: e.backendIP, SnapshotIDs: e.snapshotIDs, RestoredParent: e.restoredParent, View: view(e), Pod: pod, Slot: e.slot, GuestIP: e.guestIP, Started: e.started, Snapshots: e.snapshots}); err != nil {
+	if err := json.NewEncoder(file).Encode(journalRecord{Writeback: e.writeback, PersistentVolumes: e.persistentVolumes, Freeze: e.freeze, Version: podJournalVersion(e.pod), CompletionPhase: e.completionPhase, ShutdownDeadline: e.shutdownDeadline, Applications: e.applicationRecords(), Allocation: allocation, StartupComplete: e.startupComplete, ProbeFailure: e.probeFailure, TerminationReason: e.terminationReason, DeclaredSpec: e.declaredSpec, ProxyPorts: e.proxyPorts, BackendIP: e.backendIP, SnapshotIDs: e.snapshotIDs, RestoredParent: e.restoredParent, View: view(e), Pod: pod, Slot: e.slot, GuestIP: e.guestIP, Started: e.started, Snapshots: e.snapshots}); err != nil {
 		file.Close()
 		return err
 	}
@@ -321,6 +321,9 @@ func (p *provider) hibernate(ctx context.Context, e *podEntry) error {
 	if err := p.freezeApplications(ctx, e); err != nil {
 		return p.rollbackFreeze(e, err)
 	}
+	if err := p.syncPersistentVolumes(ctx, e); err != nil {
+		return p.rollbackFreeze(e, err)
+	}
 	if _, err := p.runner.vm(ctx, "pause", e.vm); err != nil {
 		return p.transitionFailed(e, err)
 	}
@@ -408,6 +411,9 @@ func (p *provider) resume(ctx context.Context, e *podEntry) error {
 		}
 		projections, err := p.readVolumeSources(ctx, e)
 		if err != nil {
+			if errors.Is(err, errPersistentVolumePending) {
+				p.persistentVolumeUnavailable(e, err)
+			}
 			return err
 		}
 		e.initialVolumes = projections
@@ -423,9 +429,12 @@ func (p *provider) resume(ctx context.Context, e *podEntry) error {
 			return err
 		}
 		if err := p.startAdmitted(ctx, e); err != nil {
-			if errors.Is(err, msbruntime.ErrCapacityUnavailable) {
+			if errors.Is(err, msbruntime.ErrCapacityUnavailable) || errors.Is(err, errPersistentVolumePending) {
 				p.releaseMemory(e)
 				e.state = "COLD"
+				if errors.Is(err, errPersistentVolumePending) {
+					p.persistentVolumeUnavailable(e, err)
+				}
 				return errors.Join(err, p.journal(e))
 			}
 			return p.transitionFailed(e, err)
@@ -445,10 +454,17 @@ func (p *provider) resume(ctx context.Context, e *podEntry) error {
 	if err := p.requireVMStatus(ctx, e, "Stopped"); err != nil {
 		return err
 	}
+	if err := requirePersistentWriteback(e); err != nil {
+		return err
+	}
 	if err := requireFrozenSnapshot(e); err != nil {
 		return err
 	}
 	if err := p.preflightWakeTokens(ctx, e); err != nil {
+		return err
+	}
+	if err := p.preparePersistentVolumes(ctx, e); err != nil {
+		p.persistentVolumeUnavailable(e, err)
 		return err
 	}
 	selector := e.snapshots[len(e.snapshots)-1]
@@ -460,6 +476,7 @@ func (p *provider) resume(ctx context.Context, e *podEntry) error {
 	}
 	args := []string{"snap", "restore", selector, "--name", e.vm, "--port", fmt.Sprintf("127.0.0.1:%d:8472/udp", e.port),
 		"--net-default", "deny", "--net-rule", "allow:egress@host,allow:egress@private,allow:egress@public", "--net-rule", "allow:ingress@any"}
+	args = append(args, persistentMountArgs(e)...)
 	if e.proxyAvailability {
 		for _, binding := range e.proxyPorts {
 			args = append(args, "--port", fmt.Sprintf("127.0.0.1:%d:%d", binding.BackendPort, binding.ContainerPort))

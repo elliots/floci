@@ -101,6 +101,32 @@ class ManagementTest(unittest.TestCase):
             command.assert_called_once_with("docker", "rm", "-fv", "native-peer")
         self.assertTrue((self.directory / "cluster.json").exists())
 
+    def test_destroy_preserves_persistent_volume_allocations_and_pv_metadata(self):
+        path = self.directory / "controller" / "persistent-volumes" / "owned.json"
+        for phase in ("creating", "publishing", "ready", "deleting", "retained"):
+            manage.write_private(path, json.dumps({"version": 1, "phase": phase}))
+            with patch.object(manage, "command") as command:
+                with self.assertRaisesRegex(RuntimeError, "persistent volume allocations"):
+                    manage.destroy(self.args)
+                command.assert_not_called()
+        manage.write_private(path, json.dumps({"version": 1, "phase": "deleted"}))
+        volume = {"metadata": {"annotations": {"pv.kubernetes.io/provisioned-by": "microsandbox.dev/local"}},
+                  "spec": {"nodeAffinity": {"required": {"nodeSelectorTerms": [{"matchExpressions": [
+                      {"key": "kubernetes.io/hostname", "operator": "In", "values": [self.record["node"]]}]}]}}}}
+        with patch.object(manage, "controller_running", return_value=False), \
+                patch.object(manage, "inspect_peer", return_value={"State": {"Running": True}}), \
+                patch.object(manage, "kubectl", side_effect=['{"items":[]}', json.dumps({"items": [volume]})]), \
+                patch.object(manage, "command") as command:
+            with self.assertRaisesRegex(RuntimeError, "native PV objects"):
+                manage.destroy(self.args)
+            command.assert_not_called()
+        with patch.object(manage, "controller_running", return_value=False), \
+                patch.object(manage, "inspect_peer", return_value={"State": {"Running": True}}), \
+                patch.object(manage, "kubectl", return_value='{"items":[]}'), \
+                patch.object(manage, "command") as command, patch("builtins.print"):
+            manage.destroy(self.args)
+            command.assert_called_once_with("docker", "rm", "-fv", "native-peer")
+
     def test_controller_role_has_no_cluster_admin_or_workload_creation(self):
         resources = manage.access_resources(self.record)["items"]
         role = next(value for value in resources if value["kind"] == "ClusterRole")
@@ -113,6 +139,10 @@ class ManagementTest(unittest.TestCase):
                 self.assertNotIn("update", rule["verbs"])
             if "nodes" in rule["resources"]:
                 self.assertEqual([self.record["node"]], rule["resourceNames"])
+        rules = {resource: rule for rule in role["rules"] for resource in rule["resources"]}
+        self.assertEqual({"get", "list", "watch"}, set(rules["persistentvolumeclaims"]["verbs"]))
+        self.assertEqual({"get", "list", "watch"}, set(rules["storageclasses"]["verbs"]))
+        self.assertEqual({"get", "list", "watch", "create", "update", "delete"}, set(rules["persistentvolumes"]["verbs"]))
         for binding in (value for value in resources if value["kind"].endswith("Binding")):
             self.assertEqual(self.record["accessName"], binding["roleRef"]["name"])
             self.assertEqual(self.record["user"], binding["subjects"][0]["name"])

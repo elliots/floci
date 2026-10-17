@@ -110,7 +110,12 @@ func podConditionsFor(pod *corev1.Pod, ready bool) []corev1.PodCondition {
 	return conditions
 }
 
-func podJournalVersion(*corev1.Pod) int { return 6 }
+func podJournalVersion(pod *corev1.Pod) int {
+	if hasPersistentVolumes(pod) {
+		return 7
+	}
+	return 6
+}
 
 func legacyPodJournalVersion(pod *corev1.Pod) int {
 	if hasRestartableInit(pod) {
@@ -132,7 +137,7 @@ func validateInitJournal(record journalRecord) error {
 	if hasRestartableInit(record.Pod) {
 		return validateSidecarInitJournal(record)
 	}
-	if record.Version != 3 && record.Version != 4 && record.Version != 6 || len(record.Pod.Spec.InitContainers) != len(record.Pod.Status.InitContainerStatuses) {
+	if record.Version != 3 && record.Version != 4 && record.Version != 6 && record.Version != 7 || len(record.Pod.Spec.InitContainers) != len(record.Pod.Status.InitContainerStatuses) {
 		return errors.New("init containers require a supported journal with complete statuses")
 	}
 	completed := true

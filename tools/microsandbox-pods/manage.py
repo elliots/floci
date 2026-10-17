@@ -125,6 +125,9 @@ def access_resources(record):
         {"apiGroups": [""], "resources": ["pods"], "verbs": ["get", "list", "watch", "delete"]},
         {"apiGroups": [""], "resources": ["pods/status"], "verbs": ["get", "patch", "update"]},
         {"apiGroups": [""], "resources": ["configmaps", "secrets", "services"], "verbs": ["get", "list", "watch"]},
+        {"apiGroups": [""], "resources": ["persistentvolumeclaims"], "verbs": ["get", "list", "watch"]},
+        {"apiGroups": [""], "resources": ["persistentvolumes"], "verbs": ["get", "list", "watch", "create", "update", "delete"]},
+        {"apiGroups": ["storage.k8s.io"], "resources": ["storageclasses"], "verbs": ["get", "list", "watch"]},
         {"apiGroups": [""], "resources": ["serviceaccounts"], "verbs": ["get"]},
         {"apiGroups": [""], "resources": ["serviceaccounts/token"], "verbs": ["create"]},
         {"apiGroups": [""], "resources": ["namespaces"], "resourceNames": ["kube-system"], "verbs": ["get"]},
@@ -349,6 +352,10 @@ def destroy(args):
     directory = Path(record["directory"])
     if list((directory/"controller").glob("*.json")) or (directory/"controller"/"native-command.pending").exists():
         raise RuntimeError("controller still owns workload or recovery records; delete Pods and let cleanup finish first")
+    for path in (directory/"controller"/"persistent-volumes").glob("*.json"):
+        intent = json.loads(path.read_text())
+        if intent.get("version") != 1 or intent.get("phase") != "deleted":
+            raise RuntimeError("persistent volume allocations remain; reclaim Delete volumes or preserve the cluster for Retain volumes")
     if controller_running(record):
         raise RuntimeError("stop the controller before removing its empty cluster")
     peer = inspect_peer(record)
@@ -358,6 +365,15 @@ def destroy(args):
         pods = json.loads(kubectl(record, "get", "pods", "-A", "--field-selector", "spec.nodeName="+record["node"], "-o", "json"))
         if pods["items"]:
             raise RuntimeError("Pods still target the native node; delete them and let controller cleanup finish first")
+        volumes = json.loads(kubectl(record, "get", "pv", "-o", "json"))
+        for volume in volumes["items"]:
+            if volume.get("metadata", {}).get("annotations", {}).get("pv.kubernetes.io/provisioned-by") != "microsandbox.dev/local":
+                continue
+            terms = volume.get("spec", {}).get("nodeAffinity", {}).get("required", {}).get("nodeSelectorTerms", [])
+            if any(record["node"] in expression.get("values", [])
+                   for term in terms for expression in term.get("matchExpressions", [])
+                   if expression.get("key") == "kubernetes.io/hostname"):
+                raise RuntimeError("native PV objects still target this node; finish reclamation before removing the cluster")
         command("docker", "rm", "-fv", record["peer"])
     print("Removed owned empty cluster; retained private configuration at "+str(directory))
 

@@ -24,7 +24,7 @@ const volumeRefreshInterval = 30 * time.Second
 func (p *provider) startStrictPod(e *podEntry) error {
 	for {
 		err := p.startStrictPodAttempt(e)
-		if !errors.Is(err, msbruntime.ErrCapacityUnavailable) {
+		if !errors.Is(err, msbruntime.ErrCapacityUnavailable) && !errors.Is(err, errPersistentVolumePending) {
 			return err
 		}
 		select {
@@ -59,10 +59,14 @@ func (p *provider) startStrictPodAttempt(e *podEntry) error {
 			err = p.startAdmitted(ctx, e)
 		}
 	}
-	if errors.Is(err, msbruntime.ErrCapacityUnavailable) {
+	if errors.Is(err, msbruntime.ErrCapacityUnavailable) || errors.Is(err, errPersistentVolumePending) {
 		p.releaseMemory(e)
 		e.state = "WAITINGVOLUMES"
-		p.unavailable(e, "NativeCapacityUnavailable")
+		if errors.Is(err, errPersistentVolumePending) {
+			p.persistentVolumeUnavailable(e, err)
+		} else {
+			p.unavailable(e, "NativeCapacityUnavailable")
+		}
 		return errors.Join(err, p.journal(e))
 	}
 	if err != nil && e.lifetime.Err() == nil {
@@ -94,7 +98,14 @@ func (p *provider) prepareVolumes(ctx context.Context, e *podEntry) error {
 		if err != nil {
 			return err
 		}
-		if _, err := p.runner.guest(ctx, e.vm, volumeSetupWithOwnership(e.pod, volume, allocation.MemoryMiB)); err != nil {
+		script := volumeSetupWithOwnership(e.pod, volume, allocation.MemoryMiB)
+		if volume.PersistentVolumeClaim != nil {
+			script, err = persistentVolumeSetup(e, volume)
+			if err != nil {
+				return err
+			}
+		}
+		if _, err := p.runner.guest(ctx, e.vm, script); err != nil {
 			return fmt.Errorf("initialize volume %s: %w", volume.Name, err)
 		}
 	}
@@ -175,6 +186,9 @@ func (p *provider) refreshVolumeProjections(ctx context.Context, e *podEntry, re
 }
 
 func (p *provider) readVolumeSources(ctx context.Context, e *podEntry) (map[string]map[string]volumeFile, error) {
+	if _, err := p.resolvePersistentVolumes(ctx, e); err != nil {
+		return nil, errors.Join(errPersistentVolumePending, err)
+	}
 	projections := make(map[string]map[string]volumeFile)
 	for _, volume := range mountedVolumes(e.pod) {
 		if projectedData(volume) {
@@ -278,7 +292,7 @@ func volumeMountArgsForContainer(pod *corev1.Pod, container corev1.Container) []
 	for index, mount := range container.VolumeMounts {
 		volume := volumes[mount.Name]
 		mode := "rw"
-		if mount.ReadOnly || projectedData(volume) || volume.HostPath != nil {
+		if mount.ReadOnly || projectedData(volume) || volume.HostPath != nil || volume.PersistentVolumeClaim != nil && volume.PersistentVolumeClaim.ReadOnly {
 			mode = "ro"
 		}
 		source := guestVolumePath(mount.Name)

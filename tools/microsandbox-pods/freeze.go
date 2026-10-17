@@ -158,7 +158,7 @@ func (p *provider) freezeCompletion(ctx context.Context, e *podEntry, action str
 }
 
 func (p *provider) freezeApplications(ctx context.Context, e *podEntry) error {
-	if !renewableIdentity(e) {
+	if !renewableIdentity(e) && len(e.persistentVolumes) == 0 {
 		return nil
 	}
 	if e.freeze != nil {
@@ -191,14 +191,14 @@ func (p *provider) freezeApplications(ctx context.Context, e *podEntry) error {
 }
 
 func requireFrozenSnapshot(e *podEntry) error {
-	if !renewableIdentity(e) {
+	if !renewableIdentity(e) && len(e.persistentVolumes) == 0 {
 		return nil
 	}
 	if err := validateFreeze(e); err != nil {
 		return err
 	}
 	if e.freeze == nil || e.freeze.Phase != "FROZEN" {
-		return errors.New("identity checkpoint has no application freeze proof; recreate this Pod before hibernating it again")
+		return errors.New("checkpoint has no application freeze proof; recreate this Pod before hibernating it again")
 	}
 	return nil
 }
@@ -208,6 +208,9 @@ func (p *provider) thawApplications(ctx context.Context, e *podEntry) error {
 		return nil
 	}
 	if err := validateFreeze(e); err != nil {
+		return err
+	}
+	if err := p.invalidatePersistentWriteback(e); err != nil {
 		return err
 	}
 	action := "pause"

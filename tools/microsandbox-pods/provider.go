@@ -27,6 +27,9 @@ import (
 )
 
 type provider struct {
+	storage         persistentVolumeResolver
+	storageOwner    string
+	storageRun      func(context.Context)
 	registrations   chan struct{}
 	idleJobs        chan struct{}
 	stop            context.CancelFunc
@@ -48,7 +51,9 @@ type provider struct {
 }
 
 type podEntry struct {
-	freeze *applicationFreeze
+	writeback         *persistentWriteback
+	persistentVolumes []podPersistentVolume
+	freeze            *applicationFreeze
 	applicationProgress
 	completionPhase                                  corev1.PodPhase
 	shutdownDeadline                                 time.Time
@@ -139,9 +144,13 @@ func newProvider(ctx context.Context, cfg config, client kubernetes.Interface) (
 	if err != nil {
 		return nil, err
 	}
+	if err := p.configurePersistentStorage(); err != nil {
+		return nil, err
+	}
 	if err := p.recover(ctx); err != nil {
 		return nil, err
 	}
+	p.jobs.Go(func() { p.storageRun(lifetime) })
 	p.jobs.Go(func() { p.watchAvailability(lifetime) })
 	succeeded = true
 	return p, nil
@@ -351,6 +360,9 @@ func (p *provider) CreatePod(ctx context.Context, pod *corev1.Pod) error {
 }
 
 func (p *provider) startAdmitted(ctx context.Context, e *podEntry) error {
+	if err := p.preparePersistentVolumes(ctx, e); err != nil {
+		return err
+	}
 	if podNetworkProbes(e.pod) {
 		if _, err := p.ensureRelay(ctx); err != nil {
 			return err
@@ -378,6 +390,7 @@ func (p *provider) startAdmitted(ctx context.Context, e *podEntry) error {
 		args = append(args, "--port", fmt.Sprintf("127.0.0.1:%d:%d", e.httpPort, e.appPort))
 	}
 	bootstrap := "containerd --log-level=error & while true; do if test -f /tmp/application.request; then mv /tmp/application.request /tmp/application.active && sh /tmp/application.active || sleep 0.2; else sleep 0.2; fi; done"
+	args = append(args, persistentMountArgs(e)...)
 	if concurrentApplications(e.pod) {
 		// The legacy queue still runs ordinary sequential init containers. The
 		// shared supervisor owns independent regular application processes.
@@ -622,7 +635,9 @@ func (p *provider) monitor(ctx context.Context, e *podEntry) {
 				e.op.Unlock()
 				continue
 			}
-			p.terminated(e, int32(code))
+			if err := p.terminated(e, int32(code)); err != nil {
+				p.fail(e, err)
+			}
 			e.op.Unlock()
 			return
 		}
@@ -696,7 +711,7 @@ func podConditions(ready bool) []corev1.PodCondition {
 	}
 }
 
-func (p *provider) terminated(e *podEntry, code int32) {
+func (p *provider) terminated(e *podEntry, code int32) error {
 	e.state = "TERMINATED"
 	e.mu.Lock()
 	e.pod.Status.Phase = corev1.PodSucceeded
@@ -713,15 +728,15 @@ func (p *provider) terminated(e *podEntry, code int32) {
 	e.pod.Status.Conditions = podConditionsFor(e.pod, false)
 	e.mu.Unlock()
 	if err := p.journal(e); err != nil {
-		slog.Error("cannot persist terminal pod", "pod", e.pod.Name, "error", err)
-		return
+		return err
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
 	if err := p.stopTerminal(ctx, e); err != nil {
-		slog.Error("cannot stop terminal pod VM", "pod", e.pod.Name, "error", err)
+		return err
 	}
 	p.publish(e)
+	return nil
 }
 
 func (p *provider) stopTerminal(ctx context.Context, e *podEntry) error {
@@ -731,10 +746,21 @@ func (p *provider) stopTerminal(ctx context.Context, e *podEntry) error {
 		return err
 	}
 	if exists && status != "Stopped" {
+		if status != "Running" && len(e.persistentVolumes) > 0 {
+			return errors.New("persistent terminal guest is not running; writeback cannot be verified")
+		}
+		if err := p.sealPersistentVolumes(ctx, e, "terminal"); err != nil {
+			return err
+		}
 		if _, err := p.runner.vm(ctx, "stop", "--force", e.vm); err != nil {
 			return err
 		}
 		if err := p.requireVMStatus(ctx, e, "Stopped"); err != nil {
+			return err
+		}
+	}
+	if exists {
+		if err := requirePersistentWriteback(e); err != nil {
 			return err
 		}
 	}
@@ -844,13 +870,35 @@ func (p *provider) DeletePod(ctx context.Context, pod *corev1.Pod) error {
 	if status, exists, err := p.inspectOwned(ctx, e); err != nil {
 		errs = append(errs, err)
 	} else if exists {
-		if status == "Running" && hasRestartableInit(e.pod) {
+		if status == "Running" && (hasRestartableInit(e.pod) || len(e.persistentVolumes) > 0) {
 			if err := p.drainBeforeDeletion(ctx, e, pod); err != nil {
+				if len(e.persistentVolumes) > 0 {
+					return errors.Join(errors.Join(errs...), err)
+				}
 				errs = append(errs, err)
+			}
+		}
+		if len(e.persistentVolumes) > 0 {
+			current, _, err := p.inspectOwned(ctx, e)
+			if err != nil {
+				return err
+			}
+			if current == "Running" {
+				if err := p.sealPersistentVolumes(ctx, e, "delete"); err != nil {
+					return err
+				}
+			}
+			if err := requirePersistentWriteback(e); err != nil {
+				return err
 			}
 		}
 		if _, err := p.runner.vm(ctx, "rm", "--force", e.vm); err != nil {
 			errs = append(errs, err)
+		}
+	}
+	if len(e.snapshots) > 0 {
+		if err := requirePersistentWriteback(e); err != nil {
+			return err
 		}
 	}
 	if err := p.network.detach(ctx, e); err != nil {
@@ -866,6 +914,9 @@ func (p *provider) DeletePod(ctx context.Context, pod *corev1.Pod) error {
 	}
 	if _, exists, err := p.inspectOwned(ctx, e); err != nil || exists {
 		return errors.Join(err, errors.New("owned VM deletion did not complete"))
+	}
+	if err := p.releasePersistentVolumes(ctx, e); err != nil {
+		return err
 	}
 	if err := os.RemoveAll(p.initLogDirectory(e)); err != nil {
 		return err
