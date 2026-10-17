@@ -139,6 +139,17 @@ bytes. An unverifiable inventory is `unavailable`, never zero. This explicit
 diagnostic uses the authenticated private controller API; ordinary readiness
 checks do not scan disk usage.
 
+`manage.py storage --directory ...` reports native storage categories and the
+conservative remaining admission budget. `manage.py prune --directory ...`
+previews eligible runtime memory cleanup older than 24 hours; add `--apply` to
+perform it. Image cleanup additionally requires `--images`. Use
+`--older-than-seconds N` and repeat `--retain-image registry/image:tag` to set the
+age and preserve extra preloaded application images. The controller always keeps
+its native guest base image. Owned guests, snapshots and pending reservations
+remain protected by the shared runtime, and an unknown inventory is a refusal.
+This maintenance does not impose a filesystem hard quota or prune Pod RAM
+checkpoints. See [native storage maintenance](../microsandbox-runtime/STORAGE.md).
+
 `manage.py destroy --directory /private/native-cluster` removes only
 the owned empty k3s peer. First delete its native Pods, wait for controller cleanup
 to drain, then stop the controller. Cleanup refuses remaining Pod or recovery

@@ -153,7 +153,8 @@ class ManagementTest(unittest.TestCase):
         manage.write_private(self.directory / "control-token", "a" * 32)
         for capacity in ({"memoryMiB": 768, "reservations": ["pending-wake"]}, None):
             replies = [io.BytesIO(b'{"activeMemoryMiB":0}'),
-                io.BytesIO(json.dumps(capacity).encode()) if capacity else OSError("unavailable")]
+                io.BytesIO(json.dumps(capacity).encode()) if capacity else OSError("unavailable"),
+                OSError("unavailable")]
             with patch.object(manage, "inspect_peer", return_value=None), \
                     patch.object(manage.urllib.request, "urlopen", side_effect=replies), \
                     patch("builtins.print") as output:
@@ -161,6 +162,21 @@ class ManagementTest(unittest.TestCase):
                 report = json.loads(output.call_args.args[0])
                 self.assertEqual(0, report["controller"]["activeMemoryMiB"])
                 self.assertEqual(capacity or "unavailable", report["sharedCapacity"])
+                self.assertEqual("unavailable", report["storage"])
+
+    def test_storage_cleanup_defaults_to_preview_and_requires_explicit_image_selection(self):
+        args = argparse.Namespace(directory=self.directory, apply=False, images=False,
+            older_than_seconds=86400, retain_image=[])
+        with patch.object(manage, "controller_request", return_value={"dryRun":True}) as request, patch("builtins.print"):
+            manage.prune(args)
+            self.assertEqual({"dryRun":True,"olderThanSeconds":86400,"images":False,"retainImages":[]},request.call_args.args[2])
+            args.apply,args.images,args.older_than_seconds,args.retain_image=True,True,0,["registry.example/app:v1"]
+            manage.prune(args)
+            self.assertEqual({"dryRun":False,"olderThanSeconds":0,"images":True,
+                "retainImages":["registry.example/app:v1"]},request.call_args.args[2])
+            args.older_than_seconds=-1
+            with self.assertRaises(ValueError):
+                manage.prune(args)
 
 
 if __name__ == "__main__":

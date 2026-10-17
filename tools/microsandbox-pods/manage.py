@@ -405,6 +405,7 @@ def status(args):
     except OSError:
         pass  # An absent controller is a normal diagnostic result, not proof of guest failure.
     report["sharedCapacity"] = "unavailable"
+    report["storage"] = "unavailable"
     if isinstance(report["controller"], dict):
         request = urllib.request.Request("http://127.0.0.1:"+str(record["controlPort"])+"/v1/capacity",
             headers={"Authorization": "Bearer "+token})
@@ -413,7 +414,32 @@ def status(args):
                 report["sharedCapacity"] = json.load(response)
         except OSError:
             pass  # An unavailable inventory must not be reported as zero usage.
+        try:
+            report["storage"] = controller_request(record, "storage")
+        except OSError:
+            pass  # Storage failures must remain visible separately from an empty inventory.
     print(json.dumps(report, indent=2))
+
+
+def controller_request(record, path, value=None):
+    token = read_private(Path(record["directory"])/"control-token").strip()
+    request = urllib.request.Request("http://127.0.0.1:"+str(record["controlPort"])+"/v1/"+path,
+        data=json.dumps(value).encode() if value is not None else None,
+        headers={"Authorization":"Bearer "+token,"Content-Type":"application/json"})
+    with urllib.request.urlopen(request, timeout=120) as response:
+        return json.load(response)
+
+
+def storage(args):
+    print(json.dumps(controller_request(load(args.directory), "storage"), indent=2))
+
+
+def prune(args):
+    if args.older_than_seconds < 0:
+        raise ValueError("older-than-seconds must be nonnegative")
+    value = {"dryRun":not args.apply, "olderThanSeconds":args.older_than_seconds,
+        "images":args.images,"retainImages":args.retain_image}
+    print(json.dumps(controller_request(load(args.directory), "storage/prune", value), indent=2))
 
 
 def destroy(args):
@@ -466,8 +492,14 @@ def main():
         running.add_argument("--scheduling-cpu", default="500")
         running.add_argument("--scheduling-memory", default="384Gi")
         running.add_argument("--pod-workers", type=int, default=8)
-    for operation in ("status", "destroy", "stop", "renew"):
+    for operation in ("status", "destroy", "stop", "renew", "storage"):
         commands.add_parser(operation).add_argument("--directory", required=True)
+    pruning = commands.add_parser("prune", help="preview ownership-aware native storage cleanup; --apply performs it")
+    pruning.add_argument("--directory", required=True)
+    pruning.add_argument("--apply", action="store_true")
+    pruning.add_argument("--images", action="store_true")
+    pruning.add_argument("--older-than-seconds", type=int, default=86400)
+    pruning.add_argument("--retain-image", action="append", default=[])
     args = parser.parse_args()
     try:
         if args.operation in ("run", "start", "stop", "renew", "_supervise"):
@@ -476,7 +508,8 @@ def main():
                 "start": manage_supervisor.start, "stop": manage_supervisor.stop, "renew": manage_supervisor.renew}
             operations[args.operation](args)
             return 0
-        operation = {"build": build, "prepare": prepare, "status": status, "destroy": destroy}[args.operation]
+        operation = {"build": build, "prepare": prepare, "status": status, "destroy": destroy,
+            "storage":storage,"prune":prune}[args.operation]
         if args.operation in ("prepare", "destroy"):
             with setup_lock(args.directory):
                 operation(args)
