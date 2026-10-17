@@ -70,11 +70,49 @@ mode. Build it together with the controller. See the
 
 ## Development cluster setup
 
+The setup helper creates an owned, pinned k3s peer, private certificates and a
+dedicated controller identity. From the repository root:
+
+```sh
+python3 tools/microsandbox-pods/manage.py build --binaries /private/native-tools
+python3 tools/microsandbox-pods/manage.py prepare \
+  --directory /private/native-cluster --binaries /private/native-tools \
+  --msb /path/to/msb --msb-home /private/runtime-home
+python3 tools/microsandbox-pods/manage.py run --directory /private/native-cluster
+```
+
+Use the generated `admin.kubeconfig` to deploy applications. The controller uses
+its separate `controller.kubeconfig` and the generated `controller-rbac.json`.
+Its role can read Pods, ConfigMaps and Secrets across the cluster, mint bound
+service-account tokens, publish status and manage its named node and lease.
+It cannot create workloads, change Secrets, administer RBAC or change other nodes.
+Use a dedicated development cluster: the controller still needs trusted access
+to application credentials and to the local Docker socket.
+
+The directory must be private (0700); generated credential files are 0600.
+Keep it and the runtime home across restarts. `run` stays in the foreground and
+retains guests on exit. Stop it and rerun `prepare` before the 30-day certificates
+expire, then restart `run`. Repeated setup checks ownership and preserves the
+cluster, workload state and control token. It refuses a missing cluster when
+workload ownership state exists. Recreating that cluster requires deliberate
+recovery instead of silently adopting a new identity.
+
+`manage.py status --directory /private/native-cluster` reports controller health,
+active RAM, journal states, uncertain native operations and runtime filesystem
+free space. `manage.py destroy --directory /private/native-cluster` removes only
+the owned empty k3s peer. First delete its native Pods, wait for controller cleanup
+to drain, then stop the controller. Cleanup refuses remaining Pod or recovery
+records and retains configuration for inspection. It never prunes runtime images
+or checkpoints. `python3 -m unittest discover -s tools/microsandbox-pods -p
+test_manage.py` checks these ownership and credential boundaries.
+
+For an existing development cluster, configure the controller directly:
+
 Provide an owned Docker k3s worker labeled `io.floci.pod-probe=<owner>` with exactly
 one published UDP8472 binding. Reserve an unused /22 inside the cluster Pod CIDR.
 Keep cluster, peer, owner, node and persistent private state directory unchanged
-on restart. Automatic peer installation and least-privilege manifests remain
-future work.
+on restart. The setup helper above owns a separate cluster; it does not adopt an
+existing peer.
 
 ```sh
 microsandbox-pods \

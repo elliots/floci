@@ -82,3 +82,19 @@ execution or restart through the otherwise valid client.
 Guest nftables routing also passed Docker Linux kernel tests for TCP/UDP,
 multiple resolvers, retargeting an existing UDP socket and preserving unrelated
 tables. This is not native Linux/KVM VM qualification.
+
+## Managed cluster setup: 17 October 2026
+
+On Apple Silicon, the new setup helper built all five host/guest binaries and
+created its owned k3s peer. Its restricted controller registered the virtual node,
+published a cold Pod as Ready with zero active guest RAM, woke it on HTTP and
+hibernated it back to zero RAM. After controller shutdown, repeated setup renewed
+credentials without changing ownership. Restart adopted the sleeping Pod without
+waking it; the next HTTP request returned the same in-memory UUID. Pod cleanup
+drained and `destroy` removed the empty owned peer.
+
+Real Kubernetes authorization checks denied Secret creation, Deployment creation,
+RBAC binding creation and modification of another node, while permitting required
+Pod reads. Seven Python tests cover file permissions, setup exclusion, ownership
+and image validation, cleanup refusal and role boundaries. This is a local
+development-cluster workflow, not a production Kubernetes installer.

@@ -771,3 +771,20 @@ This run also exposed and fixed shared restore admission reopening checkpoints
 by an ambiguous raw ID. Revalidation now uses the original checkpoint selector
 and checks its immutable ID, digest and memory size. Rebuild the Go host helper
 as well as the pod controller to apply that fix to Aurora restores.
+
+## Repeatable native cluster setup
+
+`tools/microsandbox-pods/manage.py` now builds matching host/guest helpers and
+prepares an owned k3s development cluster with private certificates and a scoped
+controller identity. Existing manually configured controllers need no changes.
+The helper deliberately creates its own cluster rather than adopting an existing
+one. See the [setup commands](../microsandbox-pods/README.md#development-cluster-setup).
+
+Retain both the cluster directory and native runtime home. The foreground `run`
+command preserves sleeping and running guests when stopped; `prepare` renews
+30-day certificates with the controller stopped. `status` reports RAM and journal
+state. `destroy` refuses active controllers, remaining native Pods, workload
+journals and uncertain operations, and never prunes images or checkpoints.
+The generated admin kubeconfig is for deployments; the controller uses a separate
+identity that can read application Secrets and mint service-account tokens but
+cannot create workloads, change Secrets, administer RBAC or modify other nodes.
