@@ -30,6 +30,9 @@ class MicrosandboxRdsRuntimeTest {
     private final ObjectMapper mapper = new ObjectMapper();
     private final Map<String, String> guests = new LinkedHashMap<>();
     private final Map<String, String> nativeIds = new LinkedHashMap<>();
+    private final Map<String, ObjectNode> guestConfigurations = new LinkedHashMap<>();
+    private final Map<String, String> snapshots = new LinkedHashMap<>();
+    private int snapshotSequence;
     private final AccountAwareStorageBackend<MicrosandboxMachine> journal =
             AccountAwareStorageBackend.inMemory("000000000000");
     private final String arn = "arn:aws:rds:us-east-1:000000000000:cluster:db";
@@ -65,13 +68,32 @@ class MicrosandboxRdsRuntimeTest {
         client = mock(MicrosandboxSidecarClient.class);
         when(client.port()).thenReturn(15432);
         when(client.prepareAdmission(anyList())).thenReturn("snapshot-permit");
+        when(client.commandAdmitted(anyString(), anyList())).thenAnswer(invocation -> {
+            List<String> arguments = invocation.getArgument(1);
+            String selector = arguments.get(arguments.indexOf("--sandbox") + 1) + ":" + arguments.get(2);
+            String id = "snap-" + ++snapshotSequence;
+            snapshots.put(selector, id);
+            return id;
+        });
         when(client.command(any(String[].class))).thenAnswer(invocation -> {
             List<String> args = List.of(invocation.getArguments()).stream().map(String.class::cast).toList();
             switch (args.getFirst()) {
                 case "--version" -> {
                     return "msb 0.7.8";
                 }
-                case "run" -> guests.put(args.get(args.indexOf("--name") + 1), "Running");
+                case "run" -> {
+                    String name = args.get(args.indexOf("--name") + 1);
+                    guests.put(name, "Running");
+                    ObjectNode configuration = mapper.createObjectNode();
+                    ObjectNode labels = configuration.putObject("labels");
+                    for (int i = 0; i < args.size() - 1; i++) {
+                        if (args.get(i).equals("--label")) {
+                            String[] label = args.get(++i).split("=", 2);
+                            labels.put(label[0], label[1]);
+                        }
+                    }
+                    guestConfigurations.put(name, configuration);
+                }
                 case "stop" -> guests.put(args.getLast(), "Stopped");
                 case "start", "resume" -> guests.put(args.getLast(), "Running");
                 case "rm" -> {
@@ -92,7 +114,13 @@ class MicrosandboxRdsRuntimeTest {
                             throw new IllegalStateException("restore failed");
                         }
                         restores++;
-                        guests.put(args.get(args.indexOf("--name") + 1), "Running");
+                        String name = args.get(args.indexOf("--name") + 1);
+                        guests.put(name, "Running");
+                        guestConfigurations.put(name, mapper.createObjectNode()
+                                .put("snapshot_parent", snapshots.get(args.get(2))));
+                    }
+                    if (args.get(1).equals("rm")) {
+                        snapshots.remove(args.getLast());
                     }
                 }
                 default -> {
@@ -105,13 +133,19 @@ class MicrosandboxRdsRuntimeTest {
             if (command.equals("inspect")) {
                 ObjectNode inspected = mapper.createObjectNode()
                         .put("status", guests.get((String) invocation.getArguments()[3]));
-                inspected.putObject("config").putObject("resources").put("memory_mib", 512);
+                ObjectNode configuration = guestConfigurations.get((String) invocation.getArguments()[3]).deepCopy();
+                configuration.putObject("resources").put("memory_mib", 512);
+                inspected.set("config", configuration);
                 return inspected;
             }
             ArrayNode list = mapper.createArrayNode();
             if (command.equals("ls")) {
                 guests.forEach((name, status) -> list.addObject().put("name", name).put("status", status)
                         .put("id", nativeIds.getOrDefault(name, name + "-native-id")));
+            } else if (command.equals("snap")) {
+                snapshots.forEach((selector, id) -> list.addObject()
+                        .put("group", selector.split(":", 2)[0]).put("name", selector.split(":", 2)[1])
+                        .put("snapshot_id", id));
             }
             return list;
         });
@@ -166,15 +200,15 @@ class MicrosandboxRdsRuntimeTest {
 
     @Test
     void uncertainSnapshotCaptureRetainsItsPermit() {
-        when(client.commandAdmitted(anyString(), anyList())).thenThrow(new IllegalStateException("response lost"));
+        doThrow(new IllegalStateException("response lost")).when(client).commandAdmitted(anyString(), anyList());
         assertFalse(runtime.pauseIfIdle(arn));
         verify(client, never()).cancelAdmission(anyString());
     }
 
     @Test
     void explicitSnapshotDispatchRefusalCancelsItsPermitAndRecoversTheDatabase() {
-        when(client.commandAdmitted(anyString(), anyList())).thenThrow(
-                new MicrosandboxCapacity.CapacityUnavailableException("disk capacity changed"));
+        doThrow(new MicrosandboxCapacity.CapacityUnavailableException("disk capacity changed"))
+                .when(client).commandAdmitted(anyString(), anyList());
         assertFalse(runtime.pauseIfIdle(arn));
         verify(client).cancelAdmission("snapshot-permit");
         assertEquals("RUNNING", machine().phase);
@@ -261,18 +295,101 @@ class MicrosandboxRdsRuntimeTest {
     }
 
     @Test
+    void recoveryRefusesAReplacementGuestWithTheSameName() throws Exception {
+        nativeIds.put(machine().vm, "replacement-native-id");
+        restart();
+        clearInvocations(client);
+        assertThrows(IllegalStateException.class, () -> runtime.recover(arn));
+        assertEquals(ContainerLiveness.UNKNOWN, runtime.probeContainer(handle.getContainerId()));
+        verify(client, never()).command(any(String[].class));
+    }
+
+    @Test
+    void recoveryRefusesAnUnfencedLegacyJournalWithoutRemovingItsData() throws Exception {
+        machine().guestIds.clear();
+        machine().generationParents.clear();
+        restart();
+        clearInvocations(client);
+        IllegalStateException failure = assertThrows(IllegalStateException.class, () -> runtime.recover(arn));
+        assertTrue(failure.getMessage().contains("previous runtime"));
+        assertEquals(1, guests.size());
+        assertEquals(1, journal.scanAllAccounts().size());
+        verify(client, never()).command(any(String[].class));
+    }
+
+    @Test
+    void recoveredColdEndpointStopsReportingLiveWhenItsGuestOrCheckpointDisappears() throws Exception {
+        assertTrue(runtime.pauseIfIdle(arn));
+        restart();
+        runtime.recover(arn);
+        assertEquals(ContainerLiveness.RUNNING, runtime.probeContainer(handle.getContainerId()));
+        String source = machine().vm;
+        guests.remove(source);
+        assertEquals(ContainerLiveness.NOT_RUNNING, runtime.probeContainer(handle.getContainerId()));
+        guests.put(source, "Stopped");
+        snapshots.clear();
+        assertEquals(ContainerLiveness.NOT_RUNNING, runtime.probeContainer(handle.getContainerId()));
+        assertThrows(IllegalStateException.class, () -> runtime.enter(handle.getHost(), handle.getPort()));
+        assertEquals(0, restores);
+    }
+
+    @Test
+    void substitutedCheckpointCannotWakeTheDatabaseOrReportHealthy() throws Exception {
+        assertTrue(runtime.pauseIfIdle(arn));
+        restart();
+        runtime.recover(arn);
+        snapshots.put(machine().snapshot, "foreign-checkpoint-id");
+        assertEquals(ContainerLiveness.UNKNOWN, runtime.probeContainer(handle.getContainerId()));
+        assertThrows(IllegalStateException.class, () -> runtime.enter(handle.getHost(), handle.getPort()));
+        assertEquals(0, restores);
+    }
+
+    @Test
+    void recoveredTargetRequiresItsRecordedCheckpointParent() throws Exception {
+        assertTrue(runtime.pauseIfIdle(arn));
+        failRemove = true;
+        assertThrows(IllegalStateException.class, () -> runtime.enter(handle.getHost(), handle.getPort()));
+        guestConfigurations.get(machine().vm).put("snapshot_parent", "foreign-checkpoint-id");
+        restart();
+        clearInvocations(client);
+        assertThrows(IllegalStateException.class, () -> runtime.recover(arn));
+        assertEquals(ContainerLiveness.UNKNOWN, runtime.probeContainer(handle.getContainerId()));
+        verify(client, never()).command(any(String[].class));
+        assertEquals(1, restores);
+    }
+
+    @Test
     void recoveryRetainsCapacityForAStillActiveRestoreSource() throws Exception {
+        assertTrue(runtime.pauseIfIdle(arn));
         MicrosandboxMachine machine = machine();
+        guests.put(machine.vm, "Running");
         machine.retiredVms.add(machine.vm);
         machine.vm = machine.id + "-1";
+        machine.generationParents.put(machine.vm, machine.checkpointIds.get(machine.snapshot));
         machine.generation = 1;
         machine.phase = "RESTORING";
-        machine.snapshot = machine.id + "-0:sleep";
         restart();
         clearInvocations(client);
         assertNotNull(runtime.recover(arn));
         assertEquals(512, capacity.reservedMemoryMib());
         verify(client, never()).command(any(String[].class));
+    }
+
+    @Test
+    void pausedLivenessDoesNotReleaseCapacityWhileARetiredSourceIsStillActive() throws Exception {
+        assertTrue(runtime.pauseIfIdle(arn));
+        String source = machine().vm;
+        String retired = source + "-retired";
+        guests.put(retired, "Running");
+        guestConfigurations.put(retired, guestConfigurations.get(source).deepCopy());
+        machine().retiredVms.add(retired);
+        machine().generationParents.put(retired, "");
+        restart();
+        assertEquals(512, capacity.reservedMemoryMib());
+        assertEquals(ContainerLiveness.RUNNING, runtime.probeContainer(handle.getContainerId()));
+        assertEquals(512, capacity.reservedMemoryMib());
+        runtime.stopAll();
+        assertEquals(512, capacity.reservedMemoryMib());
     }
 
     @Test

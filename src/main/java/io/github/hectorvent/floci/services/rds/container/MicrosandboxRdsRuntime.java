@@ -6,6 +6,7 @@ import io.github.hectorvent.floci.config.EmulatorConfig;
 import io.github.hectorvent.floci.core.common.AwsArnUtils;
 import io.github.hectorvent.floci.core.common.AwsException;
 import io.github.hectorvent.floci.core.common.docker.ContainerLiveness;
+import io.github.hectorvent.floci.core.common.docker.ContainerStorageHelper;
 import io.github.hectorvent.floci.core.common.microsandbox.MicrosandboxCapacity;
 import io.github.hectorvent.floci.core.storage.AccountAwareStorageBackend;
 import io.github.hectorvent.floci.core.storage.StorageFactory;
@@ -38,6 +39,7 @@ import java.util.function.BooleanSupplier;
 @Typed(MicrosandboxRdsRuntime.class)
 public class MicrosandboxRdsRuntime implements RdsBackendRuntime {
     private static final Logger LOG = Logger.getLogger(MicrosandboxRdsRuntime.class);
+    private static final String OWNER_LABEL = "floci.rds.runtime";
     private final EmulatorConfig config;
     private final MicrosandboxSidecarManager manager;
     private final MicrosandboxSidecarClient client;
@@ -126,6 +128,7 @@ public class MicrosandboxRdsRuntime implements RdsBackendRuntime {
             return null;
         }
         synchronized (machine) {
+            requireGenerationRecord(machine, machine.vm);
             if (!List.of("RUNNING", "STOPPED", "STARTING", "STOPPING", "CAPTURING", "HIBERNATED", "RESTORING")
                     .contains(machine.phase)) {
                 throw new IllegalStateException("Persisted native database has an incomplete or unknown lifecycle state");
@@ -139,8 +142,12 @@ public class MicrosandboxRdsRuntime implements RdsBackendRuntime {
             if (!present && !hibernatedTarget && machine.retiredVms.stream().noneMatch(this::exists)) {
                 throw new IllegalStateException("Native database source and restored guest are both missing");
             }
-            String status = present ? inspect(machine.vm).path("status").asText()
-                    : hibernatedTarget ? inspect(recoveredTarget).path("status").asText() : "Stopped";
+            String status = present ? inspectOwned(machine, machine.vm).path("status").asText()
+                    : hibernatedTarget ? inspectOwned(machine, recoveredTarget).path("status").asText() : "Stopped";
+            if (("HIBERNATED".equals(machine.phase) || "RESTORING".equals(machine.phase))
+                    && !checkpointExists(machine, machine.snapshot)) {
+                throw new IllegalStateException("Native database recovery checkpoint is missing");
+            }
             if (!List.of("Running", "Paused", "Stopped").contains(status)) {
                 throw new IllegalStateException("Native database guest has an uncertain runtime state");
             }
@@ -150,7 +157,7 @@ public class MicrosandboxRdsRuntime implements RdsBackendRuntime {
             boolean sourcesActive = false;
             for (String source : machine.retiredVms) {
                 if (exists(source)) {
-                    String sourceStatus = inspect(source).path("status").asText();
+                    String sourceStatus = inspectOwned(machine, source).path("status").asText();
                     if (!List.of("Running", "Paused", "Stopped").contains(sourceStatus)) {
                         throw new IllegalStateException("Native database source has an uncertain runtime state");
                     }
@@ -207,6 +214,7 @@ public class MicrosandboxRdsRuntime implements RdsBackendRuntime {
                 throw new IllegalArgumentException("floci.services.rds.microsandbox-root-disk-mib must be at least 1024");
             }
             created.vm = id + "-0";
+            created.generationParents.put(created.vm, "");
             created.phase = "CREATING";
             capacity.reserve(id, created.memoryMib, Duration.ofSeconds(90));
             save(created);
@@ -244,6 +252,7 @@ public class MicrosandboxRdsRuntime implements RdsBackendRuntime {
                         throw refused;
                     }
                 }
+                inspectOwned(machine, machine.vm);
                 ready(machine);
                 if (machine.engine == DatabaseEngine.POSTGRES) {
                     sql(machine, RdsContainerManager.postgresIamRoleInitSql());
@@ -264,7 +273,9 @@ public class MicrosandboxRdsRuntime implements RdsBackendRuntime {
     private void createGuest(MicrosandboxMachine machine, String image, String password, String dbName) {
         String database = dbName == null || dbName.isBlank() ? machine.username : dbName;
         List<String> command = new ArrayList<>(List.of("run", "-d", "--name", machine.vm, "--cpus", "1", "--memory",
-                machine.memoryMib + "M", "--root-disk", machine.rootDiskMib + "M"));
+                machine.memoryMib + "M", "--root-disk", machine.rootDiskMib + "M",
+                "--label", OWNER_LABEL + "=" + machine.id,
+                "--label", ContainerStorageHelper.OWNER_LABEL + "=" + ContainerStorageHelper.ownerIdentity(config)));
         if (machine.engine == DatabaseEngine.POSTGRES) {
             command.addAll(List.of("-e", "POSTGRES_USER=" + machine.username,
                     "-e", "POSTGRES_PASSWORD=" + password, "-e", "POSTGRES_DB=" + database));
@@ -315,6 +326,7 @@ public class MicrosandboxRdsRuntime implements RdsBackendRuntime {
 
     private void hibernate(MicrosandboxMachine machine) {
         synchronized (machine) {
+            inspectOwned(machine, machine.vm);
             String snapshotName = "sleep-" + UUID.randomUUID();
             List<String> capture = List.of("snap", "create", snapshotName,
                     "--sandbox", machine.vm, "--full", "--integrity");
@@ -326,7 +338,15 @@ public class MicrosandboxRdsRuntime implements RdsBackendRuntime {
                 save(machine);
                 client.command("pause", machine.vm);
                 captureDispatched = true;
-                client.commandAdmitted(permit, capture);
+                String snapshotId = client.commandAdmitted(permit, capture);
+                if (snapshotId.isBlank()) {
+                    throw new IllegalStateException("Native database capture returned no immutable checkpoint identity");
+                }
+                machine.checkpointIds.put(machine.snapshot, snapshotId);
+                save(machine);
+                if (!checkpointExists(machine, machine.snapshot)) {
+                    throw new IllegalStateException("Native database capture is missing from the runtime catalogue");
+                }
                 client.command("snap", "verify", machine.snapshot);
                 // Journal the verified recovery point before the source can disappear.
                 machine.phase = "HIBERNATED";
@@ -356,6 +376,10 @@ public class MicrosandboxRdsRuntime implements RdsBackendRuntime {
 
     /** Reconciles a lost helper response without ever replaying a checkpoint over acknowledged writes. */
     private void wake(MicrosandboxMachine machine) {
+        requireGenerationRecord(machine, machine.vm);
+        if (exists(machine.vm)) {
+            inspectOwned(machine, machine.vm);
+        }
         if ("STOPPING".equals(machine.phase)) {
             stopGuest(machine);
         }
@@ -369,6 +393,9 @@ public class MicrosandboxRdsRuntime implements RdsBackendRuntime {
             save(machine);
         }
         if ("HIBERNATED".equals(machine.phase)) {
+            if (!checkpointExists(machine, machine.snapshot)) {
+                throw new IllegalStateException("Native database recovery checkpoint is missing");
+            }
             String target = machine.id + "-" + (machine.generation + 1);
             boolean sourceExists = exists(machine.vm);
             if (!sourceExists && !exists(target)) {
@@ -382,10 +409,19 @@ public class MicrosandboxRdsRuntime implements RdsBackendRuntime {
             }
             machine.retiredVms.add(machine.vm);
             machine.vm = machine.id + "-" + ++machine.generation;
+            machine.generationParents.put(machine.vm, machine.checkpointIds.get(machine.snapshot));
             machine.phase = "RESTORING";
             save(machine);
         }
         if ("RESTORING".equals(machine.phase)) {
+            if (!checkpointExists(machine, machine.snapshot)) {
+                throw new IllegalStateException("Native database recovery checkpoint is missing");
+            }
+            for (String source : machine.retiredVms) {
+                if (exists(source) && !"Stopped".equals(inspectOwned(machine, source).path("status").asText())) {
+                    throw new IllegalStateException("Native database restore source is still active");
+                }
+            }
             if (!exists(machine.vm)) {
                 if (machine.retiredVms.stream().noneMatch(this::exists)) {
                     throw new IllegalStateException("Checkpoint source and target are missing; refusing stale recovery");
@@ -400,15 +436,19 @@ public class MicrosandboxRdsRuntime implements RdsBackendRuntime {
             } else {
                 capacity.observeRunning(machine.id, machine.memoryMib);
             }
+            inspectOwned(machine, machine.vm);
             ready(machine);
             // Removing the stopped source is a recovery fence: even if the local journal write
             // fails, an old HIBERNATED record cannot replay its checkpoint after this target has
             // accepted writes and subsequently disappeared. A lost rm response is reconciled by ls.
             for (String source : List.copyOf(machine.retiredVms)) {
                 if (exists(source)) {
+                    inspectOwned(machine, source);
                     client.command("rm", source);
                 }
                 machine.retiredVms.remove(source);
+                machine.guestIds.remove(source);
+                machine.generationParents.remove(source);
             }
             machine.retiredSnapshots.add(machine.snapshot);
             machine.snapshot = null;
@@ -479,9 +519,12 @@ public class MicrosandboxRdsRuntime implements RdsBackendRuntime {
         for (String vm : List.copyOf(machine.retiredVms)) {
             try {
                 if (exists(vm)) {
+                    inspectOwned(machine, vm);
                     client.command("rm", vm);
                 }
                 machine.retiredVms.remove(vm);
+                machine.guestIds.remove(vm);
+                machine.generationParents.remove(vm);
                 save(machine);
             } catch (RuntimeException e) {
                 LOG.warnv("Retaining retired microsandbox VM {0} for cleanup: {1}", vm, e.getMessage());
@@ -490,14 +533,11 @@ public class MicrosandboxRdsRuntime implements RdsBackendRuntime {
         for (String snapshot : List.copyOf(machine.retiredSnapshots)) {
             try {
                 // A failed capture may not have created an indexed snapshot.
-                boolean exists = false;
-                for (JsonNode entry : client.json("snap", "ls", "--format", "json")) {
-                    exists |= snapshot.equals(entry.path("group").asText() + ":" + entry.path("name").asText());
-                }
-                if (exists) {
+                if (checkpointExists(machine, snapshot)) {
                     client.command("snap", "rm", "--force", snapshot);
                 }
                 machine.retiredSnapshots.remove(snapshot);
+                machine.checkpointIds.remove(snapshot);
                 save(machine);
             } catch (RuntimeException e) {
                 LOG.warnv("Retaining microsandbox checkpoint for cleanup: {0}", e.getMessage());
@@ -520,6 +560,62 @@ public class MicrosandboxRdsRuntime implements RdsBackendRuntime {
 
     private JsonNode inspect(String name) {
         return client.json("inspect", "--format", "json", name);
+    }
+
+    private void requireGenerationRecord(MicrosandboxMachine machine, String vm) {
+        if (!machine.generationParents.containsKey(vm)) {
+            throw new IllegalStateException("Native database journal has no generation ownership record; "
+                    + "retain its data and export it with the previous runtime before migration");
+        }
+    }
+
+    private JsonNode inspectOwned(MicrosandboxMachine machine, String vm) {
+        requireGenerationRecord(machine, vm);
+        String nativeId = nativeGuestId(vm);
+        String expectedId = machine.guestIds.get(vm);
+        if (expectedId != null && !expectedId.equals(nativeId)) {
+            throw new IllegalStateException("Native database guest identity changed; refusing replacement storage");
+        }
+        JsonNode guest = inspect(vm);
+        String parent = machine.generationParents.get(vm);
+        requireOwnership(machine, guest.path("config"), parent);
+        if (guest.hasNonNull("active_config")) {
+            requireOwnership(machine, guest.path("active_config"), parent);
+        }
+        if (expectedId == null) {
+            machine.guestIds.put(vm, nativeId);
+            save(machine);
+        }
+        return guest;
+    }
+
+    private void requireOwnership(MicrosandboxMachine machine, JsonNode configuration, String parent) {
+        JsonNode labels = configuration.path("labels");
+        String owner = ContainerStorageHelper.ownerIdentity(config);
+        if (parent.isEmpty()) {
+            if (!machine.id.equals(labels.path(OWNER_LABEL).asText())
+                    || !owner.equals(labels.path(ContainerStorageHelper.OWNER_LABEL).asText())) {
+                throw new IllegalStateException("Native database guest ownership labels changed");
+            }
+        } else if (!parent.equals(configuration.path("snapshot_parent").asText())
+                || labels.has(OWNER_LABEL) && !machine.id.equals(labels.path(OWNER_LABEL).asText())
+                || labels.has(ContainerStorageHelper.OWNER_LABEL)
+                    && !owner.equals(labels.path(ContainerStorageHelper.OWNER_LABEL).asText())) {
+            throw new IllegalStateException("Native database guest checkpoint lineage changed");
+        }
+    }
+
+    private boolean checkpointExists(MicrosandboxMachine machine, String selector) {
+        for (JsonNode snapshot : client.json("snap", "ls", "--format", "json")) {
+            if (selector != null && selector.equals(snapshot.path("group").asText() + ":" + snapshot.path("name").asText())) {
+                String id = machine.checkpointIds.get(selector);
+                if (id == null || !id.equals(snapshot.path("snapshot_id").asText())) {
+                    throw new IllegalStateException("Native database checkpoint identity changed or is unrecorded");
+                }
+                return true;
+            }
+        }
+        return false;
     }
 
     private void ready(MicrosandboxMachine machine) {
@@ -588,6 +684,7 @@ public class MicrosandboxRdsRuntime implements RdsBackendRuntime {
         synchronized (machine) {
             if ("CREATING".equals(machine.phase) || "WAITING_CAPACITY".equals(machine.phase)) {
                 if (exists(machine.vm)) {
+                    inspectOwned(machine, machine.vm);
                     client.command("stop", "--force", machine.vm);
                     if (!"Stopped".equals(inspect(machine.vm).path("status").asText())) {
                         throw new IllegalStateException("Microsandbox database guest did not stop");
@@ -610,6 +707,9 @@ public class MicrosandboxRdsRuntime implements RdsBackendRuntime {
     }
 
     private void stopGuest(MicrosandboxMachine machine) {
+        if (exists(machine.vm)) {
+            inspectOwned(machine, machine.vm);
+        }
         if (exists(machine.vm) && !"Stopped".equals(inspect(machine.vm).path("status").asText())) {
             String vm = machine.vm;
             String nativeId = nativeGuestId(vm);
@@ -682,27 +782,41 @@ public class MicrosandboxRdsRuntime implements RdsBackendRuntime {
             return ContainerLiveness.NOT_RUNNING;
         }
         synchronized (machine) {
-            AutoPauseController controller = controllers.get(machine.id);
-            if (controller != null && controller.state() != AutoPauseController.State.RUNNING) {
-                return ContainerLiveness.RUNNING;
-            }
-            if ("HIBERNATED".equals(machine.phase)) {
-                try {
-                    if (exists(machine.vm) && "Stopped".equals(inspect(machine.vm).path("status").asText())) {
-                        capacity.release(machine.id);
-                    }
-                } catch (RuntimeException e) {
-                    LOG.debugv("Cannot reconcile paused database RAM for {0}: {1}", machine.id, e.getMessage());
-                }
-            }
-            if ("HIBERNATED".equals(machine.phase) || "RESTORING".equals(machine.phase)
-                    || "CAPTURING".equals(machine.phase)) {
-                return ContainerLiveness.RUNNING;
-            }
             try {
-                return exists(machine.vm) && "Running".equals(inspect(machine.vm).path("status").asText())
-                        ? ContainerLiveness.RUNNING : ContainerLiveness.NOT_RUNNING;
+                requireGenerationRecord(machine, machine.vm);
+                if (("HIBERNATED".equals(machine.phase) || "RESTORING".equals(machine.phase))
+                        && !checkpointExists(machine, machine.snapshot)) {
+                    return ContainerLiveness.NOT_RUNNING;
+                }
+                if (!exists(machine.vm)) {
+                    if ("RESTORING".equals(machine.phase)) {
+                        for (String source : machine.retiredVms) {
+                            if (exists(source)) {
+                                inspectOwned(machine, source);
+                                return ContainerLiveness.RUNNING;
+                            }
+                        }
+                    }
+                    return ContainerLiveness.NOT_RUNNING;
+                }
+                String status = inspectOwned(machine, machine.vm).path("status").asText();
+                if (!List.of("Running", "Paused", "Stopped").contains(status)) {
+                    return ContainerLiveness.UNKNOWN;
+                }
+                if ("Paused".equals(status) && !List.of("CAPTURING", "HIBERNATED").contains(machine.phase)) {
+                    return ContainerLiveness.UNKNOWN;
+                }
+                if ("HIBERNATED".equals(machine.phase) && "Stopped".equals(status)) {
+                    releaseStoppedCapacity(machine);
+                }
+                AutoPauseController controller = controllers.get(machine.id);
+                if (controller != null && controller.state() != AutoPauseController.State.RUNNING
+                        || List.of("HIBERNATED", "RESTORING", "CAPTURING").contains(machine.phase)) {
+                    return ContainerLiveness.RUNNING;
+                }
+                return "Running".equals(status) ? ContainerLiveness.RUNNING : ContainerLiveness.NOT_RUNNING;
             } catch (RuntimeException e) {
+                LOG.debugv("Cannot establish native database liveness for {0}: {1}", machine.id, e.getMessage());
                 return ContainerLiveness.UNKNOWN;
             }
         }
@@ -712,6 +826,15 @@ public class MicrosandboxRdsRuntime implements RdsBackendRuntime {
     public RdsContainerHandle getActiveHandle(String runtimeId) {
         return machines.values().stream().filter(machine -> machine.runtimeId.equals(runtimeId))
                 .findFirst().map(this::handle).orElse(null);
+    }
+
+    private void releaseStoppedCapacity(MicrosandboxMachine machine) {
+        for (String source : machine.retiredVms) {
+            if (exists(source) && !"Stopped".equals(inspectOwned(machine, source).path("status").asText())) {
+                return;
+            }
+        }
+        capacity.release(machine.id);
     }
 
     @Override
@@ -724,8 +847,8 @@ public class MicrosandboxRdsRuntime implements RdsBackendRuntime {
                 }
                 synchronized (machine) {
                     if ("HIBERNATED".equals(machine.phase) && exists(machine.vm)
-                            && "Stopped".equals(inspect(machine.vm).path("status").asText())) {
-                        capacity.release(machine.id);
+                            && "Stopped".equals(inspectOwned(machine, machine.vm).path("status").asText())) {
+                        releaseStoppedCapacity(machine);
                     } else {
                         stop(handle(machine));
                     }
@@ -855,6 +978,7 @@ public class MicrosandboxRdsRuntime implements RdsBackendRuntime {
                 throw new IllegalStateException("Microsandbox retired storage cleanup is pending");
             }
             if (exists(machine.vm)) {
+                inspectOwned(machine, machine.vm);
                 client.command("rm", machine.vm);
                 if (exists(machine.vm)) {
                     throw new IllegalStateException("Microsandbox database guest was not removed");

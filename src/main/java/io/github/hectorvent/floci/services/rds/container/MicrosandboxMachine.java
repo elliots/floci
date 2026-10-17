@@ -4,7 +4,9 @@ import io.github.hectorvent.floci.services.rds.model.DatabaseEngine;
 import io.quarkus.runtime.annotations.RegisterForReflection;
 
 import java.util.ArrayList;
+import java.util.LinkedHashMap;
 import java.util.List;
+import java.util.Map;
 
 /** Durable transition journal. VM generations and memory checkpoints are not AWS snapshots. */
 @RegisterForReflection
@@ -28,4 +30,7 @@ public class MicrosandboxMachine {
     public int generation;
     public List<String> retiredVms = new ArrayList<>();
     public List<String> retiredSnapshots = new ArrayList<>();
+    public Map<String, String> guestIds = new LinkedHashMap<>();
+    public Map<String, String> generationParents = new LinkedHashMap<>();
+    public Map<String, String> checkpointIds = new LinkedHashMap<>();
 }

@@ -152,7 +152,11 @@ read timeout on the first image pull; allow a longer timeout for local tests.
 
 The runtime journal is created through `StorageFactory` as
 `rds-microsandbox.json`. It tracks stable resource identities separately from
-guest generations. A missing guest disk causes an explicit failure rather than
+guest generations, recording immutable guest and checkpoint identities and each
+generation's owner labels or checkpoint parent. Legacy journals without those
+ownership records require export and migration using the previous runtime, as
+described in the [migration notes](../../tools/microsandbox/AURORA_RECOVERY_MIGRATION.md#ownership-upgrade).
+A missing guest disk causes an explicit failure rather than
 creation of an empty database. On resume, the stopped source is removed before
 clients can write to the new generation, so stale recovery state cannot replay
 old memory over newer writes. Retired checkpoint cleanup is retried independently.
