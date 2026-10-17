@@ -54,13 +54,17 @@ compatibility remain priorities for ordinary Kubernetes application manifests.
   covers identity on both worker backends. Preserve the shared controller and
   one VM per Pod seam instead of adding a kubelet to every guest. `fsGroup` and supplemental groups are implemented. Remaining security work includes
   privileged containers, custom seccomp, AppArmor and SELinux profiles.
-- Resource compatibility still needs Pod-level resources, in-place resizing,
-  resource metrics, and resource types beyond CPU/memory. Runtime overhead is a
+- Container CPU and working-set metrics are implemented without waking guests;
+  see the [metric semantics](../microsandbox-pods/METRICS.md). Resource compatibility
+  still needs Pod-level resources, in-place resizing and resource types beyond
+  CPU/memory. Runtime overhead is a
   separate local allocation reserve, not an application resource request.
 - Storage: native root disk sizes are configurable and persisted. Shared disk
   admission accounts for image caches, guest disks, checkpoints and outstanding
   reservations, with an optional free-space reserve. It is admission control,
-  not a filesystem quota or automatic image/checkpoint pruning. The opt-in
+  not a filesystem quota. Preview-first cleanup can reclaim unused runtime RAM
+  backing and opt-in old images while preserving guest/checkpoint ownership;
+  durable checkpoints are not age-evicted. See [storage maintenance](../microsandbox-runtime/STORAGE.md). The opt-in
   [local persistent-volume provisioner](../microsandbox-pods/STORAGE.md) adds
   node-bound Filesystem RWO disks, guarded single-Pod attachments and Delete/Retain
   reclaim. CSI drivers, expansion and broader access modes remain unsupported.
@@ -97,11 +101,23 @@ compatibility remain priorities for ordinary Kubernetes application manifests.
   RAM does not mean that cleanup queue has drained. Qualification now waits for
   the owned Pod journals to disappear and records cleanup time.
 - The setup helper provides repeatable owned-cluster installation, a restricted
-  controller identity, certificate renewal, diagnostics and explicit shared
-  disk/RAM reporting. Shared admission bounds new operations; cache and checkpoint
-  retention policies still need explicit operator management.
+  controller identity, an optional portable background supervisor, automatic
+  certificate renewal, diagnostics and explicit shared disk/RAM reporting.
+  Shared admission bounds new operations; unused cache cleanup is explicit and
+  durable checkpoints remain until their workload owner releases them.
 - Qualify Linux hosts as well as Apple Silicon, and test real application graphs,
   persistent client connections, concurrent wakes and failure recovery.
+
+Native Linux qualification has a manual GitHub Actions entry point,
+`Microsandbox Native Linux Qualification`, for a trusted self-hosted runner
+labelled `linux` and `microsandbox-native`. The runner needs readable/writable
+`/dev/kvm`, Docker, Python 3, OpenSSL, a C compiler and microsandbox 0.7.8 with its
+matching native runtime. Set repository variable `MICROSANDBOX_EXECUTABLE` when
+the CLI is not `/usr/local/bin/msb`, and optionally `MICROSANDBOX_NODE_IP` for an
+explicit peer-reachable host address. It builds current helpers and runs the
+existing Pod and Java wake qualification in a dedicated runtime home. It retains
+diagnostic state and publishes the JSON result. This workflow is not a completed
+Linux qualification; the current development host has no KVM device.
 
 Before the SDK migration, the expanded Apple Silicon qualification completed
 49 native checks, including 500 native-backed Pod identities with real scheduling requests, cold proxy

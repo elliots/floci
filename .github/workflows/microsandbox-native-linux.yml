@@ -1,0 +1,102 @@
+name: Microsandbox Native Linux Qualification
+
+# Dedicated trusted runner: this starts native VMs and an owned privileged k3s
+# fixture. PR unit tests remain in microsandbox-pods.yml.
+on:
+  workflow_dispatch:
+    inputs:
+      proxy_pods:
+        description: Cold proxy-ready replicas to qualify (5 through 500)
+        required: true
+        default: '5'
+
+permissions:
+  contents: read
+
+concurrency:
+  group: microsandbox-native-linux
+  cancel-in-progress: false
+
+jobs:
+  qualify:
+    runs-on: [self-hosted, linux, microsandbox-native]
+    timeout-minutes: 60
+    env:
+      MSB_EXECUTABLE: ${{ vars.MICROSANDBOX_EXECUTABLE || '/usr/local/bin/msb' }}
+      NATIVE_NODE_IP: ${{ vars.MICROSANDBOX_NODE_IP }}
+      PROXY_PODS: ${{ inputs.proxy_pods }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version-file: tools/microsandbox-pods/go.mod
+          cache-dependency-path: |
+            tools/microsandbox-pods/go.sum
+            tools/microsandbox-runtime/go.sum
+
+      - uses: actions/setup-java@de7274f081f381c8f8158605e0321c36c376e2e6 # v6.0.1
+        with:
+          distribution: temurin
+          java-version: '25'
+          cache: maven
+
+      - name: Verify native host and allocate a dedicated runtime home
+        id: fixture
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(uname -s)" = Linux
+          test -c /dev/kvm && test -r /dev/kvm && test -w /dev/kvm
+          test "$("$MSB_EXECUTABLE" --version)" = 'msb 0.7.8'
+          docker info >/dev/null
+          python3 -c 'import os; n=int(os.environ["PROXY_PODS"]); assert 5 <= n <= 500'
+          qualification_root=$(mktemp -d /tmp/floci-native-ci.XXXXXX)
+          chmod 700 "$qualification_root"
+          printf 'root=%s\n' "$qualification_root" >> "$GITHUB_OUTPUT"
+          mkdir -p native-qualification-reports
+
+      - name: Build controller and guest helpers
+        run: python3 tools/microsandbox-pods/manage.py build --binaries '${{ steps.fixture.outputs.root }}/bin'
+
+      - name: Prepare pinned runtime image
+        env:
+          MSB_HOME: ${{ steps.fixture.outputs.root }}/runtime
+        run: |
+          "$MSB_EXECUTABLE" doctor
+          "$MSB_EXECUTABLE" image pull rancher/k3s:v1.35.0-k3s1 --materialize all
+
+      - name: Qualify native workloads and shared Java wake contracts
+        env:
+          QUALIFICATION_ROOT: ${{ steps.fixture.outputs.root }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          node_args=()
+          if test -n "$NATIVE_NODE_IP"; then node_args=(--node-ip "$NATIVE_NODE_IP"); fi
+          python3 tools/microsandbox-pods/qualify.py \
+            --controller "$QUALIFICATION_ROOT/bin/microsandbox-pods" \
+            --msb "$MSB_EXECUTABLE" --msb-home "$QUALIFICATION_ROOT/runtime" \
+            --network-relay-binary "$QUALIFICATION_ROOT/bin/network-relay" \
+            --guest-fs-binary "$QUALIFICATION_ROOT/bin/guestfs" \
+            --cold-pods 2 --proxy-pods "$PROXY_PODS" \
+            --scheduling-cpu 600 --scheduling-memory 512Gi \
+            --floci-checkout "$GITHUB_WORKSPACE" --java-home "$JAVA_HOME" \
+            --report native-qualification-reports/linux.json "${node_args[@]}"
+
+      - name: Preserve qualification reports
+        if: always()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: microsandbox-native-linux-${{ github.run_id }}
+          path: native-qualification-reports/*.json
+          if-no-files-found: warn
+          retention-days: 14
+
+      - name: Report retained diagnostic state
+        if: always() && steps.fixture.outputs.root != ''
+        env:
+          QUALIFICATION_ROOT: ${{ steps.fixture.outputs.root }}
+        run: |
+          printf 'Native fixture directory retained at %s\n' "$QUALIFICATION_ROOT"
+          printf 'Qualification performs owned cleanup. Resolve any reported uncertain state before removing this directory.\n'
