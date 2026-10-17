@@ -5,6 +5,42 @@ ported from `feat/on-demand-runtime`, without importing that branch's unrelated
 service and network changes.
 Docker remains the default. No AWS request or response shapes change.
 
+## Main rebase: 17 October 2026
+
+This branch now includes `origin/main` through `fa2a49e77`. The pre-rebase branch
+is retained at `backup/microsandbox-before-main-rebase-20261017-1710`.
+
+RDS now serves a server certificate signed by Floci's shared root CA. Configured
+`FLOCI_SERVICES_RDS_TLS_HOSTNAMES` still populate its server certificate, and
+learned names survive restart. Refresh previously exported database trust files
+from `<persistent-path>/tls/floci-root-ca.crt` or its compatibility copy
+`tls/rds-ca.crt` after the first database proxy initializes. The old separate
+`rds-ca.key` is removed; keep the shared CA and its key with persistent state.
+
+Main's new `DescribeDBLogFiles` and `DownloadDBLogFilePortion` APIs work with the
+Docker database runtime. Native Aurora currently returns HTTP 400
+`UnsupportedOperation`. Log requests do not start or resume native databases,
+including after Floci restart. Database-specific native log capture and retention
+remain unsupported; generic SDK logs are not substituted for database logs.
+
+For the host GraalVM native binary, main now defaults the Docker resource namespace
+to `host-${floci.port}` and the host persistent path to the configured persistent
+path. JVM/dev mode and Docker deployments keep their existing defaults. Before
+reusing native database state, explicitly retain its original
+`FLOCI_DOCKER_RESOURCE_NAMESPACE`, `FLOCI_STORAGE_PERSISTENT_PATH`,
+`FLOCI_STORAGE_HOST_PERSISTENT_PATH` and `FLOCI_PORT` values. An old empty namespace
+can be pinned in the working directory's `config/application.yml`:
+
+```yaml
+floci:
+  docker:
+    resource-namespace: ""
+```
+
+Keep both storage paths if they previously differed.
+Changing these identities can change resource paths and ownership; recreate or
+migrate deliberately instead of weakening recovery checks.
+
 ## Managed controller and certificate renewal
 
 `tools/microsandbox-pods/manage.py run` now supervises its controller child and

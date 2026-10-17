@@ -415,3 +415,36 @@ were removed. This qualifies one protected native application and its recovery,
 not hundreds of different applications or native Linux/KVM. The
 [fixture instructions](../microsandbox-pods/README.md#protected-environment-qualification)
 describe reproduction and required preloaded images.
+
+## Main rebase validation: 17 October 2026
+
+All 134 feature commits were replayed onto `origin/main` at `fa2a49e77`. The
+pre-rebase history remains at
+`backup/microsandbox-before-main-rebase-20261017-1710`. Conflict resolution kept
+main's shared TLS CA and ECS service locking, together with this branch's custom
+database certificate names, execution boundary and explicit task teardown.
+
+The focused Java run exercised 1,661 cases. One upstream PostgreSQL fake-backend
+test initially failed while waiting for authentication; its isolated rerun and
+the subsequent complete 88-case PostgreSQL protocol suite passed without code
+changes. The follow-up run passed all 181 cases with no failures, errors or skips.
+It covered the real Docker environment firewall, origin routing, SQS enqueue,
+RabbitMQ and IoT MQTT wake, upstream IoT shadow routing, RDS log APIs and ECS
+protection, deletion and teardown. The focused run also covered Docker lifecycle,
+native network policy, RDS recovery, both database protocols and trusted TLS
+handshakes across certificate reloads.
+
+The same ten shared database cases passed on Docker and microsandbox with no
+failures, errors or skips: three MySQL, three PostgreSQL lifecycle and four
+PostgreSQL startup-parameter/IAM cases. These exercised ordinary stop/start,
+credential rotation, snapshot restore and Aurora RAM pause/resume using real
+database processes. The tests ran in an isolated worktree with separate runtime
+state and ports. Cleanup left no owned guests, snapshots, volumes or containers,
+and the dedicated native helper stopped successfully.
+
+Checkstyle, generated documentation and partition-literal checks passed. The Go
+host, SDK adapter and Pod controller sources are unchanged by this rebase. Their
+earlier native qualification is recorded above; the complete native Pod fixture
+and full repository test suite were not rerun. Native VM checks remain Apple
+Silicon qualification, not Linux/KVM qualification. Rebase-related migration
+details and the native database log limitation are in [MIGRATION.md](MIGRATION.md).
