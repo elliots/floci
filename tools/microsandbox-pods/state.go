@@ -49,7 +49,7 @@ func (record journalRecord) guestAllocation() (podAllocation, error) {
 	if record.Version == 1 && record.Allocation == (podAllocation{}) {
 		return validateStoredAllocation(podAllocation{})
 	}
-	if (record.Version < 2 || record.Version > 5) || record.Allocation.Version == 0 {
+	if (record.Version < 2 || record.Version > 6) || record.Allocation.Version == 0 {
 		return podAllocation{}, errors.New("pod journal has an invalid version or missing guest allocation")
 	}
 	if record.Version == 3 && (record.Pod == nil || len(record.Pod.Spec.InitContainers) == 0) {
@@ -178,6 +178,10 @@ func (p *provider) recover(ctx context.Context) error {
 		}
 		e.created = exists
 		p.pods[e.pod.Namespace+"/"+e.pod.Name] = e
+		// Fence older controllers before changing the owned peer transport.
+		if err := p.journal(e); err != nil {
+			return err
+		}
 		if orphan {
 			if e.proxyAvailability {
 				if _, err := p.ensureRelay(ctx); err != nil {
@@ -189,6 +193,11 @@ func (p *provider) recover(ctx context.Context) error {
 				return err
 			}
 			continue
+		}
+		if e.guestIP != "" {
+			if err := p.network.reconcilePeerVXLAN(ctx, e); err != nil {
+				return err
+			}
 		}
 		verified := false
 		if (e.state == "SLEEPING" || e.state == "CHECKPOINTED") && len(e.snapshots) > 0 {

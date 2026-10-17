@@ -208,7 +208,7 @@ func TestJournalAllocationPreservesLegacySizeAndRejectsMissingNewAllocation(t *t
 	if err != nil || allocation != wanted {
 		t.Fatalf("stored allocation changed: %+v, %v", allocation, err)
 	}
-	for _, record := range []journalRecord{{Version: 2}, {Version: 3, Allocation: wanted}, {Version: 1, Allocation: wanted}} {
+	for _, record := range []journalRecord{{Version: 2}, {Version: 3, Allocation: wanted}, {Version: 1, Allocation: wanted}, {Version: 7, Allocation: wanted}} {
 		if _, err := record.guestAllocation(); err == nil {
 			t.Fatalf("invalid journal silently accepted: %+v", record)
 		}

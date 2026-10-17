@@ -186,7 +186,7 @@ func TestSidecarJournalPreservesAdmissionAndRejectsPrematureLaterStages(t *testi
 		t.Fatal(err)
 	}
 	var record journalRecord
-	if err := json.Unmarshal(data, &record); err != nil || record.Version != 5 {
+	if err := json.Unmarshal(data, &record); err != nil || record.Version != 6 {
 		t.Fatalf("sidecar journal version: %v", err)
 	}
 	if err := validateInitJournal(record); err != nil {

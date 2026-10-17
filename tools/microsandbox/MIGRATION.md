@@ -607,6 +607,21 @@ first connection, and prevents hibernation while connected. It requires
 SDK stdin. gRPC readiness/startup/liveness probes accept numeric ports and the
 optional service field. No manifest changes are required for existing probes.
 
+## Native Pod VXLAN address reuse
+
+Native Pod peer VXLAN links now use `20000 + slot` as their fixed source port,
+derived from each Pod's persisted unique network slot. Peer DNAT and conntrack entries include that source port,
+so two Pods keep distinct routes when the runtime reuses a sleeping VM's guest IP.
+The guest and peer receive port remains 8472. Controller recovery validates each
+owned peer link against its Pod journal before replacing a legacy link with the
+same VNI, addresses, bridge and MTU. It removes only that Pod's exact legacy DNAT
+rule and UDP conntrack tuple. The owned Linux peer must provide `conntrack` (the
+pinned k3s image includes it). A changed or unowned peer link blocks migration.
+New and recovered Pod journals use format 6 before changing peer network state.
+Older controllers reject that version, so do not downgrade a controller while
+these journals and their native resources remain. Guest application data and RAM
+checkpoints do not change during the peer-link migration.
+
 ## Attached command cancellation
 
 Canceling a native attached command now kills that command and waits briefly for its

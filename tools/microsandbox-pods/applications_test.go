@@ -186,7 +186,7 @@ func TestApplicationRecoveryPreservesIndependentBackoffAndCompletedStates(t *tes
 		t.Fatal(err)
 	}
 	recovered := &podEntry{pod: record.Pod.DeepCopy(), state: "RUNNING"}
-	if err := restoreApplicationRecords(recovered, record); err != nil || record.Version != 4 || recovered.progress(0).nextRestart.IsZero() || !recovered.progress(1).nextRestart.IsZero() {
+	if err := restoreApplicationRecords(recovered, record); err != nil || record.Version != 6 || recovered.progress(0).nextRestart.IsZero() || !recovered.progress(1).nextRestart.IsZero() {
 		t.Fatalf("independent progress did not round-trip: %v", err)
 	}
 	p.unavailable(recovered, "ControllerRecovering")

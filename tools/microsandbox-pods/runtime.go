@@ -272,10 +272,7 @@ func (n *network) attach(ctx context.Context, e *podEntry) error {
 		podGateway = n.backendPrefix.Masked().Addr().Next()
 	}
 	vni := 10000 + e.slot
-	script := fmt.Sprintf("ip link add %s type vxlan id %d local %s remote %s dev eth0 dstport 8472 nolearning; "+
-		"ip link set %s master %s; ip link set %s mtu 1450 up; "+
-		"iptables -t nat -A OUTPUT -p udp -d %s --dport 8472 -j DNAT --to-destination %s:%d",
-		e.link, vni, n.peerIP, guestIP, e.link, bridgeName, e.link, guestIP, n.hostIP, e.port)
+	script := n.peerVXLANLink(e) + "; " + n.peerVXLANRules(e) + "; ip link set " + e.link + " up"
 	if _, err := n.runner.peer(ctx, script); err != nil {
 		return err
 	}
@@ -296,9 +293,11 @@ func (n *network) detach(ctx context.Context, e *podEntry) error {
 	if e.guestIP == "" {
 		return nil
 	}
-	rule := fmt.Sprintf("OUTPUT -p udp -d %s --dport 8472 -j DNAT --to-destination %s:%d", e.guestIP, n.hostIP, e.port)
-	_, err := n.runner.peer(ctx, fmt.Sprintf("if ip link show %s >/dev/null 2>&1; then ip link del %s; fi; if iptables -t nat -C %s 2>/dev/null; then iptables -t nat -D %s; fi",
-		e.link, e.link, rule, rule))
+	script := fmt.Sprintf("if ip link show %s >/dev/null 2>&1; then ip link del %s; fi; ", e.link, e.link)
+	for _, rule := range []string{n.peerVXLANRule(e), n.legacyPeerVXLANRule(e)} {
+		script += "while iptables -t nat -C " + rule + " 2>/dev/null; do iptables -t nat -D " + rule + "; done; "
+	}
+	_, err := n.runner.peer(ctx, script+n.clearPeerVXLANConntrack(e))
 	return err
 }
 

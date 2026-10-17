@@ -101,7 +101,7 @@ func TestInitContainersCompleteSequentiallyAndAppRestartsDoNotReplayThem(t *test
 	}
 	var record journalRecord
 	data, err = os.ReadFile(filepath.Join(p.runner.cfg.state, string(e.pod.UID)+".json"))
-	if err != nil || json.Unmarshal(data, &record) != nil || record.Version != 3 || validateInitJournal(record) != nil {
+	if err != nil || json.Unmarshal(data, &record) != nil || record.Version != 6 || validateInitJournal(record) != nil {
 		t.Fatal("completed init state was not durably recoverable")
 	}
 	logs, err := p.GetContainerLogs(t.Context(), "default", "app", "prepare", api.ContainerLogOpts{Tail: 1})
