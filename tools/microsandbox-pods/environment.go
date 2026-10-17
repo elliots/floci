@@ -470,6 +470,15 @@ func (e *environmentBoundary) changePorts(ctx context.Context, ports []environme
 	}
 	e.mu.Lock()
 	defer e.mu.Unlock()
+	if e.dirty {
+		identity, _, err := inspectEnvironment(ctx, e.runner, e.policy)
+		if err != nil {
+			return err
+		}
+		if !reflect.DeepEqual(identity, e.identity) {
+			return errors.New("protected environment identity changed before transport retry")
+		}
+	}
 	var changed []environmentPort
 	for _, port := range ports {
 		if !validEnvironmentPort(port) {
