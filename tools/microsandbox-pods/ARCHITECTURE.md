@@ -192,8 +192,8 @@ pull policies. This extended run used two lazy replicas; it did not repeat the
 | --- | --- | --- |
 | Lifecycle | Real UIDs, COLD, RAM sleep/resume, restart adoption, delete, verified terminal-command recovery | Ambiguous-command reconciliation, in-place updates |
 | OCI | Image ENTRYPOINT/CMD/USER defaults, command/args overrides and expansion, working directory, env and ConfigMap/Secret env references, image pull policies and registry credentials | Broader OCI image compatibility |
-| Status | Real task state; exec/HTTP/HTTPS/TCP/gRPC readiness, startup and liveness; Always/OnFailure/Never | Probe host overrides, independent probe workers, hooks |
-| Logs/exec | Actual logs, tail/byte limit, standard exec with TTY/resize, localhost port-forward | Follow, previous, timestamps, rotation, attach |
+| Status | Real task state; exec/HTTP/HTTPS/TCP/gRPC readiness, startup and liveness; Always/OnFailure/Never; postStart/preStop hooks | Probe host overrides, independent probe workers, custom stop signals |
+| Logs/exec | Bounded current/previous logs, follow, timestamps/time filters, retained sleeping logs, standard exec with TTY/resize, localhost port-forward | Attach, timestamps for legacy raw captures |
 | Network | Strict PodIP/Service/DNS with source IP; opt-in HTTP wake proxy and explicit TCP compatibility mode | NetworkPolicy, IPv6, arbitrary CNIs |
 | Containers | Multiple regular OCI containers, sequential init containers and restartable init sidecars | Ephemeral containers |
 | Volumes | Disk/memory emptyDir, ConfigMap/Secret/token projections, subPath/subPathExpr, atomic directory refresh, local RWO PVCs | CSI, expansion, broader access modes, host paths, disk quotas |
@@ -328,3 +328,8 @@ References: [Virtual Kubelet](https://github.com/virtual-kubelet/virtual-kubelet
 [provider contract](https://virtual-kubelet.io/docs/providers/),
 [microsandbox snapshots](https://github.com/superradcompany/microsandbox/blob/v0.7.8/docs/sandboxes/snapshots.mdx),
 [microsandbox networking](https://github.com/superradcompany/microsandbox/blob/v0.7.8/docs/networking/overview.mdx).
+
+Lifecycle hooks and logging share the existing per-Pod lifecycle serialization.
+[OPERATIONS.md](OPERATIONS.md) describes hook recovery fences, graceful deletion
+of sleeping containers, the bounded output-capture helper and shared Kubernetes
+Events. No injected sidecar or per-Pod host agent is required.

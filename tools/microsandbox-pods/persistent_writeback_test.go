@@ -168,6 +168,9 @@ func TestPersistentSealFailureRetainsGuestCheckpointsAndLease(t *testing.T) {
 					data, _ := json.Marshal(map[string]any{"status": "Running", "config": map[string]any{"labels": map[string]string{ownerLabel: p.runner.cfg.peerOwner, "kubernetes.io/pod-uid": string(e.pod.UID)}}})
 					return native.Result{Stdout: string(data)}, nil
 				case "exec":
+					if strings.Contains(args[len(args)-1], "application.records") {
+						return native.Result{Stdout: "EMPTY\n"}, nil
+					}
 					if strings.Contains(args[len(args)-1], "writeback") {
 						return native.Result{}, errors.New("storage writeback failed")
 					}

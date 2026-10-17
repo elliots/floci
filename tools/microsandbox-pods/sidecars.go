@@ -43,7 +43,7 @@ func (p *provider) monitorSidecars(ctx context.Context, e *podEntry) error {
 }
 
 func validateSidecarInitJournal(record journalRecord) error {
-	if record.Version != 5 && record.Version != 6 && record.Version != 7 || len(record.Pod.Spec.InitContainers) != len(record.Pod.Status.InitContainerStatuses) {
+	if record.Version != 5 && record.Version != 6 && record.Version != 7 && record.Version != 8 || len(record.Pod.Spec.InitContainers) != len(record.Pod.Status.InitContainerStatuses) {
 		return errors.New("restartable init sidecars require a supported journal with complete statuses")
 	}
 	completed := true
@@ -97,7 +97,9 @@ func (p *provider) beginSidecarShutdown(e *podEntry, phase corev1.PodPhase) erro
 		grace = max(0, *e.pod.Spec.TerminationGracePeriodSeconds)
 	}
 	e.state, e.completionPhase, e.actualReady = "DRAINING", phase, false
-	e.shutdownDeadline = time.Now().Add(time.Duration(grace) * time.Second)
+	if e.shutdownDeadline.IsZero() {
+		e.shutdownDeadline = time.Now().Add(time.Duration(grace) * time.Second)
+	}
 	for _, progress := range e.applications {
 		if !progress.killSent && progress.nextKill.After(e.shutdownDeadline) {
 			progress.nextKill = e.shutdownDeadline

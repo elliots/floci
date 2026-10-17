@@ -6,6 +6,8 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"net/netip"
+	"net/url"
+	"strconv"
 	"strings"
 	"sync/atomic"
 	"testing"
@@ -182,5 +184,28 @@ func TestHTTPProbeDoesNotUseEnvironmentProxy(t *testing.T) {
 	result, err := Check(t.Context(), serverRequest(server))
 	if err != nil || !result.Success {
 		t.Fatalf("probe inherited environment proxy: %+v %v", result, err)
+	}
+}
+
+func TestLifecycleHTTPResponseCompletesHookWithoutPassingReadiness(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Header.Get("User-Agent") != "kube-lifecycle/1.35" && r.Header.Get("User-Agent") != "kube-probe/1.35" {
+			t.Error("unexpected agent")
+		}
+		w.WriteHeader(http.StatusInternalServerError)
+	}))
+	defer server.Close()
+	parsed, _ := url.Parse(server.URL)
+	host, portText, _ := net.SplitHostPort(parsed.Host)
+	port, _ := strconv.Atoi(portText)
+	spec := Request{Address: host, Port: port, Scheme: "HTTP", TimeoutSeconds: 1, Lifecycle: true}
+	result, err := Check(t.Context(), spec)
+	if err != nil || !result.Success {
+		t.Fatal("HTTP hook response was treated as readiness failure", err)
+	}
+	spec.Lifecycle = false
+	result, err = Check(t.Context(), spec)
+	if err != nil || result.Success {
+		t.Fatal("lifecycle semantics leaked into readiness", err)
 	}
 }

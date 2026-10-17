@@ -19,6 +19,7 @@ import (
 )
 
 type Request struct {
+	Lifecycle      bool        `json:"lifecycle,omitzero"`
 	Address        string      `json:"address"`
 	Port           int         `json:"port"`
 	Scheme         string      `json:"scheme"`
@@ -81,7 +82,11 @@ func Check(ctx context.Context, spec Request) (Result, error) {
 		request.Header = make(http.Header)
 	}
 	if _, exists := request.Header["User-Agent"]; !exists {
-		request.Header.Set("User-Agent", "kube-probe/1.35")
+		agent := "kube-probe/1.35"
+		if spec.Lifecycle {
+			agent = "kube-lifecycle/1.35"
+		}
+		request.Header.Set("User-Agent", agent)
 	}
 	if _, exists := request.Header["Accept"]; !exists {
 		request.Header.Set("Accept", "*/*")
@@ -103,9 +108,18 @@ func Check(ctx context.Context, spec Request) (Result, error) {
 		return nil
 	}}
 	response, err := client.Do(request)
+	if spec.Lifecycle && err != nil && strings.Contains(err.Error(), "server gave HTTP response to HTTPS client") {
+		retry := request.Clone(ctx)
+		retry.URL.Scheme = "http"
+		retry.Header.Del("Authorization")
+		response, err = client.Do(retry)
+		if err == nil {
+			warning = "LifecycleHTTPSFallback"
+		}
+	}
 	if err != nil {
 		return Result{}, nil
 	}
 	response.Body.Close()
-	return Result{Success: response.StatusCode >= 200 && response.StatusCode < 400, Warning: warning}, nil
+	return Result{Success: spec.Lifecycle || response.StatusCode >= 200 && response.StatusCode < 400, Warning: warning}, nil
 }

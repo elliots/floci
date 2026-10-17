@@ -177,6 +177,9 @@ func (p *provider) restart(ctx context.Context, e *podEntry, code int32) error {
 		return ctx.Err()
 	case <-time.After(delay):
 	}
+	if err := p.archiveContainerLogs(ctx, e, logContainer{}); err != nil {
+		return err
+	}
 	if _, err := p.runner.guest(ctx, e.vm, "mv /tmp/application.log /tmp/application.previous.log; rm /tmp/application.exit"); err != nil {
 		return err
 	}

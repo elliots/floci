@@ -146,7 +146,7 @@ func run() error {
 		return provider, provider, nil
 	}, nodeutil.WithNodeConfig(nodeutil.NodeConfig{
 		Client: client, NodeSpec: spec, InformerResyncPeriod: time.Minute,
-		HTTPListenAddr: cfg.listen, Handler: nodeutil.WithAuth(auth, mux), NumWorkers: cfg.podWorkers,
+		HTTPListenAddr: cfg.listen, Handler: nodeutil.WithAuth(auth, containerLogOptionsHandler(mux)), NumWorkers: cfg.podWorkers,
 		TLSConfig: &tls.Config{MinVersion: tls.VersionTLS12, Certificates: []tls.Certificate{cert},
 			ClientAuth: tls.RequireAndVerifyClientCert, ClientCAs: pool},
 	}), nodeutil.AttachProviderRoutes(mux))

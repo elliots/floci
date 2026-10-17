@@ -89,6 +89,9 @@ func probePort(port intstr.IntOrString, container corev1.Container) (int, error)
 }
 
 func networkProbes(container corev1.Container) bool {
+	if lifecycle := container.Lifecycle; lifecycle != nil && (lifecycle.PostStart != nil && lifecycle.PostStart.HTTPGet != nil || lifecycle.PreStop != nil && lifecycle.PreStop.HTTPGet != nil) {
+		return true
+	}
 	for _, probe := range []*corev1.Probe{container.ReadinessProbe, container.StartupProbe, container.LivenessProbe} {
 		if probe != nil && (probe.HTTPGet != nil || probe.TCPSocket != nil || probe.GRPC != nil) {
 			return true
@@ -102,6 +105,9 @@ func (p *provider) executeProbe(ctx context.Context, e *podEntry, probe *corev1.
 }
 
 func (p *provider) executeContainerProbe(ctx context.Context, e *podEntry, container corev1.Container, task string, probe *corev1.Probe) (bool, error) {
+	return p.executeContainerCheck(ctx, e, container, task, probe, false)
+}
+func (p *provider) executeContainerCheck(ctx context.Context, e *podEntry, container corev1.Container, task string, probe *corev1.Probe, lifecycle bool) (bool, error) {
 	timeout := max(probe.TimeoutSeconds, 1)
 	check, cancel := context.WithTimeout(ctx, time.Duration(timeout)*time.Second)
 	defer cancel()
@@ -113,7 +119,7 @@ func (p *provider) executeContainerProbe(ctx context.Context, e *podEntry, conta
 	if e.proxyAvailability {
 		address = e.backendIP
 	}
-	spec := healthprobe.Request{Address: address, TimeoutSeconds: timeout}
+	spec := healthprobe.Request{Address: address, TimeoutSeconds: timeout, Lifecycle: lifecycle}
 	var err error
 	if action := probe.HTTPGet; action != nil {
 		spec.Scheme, spec.Path = string(cmp.Or(action.Scheme, corev1.URISchemeHTTP)), action.Path
@@ -225,6 +231,12 @@ func (p *provider) containerHealthChecks(ctx context.Context, e *podEntry, conta
 		}
 		return container.LivenessProbe, progress.probeFailure, nil
 	}
+	if err := p.postStart(ctx, e, container, task, progress); err != nil {
+		if ctx.Err() != nil {
+			return nil, "", ctx.Err()
+		}
+		return nil, "FailedPostStartHook", nil
+	}
 	if !progress.startupComplete {
 		if probe := container.StartupProbe; probe != nil {
 			p.evaluateContainerProbe(ctx, e, container, task, progress.started, probe, &progress.startup)
@@ -268,10 +280,26 @@ func (p *provider) stopUnhealthy(ctx context.Context, e *podEntry, probe *corev1
 		_, err := p.runner.guest(check, e.vm, "test -f /tmp/application.exit || "+ctr+" tasks kill --signal "+name+" application || test -f /tmp/application.exit")
 		return err
 	}
+	if e.nextKill.IsZero() {
+		e.nextKill = time.Now().Add(time.Duration(grace) * time.Second)
+		if err := p.journal(e); err != nil {
+			return err
+		}
+	}
+	deadline := e.nextKill
+	if err := p.preStop(ctx, e, managedContainer{}, deadline); err != nil {
+		slog.Warn("preStop hook did not complete", "pod", e.pod.Name, "error", err)
+		if !time.Now().Before(deadline) {
+			deadline = deadline.Add(2 * time.Second)
+			e.nextKill = deadline
+			if err := p.journal(e); err != nil {
+				return err
+			}
+		}
+	}
 	if err := signal("SIGTERM"); err != nil {
 		return err
 	}
-	deadline := time.Now().Add(time.Duration(grace) * time.Second)
 	for {
 		check, cancel := context.WithTimeout(ctx, 5*time.Second)
 		output, err := p.runner.guest(check, e.vm, "if test -f /tmp/application.exit; then echo EXIT; fi")

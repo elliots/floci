@@ -5,6 +5,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"log/slog"
 	"strconv"
 	"strings"
 	"time"
@@ -15,6 +16,7 @@ import (
 )
 
 type applicationProgress struct {
+	hooks                        lifecycleProgress
 	started                      time.Time
 	readiness, startup, liveness probeProgress
 	startupComplete              bool
@@ -29,14 +31,15 @@ type applicationProgress struct {
 }
 
 type applicationRecord struct {
-	Started           time.Time `json:"started"`
-	StartupComplete   bool      `json:"startupComplete,omitzero"`
-	Admitted          bool      `json:"admitted,omitzero"`
-	ProbeFailure      string    `json:"probeFailure,omitempty"`
-	TerminationReason string    `json:"terminationReason,omitempty"`
-	NextRestart       time.Time `json:"nextRestart,omitzero"`
-	NextKill          time.Time `json:"nextKill,omitzero"`
-	KillSent          bool      `json:"killSent,omitzero"`
+	Hooks             lifecycleProgress `json:"hooks,omitzero"`
+	Started           time.Time         `json:"started"`
+	StartupComplete   bool              `json:"startupComplete,omitzero"`
+	Admitted          bool              `json:"admitted,omitzero"`
+	ProbeFailure      string            `json:"probeFailure,omitempty"`
+	TerminationReason string            `json:"terminationReason,omitempty"`
+	NextRestart       time.Time         `json:"nextRestart,omitzero"`
+	NextKill          time.Time         `json:"nextKill,omitzero"`
+	KillSent          bool              `json:"killSent,omitzero"`
 }
 
 func concurrentApplications(pod *corev1.Pod) bool {
@@ -91,7 +94,7 @@ func (e *podEntry) applicationRecords() map[string]applicationRecord {
 	records := make(map[string]applicationRecord, len(e.pod.Spec.Containers))
 	for managed := range managedContainers(e.pod) {
 		container, progress := managed.container(e), managed.progress(e)
-		records[container.Name] = applicationRecord{Started: progress.started, StartupComplete: progress.startupComplete,
+		records[container.Name] = applicationRecord{Hooks: progress.hooks, Started: progress.started, StartupComplete: progress.startupComplete,
 			Admitted:     progress.admitted,
 			ProbeFailure: progress.probeFailure, TerminationReason: progress.terminationReason, NextRestart: progress.nextRestart,
 			NextKill: progress.nextKill, KillSent: progress.killSent}
@@ -101,7 +104,7 @@ func (e *podEntry) applicationRecords() map[string]applicationRecord {
 
 func restoreApplicationRecords(e *podEntry, record journalRecord) error {
 	if !concurrentApplications(e.pod) {
-		if record.Version >= 4 && record.Version != 6 && record.Version != 7 || len(record.Applications) != 0 {
+		if record.Version >= 4 && record.Version != 6 && record.Version != 7 && record.Version != 8 || len(record.Applications) != 0 {
 			return errors.New("concurrent application journal does not match Pod containers")
 		}
 		return nil
@@ -110,7 +113,7 @@ func restoreApplicationRecords(e *podEntry, record journalRecord) error {
 	for range managedContainers(e.pod) {
 		count++
 	}
-	if record.Version != 6 && record.Version != 7 && record.Version != legacyPodJournalVersion(e.pod) || len(record.Applications) != count || len(e.pod.Status.ContainerStatuses) != len(e.pod.Spec.Containers) {
+	if record.Version != 6 && record.Version != 7 && record.Version != 8 && record.Version != legacyPodJournalVersion(e.pod) || len(record.Applications) != count || len(e.pod.Status.ContainerStatuses) != len(e.pod.Spec.Containers) {
 		return errors.New("concurrent containers require a matching journal version with complete statuses")
 	}
 	for managed := range managedContainers(e.pod) {
@@ -143,7 +146,7 @@ func restoreApplicationRecords(e *podEntry, record journalRecord) error {
 			return errors.New("sidecar admission has no matching start")
 		}
 		progress := managed.progress(e)
-		*progress = applicationProgress{started: stored.Started, startupComplete: stored.StartupComplete,
+		*progress = applicationProgress{hooks: stored.Hooks, started: stored.Started, startupComplete: stored.StartupComplete,
 			admitted:     stored.Admitted,
 			probeFailure: stored.ProbeFailure, terminationReason: stored.TerminationReason, nextRestart: stored.NextRestart,
 			nextKill: stored.NextKill, killSent: stored.KillSent}
@@ -166,6 +169,9 @@ func (p *provider) startNamedApplication(ctx context.Context, e *podEntry, index
 }
 
 func (p *provider) startManagedContainer(ctx context.Context, e *podEntry, managed managedContainer) error {
+	if err := p.archiveContainerLogs(ctx, e, logContainer{index: managed.index, init: managed.init}); err != nil {
+		return err
+	}
 	container := managed.container(e)
 	root := managed.root(e)
 	if _, err := p.runner.guest(ctx, e.vm, "umask 077; mkdir -p "+quote(root)); err != nil {
@@ -282,6 +288,9 @@ func (p *provider) monitorManagedContainer(ctx context.Context, e *podEntry, man
 			return errors.New("container exit status is invalid")
 		}
 		if err := p.releaseContainerSubpaths(ctx, e, managed.container(e)); err != nil {
+			return err
+		}
+		if err := p.retainContainerLogs(ctx, e, logContainer{index: managed.index, init: managed.init}); err != nil {
 			return err
 		}
 		if managed.init {
@@ -461,6 +470,26 @@ func (p *provider) stopManagedUnhealthy(ctx context.Context, e *podEntry, manage
 	if probe != nil && probe.TerminationGracePeriodSeconds != nil {
 		grace = *probe.TerminationGracePeriodSeconds
 	}
+	progress.nextKill = time.Now().Add(time.Duration(grace) * time.Second)
+	if e.state == "DRAINING" {
+		progress.nextKill = minTime(progress.nextKill, e.shutdownDeadline)
+	}
+	if err := p.journal(e); err != nil {
+		return err
+	}
+	if err := p.preStop(ctx, e, managed, progress.nextKill); err != nil {
+		slog.Warn("preStop hook did not complete", "pod", e.pod.Name, "container", managed.container(e).Name, "error", err)
+		if errors.Is(err, context.DeadlineExceeded) && ctx.Err() == nil && !time.Now().Before(progress.nextKill) {
+			progress.nextKill = progress.nextKill.Add(2 * time.Second)
+			if e.state == "DRAINING" && progress.nextKill.After(e.shutdownDeadline) {
+				e.shutdownDeadline = progress.nextKill
+			}
+			if err := p.journal(e); err != nil {
+				return err
+			}
+		}
+	}
+	p.event(e, corev1.EventTypeNormal, "Killing", "Stopping container %s: %s", managed.container(e).Name, reason)
 	root, task := managed.root(e), managed.task(e)
 	script := "test -f " + quote(root+"/application.exit") + " || " + ctr + " tasks kill --signal SIGTERM " + quote(task) + " || test -f " + quote(root+"/application.exit")
 	if _, err := p.runner.guest(ctx, e.vm, script); err != nil {
@@ -468,6 +497,5 @@ func (p *provider) stopManagedUnhealthy(ctx context.Context, e *podEntry, manage
 	}
 	// Escalation is tracked per container; other containers keep being observed
 	// while this container consumes its graceful termination period.
-	progress.nextKill = time.Now().Add(time.Duration(grace) * time.Second)
 	return p.journal(e)
 }

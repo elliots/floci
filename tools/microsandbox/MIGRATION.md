@@ -987,6 +987,7 @@ The Pod helper always retains the base image needed by cold Pods. Operators usin
 the host helper should retain other preloaded images needed by never-started
 workloads. See [storage maintenance](../microsandbox-runtime/STORAGE.md) for exact
 accounting and cleanup limits. AWS endpoint shapes and Docker execution are unchanged.
+
 ## Managed background retention
 
 New managed credential generations carry a private ownership marker. Successful
@@ -995,3 +996,32 @@ older complete generations with the same cluster owner. Existing unmarked
 generations remain untouched. Controller logs rotate after 10 MiB with two
 backups; manager logs rotate on startup. Copy-and-truncate log rotation can lose
 diagnostic lines at its boundary and never alters workload recovery records.
+
+## Lifecycle hooks and retained logs
+
+Rebuild the native Pod controller, Linux network relay and Linux guestfs helper
+together. New container attempts use bounded output capture with authentic
+receipt timestamps; existing checkpoints retain readable raw output and require
+a container restart before timestamp/time-filtered logs become available. Logs
+can be read or followed while a Pod sleeps without waking it.
+
+Strict sleeping singleton containers now retain logical `Running` status with
+Ready=false, matching the existing multi-container behavior. Their VM remains
+stopped and consumes no active VM RAM. Proxy-ready mode remains available.
+Graceful deletion of a previously running sleeping Pod with `preStop` can restore
+it within the remaining deletion grace and shared admission budget to run its
+hook. Cold Pods and forced zero-grace deletion do not start execution.
+
+Completed `postStart`/`preStop` hooks are persisted per container attempt and are
+not replayed by RAM restore. An incomplete hook after a controller crash fails
+instead of replaying unknown side effects. Hook-bearing Pods now use journal
+version 8. Earlier controllers reject that
+version before orphan cleanup or native reconciliation; keep the current
+controller until these Pods and their checkpoints are removed. A pre-v8 journal
+containing hooks is refused rather than guessing whether its side effects ran.
+
+Downward API volume resource limits without explicit CPU/memory limits expose the
+virtual node's advertised allocatable capacity, as Kubernetes does. This is not
+the guest's RAM allocation or the shared VM budget's current free capacity. See
+[Pod operations](../microsandbox-pods/OPERATIONS.md) for accepted handlers, log
+bounds, and remaining explicit compatibility limitations.

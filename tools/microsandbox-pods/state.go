@@ -23,6 +23,8 @@ type stateIdentity struct {
 	Node, ClusterUID, PeerOwner, Peer, PodCIDR, ProxyBackendCIDR string
 }
 type journalRecord struct {
+	NextKill          time.Time                    `json:"nextKill,omitzero"`
+	Hooks             lifecycleProgress            `json:"hooks,omitzero"`
 	Writeback         *persistentWriteback         `json:"persistentWriteback,omitempty"`
 	PersistentVolumes []podPersistentVolume        `json:"persistentVolumes,omitempty"`
 	Freeze            *applicationFreeze           `json:"freeze,omitempty"`
@@ -48,13 +50,16 @@ type journalRecord struct {
 }
 
 func (record journalRecord) guestAllocation() (podAllocation, error) {
-	if hasPersistentVolumes(record.Pod) != (record.Version == 7) {
+	if record.Pod != nil && hasLifecycle(record.Pod) && record.Version < 8 {
+		return podAllocation{}, errors.New("lifecycle hooks require journal version 8 before recovery or orphan cleanup")
+	}
+	if hasPersistentVolumes(record.Pod) && record.Version < 7 || !hasPersistentVolumes(record.Pod) && record.Version == 7 {
 		return podAllocation{}, errors.New("persistent-volume Pods require journal version 7; older cleanup must not discard unflushed disks")
 	}
 	if record.Version == 1 && record.Allocation == (podAllocation{}) {
 		return validateStoredAllocation(podAllocation{})
 	}
-	if (record.Version < 2 || record.Version > 7) || record.Allocation.Version == 0 {
+	if (record.Version < 2 || record.Version > 8) || record.Allocation.Version == 0 {
 		return podAllocation{}, errors.New("pod journal has an invalid version or missing guest allocation")
 	}
 	if record.Version == 3 && (record.Pod == nil || len(record.Pod.Spec.InitContainers) == 0) {
@@ -154,9 +159,11 @@ func (p *provider) recover(ctx context.Context) error {
 			orphan = true
 		}
 		e.completionPhase, e.shutdownDeadline = record.CompletionPhase, record.ShutdownDeadline
-		if e.state == "DRAINING" && (!hasRestartableInit(e.pod) && len(e.persistentVolumes) == 0 || e.shutdownDeadline.IsZero() || e.completionPhase != corev1.PodSucceeded && e.completionPhase != corev1.PodFailed) {
+		if e.state == "DRAINING" && (!hasRestartableInit(e.pod) && len(e.persistentVolumes) == 0 && !hasLifecycle(e.pod) || e.shutdownDeadline.IsZero() || e.completionPhase != corev1.PodSucceeded && e.completionPhase != corev1.PodFailed) {
 			return errors.New("sidecar shutdown journal has no valid completion phase or deadline")
 		}
+		e.hooks = record.Hooks
+		e.nextKill = record.NextKill
 		e.startupComplete, e.probeFailure = record.StartupComplete, record.ProbeFailure
 		e.terminationReason = record.TerminationReason
 		if !orphan {

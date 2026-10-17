@@ -1,12 +1,10 @@
 package main
 
 import (
-	"bytes"
 	"cmp"
 	"context"
 	"errors"
 	"fmt"
-	"io"
 	"log/slog"
 	"os"
 	"path/filepath"
@@ -22,9 +20,11 @@ import (
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/client-go/kubernetes"
+	"k8s.io/client-go/tools/record"
 )
 
 type provider struct {
+	events          record.EventRecorder
 	storage         persistentVolumeResolver
 	storageOwner    string
 	storageRun      func(context.Context)
@@ -49,6 +49,7 @@ type provider struct {
 }
 
 type podEntry struct {
+	lastEventState    string
 	writeback         *persistentWriteback
 	persistentVolumes []podPersistentVolume
 	freeze            *applicationFreeze
@@ -138,6 +139,7 @@ func newProvider(ctx context.Context, cfg config, client kubernetes.Interface) (
 		}
 	}()
 	p := &provider{registrations: make(chan struct{}, 8), idleJobs: make(chan struct{}, 2), stop: stop, stateLock: stateLock, client: client, ctx: lifetime, runner: runner, network: network, pods: make(map[string]*podEntry), starts: make(chan struct{}, 2)}
+	p.configureEvents()
 	p.proxy, err = newWakeProxy(lifetime, 1024, 4*time.Minute)
 	if err != nil {
 		return nil, err
@@ -185,8 +187,11 @@ func validatePodWithCA(pod *corev1.Pod, caPath string) error {
 			return errdefs.InvalidInput("unresolved envFrom source")
 		}
 		if container.RestartPolicy != nil || len(container.RestartPolicyRules) != 0 ||
-			len(container.VolumeDevices) != 0 || container.Lifecycle != nil || container.Stdin || container.TTY {
-			return errdefs.InvalidInput("container restart overrides, volume devices, hooks and TTY are not qualified")
+			len(container.VolumeDevices) != 0 || container.Stdin || container.TTY {
+			return errdefs.InvalidInput("container restart overrides, volume devices and TTY are not qualified")
+		}
+		if err := validateLifecycle(container); err != nil {
+			return errdefs.InvalidInput(err.Error())
 		}
 		if err := validateProbes(container); err != nil {
 			return errdefs.InvalidInput(err.Error())
@@ -446,6 +451,8 @@ func (p *provider) startApplication(ctx context.Context, e *podEntry) error {
 		return fmt.Errorf("submit application process to guest supervisor: %w", err)
 	}
 	e.started = time.Now()
+	e.hooks = lifecycleProgress{}
+	e.nextKill = time.Time{}
 	e.mu.Lock()
 	e.pod.Status.ContainerStatuses[0].User = nil
 	e.mu.Unlock()
@@ -510,6 +517,9 @@ func (p *provider) containerLaunch(ctx context.Context, e *podEntry, container c
 	}
 	args = append(args, image, task)
 	args = append(args, launch.Args...)
+	if p.runner.cfg.guestFSBinary != "" {
+		args = append([]string{guestFS, "log", "--root", stateRoot, "--"}, args...)
+	}
 	return args, oom, nil
 }
 
@@ -744,6 +754,11 @@ func (p *provider) stopTerminal(ctx context.Context, e *podEntry) error {
 		return err
 	}
 	if exists && status != "Stopped" {
+		if status == "Running" {
+			if err := p.captureContainerLogs(ctx, e); err != nil {
+				return err
+			}
+		}
 		if status != "Running" && len(e.persistentVolumes) > 0 {
 			return errors.New("persistent terminal guest is not running; writeback cannot be verified")
 		}
@@ -787,6 +802,7 @@ func (p *provider) fail(e *podEntry, err error) {
 	if releaseErr := p.releaseInactiveMemory(context.Background(), e); releaseErr != nil {
 		slog.Error("cannot reconcile failed pod memory", "pod", e.pod.Name, "error", releaseErr)
 	}
+	p.event(e, corev1.EventTypeWarning, "NativeRuntimeFailed", "Pod runtime failed: %s", err)
 	slog.Error("pod runtime failed", "pod", e.pod.Namespace+"/"+e.pod.Name, "error", err)
 	p.publish(e)
 }
@@ -795,6 +811,19 @@ func (p *provider) publish(e *podEntry) {
 	e.publication.Lock()
 	defer e.publication.Unlock()
 	p.projectProxyAvailability(e)
+	if e.lastEventState != e.state {
+		e.lastEventState = e.state
+		switch e.state {
+		case "COLD":
+			p.event(e, corev1.EventTypeNormal, "DeferredStart", "Workload is deployed; application startup waits for wake traffic")
+		case "SLEEPING":
+			p.event(e, corev1.EventTypeNormal, "Hibernated", "Workload memory was checkpointed and active VM memory released")
+		case "READY":
+			p.event(e, corev1.EventTypeNormal, "Ready", "Application checks passed")
+		case "RUNNING":
+			p.event(e, corev1.EventTypeNormal, "Started", "Application is running; readiness is being checked")
+		}
+	}
 	refreshView(e)
 	e.mu.Lock()
 	pod := e.pod.DeepCopy()
@@ -857,6 +886,21 @@ func (p *provider) DeletePod(ctx context.Context, pod *corev1.Pod) error {
 	if err := p.runner.checkPending(); err != nil {
 		return err
 	}
+	if needsTerminationWake(e, pod) {
+		deadline := deletionDeadline(pod)
+		wake, cancel := context.WithDeadline(ctx, deadline)
+		err := p.resumeFor(wake, e, true)
+		cancel()
+		if err != nil {
+			p.event(e, corev1.EventTypeWarning, "FailedPreStopHook", "Could not resume sleeping workload within termination grace")
+			// Failed admission leaves the verified stopped guest intact. An
+			// uncertain restore must be reconciled before destructive cleanup.
+			if e.state != "SLEEPING" {
+				return err
+			}
+		}
+		e.shutdownDeadline = deadline
+	}
 	e.deleted = true
 	p.network.closeIngress(e)
 	e.tokens.clear()
@@ -868,7 +912,7 @@ func (p *provider) DeletePod(ctx context.Context, pod *corev1.Pod) error {
 	if status, exists, err := p.inspectOwned(ctx, e); err != nil {
 		errs = append(errs, err)
 	} else if exists {
-		if status == "Running" && (hasRestartableInit(e.pod) || len(e.persistentVolumes) > 0) {
+		if status == "Running" && (hasRestartableInit(e.pod) || len(e.persistentVolumes) > 0 || hasLifecycle(e.pod)) {
 			if err := p.drainBeforeDeletion(ctx, e, pod); err != nil {
 				if len(e.persistentVolumes) > 0 {
 					return errors.Join(errors.Join(errs...), err)
@@ -977,52 +1021,6 @@ func (p *provider) GetPods(context.Context) ([]*corev1.Pod, error) {
 		e.mu.Unlock()
 	}
 	return pods, nil
-}
-func (p *provider) GetContainerLogs(ctx context.Context, namespace, name, container string, opts api.ContainerLogOpts) (io.ReadCloser, error) {
-	e, err := p.entry(namespace, name)
-	if err != nil {
-		return nil, err
-	}
-	e.op.Lock()
-	defer e.op.Unlock()
-	if opts.Follow || opts.Previous || opts.Timestamps || opts.SinceSeconds != 0 || !opts.SinceTime.IsZero() {
-		return nil, errdefs.InvalidInput("follow, previous, timestamp and time-filtered logs are not qualified")
-	}
-	for index, init := range e.pod.Spec.InitContainers {
-		if container == init.Name {
-			data, err := p.readInitLogs(ctx, e, index, opts)
-			if err != nil {
-				return nil, err
-			}
-			return io.NopCloser(bytes.NewReader(data)), nil
-		}
-	}
-	if e.state != "READY" && e.state != "RUNNING" {
-		return nil, errdefs.InvalidInput("pod is not executing")
-	}
-	index := -1
-	for i, declared := range e.pod.Spec.Containers {
-		if container == declared.Name {
-			index = i
-			break
-		}
-	}
-	if index < 0 {
-		return nil, errdefs.NotFound("container not found")
-	}
-	log := quote(applicationRoot(e.pod, index) + "/application.log")
-	script := "cat " + log
-	if opts.Tail > 0 {
-		script = fmt.Sprintf("tail -n %d %s", opts.Tail, log)
-	}
-	data, err := p.runner.nativeOutput(ctx, []string{"exec", "--no-stdin", e.vm, "--", "sh", "-ec", script}, nil)
-	if err != nil {
-		return nil, err
-	}
-	if opts.LimitBytes > 0 && len(data) > opts.LimitBytes {
-		data = data[:opts.LimitBytes]
-	}
-	return io.NopCloser(bytes.NewReader(data)), nil
 }
 func (p *provider) AttachToContainer(context.Context, string, string, string, api.AttachIO) error {
 	return errdefs.InvalidInput("attach is not qualified")

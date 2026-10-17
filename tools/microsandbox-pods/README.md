@@ -322,7 +322,7 @@ which builds a small Linux gRPC health application using the local Go toolchain.
 The fixture passed on Apple Silicon with serving/not-serving transitions,
 interactive resize and exit status 23, and localhost forwarding before and after
 RAM hibernation. Attach to the
-application's original stdio, previous/follow/timestamp logs and metrics remain
+application's original stdio and metrics remain
 explicit unsupported operations.
 
 ## Mounted configuration and temporary storage
@@ -513,3 +513,8 @@ controller, microsandbox, runtime-home and report arguments to test Java gateway
 and queue activation against two real cold replicas with only one guest's RAM
 budget. This fixture checks that the other replica stays cold and that the
 selected replica retains its identity and memory over two hibernation cycles.
+
+Application lifecycle hooks, projected resources, bounded retained logs and
+Kubernetes Events are described in [OPERATIONS.md](OPERATIONS.md). Rebuild the
+controller, network relay and guestfs together to enable timestamp capture for new
+container attempts; existing raw-log checkpoints remain readable.

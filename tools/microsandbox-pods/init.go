@@ -43,8 +43,11 @@ func validateInitContainers(pod *corev1.Pod) error {
 			return errors.New("unresolved envFrom source")
 		}
 		if container.RestartPolicy != nil && (!initNames[container.Name] || !restartableInit(container)) || len(container.RestartPolicyRules) != 0 ||
-			len(container.VolumeDevices) != 0 || container.Lifecycle != nil || container.Stdin || container.TTY {
-			return errors.New("container restart overrides other than Always init sidecars, volume devices, hooks and TTY are not qualified")
+			len(container.VolumeDevices) != 0 || container.Stdin || container.TTY {
+			return errors.New("container restart overrides other than Always init sidecars, volume devices and TTY are not qualified")
+		}
+		if err := validateLifecycle(container); err != nil {
+			return err
 		}
 		for _, env := range container.Env {
 			if env.ValueFrom != nil {
@@ -63,6 +66,9 @@ func validateInitContainers(pod *corev1.Pod) error {
 				return err
 			}
 			continue
+		}
+		if container.Lifecycle != nil {
+			return fmt.Errorf("ordinary init container %s cannot have lifecycle hooks", container.Name)
 		}
 		if container.ReadinessProbe != nil || container.StartupProbe != nil || container.LivenessProbe != nil {
 			return fmt.Errorf("ordinary init container %s cannot have probes", container.Name)
@@ -111,6 +117,9 @@ func podConditionsFor(pod *corev1.Pod, ready bool) []corev1.PodCondition {
 }
 
 func podJournalVersion(pod *corev1.Pod) int {
+	if hasLifecycle(pod) {
+		return 8
+	}
 	if hasPersistentVolumes(pod) {
 		return 7
 	}
@@ -137,7 +146,7 @@ func validateInitJournal(record journalRecord) error {
 	if hasRestartableInit(record.Pod) {
 		return validateSidecarInitJournal(record)
 	}
-	if record.Version != 3 && record.Version != 4 && record.Version != 6 && record.Version != 7 || len(record.Pod.Spec.InitContainers) != len(record.Pod.Status.InitContainerStatuses) {
+	if record.Version != 3 && record.Version != 4 && record.Version != 6 && record.Version != 7 && record.Version != 8 || len(record.Pod.Spec.InitContainers) != len(record.Pod.Status.InitContainerStatuses) {
 		return errors.New("init containers require a supported journal with complete statuses")
 	}
 	completed := true
@@ -238,6 +247,9 @@ func (p *provider) advanceInit(ctx context.Context, e *podEntry) error {
 		}
 	}
 	container := e.pod.Spec.InitContainers[index]
+	if err := p.archiveContainerLogs(ctx, e, logContainer{index: index, init: true}); err != nil {
+		return err
+	}
 	root := initRoot(index)
 	if _, err := p.runner.guest(ctx, e.vm, "mkdir -p "+quote(root)); err != nil {
 		return err

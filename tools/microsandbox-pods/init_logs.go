@@ -25,6 +25,9 @@ func (p *provider) initLogPath(e *podEntry, index int) string {
 // Keep a bounded completed log outside the guest so failed init diagnostics
 // remain available after releasing its RAM and across controller recovery.
 func (p *provider) captureInitLogs(ctx context.Context, e *podEntry, index int) error {
+	if err := p.retainContainerLogs(ctx, e, logContainer{index: index, init: true}); err != nil {
+		return err
+	}
 	data, err := p.initLogOutput(ctx, e, index)
 	if err != nil {
 		return fmt.Errorf("capture init container logs: %w", err)

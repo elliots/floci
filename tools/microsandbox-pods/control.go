@@ -215,7 +215,7 @@ func (p *provider) journal(e *podEntry) error {
 		file.Close()
 		return err
 	}
-	if err := json.NewEncoder(file).Encode(journalRecord{Writeback: e.writeback, PersistentVolumes: e.persistentVolumes, Freeze: e.freeze, Version: podJournalVersion(e.pod), CompletionPhase: e.completionPhase, ShutdownDeadline: e.shutdownDeadline, Applications: e.applicationRecords(), Allocation: allocation, StartupComplete: e.startupComplete, ProbeFailure: e.probeFailure, TerminationReason: e.terminationReason, DeclaredSpec: e.declaredSpec, ProxyPorts: e.proxyPorts, BackendIP: e.backendIP, SnapshotIDs: e.snapshotIDs, RestoredParent: e.restoredParent, View: view(e), Pod: pod, Slot: e.slot, GuestIP: e.guestIP, Started: e.started, Snapshots: e.snapshots}); err != nil {
+	if err := json.NewEncoder(file).Encode(journalRecord{NextKill: e.nextKill, Hooks: e.hooks, Writeback: e.writeback, PersistentVolumes: e.persistentVolumes, Freeze: e.freeze, Version: podJournalVersion(e.pod), CompletionPhase: e.completionPhase, ShutdownDeadline: e.shutdownDeadline, Applications: e.applicationRecords(), Allocation: allocation, StartupComplete: e.startupComplete, ProbeFailure: e.probeFailure, TerminationReason: e.terminationReason, DeclaredSpec: e.declaredSpec, ProxyPorts: e.proxyPorts, BackendIP: e.backendIP, SnapshotIDs: e.snapshotIDs, RestoredParent: e.restoredParent, View: view(e), Pod: pod, Slot: e.slot, GuestIP: e.guestIP, Started: e.started, Snapshots: e.snapshots}); err != nil {
 		file.Close()
 		return err
 	}
@@ -244,7 +244,7 @@ func (p *provider) unavailable(e *podEntry, reason string) {
 	for i := range e.pod.Status.ContainerStatuses {
 		status := &e.pod.Status.ContainerStatuses[i]
 		status.Ready = false
-		if !concurrentApplications(e.pod) {
+		if !concurrentApplications(e.pod) && e.state != "HIBERNATING" && e.state != "SLEEPING" && e.state != "CHECKPOINTED" && e.state != "RESUMING" {
 			status.Started = new(false)
 			status.State = corev1.ContainerState{Waiting: &corev1.ContainerStateWaiting{Reason: reason}}
 		}
@@ -323,6 +323,9 @@ func (p *provider) hibernate(ctx context.Context, e *podEntry) error {
 	if err := p.freezeApplications(ctx, e); err != nil {
 		return p.rollbackFreeze(e, err)
 	}
+	if err := p.captureContainerLogs(ctx, e); err != nil {
+		return p.rollbackFreeze(e, err)
+	}
 	if err := p.syncPersistentVolumes(ctx, e); err != nil {
 		return p.rollbackFreeze(e, err)
 	}
@@ -397,7 +400,10 @@ func (p *provider) requireVMStatus(ctx context.Context, e *podEntry, wanted stri
 }
 
 func (p *provider) resume(ctx context.Context, e *podEntry) error {
-	if e.lifetime != nil {
+	return p.resumeFor(ctx, e, false)
+}
+func (p *provider) resumeFor(ctx context.Context, e *podEntry, terminating bool) error {
+	if e.lifetime != nil && !terminating {
 		linked, cancel := context.WithCancel(ctx)
 		stop := context.AfterFunc(e.lifetime, cancel)
 		defer stop()
@@ -408,7 +414,7 @@ func (p *provider) resume(ctx context.Context, e *podEntry) error {
 		return err
 	}
 	if e.state == "COLD" {
-		if err := p.checkCurrentPod(ctx, e); err != nil {
+		if err := p.checkResumePod(ctx, e, terminating); err != nil {
 			return err
 		}
 		projections, err := p.readVolumeSources(ctx, e)
@@ -450,7 +456,7 @@ func (p *provider) resume(ctx context.Context, e *podEntry) error {
 	if e.state != "SLEEPING" || len(e.snapshots) == 0 {
 		return fmt.Errorf("cannot resume pod in state %s", e.state)
 	}
-	if err := p.checkCurrentPod(ctx, e); err != nil {
+	if err := p.checkResumePod(ctx, e, terminating); err != nil {
 		return err
 	}
 	if err := p.requireVMStatus(ctx, e, "Stopped"); err != nil {
