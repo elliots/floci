@@ -84,9 +84,15 @@ request after forwarding it to the application.
 ## Kubernetes workloads
 
 For opted-in Kubernetes Deployments, see
-[native Kubernetes pods](microsandbox-kubernetes.md). Their wake rules use the
-same HTTP and queue coordinator, while the pod controller preserves Pod UIDs and
-replicas across hibernation. Their shared pod proxy defaults to HTTP request
+[native Kubernetes pods](microsandbox-kubernetes.md). Kubernetes activation defaults to one
+replica, reusing an awake pod and routing gateway requests to that selected pod.
+Set `runtime.wake-replicas` for a fixed number of parallel consumers; desired
+Kubernetes replicas remain unchanged. Custom `backend-url` origins require
+explicit `runtime.backend-routing: service`, which may wake additional replicas
+through Service balancing.
+
+These rules use the same HTTP and queue coordinator, while the pod controller
+preserves Pod UIDs and replicas across hibernation. The shared pod proxy defaults to HTTP request
 accounting, so direct Service/PodIP requests from other pods also wake the selected
 application. Responses and upgraded streams hold it awake; idle frontend HTTP
 keepalive connections do not. Explicit `microsandbox.dev/proxy-protocol: tcp`

@@ -788,3 +788,29 @@ journals and uncertain operations, and never prunes images or checkpoints.
 The generated admin kubeconfig is for deployments; the controller uses a separate
 identity that can read application Secrets and mint service-account tokens but
 cannot create workloads, change Secrets, administer RBAC or modify other nodes.
+
+## Kubernetes Deployment activation granularity
+
+Floci now defaults to waking one Deployment replica for HTTP or queue activity,
+reusing a Ready or starting replica when possible. `runtime.wake-replicas` sets a
+larger fixed target for parallel consumers, capped by the actual desired replica
+count. Kubernetes replicas and Pod identities remain unchanged. Unselected cold
+pods stay cold, and normal idle hibernation still checks every owned pod.
+
+The default `runtime.backend-routing: pod` routes requests to the selected pod's
+first declared TCP port instead of a Service that could choose another cold
+replica. Remove `runtime.backend-url` for this mode and rebuild the pod
+controller so it advertises `proxyProtocol`. HTTP proxy pods use their wake
+listener for application requests and their direct endpoint for health checks;
+strict pods use their direct HTTP endpoint. The controller's loopback listener
+addresses are resolved on its configured host without changing their ports;
+Floci must be able to reach those listeners.
+
+For HTTPS, custom ingress, another application port or existing Service routing,
+keep the exact `backend-url` and add `runtime.backend-routing: service` explicitly.
+Service balancing can wake more replicas than `wake-replicas`; forwarded health
+checks through a wake proxy can also renew activity in this compatibility mode.
+An explicit
+`backend-url` without that routing choice now fails configuration validation
+rather than being silently redirected. This policy does not change direct
+Kubernetes Service routing, infer queue-depth scaling, or change AWS API shapes.

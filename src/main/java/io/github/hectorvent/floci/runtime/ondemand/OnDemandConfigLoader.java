@@ -8,6 +8,8 @@ import io.github.hectorvent.floci.core.common.AwsRegions;
 import io.github.hectorvent.floci.runtime.ondemand.WorkloadDefinition.BackendProtocol;
 import io.github.hectorvent.floci.runtime.ondemand.WorkloadDefinition.HealthRequest;
 import io.github.hectorvent.floci.runtime.ondemand.WorkloadDefinition.HealthResponse;
+import io.github.hectorvent.floci.runtime.ondemand.WorkloadDefinition.KubernetesRouting;
+import io.github.hectorvent.floci.runtime.ondemand.WorkloadDefinition.KubernetesSpec;
 import io.github.hectorvent.floci.runtime.ondemand.WorkloadDefinition.MicrosandboxSpec;
 import io.github.hectorvent.floci.runtime.ondemand.WorkloadDefinition.RabbitMqQueue;
 import io.github.hectorvent.floci.runtime.ondemand.WorkloadDefinition.RuntimeType;
@@ -60,7 +62,7 @@ public final class OnDemandConfigLoader {
             };
             fields(runtime, id + ".runtime", switch (type) {
                 case KUBERNETES -> Set.of("type", "deployment", "namespace", "replicas", "backend-url",
-                        "cluster-name", "backend-protocol");
+                        "cluster-name", "backend-protocol", "wake-replicas", "backend-routing");
                 case ECS -> Set.of("type", "service", "cluster-name", "replicas", "backend-url", "backend-protocol");
                 case MICROSANDBOX -> Set.of("type", "image", "command", "environment", "cpus", "memory-mib",
                         "root-disk-mib", "backend-port", "backend-protocol");
@@ -70,6 +72,14 @@ public final class OnDemandConfigLoader {
                 case "http2" -> BackendProtocol.HTTP2;
                 default -> throw invalid(id, "backend-protocol must be http1 or http2");
             };
+            KubernetesSpec kubernetes = new KubernetesSpec(number(runtime, "wake-replicas", 1, 1, 1000),
+                    switch (text(runtime, "backend-routing", "pod")) {
+                        case "pod" -> KubernetesRouting.POD;
+                        case "service" -> KubernetesRouting.SERVICE;
+                        default -> throw invalid(id, "backend-routing must be pod or service");
+                    });
+            boolean needsConfiguredBackend = type == RuntimeType.ECS
+                    || type == RuntimeType.KUBERNETES && kubernetes.backendRouting() == KubernetesRouting.SERVICE;
             String account = text(node, "account-id", defaultAccount);
             if (!account.matches("[0-9]{12}")) {
                 throw invalid(id, "account-id must contain 12 digits");
@@ -116,10 +126,14 @@ public final class OnDemandConfigLoader {
                     || (backend.getPath() != null && !Set.of("", "/").contains(backend.getPath())))) {
                 throw invalid(id, "backend-url must be an HTTP(S) origin without credentials, path, query or fragment");
             }
+            if (type == RuntimeType.KUBERNETES && kubernetes.backendRouting() == KubernetesRouting.POD && backend != null) {
+                throw invalid(id, "pod backend-routing discovers the selected pod endpoint; remove backend-url"
+                        + " or explicitly select backend-routing: service");
+            }
             if (backend != null && host != null && backend.getHost().equalsIgnoreCase(host)) {
                 throw invalid(id, "backend-url must bypass the gateway hostname");
             }
-            if (requiresBackendUrl(type) && host != null && backend == null) {
+            if (needsConfiguredBackend && host != null && backend == null) {
                 throw invalid(id, "Kubernetes and ECS HTTP workloads require a reachable backend-url");
             }
             List<String> queues = strings(node, "queues");
@@ -165,7 +179,7 @@ public final class OnDemandConfigLoader {
                 fields(readiness, "readiness", Set.of("enabled", "path", "status"));
             }
             boolean httpReadiness = bool(readiness, "enabled", host != null || readiness.has("path"));
-            if (httpReadiness && requiresBackendUrl(type) && backend == null) {
+            if (httpReadiness && needsConfiguredBackend && backend == null) {
                 throw invalid(id, "HTTP readiness requires a backend-url");
             }
             definitions.add(new WorkloadDefinition(id, bool(node, "enabled", true), account, region,
@@ -176,7 +190,7 @@ public final class OnDemandConfigLoader {
                     List.copyOf(queues), List.copyOf(healthRequests), sleeping,
                     httpReadiness ? path(readiness, "path", "/ready") : null,
                     number(readiness, "status", 200, 200, 299), clusterName, protocol, List.copyOf(rabbitMqQueues),
-                    type == RuntimeType.MICROSANDBOX ? microsandbox(runtime) : null));
+                    type == RuntimeType.MICROSANDBOX ? microsandbox(runtime) : null, kubernetes));
         }
         for (WorkloadDefinition definition : definitions) {
             if (definition.backendUrl() != null
@@ -185,10 +199,6 @@ public final class OnDemandConfigLoader {
             }
         }
         return List.copyOf(definitions);
-    }
-
-    private static boolean requiresBackendUrl(RuntimeType type) {
-        return type == RuntimeType.KUBERNETES || type == RuntimeType.ECS;
     }
 
     private static MicrosandboxSpec microsandbox(JsonNode runtime) {

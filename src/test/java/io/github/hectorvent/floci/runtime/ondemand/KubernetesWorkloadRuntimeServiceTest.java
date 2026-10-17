@@ -6,6 +6,8 @@ import io.github.hectorvent.floci.core.common.microsandbox.PodControllerClient.D
 import io.github.hectorvent.floci.core.common.microsandbox.PodControllerClient.Pod;
 import io.github.hectorvent.floci.runtime.ondemand.ActivationCoordinator.State;
 import io.github.hectorvent.floci.runtime.ondemand.WorkloadDefinition.BackendProtocol;
+import io.github.hectorvent.floci.runtime.ondemand.WorkloadDefinition.KubernetesRouting;
+import io.github.hectorvent.floci.runtime.ondemand.WorkloadDefinition.KubernetesSpec;
 import io.github.hectorvent.floci.runtime.ondemand.WorkloadDefinition.RuntimeType;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
@@ -40,18 +42,18 @@ class KubernetesWorkloadRuntimeServiceTest {
     }
 
     @Test
-    void wakesAndHibernatesAllPodsWithoutChangingReplicaCountOrPodUids() throws Exception {
+    void wakesOnePodAndLeavesOtherReplicasSleepingWithoutChangingKubernetesIdentities() throws Exception {
         assertFalse(runtime.isRunning());
         runtime.start(TIMEOUT);
         runtime.awaitReady(TIMEOUT);
         assertTrue(runtime.isRunning());
-        assertEquals(URI.create("http://workers-service.local:8080"), runtime.backend());
-        assertEquals(List.of("resume:pod-a:1", "resume:pod-b:4"), controller.operations);
+        assertEquals(URI.create("http://127.0.0.1:31001"), runtime.backend());
+        assertEquals(List.of("resume:pod-a:1"), controller.operations);
         runtime.stop(TIMEOUT);
         assertFalse(runtime.isRunning());
         assertEquals(List.of("pod-a", "pod-b"), List.copyOf(controller.pods.keySet()));
         assertEquals(2, controller.deployment("apps", "workers", TIMEOUT).replicas());
-        assertEquals(List.of("resume:pod-a:1", "resume:pod-b:4", "hibernate:pod-a:2", "hibernate:pod-b:5"),
+        assertEquals(List.of("resume:pod-a:1", "hibernate:pod-a:2"),
                 controller.operations);
     }
 
@@ -60,11 +62,12 @@ class KubernetesWorkloadRuntimeServiceTest {
         runtime.start(TIMEOUT);
         controller.deploymentUid = "new-deployment";
         assertThrows(IllegalStateException.class, () -> runtime.awaitReady(TIMEOUT));
-        assertEquals(2, controller.operations.size());
+        assertEquals(1, controller.operations.size());
     }
 
     @Test
-    void partialHibernateFailureCanWakeTheAlreadySleepingPodWithoutReplayingTheOther() throws Exception {
+    void partialHibernateFailureReusesTheStillRunningPodWithoutWakingTheOther() throws Exception {
+        controller.pods.replaceAll((uid, current) -> pod(uid, "READY", current.generation()));
         runtime.start(TIMEOUT);
         runtime.awaitReady(TIMEOUT);
         controller.failSecondHibernate = true;
@@ -74,7 +77,8 @@ class KubernetesWorkloadRuntimeServiceTest {
         controller.operations.clear();
         runtime.start(TIMEOUT);
         runtime.awaitReady(TIMEOUT);
-        assertEquals(List.of("resume:pod-a:3"), controller.operations);
+        assertTrue(controller.operations.isEmpty());
+        assertEquals(URI.create("http://127.0.0.1:31002"), runtime.backend());
     }
 
     @Test
@@ -125,11 +129,12 @@ class KubernetesWorkloadRuntimeServiceTest {
     }
 
     @Test
-    void podsWaitingForVolumesCannotCompleteActivationOrHibernate() {
+    void podsWaitingForVolumesCannotCompleteActivationAndRemainUntouchedOnIdleStop() throws Exception {
         controller.pods.replaceAll((uid, current) -> pod(uid, "WAITINGVOLUMES", current.generation()));
         Duration timeout = Duration.ofMillis(10);
         assertThrows(IllegalStateException.class, () -> runtime.start(timeout));
-        assertThrows(IllegalStateException.class, () -> runtime.stop(timeout));
+        assertFalse(runtime.isRunning());
+        runtime.stop(timeout);
         assertTrue(controller.operations.isEmpty());
         assertTrue(controller.pods.values().stream().allMatch(pod -> "WAITINGVOLUMES".equals(pod.state())));
     }
@@ -145,7 +150,8 @@ class KubernetesWorkloadRuntimeServiceTest {
     }
 
     @Test
-    void activationResumesBothColdAndHibernatedPods() throws Exception {
+    void explicitParallelConsumerPolicyResumesColdAndHibernatedPods() throws Exception {
+        configure(2, KubernetesRouting.POD);
         controller.pods.put("pod-a", pod("pod-a", "COLD", 1));
         assertFalse(runtime.isRunning());
         runtime.start(TIMEOUT);
@@ -292,6 +298,139 @@ class KubernetesWorkloadRuntimeServiceTest {
         assertTrue(controller.operations.isEmpty());
     }
 
+    @Test
+    void repeatedGatewayHealthChecksUseDirectEndpointAndDoNotRenewIdleTime() {
+        AtomicLong time = new AtomicLong(1);
+        try (ActivationCoordinator coordinator = new ActivationCoordinator(Executors.newSingleThreadExecutor(),
+                (workload, endpoint, timeout) -> assertEquals(URI.create("http://127.0.0.1:32001"), endpoint),
+                1, 2, 2, time::get)) {
+            coordinator.register(definition, runtime);
+            try (ActivationCoordinator.RequestLease request = coordinator.acquire("workers")) {
+                assertEquals(URI.create("http://127.0.0.1:31001"), request.ready().join());
+            }
+            coordinator.reconcile("workers", false, true);
+            for (int probe = 0; probe < 5; probe++) {
+                time.addAndGet(Duration.ofMillis(250).toNanos());
+                try (ActivationCoordinator.RequestLease health = coordinator.acquireHealth("workers").orElseThrow()) {
+                    assertEquals(URI.create("http://127.0.0.1:32001"), health.ready().join());
+                    coordinator.tick("workers");
+                    assertEquals(State.READY, coordinator.state("workers"), "An in-flight health check holds the pod");
+                }
+            }
+            coordinator.tick("workers");
+            await().atMost(TIMEOUT).until(() -> coordinator.state("workers") == State.SLEEPING);
+            assertEquals(List.of("resume:pod-a:1", "hibernate:pod-a:2"), controller.operations);
+        }
+    }
+
+    @Test
+    void deploymentReplacementBetweenParallelWakesStopsBeforeMutatingAnotherPod() {
+        configure(2, KubernetesRouting.POD);
+        controller.replaceAfterResume = true;
+        assertThrows(IllegalStateException.class, () -> runtime.start(TIMEOUT));
+        assertEquals(List.of("resume:pod-a:1"), controller.operations);
+        assertEquals("SLEEPING", controller.pods.get("pod-b").state());
+    }
+
+    @Test
+    void queueOnlyConsumersDoNotRequireAnyPublishedHttpEndpoint() throws Exception {
+        definition = new WorkloadDefinition(definition.id(), definition.enabled(), definition.accountId(),
+                definition.region(), null, definition.type(), definition.target(), definition.namespace(),
+                definition.replicas(), null, 80, definition.idleTimeout(), definition.startupTimeout(),
+                definition.queues(), List.of(), null, null, 200, definition.clusterName(), definition.backendProtocol());
+        controller.failEndpoint = true;
+        runtime = new KubernetesWorkloadRuntime(definition, controller);
+        runtime.start(TIMEOUT);
+        runtime.awaitReady(TIMEOUT);
+        assertEquals(List.of("resume:pod-a:1"), controller.operations);
+        assertNull(runtime.backend());
+        assertNull(runtime.healthBackend());
+    }
+
+    @Test
+    void missingHttpEndpointFailsBeforeAnyPodIsWoken() {
+        controller.failEndpoint = true;
+        assertThrows(IllegalStateException.class, () -> runtime.start(TIMEOUT));
+        assertTrue(controller.operations.isEmpty());
+    }
+
+    @Test
+    void aReplicaWithMissingVolumeSourcesDoesNotBlockAnAvailableColdReplica() throws Exception {
+        controller.pods.put("pod-a", pod("pod-a", "WAITINGVOLUMES", 1));
+        controller.pods.put("pod-b", pod("pod-b", "COLD", 4));
+        runtime.start(TIMEOUT);
+        runtime.awaitReady(TIMEOUT);
+        assertEquals(List.of("resume:pod-b:4"), controller.operations);
+        assertEquals("WAITINGVOLUMES", controller.pods.get("pod-a").state());
+        runtime.stop(TIMEOUT);
+        assertEquals("SLEEPING", controller.pods.get("pod-b").state());
+        assertEquals("WAITINGVOLUMES", controller.pods.get("pod-a").state());
+    }
+
+    @Test
+    void defaultActivationOfFiveHundredReplicasStartsOnlyOne() throws Exception {
+        controller.pods.clear();
+        for (int index = 0; index < 500; index++) {
+            String uid = "pod-" + String.format("%03d", index);
+            controller.pods.put(uid, pod(uid, "COLD", 1));
+        }
+        runtime.start(TIMEOUT);
+        runtime.awaitReady(TIMEOUT);
+        assertEquals(List.of("resume:pod-000:1"), controller.operations);
+        assertEquals(499, controller.pods.values().stream().filter(pod -> "COLD".equals(pod.state())).count());
+        assertEquals(500, controller.deployment("apps", "workers", TIMEOUT).replicas());
+        runtime.stop(TIMEOUT);
+        assertEquals(499, controller.pods.values().stream().filter(pod -> "COLD".equals(pod.state())).count());
+    }
+
+    @Test
+    void activationReusesReadyReplicaWithoutWaitingForAnUnselectedInitContainer() throws Exception {
+        controller.pods.put("pod-a", pod("pod-a", "INITIALIZING", 1));
+        controller.pods.put("pod-b", pod("pod-b", "READY", 4));
+        runtime.start(TIMEOUT);
+        runtime.awaitReady(TIMEOUT);
+        assertTrue(controller.operations.isEmpty());
+        assertEquals(URI.create("http://127.0.0.1:31002"), runtime.backend());
+    }
+
+    @Test
+    void serviceRoutingPreservesExplicitHttpsEndpointAndCapsWakeCountAtDesiredReplicas() throws Exception {
+        configure(20, KubernetesRouting.SERVICE);
+        runtime.start(TIMEOUT);
+        runtime.awaitReady(TIMEOUT);
+        assertEquals(definition.backendUrl(), runtime.backend());
+        assertEquals(2, controller.operations.size());
+    }
+
+    @Test
+    void deploymentReplacementAfterActivationInvalidatesCachedBackend() throws Exception {
+        runtime.start(TIMEOUT);
+        runtime.awaitReady(TIMEOUT);
+        controller.deploymentUid = "replacement-deployment";
+        assertFalse(runtime.isRunning());
+    }
+
+    @Test
+    void externallyWokenReplicaIsAdoptedWithoutBootingAnyColdPeer() throws Exception {
+        controller.pods.put("pod-a", pod("pod-a", "COLD", 1));
+        controller.pods.put("pod-b", pod("pod-b", "RUNNING", 4));
+        controller.readyOnSecondObservation = true;
+        runtime.start(TIMEOUT);
+        runtime.awaitReady(TIMEOUT);
+        assertTrue(controller.operations.isEmpty());
+        assertEquals(URI.create("http://127.0.0.1:31002"), runtime.backend());
+    }
+
+    private void configure(int replicas, KubernetesRouting routing) {
+        definition = new WorkloadDefinition(definition.id(), definition.enabled(), definition.accountId(),
+                definition.region(), definition.host(), definition.type(), definition.target(), definition.namespace(),
+                definition.replicas(), URI.create("https://workers-service.local:8443/"), definition.backendPort(),
+                definition.idleTimeout(), definition.startupTimeout(), definition.queues(), definition.healthRequests(),
+                definition.sleepingHealth(), definition.readinessPath(), definition.readinessStatus(), definition.clusterName(),
+                definition.backendProtocol(), definition.rabbitMqQueues(), null, new KubernetesSpec(replicas, routing));
+        runtime = new KubernetesWorkloadRuntime(definition, controller);
+    }
+
     private static Pod pod(String uid, String state, long generation) {
         return new Pod(uid, "apps", uid, state, generation);
     }
@@ -302,6 +441,8 @@ class KubernetesWorkloadRuntimeServiceTest {
         private String deploymentUid = "deployment-uid";
         private String cluster = "dev";
         private boolean failSecondHibernate;
+        private boolean replaceAfterResume;
+        private boolean failEndpoint;
         private boolean deferReadiness;
         private boolean readyOnSecondObservation;
         private boolean failObservation;
@@ -309,6 +450,22 @@ class KubernetesWorkloadRuntimeServiceTest {
 
         private FakeController() {
             super("http://localhost:18187", "controller-token-at-least-thirty-two-characters", new ObjectMapper());
+        }
+
+        @Override
+        public URI applicationEndpoint(Pod observed) {
+            if (failEndpoint) {
+                throw new IllegalStateException("No HTTP endpoint");
+            }
+            return URI.create("http://127.0.0.1:" + (observed.uid().equals("pod-b") ? 31002 : 31001));
+        }
+
+        @Override
+        public URI healthEndpoint(Pod observed) {
+            if (failEndpoint) {
+                throw new IllegalStateException("No HTTP endpoint");
+            }
+            return URI.create("http://127.0.0.1:" + (observed.uid().equals("pod-b") ? 32002 : 32001));
         }
 
         @Override
@@ -329,7 +486,7 @@ class KubernetesWorkloadRuntimeServiceTest {
             if (readyOnSecondObservation && ++observations >= 2) {
                 pods.replaceAll((uid, current) -> pod(uid, "READY", current.generation()));
             }
-            return new Deployment(deploymentUid, namespace, name, cluster, 1, 2, List.copyOf(pods.values()));
+            return new Deployment(deploymentUid, namespace, name, cluster, 1, pods.size(), List.copyOf(pods.values()));
         }
 
         @Override
@@ -338,6 +495,9 @@ class KubernetesWorkloadRuntimeServiceTest {
             operations.add("resume:" + observed.uid() + ":" + observed.generation());
             Pod resumed = pod(observed.uid(), deferReadiness ? "RUNNING" : "READY", observed.generation() + 1);
             pods.put(observed.uid(), resumed);
+            if (replaceAfterResume) {
+                deploymentUid = "replacement-deployment";
+            }
             return resumed;
         }
 

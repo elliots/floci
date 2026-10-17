@@ -148,6 +148,7 @@ class OnDemandConfigLoaderServiceTest {
                   type: kubernetes
                   namespace: integrations
                   deployment: orders
+                  backend-routing: service
                   backend-url: http://orders-backend:8080
                 queues: [orders-incoming]
                 health:
@@ -296,6 +297,38 @@ class OnDemandConfigLoaderServiceTest {
                 """);
         assertEquals(2, definitions.size());
         assertEquals("managed", definitions.getLast().clusterName());
+    }
+
+    @Test
+    void kubernetesDefaultsToOneDiscoveredPodAndAllowsExplicitParallelConsumers() throws Exception {
+        String yaml = """
+                workloads:
+                  api:
+                    host: api.test
+                    runtime: {type: kubernetes, deployment: api}
+                  consumer:
+                    queues: [jobs]
+                    runtime: {type: kubernetes, deployment: workers, wake-replicas: 4}
+                """;
+        List<WorkloadDefinition> definitions = parse(yaml);
+        assertEquals(1, definitions.getFirst().kubernetes().wakeReplicas());
+        assertEquals("POD", definitions.getFirst().kubernetes().backendRouting().name());
+        assertNull(definitions.getFirst().backendUrl());
+        assertEquals("/ready", definitions.getFirst().readinessPath());
+        assertEquals(4, definitions.getLast().kubernetes().wakeReplicas());
+        assertNull(definitions.getLast().readinessPath());
+        for (String value : List.of("0", "-1", "1001", "1.5", "all")) {
+            assertThrows(IllegalArgumentException.class, () -> parse(yaml.replace("wake-replicas: 4", "wake-replicas: " + value)));
+        }
+    }
+
+    @Test
+    void existingCustomEndpointsRequireAnExplicitServiceRoutingChoice() {
+        IllegalArgumentException failure = assertThrows(IllegalArgumentException.class,
+                () -> parse(CONFIG.replace("      backend-routing: service\n", "")));
+        assertTrue(failure.getMessage().contains("backend-routing: service"));
+        assertTrue(failure.getMessage().contains("remove backend-url"));
+        assertThrows(IllegalArgumentException.class, () -> parse(CONFIG.replace("backend-routing: service", "backend-routing: random")));
     }
 
     @Test

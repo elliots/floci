@@ -22,6 +22,7 @@ type lifecycleView struct {
 	MemoryMiB         int    `json:"memoryMiB,omitzero"`
 	ProxyURL          string `json:"proxyUrl,omitempty"`
 	ProxyAvailability bool   `json:"proxyAvailability"`
+	ProxyProtocol     string `json:"proxyProtocol,omitempty"`
 	IdleOwner         string `json:"idleOwner,omitempty"`
 	ActiveConnections int    `json:"activeConnections"`
 	ActiveRequests    int    `json:"activeRequests"`
@@ -44,6 +45,9 @@ func view(e *podEntry) lifecycleView {
 	v := lifecycleView{ProxyAvailability: e.proxyAvailability, IdleOwner: e.idleOwner, ActiveConnections: e.activeConnections, UID: string(e.pod.UID), Namespace: e.pod.Namespace, Name: e.pod.Name, State: e.state,
 		Generation: e.generation, PodIP: e.ip, VM: e.vm, UDPPort: e.port, HTTPPort: e.httpPort, ApplicationPort: e.appPort}
 	v.VCPUs, v.MemoryMiB = e.allocation.VCPUs, e.allocation.MemoryMiB
+	if e.proxyAvailability {
+		v.ProxyProtocol = proxyProtocol(e.pod)
+	}
 	v.ActiveRequests, v.ActivitySequence = e.activeRequests, e.activitySequence
 	if e.httpPort != 0 {
 		v.BackendURL = fmt.Sprintf("http://127.0.0.1:%d", e.httpPort)

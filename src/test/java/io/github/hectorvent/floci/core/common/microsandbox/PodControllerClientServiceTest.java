@@ -12,6 +12,7 @@ import org.junit.jupiter.api.Test;
 
 import java.io.IOException;
 import java.net.InetSocketAddress;
+import java.net.URI;
 import java.nio.charset.StandardCharsets;
 import java.time.Duration;
 import java.util.List;
@@ -84,6 +85,49 @@ class PodControllerClientServiceTest {
         exchange.sendResponseHeaders(status, bytes.length);
         exchange.getResponseBody().write(bytes);
         exchange.close();
+    }
+
+    @Test
+    void routesProxyHttpToTheSelectedPodAndKeepsStrictBackendSeparate() {
+        deployment = deployment.replace("\"state\":\"SLEEPING\"", """
+                "state":"SLEEPING","proxyAvailability":true,"idleOwner":"external","proxyProtocol":"http",
+                "proxyUrl":"http://127.0.0.1:31001/","backendUrl":"http://127.0.0.1:31002"
+                """);
+        Pod proxy = client.deployment("apps", "worker", TIMEOUT).pods().getFirst();
+        assertEquals(URI.create("http://127.0.0.1:31001/"), client.applicationEndpoint(proxy));
+        PodControllerClient remote = new PodControllerClient("http://host.docker.internal:18187", TOKEN, mapper);
+        assertEquals(URI.create("http://host.docker.internal:31001/"), remote.applicationEndpoint(proxy));
+        deployment = deployment.replace("\"proxyAvailability\":true", "\"proxyAvailability\":false");
+        Pod strict = client.deployment("apps", "worker", TIMEOUT).pods().getFirst();
+        assertEquals(URI.create("http://127.0.0.1:31002"), client.applicationEndpoint(strict));
+    }
+
+    @Test
+    void refusesOpaqueProxyAndUnknownOrForeignEndpointsWithoutExposingTheirContents() {
+        String original = deployment;
+        for (String protocol : List.of("tcp", "unknown", "")) {
+            deployment = original.replace("\"state\":\"SLEEPING\"", """
+                    "state":"SLEEPING","proxyAvailability":true,"idleOwner":"external","proxyProtocol":"%s",
+                    "proxyUrl":"http://127.0.0.1:31001"
+                    """.formatted(protocol));
+            Pod observed = client.deployment("apps", "worker", TIMEOUT).pods().getFirst();
+            assertThrows(IllegalStateException.class, () -> client.applicationEndpoint(observed));
+        }
+        deployment = original.replace("\"state\":\"SLEEPING\"", """
+                "state":"SLEEPING","backendUrl":"http://another-host:31001"
+                """);
+        Pod foreign = client.deployment("apps", "worker", TIMEOUT).pods().getFirst();
+        assertThrows(IllegalStateException.class, () -> client.applicationEndpoint(foreign));
+        for (String address : List.of("http://secret:private@127.0.0.1:31001", "https://127.0.0.1:31001",
+                "http://127.0.0.1:31001/path", "http://127.0.0.1:31001?secret=private", "http://127.0.0.1")) {
+            deployment = original.replace("\"state\":\"SLEEPING\"", "\"state\":\"SLEEPING\",\"backendUrl\":\"" + address + "\"");
+            IllegalStateException failure = assertThrows(IllegalStateException.class,
+                    () -> client.deployment("apps", "worker", TIMEOUT));
+            assertFalse(failure.getMessage().contains("private"));
+        }
+        deployment = original;
+        Pod legacy = client.deployment("apps", "worker", TIMEOUT).pods().getFirst();
+        assertThrows(IllegalStateException.class, () -> client.applicationEndpoint(legacy));
     }
 
     @Test

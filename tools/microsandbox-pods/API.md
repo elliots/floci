@@ -25,11 +25,18 @@ send it when the observation includes `activitySequence`.
 Pod views contain `uid`, `namespace`, `name`, `state`, `generation`, `podIP`, `vm`,
 `vcpus`, `memoryMiB` (the persisted guest allocation),
 `udpPort`, optional `snapshot`, and optional `backendUrl`, `httpPort`,
-`applicationPort`, `proxyAvailability`, `idleOwner`, `activeRequests`,
+`applicationPort`, `proxyAvailability`, optional `proxyProtocol` (`http` or `tcp`),
+`idleOwner`, `activeRequests`,
 `activeConnections`, `activitySequence`, and
 optional `proxyUrl` (first host wake listener). The backend is `http://127.0.0.1:<published-port>` for the first
-declared TCP container port, assigned before cold boot. It does not load balance
-replicas; coordinators should explicitly configure a Service/backend for that.
+declared TCP container port, assigned before cold boot. Neither endpoint load
+balances replicas. Floci's default pod routing chooses one owned pod and uses
+its HTTP `proxyUrl` for application requests, with `backendUrl` for running
+health checks. A loopback advertisement is resolved on the configured controller
+host without changing its port. The listeners must actually be reachable there.
+Explicit Service routing preserves custom origins but can wake other replicas
+through Service balancing. A missing `proxyProtocol` cannot prove that a proxy
+speaks HTTP; rebuild the controller or explicitly use Service routing.
 
 States: COLD, WAITINGVOLUMES, STARTING, INITSTARTING, INITIALIZING, RUNNING, READY,
 HIBERNATING, CHECKPOINTED, SLEEPING, RESUMING, RESTARTING, TERMINATED, FAILED.

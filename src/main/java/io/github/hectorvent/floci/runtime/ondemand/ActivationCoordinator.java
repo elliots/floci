@@ -31,6 +31,7 @@ public final class ActivationCoordinator implements AutoCloseable {
         private final WorkloadRuntime runtime;
         private State state;
         private URI backend;
+        private URI healthBackend;
         private CompletableFuture<URI> transition;
         private int active;
         private int pending;
@@ -135,7 +136,7 @@ public final class ActivationCoordinator implements AutoCloseable {
             entry.active++;
             RequestLease lease = new RequestLease(entry, false);
             lease.pendingReleased.set(true);
-            lease.ready.complete(entry.backend);
+            lease.ready.complete(entry.healthBackend);
             return Optional.of(lease);
         }
     }
@@ -190,6 +191,7 @@ public final class ActivationCoordinator implements AutoCloseable {
             if (!running && observed != State.FAILED) {
                 entry.state = observed == State.READY ? State.FAILED : State.SLEEPING;
                 entry.backend = null;
+                entry.healthBackend = null;
                 entry.idleSince = nanoTime.getAsLong();
             }
         }
@@ -245,6 +247,7 @@ public final class ActivationCoordinator implements AutoCloseable {
                 entry.state = entry.stopFromFailure ? State.FAILED : State.SLEEPING;
                 entry.failedCleanup = entry.stopFromFailure;
                 entry.backend = null;
+                entry.healthBackend = null;
             }
             stopping.complete(null);
             LOG.debugv("Stopped idle on-demand workload {0}", entry.definition.id());
@@ -317,13 +320,15 @@ public final class ActivationCoordinator implements AutoCloseable {
             }
             entry.runtime.awaitReady(remaining(deadline));
             URI backend = entry.runtime.backend();
-            readiness.await(entry.definition, backend, remaining(deadline));
+            URI healthBackend = entry.runtime.healthBackend();
+            readiness.await(entry.definition, healthBackend, remaining(deadline));
             remaining(deadline);
             synchronized (entry) {
                 if (closed) {
                     throw new IllegalStateException("On-demand runtime is shutting down");
                 }
                 entry.backend = backend;
+                entry.healthBackend = healthBackend;
                 entry.state = State.READY;
                 entry.idleSince = nanoTime.getAsLong();
             }

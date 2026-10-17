@@ -35,6 +35,7 @@ public class OnDemandQueueTestResource implements QuarkusTestResourceLifecycleMa
                         queues: [mqtt-incoming]
                         runtime:
                           type: kubernetes
+                          backend-routing: service
                           deployment: mqtt-worker
                     """);
             return Map.of("floci.on-demand.enabled", "true", "floci.on-demand.config-file", config.toString(),
@@ -68,6 +69,7 @@ public class OnDemandQueueTestResource implements QuarkusTestResourceLifecycleMa
                     queues: [on-demand-incoming]
                     runtime:
                       type: kubernetes
+                      backend-routing: service
                       deployment: %s
                       backend-url: %s
                 """.formatted(id, id, account, region, id, origin);

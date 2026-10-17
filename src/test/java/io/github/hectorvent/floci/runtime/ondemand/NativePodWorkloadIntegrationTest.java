@@ -6,6 +6,8 @@ import io.github.hectorvent.floci.core.common.microsandbox.PodControllerClient.D
 import io.github.hectorvent.floci.core.common.microsandbox.PodControllerClient.Pod;
 import io.github.hectorvent.floci.runtime.ondemand.ActivationCoordinator.State;
 import io.github.hectorvent.floci.runtime.ondemand.WorkloadDefinition.BackendProtocol;
+import io.github.hectorvent.floci.runtime.ondemand.WorkloadDefinition.HealthRequest;
+import io.github.hectorvent.floci.runtime.ondemand.WorkloadDefinition.HealthResponse;
 import io.github.hectorvent.floci.runtime.ondemand.WorkloadDefinition.RuntimeType;
 import io.vertx.core.Vertx;
 import io.vertx.core.http.HttpClient;
@@ -38,7 +40,7 @@ class NativePodWorkloadIntegrationTest {
                 required("FLOCI_NATIVE_POD_CONTROLLER_TOKEN"), new ObjectMapper());
         String namespace = required("FLOCI_NATIVE_POD_NAMESPACE");
         String deploymentName = required("FLOCI_NATIVE_POD_DEPLOYMENT");
-        URI backend = URI.create(required("FLOCI_NATIVE_POD_BACKEND_URL"));
+
         String httpPath = System.getenv().getOrDefault("FLOCI_NATIVE_POD_HTTP_PATH", "/");
         controller.checkAvailable(TIMEOUT);
         Deployment original = controller.deployment(namespace, deploymentName, TIMEOUT);
@@ -46,11 +48,13 @@ class NativePodWorkloadIntegrationTest {
             assertTrue(original.pods().stream().allMatch(pod -> "COLD".equals(pod.state())),
                     "First gateway request must boot the untouched cold Deployment");
         }
+        assertEquals(Integer.parseInt(System.getenv().getOrDefault("FLOCI_NATIVE_POD_EXPECT_REPLICAS", "1")), original.replicas());
         Map<String, String> identities = identities(original);
         WorkloadDefinition definition = new WorkloadDefinition("native-pods", true, "000000000000", "us-east-1",
-                "native-pods.test", RuntimeType.KUBERNETES, deploymentName, namespace, original.replicas(), backend,
-                backend.getPort() > 0 ? backend.getPort() : 80, Duration.ofSeconds(1), TIMEOUT,
-                List.of(), List.of(), null, httpPath, 200, original.clusterName().isBlank() ? null : original.clusterName(),
+                "native-pods.test", RuntimeType.KUBERNETES, deploymentName, namespace, original.replicas(), null,
+                80, Duration.ofSeconds(1), TIMEOUT,
+                Boolean.parseBoolean(System.getenv("FLOCI_NATIVE_POD_QUEUE_WAKE")) ? List.of("native-jobs") : List.of(),
+                List.of(new HealthRequest("GET", "/ready")), new HealthResponse(200, "ready", "text/plain"), httpPath, 200, original.clusterName().isBlank() ? null : original.clusterName(),
                 BackendProtocol.HTTP1);
         KubernetesWorkloadRuntime runtime = new KubernetesWorkloadRuntime(definition, controller);
         AtomicLong clock = new AtomicLong();
@@ -75,13 +79,35 @@ class NativePodWorkloadIntegrationTest {
                 coordinator.reconcile(definition.id(), false, true);
                 await().atMost(TIMEOUT).until(() -> coordinator.state(definition.id()) == State.READY);
             }
+            if (Boolean.parseBoolean(System.getenv("FLOCI_NATIVE_POD_QUEUE_WAKE"))) {
+                coordinator.reconcile(definition.id(), true, true);
+                await().atMost(TIMEOUT).until(() -> coordinator.state(definition.id()) == State.READY);
+                assertSelectedReplica(controller.deployment(namespace, deploymentName, TIMEOUT), original.replicas());
+                coordinator.reconcile(definition.id(), false, true);
+            }
             Reply initial = invoke(http, gateway.port(), httpPath);
             assertEquals(200, initial.status(), initial.body());
             assertFalse(initial.body().isBlank());
+            Deployment firstActivation = controller.deployment(namespace, deploymentName, TIMEOUT);
+            assertSelectedReplica(firstActivation, original.replicas());
+            Pod selected = firstActivation.pods().stream().filter(pod -> "READY".equals(pod.state())).findFirst().orElseThrow();
+            Map<String, Long> untouched = firstActivation.pods().stream().filter(pod -> !pod.uid().equals(selected.uid()))
+                    .collect(Collectors.toMap(Pod::uid, Pod::generation));
+            await().atMost(TIMEOUT).until(() -> controller.deployment(namespace, deploymentName, TIMEOUT).pods().stream()
+                    .filter(pod -> pod.uid().equals(selected.uid())).allMatch(pod -> pod.activeRequests() == 0));
+            long activityBeforeHealth = controller.deployment(namespace, deploymentName, TIMEOUT).pods().stream()
+                    .filter(pod -> pod.uid().equals(selected.uid())).findFirst().orElseThrow().activitySequence();
+            for (int probe = 0; probe < 5; probe++) {
+                Reply health = invoke(http, gateway.port(), "/ready");
+                assertEquals(200, health.status(), health.body());
+            }
+            assertEquals(activityBeforeHealth, controller.deployment(namespace, deploymentName, TIMEOUT).pods().stream()
+                    .filter(pod -> pod.uid().equals(selected.uid())).findFirst().orElseThrow().activitySequence(),
+                    "Gateway health probes must bypass application request activity");
             for (int cycle = 0; cycle < 2; cycle++) {
                 await().atMost(TIMEOUT).until(() -> coordinator.state(definition.id()) == State.READY);
-                clock.addAndGet(Duration.ofSeconds(2).toNanos());
                 await().atMost(TIMEOUT).until(() -> {
+                    clock.addAndGet(Duration.ofMillis(500).toNanos());
                     coordinator.tick(definition.id());
                     return coordinator.state(definition.id()) == State.SLEEPING;
                 });
@@ -89,7 +115,8 @@ class NativePodWorkloadIntegrationTest {
                 assertEquals(original.uid(), sleeping.uid());
                 assertEquals(original.replicas(), sleeping.replicas());
                 assertEquals(identities, identities(sleeping));
-                assertTrue(sleeping.pods().stream().allMatch(pod -> "SLEEPING".equals(pod.state())));
+                assertTrue(sleeping.pods().stream().allMatch(pod -> pod.uid().equals(selected.uid())
+                        ? "SLEEPING".equals(pod.state()) : "COLD".equals(pod.state())), sleeping.toString());
 
                 Reply resumed = invoke(http, gateway.port(), httpPath);
                 assertEquals(200, resumed.status());
@@ -99,12 +126,22 @@ class NativePodWorkloadIntegrationTest {
                 assertEquals(original.generation(), ready.generation());
                 assertEquals(original.replicas(), ready.replicas());
                 assertEquals(identities, identities(ready));
-                assertTrue(ready.pods().stream().allMatch(pod -> "READY".equals(pod.state())));
+                assertSelectedReplica(ready, original.replicas());
+                assertTrue(ready.pods().stream().filter(pod -> untouched.containsKey(pod.uid()))
+                        .allMatch(pod -> untouched.get(pod.uid()) == pod.generation()),
+                        "Unselected replicas must not boot or change lifecycle generation");
+                assertEquals("READY", ready.pods().stream().filter(pod -> pod.uid().equals(selected.uid()))
+                        .findFirst().orElseThrow().state());
             }
         } finally {
             http.close().toCompletionStage().toCompletableFuture().get(10, TimeUnit.SECONDS);
             vertx.close().toCompletionStage().toCompletableFuture().get(10, TimeUnit.SECONDS);
         }
+    }
+
+    private static void assertSelectedReplica(Deployment deployment, int replicas) {
+        assertEquals(1, deployment.pods().stream().filter(pod -> "READY".equals(pod.state())).count(), deployment.toString());
+        assertEquals(replicas - 1, deployment.pods().stream().filter(pod -> "COLD".equals(pod.state())).count(), deployment.toString());
     }
 
     private static Reply invoke(HttpClient client, int port, String path) throws Exception {

@@ -383,6 +383,15 @@ proxy port in the pod. HTTPS must be terminated before an HTTP-mode listener or
 use TCP mode; encrypted traffic cannot receive request-level idle accounting.
 Port-forward remains connection-based. Strict mode requires an external wake route.
 Scaling a Deployment to zero deletes RAM identity, so hibernation retains replicas.
+Floci's coordinator defaults to `runtime.wake-replicas: 1` and reuses an already
+awake replica before waking another. Its default `backend-routing: pod` sends
+HTTP to that selected pod's first declared TCP port; omit `backend-url`.
+Set a larger `wake-replicas` for parallel queue consumers without changing
+Kubernetes desired replicas. Explicit `backend-routing: service` preserves a
+custom `backend-url`, including TLS or another application port, but Service
+balancing can wake additional replicas. See the [configuration and migration
+rules](../../docs/configuration/microsandbox-kubernetes.md).
+
 Both proxy modes translate client source IPs. Direct HTTP health requests wake apps
 and count as requests; configure synthetic health handling at the Floci gateway
 when they should not. Kubernetes probes and status checks do not wake sleeping
@@ -390,3 +399,9 @@ guests or extend their normal idle timer. SQS visible/in-flight and RabbitMQ
 ready/unacknowledged message accounting is unchanged.
 Reserve both /22 ranges without overlap
 with existing nodes, and preserve those network settings across controller restart.
+
+Use `qualify.py --activation-only --floci-checkout /path/to/floci` with the usual
+controller, microsandbox, runtime-home and report arguments to test Java gateway
+and queue activation against two real cold replicas with only one guest's RAM
+budget. This fixture checks that the other replica stays cold and that the
+selected replica retains its identity and memory over two hibernation cycles.

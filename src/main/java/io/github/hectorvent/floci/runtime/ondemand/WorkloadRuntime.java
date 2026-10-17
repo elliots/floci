@@ -30,4 +30,9 @@ public interface WorkloadRuntime {
     default void awaitQuiescence(Duration timeout) throws Exception {}
 
     URI backend();
+
+    /** Running health probes bypass application-activity accounting while their coordinator lease prevents sleep. */
+    default URI healthBackend() {
+        return backend();
+    }
 }

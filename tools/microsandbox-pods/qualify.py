@@ -15,6 +15,7 @@ import urllib.request
 import urllib.error
 
 from qualification_registry import QualificationRegistry
+from qualification_activation import qualify_activation
 from qualification_applications import qualify_applications
 from qualification_operations import qualify_operations
 from qualification_sidecars import qualify_sidecars
@@ -144,6 +145,8 @@ def qualify(args):
                 "--network-peer", peer, "--peer-owner", owner, "--listen", f"0.0.0.0:{port}", "--node-ip", host_ip,
                 "--tls-cert", str(temporary/"server.crt"), "--tls-key", str(temporary/"server.key"),
                 "--client-ca", str(temporary/"client-ca.crt"), "--control-listen", f"127.0.0.1:{control_port}", "--control-token-file", str(token_path), "--cleanup-on-exit", "--cluster-name", "qualification"]
+            if args.activation_only:
+                controller_args.extend(["--max-active-memory-mib", "768"])
             if args.network_relay_binary:
                 controller_args.extend(["--network-relay-binary",args.network_relay_binary])
             if args.guest_fs_binary:
@@ -187,6 +190,10 @@ def qualify(args):
                     "tolerations":[{"key":"microsandbox.dev/runtime","operator":"Equal","value":"native","effect":"NoSchedule"}],
                     "automountServiceAccountToken":False, "restartPolicy":"Never",
                     "containers":[{"name":"app","image":"public.ecr.aws/docker/library/busybox:1.37.0","command":["sh","-ec",script]}]}}
+            if args.activation_only:
+                qualify_activation(args=args, pod=pod, apply=apply, resource=resource,
+                    control_get=control_get, wait=wait, report=report, log=log, control_port=control_port, token=token)
+                raise QualificationComplete()
             if args.http_activity_only:
                 if not args.network_relay_binary:
                     raise RuntimeError("HTTP activity qualification requires --network-relay-binary")
@@ -886,14 +893,14 @@ def qualify(args):
                 if args.proxy_pods:
                     cold_annotations.update({"microsandbox.dev/availability":"proxy","microsandbox.dev/idle-owner":"external"})
                 apply({"apiVersion":"apps/v1","kind":"Deployment","metadata":{"name":"native-cold"},"spec":{
-                    "replicas":1,"selector":{"matchLabels":{"app":"native-cold"}},"template":{"metadata":{"labels":{"app":"native-cold"},"annotations":cold_annotations},"spec":cold_spec}}})
+                    "replicas":2,"selector":{"matchLabels":{"app":"native-cold"}},"template":{"metadata":{"labels":{"app":"native-cold"},"annotations":cold_annotations},"spec":cold_spec}}})
                 if args.proxy_pods:
-                    wait("external lazy Deployment ready",lambda:resource("deployment","native-cold").get("status",{}).get("availableReplicas")==1)
+                    wait("external lazy Deployment ready",lambda:resource("deployment","native-cold").get("status",{}).get("availableReplicas")==2)
                 cold_deployment=wait("cold Deployment discovery",lambda:control_get("deployments/default/native-cold"))
-                assert cold_deployment["pods"][0]["state"]=="COLD"
+                assert len(cold_deployment["pods"])==2 and all(p["state"]=="COLD" for p in cold_deployment["pods"])
                 java_env = dict(os.environ,JAVA_HOME=args.java_home or os.environ.get("JAVA_HOME",""),FLOCI_NATIVE_POD_TEST="true",FLOCI_NATIVE_POD_CONTROLLER_URL=f"http://127.0.0.1:{control_port}",
                     FLOCI_NATIVE_POD_CONTROLLER_TOKEN=token,FLOCI_NATIVE_POD_NAMESPACE="default",FLOCI_NATIVE_POD_DEPLOYMENT="native-cold",
-                    FLOCI_NATIVE_POD_BACKEND_URL=cold_deployment["pods"][0]["backendUrl"],FLOCI_NATIVE_POD_HTTP_PATH="/cgi-bin/source",FLOCI_NATIVE_POD_EXPECT_COLD="true")
+                    FLOCI_NATIVE_POD_BACKEND_URL=cold_deployment["pods"][0]["backendUrl"],FLOCI_NATIVE_POD_HTTP_PATH="/cgi-bin/source",FLOCI_NATIVE_POD_EXPECT_COLD="true",FLOCI_NATIVE_POD_EXPECT_REPLICAS="2")
                 if args.proxy_pods:
                     java_env["FLOCI_NATIVE_POD_PROXY_URL"]=cold_deployment["pods"][0]["proxyUrl"]
                 if args.maven_ready_file:
@@ -904,7 +911,10 @@ def qualify(args):
                     cwd=args.floci_checkout,env=java_env,stdout=log,stderr=log,timeout=900)
                 if completed.returncode: raise RuntimeError("Java native workload integration test failed; see controller log")
                 report["checks"]["java_on_demand_http_wake"] = True
-                cold_name = cold_deployment["pods"][0]["name"]
+                current_cold=control_get("deployments/default/native-cold")
+                assert sum(p["state"]=="READY" for p in current_cold["pods"])==1, current_cold
+                assert sum(p["state"]=="COLD" for p in current_cold["pods"])==1, current_cold
+                cold_name = next(p["name"] for p in current_cold["pods"] if p["state"]=="READY")
                 assert kubectl("exec",cold_name,"--","cat","/work/disk/initialized")=="initialized"
                 kubectl("exec",cold_name,"--","sh","-ec","test ! -e /work/disk/marker; test ! -e /work/memory/marker")
                 report["checks"]["new_pod_emptydir_starts_empty"] = True
@@ -1008,6 +1018,7 @@ if __name__ == "__main__":
     parser.add_argument("--network-relay-binary")
     parser.add_argument("--guest-fs-binary")
     parser.add_argument("--groups-only", action="store_true", help="run the same group and volume permission fixture on Docker and native pods")
+    parser.add_argument("--activation-only", action="store_true", help="qualify Java HTTP/queue wake of one replica with a single-guest memory budget")
     parser.add_argument("--http-activity-only", action="store_true", help="qualify HTTP request leases and same-connection wake through the shared owned fixture")
     parser.add_argument("--scheduling-cpu", help="virtual CPU capacity advertised to the Kubernetes scheduler")
     parser.add_argument("--scheduling-memory", help="virtual memory capacity advertised to the Kubernetes scheduler")

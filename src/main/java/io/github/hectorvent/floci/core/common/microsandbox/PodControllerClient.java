@@ -6,6 +6,7 @@ import com.fasterxml.jackson.databind.node.ObjectNode;
 
 import java.io.IOException;
 import java.net.URI;
+import java.net.URISyntaxException;
 import java.net.URLEncoder;
 import java.net.http.HttpClient;
 import java.net.http.HttpRequest;
@@ -56,7 +57,15 @@ public class PodControllerClient {
 
     public record Pod(String uid, String namespace, String name, String state, long generation,
                       boolean proxyAvailability, String idleOwner, int activeConnections, int activeRequests,
-                      long activitySequence, boolean activitySequenceKnown) {
+                      long activitySequence, boolean activitySequenceKnown,
+                      URI backendUrl, URI proxyUrl, String proxyProtocol) {
+        public Pod(String uid, String namespace, String name, String state, long generation,
+                   boolean proxyAvailability, String idleOwner, int activeConnections, int activeRequests,
+                   long activitySequence, boolean activitySequenceKnown) {
+            this(uid, namespace, name, state, generation, proxyAvailability, idleOwner, activeConnections,
+                    activeRequests, activitySequence, activitySequenceKnown, null, null, null);
+        }
+
         public Pod(String uid, String namespace, String name, String state, long generation) {
             this(uid, namespace, name, state, generation, false, "external", 0, 0, 0, false);
         }
@@ -233,7 +242,65 @@ public class PodControllerClient {
         }
         return new Pod(requiredText(value, "uid"), requiredText(value, "namespace"), requiredText(value, "name"),
                 state, generation(value), proxy, idleOwner, connections, requestsValue.asInt(0), sequenceValue.asLong(0),
-                !sequenceValue.isMissingNode());
+                !sequenceValue.isMissingNode(), endpoint(value, "backendUrl"), endpoint(value, "proxyUrl"),
+                value.path("proxyProtocol").asText(null));
+    }
+
+    /** Resolves a host-local application listener without routing through a Service that could wake another pod. */
+    public URI applicationEndpoint(Pod pod) {
+        if (pod.proxyAvailability() && !"http".equals(pod.proxyProtocol())) {
+            throw new IllegalStateException("Pod routing requires an HTTP-mode proxy; rebuild the controller or use"
+                    + " backend-routing: service for TCP/TLS or custom endpoints");
+        }
+        return resolveApplicationEndpoint(pod.proxyAvailability() ? pod.proxyUrl() : pod.backendUrl());
+    }
+
+    public URI healthEndpoint(Pod pod) {
+        return resolveApplicationEndpoint(pod.backendUrl());
+    }
+
+    private URI resolveApplicationEndpoint(URI advertised) {
+        if (advertised == null) {
+            throw new IllegalStateException("Selected pod has no published HTTP endpoint; declare a TCP application port"
+                    + " or configure backend-routing: service with backend-url");
+        }
+        URI controller = URI.create(url);
+        String host = advertised.getHost();
+        boolean loopback = "127.0.0.1".equals(host) || "[::1]".equals(host) || "::1".equals(host);
+        if (!loopback && !controller.getHost().equalsIgnoreCase(host)) {
+            throw new IllegalStateException("Pod application endpoint must be on the configured controller host");
+        }
+        try {
+            return new URI(advertised.getScheme(), null, loopback ? controller.getHost() : host,
+                    advertised.getPort(), advertised.getPath(), null, null);
+        } catch (URISyntaxException ignored) {
+            // Only validated origins reach this branch; exclude controller and application URLs from diagnostics.
+            throw new IllegalStateException("Cannot resolve the selected pod application endpoint");
+        }
+    }
+
+    private static URI endpoint(JsonNode value, String field) {
+        JsonNode address = value.path(field);
+        if (address.isMissingNode()) {
+            return null;
+        }
+        if (!address.isTextual()) {
+            throw new IllegalStateException("Pod controller returned an invalid application endpoint");
+        }
+        URI endpoint;
+        try {
+            endpoint = URI.create(address.asText());
+        } catch (IllegalArgumentException ignored) {
+            // Never include a possibly credential-bearing address in an exception.
+            throw new IllegalStateException("Pod controller returned an invalid application endpoint");
+        }
+        if (!"http".equals(endpoint.getScheme()) || endpoint.getHost() == null
+                || endpoint.getPort() < 1 || endpoint.getPort() > 65535 || endpoint.getUserInfo() != null
+                || endpoint.getQuery() != null || endpoint.getFragment() != null
+                || !Set.of("", "/").contains(endpoint.getPath())) {
+            throw new IllegalStateException("Pod controller returned an invalid application endpoint");
+        }
+        return endpoint;
     }
 
     private static long generation(JsonNode value) {

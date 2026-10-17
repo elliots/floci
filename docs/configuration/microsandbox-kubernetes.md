@@ -118,7 +118,8 @@ workloads:
       type: kubernetes
       namespace: default
       deployment: orders
-      backend-url: http://127.0.0.1:31080
+      wake-replicas: 1
+      backend-routing: pod
     queues: [orders-incoming]
     idle-timeout-seconds: 120
     startup-timeout-seconds: 240
@@ -126,8 +127,24 @@ workloads:
       path: /ready
 ```
 
-Set `backend-url` to a reachable application endpoint that bypasses the Floci wake
-gateway, for example a published Service endpoint. In proxy availability mode,
+The default `backend-routing: pod` discovers the selected pod's published first
+TCP application port. Real gateway requests use its HTTP wake proxy when proxy
+availability is enabled, or its direct HTTP endpoint in strict mode. Running
+health checks use the selected direct endpoint so monitoring does not renew the
+application idle timer. Floci and the controller must share reachable application
+listeners; a loopback address advertised by the controller is resolved on the
+configured controller host, with its published port unchanged. This does not
+open or tunnel that port remotely.
+
+Omit `backend-url` in pod routing mode. For HTTPS, a custom ingress endpoint or a
+different application port, explicitly select `backend-routing: service` and set
+`backend-url` to the same reachable HTTP(S) origin used before, bypassing the
+Floci wake gateway. Service routing can select and wake additional cold pods.
+If that endpoint itself traverses a wake proxy, forwarded health checks are
+ordinary proxy requests and can extend its idle timer. Pod routing avoids that
+by using the selected direct endpoint for running health checks.
+Proxy pod routing requires `microsandbox.dev/proxy-protocol: http`; opaque
+TCP/TLS listeners need the explicit Service routing choice. In proxy availability mode,
 declared TCP ports accept traffic through both Pod IPs and Services while the VM
 is cold or hibernated. In strict mode, direct calls to sleeping pods or ClusterIPs
 do not wake them; route requests through the Floci gateway.
@@ -181,9 +198,21 @@ through ordinary Kubernetes manifests, and keep at least one desired replica.
 Deployments already scaled to zero must be scaled up before this backend can
 adopt their pods.
 
-A Floci workload activation starts all of its Deployment's desired replicas and
-waits for all of them to be ready. Keep that replica count within the active RAM
-budget. Standalone proxy traffic activates only the pod selected by the Service.
+A Floci workload activation defaults to `runtime.wake-replicas: 1`. It reuses a
+Ready or already-starting replica before restoring a sleeping replica or booting
+a cold one, with Pod UID ordering to make equal choices stable. It waits for
+actual readiness only on the selected replicas. Other cold replicas remain cold;
+Kubernetes desired replicas, Pod UIDs and proxy readiness do not change.
+
+Set `wake-replicas` to a larger positive number when a queue needs parallel
+consumers. The target is capped at the Deployment's current desired replicas;
+it never scales the Deployment. The same configured minimum applies to gateway
+HTTP and SQS/RabbitMQ activation, including IoT rules routed into SQS. It is a
+fixed wake target, not automatic scaling from queue depth or request concurrency.
+Already-awake additional replicas are left running until the workload's normal
+idle decision, and direct Service traffic can wake more replicas independently.
+Choose a target that fits the shared active RAM budget. Whole-workload idle
+hibernation still accounts for every owned replica's requests and streams.
 
 If `runtime.cluster-name` is supplied, it must match the controller's advertised
 `--cluster-name`. One configured controller endpoint currently serves the local
