@@ -152,3 +152,33 @@ func TestEnvironmentPeerRulesRequireFirstHookAndExactSemantics(t *testing.T) {
 		}
 	}
 }
+
+func TestEnvironmentExplicitGatewayPortsPrecedeImplicitHostDenial(t *testing.T) {
+	e := &environmentBoundary{
+		runner: commandRunner{cfg: config{peerOwner: "owned", clusterCIDR: "10.42.0.0/16", serviceCIDR: "10.43.0.0/16"}},
+		identity: environmentIdentity{PeerIP: "172.28.0.3", HostIP: "172.28.0.1", Prefixes: []string{"172.28.0.0/16"},
+			Gateways: []string{"172.28.0.1"}},
+		policy: msbruntime.NetworkBoundaryInfo{GlobalEgress: []msbruntime.NetworkEgressEndpoint{
+			{Destination: "172.28.0.1/32", Protocol: "tcp", Ports: "443"},
+			{Destination: "172.28.0.1/32", Protocol: "udp", Ports: "53"},
+		}},
+		ports: map[environmentPort]bool{{Protocol: "tcp", Port: 10250}: true},
+	}
+	rules := e.peerRules(false)
+	chain := e.chain()
+	transport := strings.Index(rules, "-A "+chain+" -s 172.28.0.3/32 -d 172.28.0.1/32 -p tcp -m tcp --dport 10250 -j RETURN\n")
+	denial := strings.Index(rules, "-A "+chain+" -d 172.28.0.1/32 -j DROP\n")
+	internal := strings.Index(rules, "-A "+chain+" -d 172.28.0.0/16 -j RETURN\n")
+	if transport < 0 || denial <= transport || internal <= denial {
+		t.Fatal("gateway must retain its peer-only transport grants and deny implicit protected-subnet access", rules)
+	}
+	for _, permission := range []string{"-p tcp -m tcp --dport 443", "-p udp -m udp --dport 53"} {
+		allowed := strings.Index(rules, "-A "+chain+" -d 172.28.0.1/32 "+permission+" -j RETURN\n")
+		if allowed <= transport || allowed >= denial {
+			t.Fatalf("explicit gateway permission %q is shadowed or changed: %s", permission, rules)
+		}
+	}
+	if strings.Contains(e.peerRules(true), "172.28.0.1") {
+		t.Fatal("IPv4 gateway permissions widened IPv6 egress")
+	}
+}

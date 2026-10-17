@@ -35,13 +35,18 @@ func TestDockerEnvironmentPeerEgressBeforeSourceNAT(t *testing.T) {
 	host := f.container(t, "host", "--network", "host", f.image, "sh", "-ec",
 		"socat -d -d TCP4-LISTEN:0,fork,reuseaddr EXEC:cat 2>/tmp/tcp.log & "+
 			"socat -d -d TCP4-LISTEN:0,fork,reuseaddr EXEC:cat 2>/tmp/other.log & "+
-			"socat -d -d UDP4-RECVFROM:0,fork,reuseaddr EXEC:cat 2>/tmp/udp.log & wait")
+			"socat -d -d UDP4-RECVFROM:0,fork,reuseaddr EXEC:cat 2>/tmp/udp.log & "+
+			"socat -d -d TCP4-LISTEN:0,fork,reuseaddr EXEC:cat 2>/tmp/global-tcp.log & "+
+			"socat -d -d UDP4-RECVFROM:0,fork,reuseaddr EXEC:cat 2>/tmp/global-udp.log & "+
+			"socat -d -d UDP4-RECVFROM:0,fork,reuseaddr EXEC:cat 2>/tmp/other-udp.log & wait")
 	peerIP, _ := f.addresses(t, peer)
 	localIP, _ := f.addresses(t, local)
 	allowedIP, _ := f.addresses(t, allowed)
 	deniedIP, deniedIPv6 := f.addresses(t, denied)
 	hostTCP, hostUDP := f.listenerPort(t, host, "tcp"), f.listenerPort(t, host, "udp")
 	otherHostTCP := f.listenerPort(t, host, "other")
+	globalHostTCP, globalHostUDP := f.listenerPort(t, host, "global-tcp"), f.listenerPort(t, host, "global-udp")
+	otherHostUDP := f.listenerPort(t, host, "other-udp")
 
 	f.must(t, "exec", probe, "sh", "-ec", `
 ip netns add app
@@ -88,6 +93,9 @@ ip6tables -I OUTPUT 1 -j ACCEPT
 		{"Service DNAT to outside", "10.43.9.10", "tcp", 8080, false},
 		{"Service DNAT to simulator", "10.43.9.11", "tcp", 8080, true},
 		{"unlisted host listener", f.gateway, "tcp", otherHostTCP, false},
+		{"explicit gateway TCP", f.gateway, "tcp", globalHostTCP, true},
+		{"explicit gateway UDP", f.gateway, "udp", globalHostUDP, true},
+		{"unlisted gateway UDP", f.gateway, "udp", otherHostUDP, false},
 	}
 	// Positive controls prove every denied case reaches a real listening service
 	// before the boundary is installed, including forwarded IPv6 and DNAT paths.
@@ -107,6 +115,8 @@ ip6tables -I OUTPUT 1 -j ACCEPT
 		policy: msbruntime.NetworkBoundaryInfo{GlobalEgress: []msbruntime.NetworkEgressEndpoint{
 			{Destination: allowedIP + "/32", Protocol: "tcp", Ports: "8080"},
 			{Destination: allowedIP + "/32", Protocol: "udp", Ports: "8082"},
+			{Destination: f.gateway + "/32", Protocol: "tcp", Ports: strconv.Itoa(globalHostTCP)},
+			{Destination: f.gateway + "/32", Protocol: "udp", Ports: strconv.Itoa(globalHostUDP)},
 		}},
 		ports: map[environmentPort]bool{{Protocol: "tcp", Port: hostTCP}: true, {Protocol: "udp", Port: hostUDP}: true},
 	}

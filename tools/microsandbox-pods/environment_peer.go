@@ -29,15 +29,17 @@ func (e *environmentBoundary) peerRules(ipv6 bool) string {
 		for _, port := range e.portList() {
 			fmt.Fprintf(&rules, "-A %s -s %s/32 -d %s/32 -p %s -m %s --dport %d -j RETURN\n", chain, e.identity.PeerIP, e.identity.HostIP, port.Protocol, port.Protocol, port.Port)
 		}
+		for _, endpoint := range e.policy.GlobalEgress {
+			fmt.Fprintf(&rules, "-A %s -d %s -p %s -m %s --dport %s -j RETURN\n", chain, endpoint.Destination, endpoint.Protocol, endpoint.Protocol, strings.ReplaceAll(endpoint.Ports, "-", ":"))
+		}
 		// Bridge gateways are Docker-host addresses, not simulator endpoints.
+		// Only explicit permissions above may admit them; their protected subnet
+		// alone must not authorize every host listener.
 		for _, gateway := range e.identity.Gateways {
 			fmt.Fprintf(&rules, "-A %s -d %s/32 -j DROP\n", chain, gateway)
 		}
 		for _, prefix := range append([]string{e.runner.cfg.clusterCIDR, e.runner.cfg.serviceCIDR}, e.identity.Prefixes...) {
 			fmt.Fprintf(&rules, "-A %s -d %s -j RETURN\n", chain, prefix)
-		}
-		for _, endpoint := range e.policy.GlobalEgress {
-			fmt.Fprintf(&rules, "-A %s -d %s -p %s -m %s --dport %s -j RETURN\n", chain, endpoint.Destination, endpoint.Protocol, endpoint.Protocol, strings.ReplaceAll(endpoint.Ports, "-", ":"))
 		}
 	}
 	fmt.Fprintf(&rules, "-A %s -j DROP\nCOMMIT\n", chain)
