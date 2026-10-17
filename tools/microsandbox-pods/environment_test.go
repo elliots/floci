@@ -10,6 +10,26 @@ import (
 	msbruntime "github.com/floci-io/floci/tools/microsandbox-runtime"
 )
 
+func TestEnvironmentResolverChecksDestinationsIndependentlyOfOptions(t *testing.T) {
+	for _, value := range []string{
+		"nameserver 172.28.0.2\noptions timeout:2 attempts:2\n",
+		"# Floci\nnameserver 172.28.0.2\noptions ndots:0\n",
+		"nameserver 172.28.0.2 # controlled\nsearch svc.cluster.local cluster.local\n",
+	} {
+		if !environmentResolverMatches(value, "172.28.0.2") {
+			t.Fatalf("valid shared resolver refused: %q", value)
+		}
+	}
+	for _, value := range []string{
+		"options ndots:0", "nameserver 8.8.8.8", "nameserver 172.28.0.2\nnameserver 8.8.8.8",
+		"nameserver 172.28.0.2\nnameserver 172.28.0.2", "nameserver 172.28.0.2 8.8.8.8",
+	} {
+		if environmentResolverMatches(value, "172.28.0.2") {
+			t.Fatalf("changed resolver accepted: %q", value)
+		}
+	}
+}
+
 func TestEnvironmentOptionsRequireCompleteSecurePeer(t *testing.T) {
 	valid := config{environmentNetwork: "protected", isolationHelper: "helper", environmentDNS: "172.28.0.2", networkPolicy: true}
 	if err := valid.validateEnvironment(); err != nil {

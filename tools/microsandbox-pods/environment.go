@@ -260,7 +260,7 @@ func inspectEnvironment(ctx context.Context, runner commandRunner, policy msbrun
 	slices.Sort(identity.Gateways)
 	identity.Gateways = slices.Compact(identity.Gateways)
 	resolver, err := runner.peer(ctx, "cat /etc/floci-resolv.conf")
-	if err != nil || strings.TrimSpace(resolver) != "nameserver "+identity.DNS+"\noptions ndots:0" {
+	if err != nil || !environmentResolverMatches(resolver, identity.DNS) {
 		return identity, contract, errors.New("peer's staged DNS resolver differs")
 	}
 	output, err = runner.run(ctx, "docker", "exec", helper.ID, "nft", "-j", "list", "table", "inet", contract.Table)
@@ -279,6 +279,29 @@ func inspectEnvironment(ctx context.Context, runner commandRunner, policy msbrun
 		return identity, contract, err
 	}
 	return identity, contract, nil
+}
+
+func environmentResolverMatches(resolver, address string) bool {
+	nameservers := 0
+	for line := range strings.SplitSeq(resolver, "\n") {
+		line, _, _ = strings.Cut(line, "#")
+		fields := strings.Fields(line)
+		if len(fields) == 0 {
+			continue
+		}
+		switch fields[0] {
+		case "nameserver":
+			if len(fields) != 2 || fields[1] != address {
+				return false
+			}
+			nameservers++
+		case "options", "search", "domain", "sortlist":
+			// Resolver timing and search settings do not authorize a new server.
+		default:
+			return false
+		}
+	}
+	return nameservers == 1
 }
 
 func newEnvironmentBoundary(ctx context.Context, runner commandRunner, policy msbruntime.NetworkBoundaryInfo) (*environmentBoundary, error) {
