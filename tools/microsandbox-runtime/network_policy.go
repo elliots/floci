@@ -31,6 +31,7 @@ type nativeNetworkBoundary struct {
 	fingerprint string
 	caBytes     []byte
 	guestAgent  []byte
+	global      []networkEndpoint
 }
 
 type networkEndpoint struct {
@@ -40,7 +41,8 @@ type networkEndpoint struct {
 }
 
 // The same file configures Floci's outer Docker boundary and the native SDK.
-// Only native settings are read here; Floci validates simulator route settings.
+// Global and native egress settings are read here; Floci validates simulator
+// routes and the outer Docker boundary.
 func readNetworkBoundary(file string) (*nativeNetworkBoundary, error) {
 	if file == "" {
 		return nil, nil
@@ -59,7 +61,8 @@ func readNetworkBoundary(file string) (*nativeNetworkBoundary, error) {
 			Isolation struct {
 				Enabled bool `yaml:"enabled"`
 			} `yaml:"isolation"`
-			Native yaml.Node `yaml:"native"`
+			Native  yaml.Node `yaml:"native"`
+			Allowed yaml.Node `yaml:"allowed-egress"`
 		} `yaml:"network"`
 	}
 	decoder := yaml.NewDecoder(bytes.NewReader(data))
@@ -101,6 +104,34 @@ func readNetworkBoundary(file string) (*nativeNetworkBoundary, error) {
 		if _, _, err := portRange(endpoint.Ports); err != nil {
 			return nil, errors.New("native allowed egress requires an explicit valid port range")
 		}
+	}
+	if document.Network.Allowed.Kind != 0 {
+		encoded, err := yaml.Marshal(&document.Network.Allowed)
+		if err != nil {
+			return nil, errors.New("invalid global allowed egress configuration")
+		}
+		var endpoints []networkEndpoint
+		reader := yaml.NewDecoder(bytes.NewReader(encoded))
+		reader.KnownFields(true)
+		if err := reader.Decode(&endpoints); err != nil {
+			return nil, errors.New("invalid global allowed egress fields")
+		}
+		for index, endpoint := range endpoints {
+			prefix, err := netip.ParsePrefix(endpoint.Destination)
+			if err != nil || !globalEgressPrefix(prefix) {
+				return nil, errors.New("global allowed egress requires a canonical IPv4 CIDR without unspecified, loopback, link-local, multicast or reserved addresses")
+			}
+			if endpoint.Protocol != "tcp" && endpoint.Protocol != "udp" {
+				return nil, errors.New("global allowed egress requires TCP or UDP")
+			}
+			ports, err := globalEgressPorts(endpoint.Ports)
+			if err != nil {
+				return nil, err
+			}
+			endpoints[index].Ports = ports
+		}
+		boundary.global = slices.Clone(endpoints)
+		boundary.Allowed = append(boundary.Allowed, endpoints...)
 	}
 	for _, server := range boundary.Nameservers {
 		address, err := netip.ParseAddrPort(server)
@@ -159,6 +190,50 @@ func privatePrefix(prefix netip.Prefix) bool {
 	return false
 }
 
+// Public SDK rules must never become an explicit CIDR rule spanning a more
+// privileged destination group. Keep the entire prefix outside local/reserved
+// ranges, including the SDK's possible benchmark-range host gateway.
+func publicPrefix(prefix netip.Prefix) bool {
+	if !prefix.IsValid() || !prefix.Addr().Is4() {
+		return false
+	}
+	for _, excluded := range nonPublicSDKNetworks {
+		if prefix.Overlaps(netip.MustParsePrefix(excluded)) {
+			return false
+		}
+	}
+	return true
+}
+
+func globalEgressPrefix(prefix netip.Prefix) bool {
+	if !prefix.IsValid() || !prefix.Addr().Is4() || prefix.Bits() == 0 || prefix != prefix.Masked() {
+		return false
+	}
+	for _, excluded := range []string{"0.0.0.0/8", "127.0.0.0/8", "169.254.0.0/16", "224.0.0.0/4", "240.0.0.0/4"} {
+		if prefix.Overlaps(netip.MustParsePrefix(excluded)) {
+			return false
+		}
+	}
+	return true
+}
+
+func globalEgressPorts(value string) (string, error) {
+	low, high, err := portRange(value)
+	if err != nil {
+		return "", errors.New("global allowed egress requires an explicit valid port range")
+	}
+	for _, part := range strings.Split(value, "-") {
+		number, err := strconv.Atoi(part)
+		if err != nil || part != strconv.Itoa(number) {
+			return "", errors.New("global allowed egress ports must use canonical positive decimal values")
+		}
+	}
+	if low == high {
+		return strconv.Itoa(low), nil
+	}
+	return strconv.Itoa(low) + "-" + strconv.Itoa(high), nil
+}
+
 func (b *nativeNetworkBoundary) restrict(original *msb.NetworkConfig) (*msb.NetworkConfig, error) {
 	if original == nil {
 		original = msb.NetworkPolicy.FromProfiles(msb.NetworkProfilePublic)
@@ -184,12 +259,14 @@ func (b *nativeNetworkBoundary) restrict(original *msb.NetworkConfig) (*msb.Netw
 			return nil, invalid("native boundary cannot interpret rule action")
 		}
 		for _, endpoint := range b.Allowed {
-			intersection, ok, err := intersectEndpoint(rule, endpoint)
-			if err != nil {
-				return nil, err
-			}
-			if ok {
-				result.Rules = append(result.Rules, intersection)
+			for _, candidate := range profileEndpoints(rule.Destination, endpoint) {
+				intersection, ok, err := intersectEndpoint(rule, candidate)
+				if err != nil {
+					return nil, err
+				}
+				if ok {
+					result.Rules = append(result.Rules, intersection)
+				}
 			}
 		}
 	}
@@ -225,11 +302,14 @@ func intersectEndpoint(rule msb.PolicyRule, endpoint networkEndpoint) (msb.Polic
 		}
 	case "private":
 		prefix, _ := netip.ParsePrefix(destination)
-		if destination == "host" || !prefix.IsValid() || !prefix.Addr().IsPrivate() {
+		if !privateSDKPrefix(prefix) {
 			return rule, false, nil
 		}
 	case "public":
-		return rule, false, nil
+		prefix, err := netip.ParsePrefix(destination)
+		if err != nil || !publicPrefix(prefix) {
+			return rule, false, nil
+		}
 	default:
 		original, err := netip.ParsePrefix(rule.Destination)
 		if err != nil {

@@ -65,6 +65,23 @@ guest and checkpoint IDs. SDK 0.7.8 drops network/DNS settings on restore, so th
 adapter reapplies policy before resuming RAM and blocks the SDK default resolver.
 See [network configuration](../../docs/configuration/workload-network.md).
 
+The adapter combines `network.allowed-egress` with `network.native.allowed-egress`
+and intersects that allowlist with each workload's requested SDK policy. The
+global entries accept canonical IPv4 unicast CIDRs, including public addresses,
+with explicit `tcp` or `udp` and a port or port range. Native entries retain their
+private-CIDR or `host` transport restriction. Neither field adds a default allow;
+the configured DNS nameservers remain the default resolver. Explicit DNS-port
+allowances use the same validation as other service ports. SDK DNS interception
+still applies independently to its reserved ports.
+
+`Client.NetworkBoundary()` returns copied fingerprint, DNS endpoints, effective
+allowlist and separate global entries for consumers that enforce the outer peer
+boundary. Callers cannot mutate the runtime's validated policy through this
+snapshot. Named public/private SDK profiles are intersected by splitting mixed
+CIDRs, preserving explicit deny rules and port limits. The benchmark range
+`198.18.0.0/15` is excluded from a public-profile projection because the SDK can
+use it for host transport; an explicit workload CIDR rule remains available.
+
 Lifecycle methods use the SDK's stable identity guards wherever exposed. The
 0.7.8 Go binding still addresses resident `resume` and snapshot capture by name.
 For those operations the adapter verifies the captured identity before and
