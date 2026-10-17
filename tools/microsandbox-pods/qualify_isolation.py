@@ -14,6 +14,7 @@ import urllib.request
 import urllib.error
 
 import manage
+from isolation_probe import probe
 from qualify_managed import ManagedQualification
 
 
@@ -99,6 +100,14 @@ class EnvironmentFixture:
                 input_text=json.dumps(control)))
             return all(value["success"] for value in result)
         manage.wait("external TCP UDP DNS canaries ready", servers_ready)
+        try:
+            for kind, port in (("tcp", 18080), ("udp", 18081), ("tcp", 18082), ("udp", 18083),
+                    ("dns-tcp", 1053), ("dns-udp", 1053), ("dns-tcp", 1054), ("dns-udp", 1054)):
+                probe({"kind": kind, "target": [self.external_ip, port], "timeout": 3})
+        except Exception as error:
+            raise RuntimeError("host cannot route to the owned TEST-NET canary " + self.external_ip
+                + "; native public-egress policy cannot be qualified on this route") from error
+        q.report["checks"]["host_routes_to_public_canary_tcp_udp_and_dns_ports"] = True
         public = json.loads(self.command("docker", "exec", "-i", self.external, "python", "/probe.py", "probe",
             input_text=json.dumps([{"name": "public-dns", "kind": "resolve", "target": "example.com"}])))
         assert public[0]["success"], public
