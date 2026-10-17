@@ -234,6 +234,9 @@ retired after deletion. Restored VMs explicitly receive the original named disk
 mount map with the SDK's strict external-mount policy. `run` and `snap restore`
 accept `--mount-named NAME:/guest/path:kind=disk,size=256M`, but reject any mount
 without a matching durable attachment to that VM.
+Preparation and dispatch verify the disk under the shared admission lock. A
+prepared permit prevents attachment release until dispatch or cancellation;
+a known validation failure before dispatch releases that permit for safe retry.
 
 An attachment remains held while its guest exists, including stopped guests,
 while its checkpoints exist, or while an uncertain guest operation is recorded.

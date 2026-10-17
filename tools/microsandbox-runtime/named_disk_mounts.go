@@ -9,6 +9,25 @@ import (
 	msb "github.com/superradcompany/microsandbox/sdk/go"
 )
 
+var errNamedDiskPreflight = errors.New("named disk could not be verified before native dispatch")
+
+// prepare and dispatch call this under the shared capacity lock. The resulting
+// pending permit keeps ReleaseNamedDisk from changing the lease after validation.
+func (c *Client) namedDiskAdmissionCheck(ctx context.Context, request command) func() error {
+	return func() error {
+		if len(request.config.Volumes) == 0 {
+			return nil
+		}
+		if err := c.core.initialize(); err != nil {
+			return errors.Join(errNamedDiskPreflight, err)
+		}
+		if err := c.validateNamedDiskMountsLocked(ctx, request); err != nil {
+			return errors.Join(errNamedDiskPreflight, err)
+		}
+		return nil
+	}
+}
+
 func parseNamedDiskMount(config *msb.SandboxConfig, value string) error {
 	parts := strings.Split(value, ":")
 	if len(parts) != 3 || !namedDiskName.MatchString(parts[0]) || !path.IsAbs(parts[1]) ||
@@ -63,17 +82,21 @@ func (c *Client) validateNamedDiskMounts(ctx context.Context, request command) e
 		return err
 	}
 	return c.capacity.transaction(ctx, func(_ *capacityState) error {
-		for _, mount := range request.config.Volumes {
-			record, err := c.readNamedDisk(mount.Named)
-			if err != nil || record.Phase != "ready" || record.Identity == nil || record.Attachment == nil ||
-				record.Attachment.VMName != request.name || record.Identity.CapacityMiB != mount.SizeMiB {
-				return errors.Join(errors.New("named disk mount has no matching durable Pod attachment"), err)
-			}
-			actual, err := c.disks.inspect(ctx, mount.Named)
-			if err != nil || !record.Identity.Matches(actual) {
-				return errors.Join(errors.New("attached named disk identity changed before launch or restore"), err)
-			}
-		}
-		return nil
+		return c.validateNamedDiskMountsLocked(ctx, request)
 	})
+}
+
+func (c *Client) validateNamedDiskMountsLocked(ctx context.Context, request command) error {
+	for _, mount := range request.config.Volumes {
+		record, err := c.readNamedDisk(mount.Named)
+		if err != nil || record.Phase != "ready" || record.Identity == nil || record.Attachment == nil ||
+			record.Attachment.VMName != request.name || record.Identity.CapacityMiB != mount.SizeMiB {
+			return errors.Join(errors.New("named disk mount has no matching durable Pod attachment"), err)
+		}
+		actual, err := c.disks.inspect(ctx, mount.Named)
+		if err != nil || !record.Identity.Matches(actual) {
+			return errors.Join(errors.New("attached named disk identity changed before launch or restore"), err)
+		}
+	}
+	return nil
 }

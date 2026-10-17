@@ -336,6 +336,11 @@ func (c *Client) namedDiskAttachment(ctx context.Context, expected NamedDiskIden
 			return errors.Join(errors.New("named disk backing identity differs"), err)
 		}
 		if record.Attachment != nil && *record.Attachment != attachment {
+			if release {
+				// A rejected attachment still has a Pod-side intent to clean up.
+				// Its cleanup must preserve the other Pod's exact live lease.
+				return nil
+			}
 			return ErrNamedDiskAttached
 		}
 		if release {

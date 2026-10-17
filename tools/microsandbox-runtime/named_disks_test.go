@@ -102,6 +102,60 @@ func TestNamedDiskReleaseAfterUnattachedReclaimIsIdempotent(t *testing.T) {
 	}
 }
 
+func TestNamedDiskAdmissionRejectsMissingMountBeforeReservationOrDispatch(t *testing.T) {
+	client, _ := namedDiskClient(t, CapacityLimits{MemoryMiB: 1024})
+	args := []string{"run", "--detach", "--name", "fvp-owned", "--memory", "512M", "--mount-named", "pvc-missing:/data:kind=disk,size=256M", "busybox:1.37.0"}
+	if _, err := client.Execute(t.Context(), args, nil); !errors.Is(err, ErrCapacityUnavailable) {
+		t.Fatal("mount preflight was not a known nondispatch", err)
+	}
+	status, err := client.Capacity(t.Context())
+	if err != nil || len(status.Reservations) != 0 {
+		t.Fatal("rejected mount retained reservation", status, err)
+	}
+	client.capacity.snapshot = func(context.Context, string) (capacitySnapshot, error) {
+		t.Fatal("snapshot admission preceded missing-disk check")
+		return capacitySnapshot{}, nil
+	}
+	restore := []string{"snap", "restore", "owned:checkpoint", "--name", "fvp-owned", "--mount-named", "pvc-missing:/data:kind=disk,size=256M"}
+	if _, err := client.PrepareAdmission(t.Context(), AdmissionRequest{Arguments: restore, SourceName: "fvp-owned"}); !errors.Is(err, ErrCapacityUnavailable) {
+		t.Fatal("restore was prepared with a missing disk", err)
+	}
+}
+
+func TestNamedDiskPreparedMountIsRevalidatedBeforeDispatchAndCancelsKnownFailure(t *testing.T) {
+	client, disks := namedDiskClient(t, CapacityLimits{MemoryMiB: 1024})
+	disk, err := client.CreateNamedDisk(t.Context(), diskRequest())
+	if err != nil {
+		t.Fatal(err)
+	}
+	attachment := NamedDiskAttachment{Owner: "cluster/node", PodUID: "pod-uid", VMName: "fvp-owned"}
+	if err := client.AttachNamedDisk(t.Context(), disk, attachment); err != nil {
+		t.Fatal(err)
+	}
+	args := []string{"run", "--detach", "--name", attachment.VMName, "--memory", "512M", "--mount-named", disk.Name + ":/data:kind=disk,size=256M", "busybox:1.37.0"}
+	token, err := client.PrepareAdmission(t.Context(), AdmissionRequest{Arguments: args})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := client.ReleaseNamedDisk(t.Context(), disk, attachment); !errors.Is(err, ErrNamedDiskUncertain) {
+		t.Fatal("lease changed between prepare and dispatch", err)
+	}
+	changed := disk
+	changed.Inode++
+	disks.items[disk.Name] = changed
+	if _, err := client.ExecuteAdmitted(t.Context(), args, nil, token); !errors.Is(err, ErrCapacityUnavailable) {
+		t.Fatal("changed mount reached native dispatch", err)
+	}
+	status, err := client.Capacity(t.Context())
+	if err != nil || len(status.Reservations) != 0 {
+		t.Fatal("known nondispatch leaked prepared permit", status, err)
+	}
+	disks.items[disk.Name] = disk
+	if err := client.ReleaseNamedDisk(t.Context(), disk, attachment); err != nil {
+		t.Fatal("known nondispatch blocked cleanup", err)
+	}
+}
+
 func TestNamedDiskCreationReservesBeforeDispatchAndCountsNoGuestRAM(t *testing.T) {
 	client, disks := namedDiskClient(t, CapacityLimits{MemoryMiB: 1, Starts: 1, DiskMiB: 512})
 	disks.onCreate = func(ctx context.Context) {
@@ -188,6 +242,17 @@ func TestNamedDiskAttachmentSurvivesSleepAndRejectsReplacementUntilCleanup(t *te
 	old := NamedDiskAttachment{Owner: "node-controller", PodUID: "pod-one", VMName: "fvp-pod-one"}
 	if err := client.AttachNamedDisk(t.Context(), identity, old); err != nil {
 		t.Fatal(err)
+	}
+	rejected := NamedDiskAttachment{Owner: old.Owner, PodUID: "pod-rejected", VMName: "fvp-rejected"}
+	if err := client.AttachNamedDisk(t.Context(), identity, rejected); !errors.Is(err, ErrNamedDiskAttached) {
+		t.Fatal(err)
+	}
+	if err := client.ReleaseNamedDisk(t.Context(), identity, rejected); err != nil {
+		t.Fatal("failed attachment cleanup blocked deletion", err)
+	}
+	record, err := client.readNamedDisk(identity.Name)
+	if err != nil || record.Attachment == nil || *record.Attachment != old {
+		t.Fatal("failed contender cleanup changed original lease", err)
 	}
 	disks.references = true // A stopped VM or its full-RAM checkpoint retains the attachment.
 	if err := client.ReleaseNamedDisk(t.Context(), identity, old); err == nil {

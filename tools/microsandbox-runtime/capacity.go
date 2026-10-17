@@ -155,7 +155,7 @@ func (c *Client) PrepareAdmission(ctx context.Context, request AdmissionRequest)
 	if c.capacity == nil {
 		return "", errors.New("native capacity manager unavailable")
 	}
-	return c.capacity.prepare(ctx, r, request.Arguments, request.SourceName)
+	return c.capacity.prepare(ctx, r, request.Arguments, request.SourceName, c.namedDiskAdmissionCheck(ctx, r))
 }
 
 func (c *Client) CancelAdmission(ctx context.Context, token string) error {
@@ -184,13 +184,13 @@ func (c *Client) admit(ctx context.Context, request command, args []string) (fun
 	automatic := token == ""
 	if token == "" {
 		var err error
-		token, err = c.capacity.prepare(ctx, request, args, "")
+		token, err = c.capacity.prepare(ctx, request, args, "", c.namedDiskAdmissionCheck(ctx, request))
 		if err != nil {
 			return nil, err
 		}
 	}
-	if err := c.capacity.dispatch(ctx, token, args); err != nil {
-		if automatic {
+	if err := c.capacity.dispatch(ctx, token, args, c.namedDiskAdmissionCheck(ctx, request)); err != nil {
+		if automatic || errors.Is(err, errNamedDiskPreflight) {
 			cleanup, cancel := context.WithTimeout(context.WithoutCancel(ctx), 10*time.Second)
 			defer cancel()
 			_ = c.CancelAdmission(cleanup, token)
@@ -215,7 +215,7 @@ func argumentsHash(args []string) string {
 	return hex.EncodeToString(digest[:])
 }
 
-func (m *capacityManager) prepare(ctx context.Context, r command, args []string, source string) (string, error) {
+func (m *capacityManager) prepare(ctx context.Context, r command, args []string, source string, checks ...func() error) (string, error) {
 	if !capacityOperation(r.op) || source != "" && r.op != "snap restore" {
 		return "", invalid("admission requires a native launch, start, capture or restore")
 	}
@@ -224,6 +224,11 @@ func (m *capacityManager) prepare(ctx context.Context, r command, args []string,
 	}
 	token := rand.Text()
 	err := m.transaction(ctx, func(state *capacityState) error {
+		for _, check := range checks {
+			if err := check(); err != nil {
+				return err
+			}
+		}
 		guests, err := m.inventory(ctx)
 		if err != nil {
 			return err
@@ -288,11 +293,16 @@ func (m *capacityManager) prepare(ctx context.Context, r command, args []string,
 	return token, nil
 }
 
-func (m *capacityManager) dispatch(ctx context.Context, token string, args []string) error {
+func (m *capacityManager) dispatch(ctx context.Context, token string, args []string, checks ...func() error) error {
 	return m.transaction(ctx, func(state *capacityState) error {
 		p, found := state.Permits[token]
 		if !found || p.Dispatched || p.Hash != argumentsHash(args) {
 			return errors.New("native admission permit does not match")
+		}
+		for _, check := range checks {
+			if err := check(); err != nil {
+				return err
+			}
 		}
 		guests, err := m.inventory(ctx)
 		if err != nil {

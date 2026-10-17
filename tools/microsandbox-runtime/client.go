@@ -225,11 +225,6 @@ func (c *Client) executeWithOptions(ctx context.Context, args []string, stdin io
 		return 0, err
 	}
 	defer func() { complete(resultErr == nil) }()
-	if len(req.config.Volumes) != 0 {
-		if err := c.validateNamedDiskMounts(ctx, req); err != nil {
-			return 0, safeError(req.op, err)
-		}
-	}
 	if req.fallback {
 		if req.op == "run" {
 			if err := c.core.initialize(); err != nil {
