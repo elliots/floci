@@ -515,9 +515,18 @@ while Floci currently applies the 256-ACU ceiling uniformly.
 
 When `MinCapacity` is zero, `SecondsUntilAutoPause` accepts 300–86,400 seconds and defaults to 300.
 Changing the minimum to a nonzero value removes the auto-pause interval, matching the AWS response
-shape. AWS limits zero-capacity auto-pause to compatible Aurora versions; Floci does not currently
-enforce that version matrix. `ModifyDBCluster` accepts partial scaling updates and preserves omitted
-values. `AWS::RDS::DBCluster` creation also maps the equivalent CloudFormation property.
+shape. Zero capacity requires Aurora PostgreSQL 13.15+, 14.12+, 15.7+, 16.3+, or a later
+major version, or Aurora MySQL `8.0.mysql_aurora.3.08.0` or later, following the
+[AWS auto-pause version requirements](https://docs.aws.amazon.com/AmazonRDS/latest/AuroraUserGuide/aurora-serverless-v2-auto-pause.html).
+Create and modify requests reject unsupported or unknown effective versions with
+`InvalidParameterValue`. `ModifyDBCluster` accepts partial scaling updates and preserves
+omitted values. `AWS::RDS::DBCluster` creation also maps the equivalent CloudFormation property.
+
+New Aurora MySQL clusters default to `8.0.mysql_aurora.3.08.0`. Recognized major aliases
+resolve to a concrete catalogue version when creating a cluster. Existing stored versions
+remain unchanged; legacy records with missing or unsupported versions cannot auto-pause.
+See the [version migration notes](../../tools/microsandbox/AURORA_VERSION_MIGRATION.md).
+Floci does not yet model all replication, zero-ETL, or regional restrictions on auto-pause.
 
 If a persisted cluster record does not contain its original AWS engine identifier, Floci rejects a
 new scaling configuration instead of assuming that the cluster is Aurora.

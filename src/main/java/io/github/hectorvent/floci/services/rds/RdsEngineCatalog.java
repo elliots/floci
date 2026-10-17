@@ -5,6 +5,8 @@ import java.util.Comparator;
 import java.util.List;
 import java.util.Locale;
 import java.util.Map;
+import java.util.regex.Matcher;
+import java.util.regex.Pattern;
 
 /**
  * The engine versions RDS reports through DescribeDBEngineVersions and
@@ -14,6 +16,10 @@ import java.util.Map;
  * family is the one the create path computes for that version.
  */
 final class RdsEngineCatalog {
+
+    private static final Pattern POSTGRES_VERSION = Pattern.compile("([0-9]+)\\.([0-9]+)(?:\\.[0-9]+)?");
+    private static final Pattern AURORA_MYSQL_VERSION = Pattern.compile(
+            "[0-9]+\\.[0-9]+\\.mysql_aurora\\.([0-9]+)\\.([0-9]+)\\.([0-9]+)");
 
     /** One engine version; {@code instanceClasses} are its orderable classes. */
     record EngineVersion(String engine, String version, String majorVersion, String family,
@@ -57,9 +63,9 @@ final class RdsEngineCatalog {
             new EngineVersion("aurora-postgresql", "17.4", "17", "aurora-postgresql17",
                     "Aurora (PostgreSQL)", false, List.of(), PROVISIONED),
             new EngineVersion("aurora-mysql", "8.0.mysql_aurora.3.05.2", "8.0", "aurora-mysql8.0",
-                    "Aurora MySQL", true, AURORA_CLASSES, PROVISIONED),
+                    "Aurora MySQL", false, AURORA_CLASSES, PROVISIONED),
             new EngineVersion("aurora-mysql", "8.0.mysql_aurora.3.08.0", "8.0", "aurora-mysql8.0",
-                    "Aurora MySQL", false, List.of(), PROVISIONED));
+                    "Aurora MySQL", true, AURORA_CLASSES, PROVISIONED));
 
     private RdsEngineCatalog() {
     }
@@ -141,6 +147,57 @@ final class RdsEngineCatalog {
                 .map(EngineVersion::version)
                 .findFirst()
                 .orElse(null);
+    }
+
+    /** Resolves a new Aurora cluster's default or major alias before recording its version. */
+    static String resolveAuroraVersion(String engine, String requested) {
+        String version = requested == null || requested.isBlank() ? defaultVersion(engine) : requested.trim();
+        if (version == null) {
+            return null;
+        }
+        boolean majorAlias = "aurora-postgresql".equalsIgnoreCase(engine) && version.matches("[0-9]+")
+                || "aurora-mysql".equalsIgnoreCase(engine) && version.matches("[0-9]+\\.[0-9]+");
+        if (!majorAlias) {
+            return version;
+        }
+        return VERSIONS.stream()
+                .filter(candidate -> candidate.engine().equalsIgnoreCase(engine)
+                        && versionMatches(candidate.version(), version))
+                .max(Comparator.comparing(EngineVersion::isDefault)
+                        .thenComparing(EngineVersion::version, RdsEngineCatalog::compareVersions))
+                .map(EngineVersion::version)
+                .orElse(version);
+    }
+
+    /** Unknown legacy versions cannot establish Aurora Serverless v2 zero-capacity support. */
+    static boolean supportsServerlessV2AutoPause(String engine, String version) {
+        if (version == null) {
+            return false;
+        }
+        Matcher postgres = POSTGRES_VERSION.matcher(version);
+        Matcher mysql = AURORA_MYSQL_VERSION.matcher(version);
+        try {
+            if ("aurora-postgresql".equalsIgnoreCase(engine) && postgres.matches()) {
+                int major = Integer.parseInt(postgres.group(1));
+                int minor = Integer.parseInt(postgres.group(2));
+                return switch (major) {
+                    case 13 -> minor >= 15;
+                    case 14 -> minor >= 12;
+                    case 15 -> minor >= 7;
+                    case 16 -> minor >= 3;
+                    default -> major >= 17;
+                };
+            }
+            if ("aurora-mysql".equalsIgnoreCase(engine) && mysql.matches()) {
+                int major = Integer.parseInt(mysql.group(1));
+                int minor = Integer.parseInt(mysql.group(2));
+                return major > 3 || major == 3 && minor >= 8;
+            }
+        } catch (NumberFormatException ignored) {
+            // Out-of-range numeric components cannot identify a supported engine version.
+            return false;
+        }
+        return false;
     }
 
     /**

@@ -66,7 +66,7 @@ class RdsCatalogueReadIntegrationTest {
         // Without a version, DefaultOnly gives the version Floci creates when none is named.
         query("DescribeDBEngineVersions").formParam("Engine", "aurora-mysql").formParam("DefaultOnly", "true")
         .when().post("/").then().statusCode(200)
-                .body(VERSIONS + ".EngineVersion", equalTo("8.0.mysql_aurora.3.05.2"))
+                .body(VERSIONS + ".EngineVersion", equalTo("8.0.mysql_aurora.3.08.0"))
                 .body(VERSIONS + ".DBParameterGroupFamily", equalTo("aurora-mysql8.0"));
 
         query("DescribeDBEngineVersions")
@@ -143,7 +143,7 @@ class RdsCatalogueReadIntegrationTest {
     }
 
     @ParameterizedTest
-    @CsvSource({"aurora-mysql, 8.0.mysql_aurora.3.05.2", "aurora-postgresql, 16.3"})
+    @CsvSource({"aurora-mysql, 8.0.mysql_aurora.3.08.0", "aurora-postgresql, 16.3"})
     void clusterCreatedWithoutAVersionGetsTheCataloguesDefault(String engine, String expected) {
         String id = "default-" + engine;
         String created = query("CreateDBCluster")

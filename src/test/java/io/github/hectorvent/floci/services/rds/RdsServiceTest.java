@@ -3334,9 +3334,11 @@ class RdsServiceTest {
         List<Map<String, String>> mysql = rdsService.describeOrderableDbInstanceOptions("aurora-mysql", null, null);
         List<Map<String, String>> postgres = rdsService.describeOrderableDbInstanceOptions("aurora-postgresql", null, null);
 
-        assertEquals(auroraClasses, mysql.stream().map(o -> o.get("dbInstanceClass")).toList());
+        assertEquals(auroraClasses, mysql.stream().map(o -> o.get("dbInstanceClass")).distinct().toList());
         assertTrue(mysql.stream().allMatch(o -> "aurora-mysql".equals(o.get("engine"))
-                && "8.0.mysql_aurora.3.05.2".equals(o.get("engineVersion"))));
+                && List.of("8.0.mysql_aurora.3.05.2", "8.0.mysql_aurora.3.08.0").contains(o.get("engineVersion"))));
+        assertEquals(auroraClasses.size(), mysql.stream()
+                .filter(o -> "8.0.mysql_aurora.3.08.0".equals(o.get("engineVersion"))).count());
         assertEquals(auroraClasses, postgres.stream().map(o -> o.get("dbInstanceClass")).toList());
         assertTrue(postgres.stream().allMatch(o -> "aurora-postgresql".equals(o.get("engine"))
                 && "16.3".equals(o.get("engineVersion"))));
@@ -3471,6 +3473,25 @@ class RdsServiceTest {
 
         rdsService.modifyDbCluster("paused", null, null, 0.5, null, null);
         verify(containerManager).configureAutoPause(eq(cluster.getDbClusterArn()), isNull(), any());
+    }
+
+    @ParameterizedTest
+    @CsvSource({"16.2", "''"})
+    void legacyUnsupportedOrUnknownVersionDoesNotAcquireZeroCapacityEligibility(String version) {
+        DbCluster cluster = createAutoPauseCluster(rdsService, "legacy-version", 300);
+        createMember(rdsService, "legacy-version-1", "db.serverless", "legacy-version");
+        AutoPauseListener listener = capturedAutoPauseListener(cluster);
+        assertTrue(listener.mayPause());
+        cluster.setEngineVersion(version.isEmpty() ? null : version);
+        assertFalse(listener.mayPause());
+        AwsException failure = assertThrows(AwsException.class,
+                () -> rdsService.modifyDbCluster("legacy-version", "changed-password", null, null, 8.0, null));
+        assertEquals("InvalidParameterValue", failure.getErrorCode());
+        assertEquals("password", cluster.getMasterPassword());
+        assertEquals(4.0, cluster.getServerlessV2MaxCapacity());
+        assertEquals(version.isEmpty() ? null : version, cluster.getEngineVersion());
+        assertDoesNotThrow(() -> rdsService.modifyDbCluster("legacy-version", null, null, 0.5, null, null));
+        assertNull(cluster.getServerlessV2SecondsUntilAutoPause());
     }
 
     @Test

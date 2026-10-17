@@ -4382,11 +4382,15 @@ public class RdsService implements Resettable, ResourceProvider {
                     "DB cluster " + id + " already exists.", 400);
         }
         DatabaseEngine engine = resolveEngine(engineParam);
+        if (isAuroraEngine(engineParam)) {
+            engineVersion = RdsEngineCatalog.resolveAuroraVersion(engineParam, engineVersion);
+        }
         validateServerlessV2Engine(
                 engineParam, serverlessV2MinCapacity, serverlessV2MaxCapacity,
                 serverlessV2SecondsUntilAutoPause);
         Integer effectiveAutoPauseSeconds = validateServerlessV2ScalingConfiguration(
                 serverlessV2MinCapacity, serverlessV2MaxCapacity, serverlessV2SecondsUntilAutoPause);
+        validateAutoPauseEngineVersion(engineParam, engineVersion, effectiveAutoPauseSeconds);
         validateClusterParameterGroup(
                 paramGroupName, engineParam, engineVersion, effectiveRegion);
         PlacementResolution placement = resolvePlacement(dbSubnetGroupName, availabilityZone, multiAz, effectiveRegion);
@@ -4549,6 +4553,13 @@ public class RdsService implements Resettable, ResourceProvider {
                 || "aurora-postgresql".equalsIgnoreCase(engineIdentifier));
     }
 
+    private static void validateAutoPauseEngineVersion(String engine, String version, Integer autoPauseSeconds) {
+        if (autoPauseSeconds != null && !RdsEngineCatalog.supportsServerlessV2AutoPause(engine, version)) {
+            throw new AwsException("InvalidParameterValue",
+                    "MinCapacity 0 requires an Aurora engine version that supports automatic pause and resume.", 400);
+        }
+    }
+
     // ── Aurora Serverless v2 auto-pause ───────────────────────────────────────
 
     /**
@@ -4559,7 +4570,8 @@ public class RdsService implements Resettable, ResourceProvider {
         if (config.services().rds().mock() || cluster.getDbClusterArn() == null) {
             return;
         }
-        Integer secondsUntilAutoPause = isAuroraEngine(cluster.getEngineIdentifier())
+        Integer secondsUntilAutoPause = RdsEngineCatalog.supportsServerlessV2AutoPause(
+                cluster.getEngineIdentifier(), cluster.getEngineVersion())
                 ? cluster.getServerlessV2SecondsUntilAutoPause()
                 : null;
         containerManager.configureAutoPause(cluster.getDbClusterArn(), secondsUntilAutoPause,
@@ -4578,6 +4590,7 @@ public class RdsService implements Resettable, ResourceProvider {
         if (cluster == null
                 || (cluster.getStatus() != null && cluster.getStatus() != DbInstanceStatus.AVAILABLE)
                 || cluster.getServerlessV2SecondsUntilAutoPause() == null
+                || !RdsEngineCatalog.supportsServerlessV2AutoPause(cluster.getEngineIdentifier(), cluster.getEngineVersion())
                 || cluster.getGlobalClusterIdentifier() != null) {
             return false;
         }
@@ -4876,6 +4889,7 @@ public class RdsService implements Resettable, ResourceProvider {
                     : cluster.getServerlessV2SecondsUntilAutoPause();
             effectiveAutoPauseSeconds = validateServerlessV2ScalingConfiguration(
                     effectiveMinCapacity, effectiveMaxCapacity, requestedOrExistingAutoPause);
+            validateAutoPauseEngineVersion(cluster.getEngineIdentifier(), cluster.getEngineVersion(), effectiveAutoPauseSeconds);
         }
         String effectiveSecretKmsKeyId = Boolean.TRUE.equals(manageMasterUserPassword)
                 && cluster.getMasterUserSecretArn() == null
