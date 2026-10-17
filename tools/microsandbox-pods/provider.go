@@ -367,7 +367,7 @@ func (p *provider) startAdmitted(ctx context.Context, e *podEntry) error {
 		return err
 	}
 	args := []string{"run", "--detach", "--entrypoint", "/bin/sh", "--name", e.vm, "--label", ownerLabel + "=" + p.runner.cfg.peerOwner,
-		"--label", "kubernetes.io/pod-uid=" + string(e.pod.UID), "--cpus", strconv.Itoa(e.allocation.VCPUs), "--memory", strconv.Itoa(e.allocation.MemoryMiB) + "M", "--root-disk", "flat:4G", "--net", "host,private,public",
+		"--label", "kubernetes.io/pod-uid=" + string(e.pod.UID), "--cpus", strconv.Itoa(e.allocation.VCPUs), "--memory", strconv.Itoa(e.allocation.MemoryMiB) + "M", "--root-disk", "flat:" + strconv.Itoa(e.allocation.RootDiskMiB) + "M", "--net", "host,private,public",
 		"--port", fmt.Sprintf("127.0.0.1:%d:8472/udp", e.port)}
 	if e.proxyAvailability {
 		for _, binding := range e.proxyPorts {

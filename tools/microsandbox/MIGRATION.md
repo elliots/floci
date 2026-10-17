@@ -845,3 +845,15 @@ An explicit
 `backend-url` without that routing choice now fails configuration validation
 rather than being silently redirected. This policy does not change direct
 Kubernetes Service routing, infer queue-depth scaling, or change AWS API shapes.
+
+## Pod root disk geometry
+
+Pod root disks still default to 4 GiB. The opt-in annotation
+`microsandbox.dev/root-disk-size: "8Gi"` selects at least 1 GiB, rounded up to
+whole MiB. The controller journals the effective disk size before VM creation
+and supplies it to shared disk admission. Changing this annotation requires Pod
+replacement. Existing allocation journals migrate to their original 4 GiB root
+disk; recovering a checkpoint never derives a different size from current
+annotations. New allocation records missing disk geometry are rejected.
+Kubernetes `ephemeral-storage` requests/limits and disk `emptyDir.sizeLimit`
+remain unsupported.

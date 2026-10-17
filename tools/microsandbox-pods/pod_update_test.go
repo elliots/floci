@@ -168,7 +168,7 @@ func TestDeclaredSpecCaptureRejectsStalePodIdentity(t *testing.T) {
 }
 
 func TestMetadataUpdateRejectsActualSpecAndRuntimePolicyChanges(t *testing.T) {
-	for _, scenario := range []string{"image", "command", "env value", "env addition", "duplicate env", "UID", "availability", "idle owner"} {
+	for _, scenario := range []string{"image", "command", "env value", "env addition", "duplicate env", "UID", "availability", "idle owner", "root disk"} {
 		t.Run(scenario, func(t *testing.T) {
 			entry := availabilityEntry(t)
 			entry.proxyAvailability = false
@@ -191,6 +191,8 @@ func TestMetadataUpdateRejectsActualSpecAndRuntimePolicyChanges(t *testing.T) {
 				updated.UID = "different"
 			case "availability":
 				updated.Annotations = map[string]string{"microsandbox.dev/availability": "proxy"}
+			case "root disk":
+				updated.Annotations = map[string]string{rootDiskAnnotation: "8Gi"}
 			case "idle owner":
 				updated.Annotations = map[string]string{"microsandbox.dev/idle-owner": "external"}
 			}

@@ -16,12 +16,16 @@ const (
 	maxGuestVCPUs          = 255
 	maxGuestMemoryMiB      = int(math.MaxUint32 - 1)
 	bytesPerMiB            = int64(1024 * 1024)
+	defaultRootDiskMiB     = 4096
+	minimumRootDiskMiB     = 1024
+	rootDiskAnnotation     = "microsandbox.dev/root-disk-size"
 )
 
 type podAllocation struct {
-	Version   int `json:"version"`
-	VCPUs     int `json:"vcpus"`
-	MemoryMiB int `json:"memoryMiB"`
+	Version     int `json:"version"`
+	VCPUs       int `json:"vcpus"`
+	MemoryMiB   int `json:"memoryMiB"`
+	RootDiskMiB int `json:"rootDiskMiB"`
 }
 
 func derivePodAllocation(pod *corev1.Pod) (podAllocation, error) {
@@ -67,7 +71,11 @@ func derivePodAllocation(pod *corev1.Pod) (podAllocation, error) {
 	guestMemoryMiB := max(vmMemoryMiB, int(memoryMiB)+guestMemoryHeadroomMiB)
 	// The pinned runtime's guest-memory topology requires 2 MiB alignment.
 	guestMemoryMiB += guestMemoryMiB % 2
-	allocation := podAllocation{Version: 1, VCPUs: max(1, int((cpuMilli+999)/1000)), MemoryMiB: guestMemoryMiB}
+	diskMiB, err := rootDiskSize(pod)
+	if err != nil {
+		return podAllocation{}, err
+	}
+	allocation := podAllocation{Version: 2, VCPUs: max(1, int((cpuMilli+999)/1000)), MemoryMiB: guestMemoryMiB, RootDiskMiB: diskMiB}
 	return validateStoredAllocation(allocation)
 }
 
@@ -75,13 +83,30 @@ func validateStoredAllocation(allocation podAllocation) (podAllocation, error) {
 	if allocation == (podAllocation{}) {
 		// Existing journals always describe this fixed guest. Recomputing from
 		// the Pod or a newer sizing policy would misaccount a restored snapshot.
-		return podAllocation{Version: 1, VCPUs: 1, MemoryMiB: vmMemoryMiB}, nil
+		return podAllocation{Version: 2, VCPUs: 1, MemoryMiB: vmMemoryMiB, RootDiskMiB: defaultRootDiskMiB}, nil
 	}
-	if allocation.Version != 1 || allocation.VCPUs < 1 || allocation.VCPUs > maxGuestVCPUs ||
+	if allocation.Version == 1 && allocation.RootDiskMiB == 0 {
+		allocation.Version, allocation.RootDiskMiB = 2, defaultRootDiskMiB
+	}
+	if allocation.Version != 2 || allocation.VCPUs < 1 || allocation.VCPUs > maxGuestVCPUs ||
+		allocation.RootDiskMiB < minimumRootDiskMiB || allocation.RootDiskMiB > math.MaxUint32 ||
 		allocation.MemoryMiB < vmMemoryMiB || allocation.MemoryMiB > maxGuestMemoryMiB || allocation.MemoryMiB%2 != 0 {
 		return podAllocation{}, fmt.Errorf("invalid or unsupported persisted native pod allocation")
 	}
 	return allocation, nil
+}
+
+func rootDiskSize(pod *corev1.Pod) (int, error) {
+	text, exists := pod.Annotations[rootDiskAnnotation]
+	if !exists {
+		return defaultRootDiskMiB, nil
+	}
+	quantity, err := resource.ParseQuantity(text)
+	if err != nil || quantity.CmpInt64(minimumRootDiskMiB*bytesPerMiB) < 0 ||
+		quantity.CmpInt64(int64(math.MaxUint32)*bytesPerMiB) > 0 {
+		return 0, fmt.Errorf("%s must be a storage quantity from 1Gi through %dMi; replacing a Pod is required to change its root disk", rootDiskAnnotation, uint64(math.MaxUint32))
+	}
+	return int((quantity.Value()-1)/bytesPerMiB + 1), nil
 }
 
 func validateContainerResources(container corev1.Container) error {

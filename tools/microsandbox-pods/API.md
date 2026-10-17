@@ -23,7 +23,7 @@ idle decision and hibernation. Older clients can omit it; new coordinators shoul
 send it when the observation includes `activitySequence`.
 
 Pod views contain `uid`, `namespace`, `name`, `state`, `generation`, `podIP`, `vm`,
-`vcpus`, `memoryMiB` (the persisted guest allocation),
+`vcpus`, `memoryMiB`, `rootDiskMiB` (the persisted guest allocation),
 `udpPort`, optional `snapshot`, and optional `backendUrl`, `httpPort`,
 `applicationPort`, `proxyAvailability`, optional `proxyProtocol` (`http` or `tcp`),
 `idleOwner`, `activeRequests`,

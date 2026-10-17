@@ -320,7 +320,12 @@ restore, so they may observe the previous configuration first.
 
 Both `emptyDir` variants survive container restart and RAM hibernation, and belong
 only to their Pod UID. Pod deletion removes them with its VM. Disk-backed
-`emptyDir` shares the VM's 4 GiB root disk; disk `sizeLimit` is unsupported. Memory
+`emptyDir` shares the VM's root disk, which defaults to 4 GiB; disk `sizeLimit` is
+unsupported. The immutable annotation `microsandbox.dev/root-disk-size: "8Gi"`
+chooses a root disk of at least 1 GiB, rounded up to whole MiB. Its size is
+journaled before boot and used for shared disk admission; recovery and RAM
+restore retain that geometry. Replace the Pod to change it. This does not add
+support for `ephemeral-storage` resource requests or limits. Memory
 `emptyDir` uses guest tmpfs and accepts a positive size limit up to the guest's
 RAM allocation. Its
 contents consume guest RAM while awake and checkpoint space while sleeping.

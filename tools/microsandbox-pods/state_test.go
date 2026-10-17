@@ -200,10 +200,10 @@ func TestRecoveryPreservesTerminalOOMStatusWithoutReservingStoppedGuest(t *testi
 func TestJournalAllocationPreservesLegacySizeAndRejectsMissingNewAllocation(t *testing.T) {
 	legacy := journalRecord{Version: 1}
 	allocation, err := legacy.guestAllocation()
-	if err != nil || allocation != (podAllocation{Version: 1, VCPUs: 1, MemoryMiB: 768}) {
+	if err != nil || allocation != (podAllocation{Version: 2, VCPUs: 1, MemoryMiB: 768, RootDiskMiB: 4096}) {
 		t.Fatalf("legacy guest changed size: %+v, %v", allocation, err)
 	}
-	wanted := podAllocation{Version: 1, VCPUs: 2, MemoryMiB: 1536}
+	wanted := podAllocation{Version: 2, VCPUs: 2, MemoryMiB: 1536, RootDiskMiB: 8192}
 	allocation, err = (journalRecord{Version: 2, Allocation: wanted}).guestAllocation()
 	if err != nil || allocation != wanted {
 		t.Fatalf("stored allocation changed: %+v, %v", allocation, err)

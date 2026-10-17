@@ -337,7 +337,7 @@ Environment-variable references remain unchanged until Pod replacement.
 Both disk-backed `emptyDir` and `emptyDir.medium: Memory` survive container
 restart and RAM hibernation. Their contents belong to a single Pod UID and are
 removed with its VM when the Pod is deleted. Disk-backed volumes share the
-guest's 4 GiB root disk. Memory volumes use guest tmpfs, optionally bounded by
+guest's root disk (4 GiB by default). Memory volumes use guest tmpfs, optionally bounded by
 `sizeLimit` up to the pod's guest allocation; their data consumes guest RAM and
 RAM-checkpoint space. Disk-backed `sizeLimit` is not implemented.
 
@@ -487,7 +487,14 @@ rejects an incompatible relay rather than silently accepting failed checks.
 
 The controller's `--max-pods` defaults to 512 tracked pod identities, including
 sleepers. Its `--max-active-memory-mib` defaults to 4096 MiB of active pod guest
-RAM. Each pod has a 4 GiB private root disk. New guest sizes cover the larger of
+RAM. Each pod defaults to a 4 GiB private root disk. Set the immutable Pod
+annotation `microsandbox.dev/root-disk-size: "8Gi"` to choose another size, at
+least 1 GiB. Sizes round up to whole MiB and participate in shared host disk
+admission. The effective geometry is recorded before boot and retained across
+recovery and RAM restore. Replace the Pod to resize its root disk; existing
+journals retain their original 4 GiB size. This annotation does not implement
+Kubernetes `ephemeral-storage` requests, limits or disk `emptyDir.sizeLimit`.
+New guest CPU and RAM sizes cover the larger of
 regular applications plus all restartable init sidecars, or each sequential init
 stage plus the sidecars already started before it. Each container contributes
 the greater of its request and limit:

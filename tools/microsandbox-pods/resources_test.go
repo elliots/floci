@@ -35,7 +35,7 @@ func TestDerivePodAllocationUsesDeclarationsAndGuestHeadroom(t *testing.T) {
 			pod := resourcePod(test.requests, test.limits)
 			before := pod.DeepCopy()
 			allocation, err := derivePodAllocation(pod)
-			if err != nil || allocation != (podAllocation{Version: 1, VCPUs: test.vcpus, MemoryMiB: test.memoryMiB}) {
+			if err != nil || allocation != (podAllocation{Version: 2, VCPUs: test.vcpus, MemoryMiB: test.memoryMiB, RootDiskMiB: 4096}) {
 				t.Fatalf("unexpected allocation: %+v, %v", allocation, err)
 			}
 			if !reflect.DeepEqual(before, pod) {
@@ -108,7 +108,7 @@ func TestDerivePodAllocationChecksExactNativeLimits(t *testing.T) {
 	pod := resourcePod(corev1.ResourceList{corev1.ResourceCPU: resource.MustParse("255"),
 		corev1.ResourceMemory: *resource.NewQuantity(maximum, resource.BinarySI)}, nil)
 	allocation, err := derivePodAllocation(pod)
-	if err != nil || allocation != (podAllocation{Version: 1, VCPUs: 255, MemoryMiB: maxGuestMemoryMiB}) {
+	if err != nil || allocation != (podAllocation{Version: 2, VCPUs: 255, MemoryMiB: maxGuestMemoryMiB, RootDiskMiB: 4096}) {
 		t.Fatalf("native bounds did not round-trip: %+v, %v", allocation, err)
 	}
 	pod.Spec.Containers[0].Resources.Requests[corev1.ResourceMemory] = *resource.NewQuantity(maximum+1, resource.BinarySI)
@@ -119,8 +119,8 @@ func TestDerivePodAllocationChecksExactNativeLimits(t *testing.T) {
 
 func TestValidateStoredAllocationPreservesLegacyAndRecordedGuestSize(t *testing.T) {
 	for _, test := range []struct{ input, expected podAllocation }{
-		{podAllocation{}, podAllocation{Version: 1, VCPUs: 1, MemoryMiB: 768}},
-		{podAllocation{Version: 1, VCPUs: 3, MemoryMiB: 2304}, podAllocation{Version: 1, VCPUs: 3, MemoryMiB: 2304}},
+		{podAllocation{}, podAllocation{Version: 2, VCPUs: 1, MemoryMiB: 768, RootDiskMiB: 4096}},
+		{podAllocation{Version: 1, VCPUs: 3, MemoryMiB: 2304}, podAllocation{Version: 2, VCPUs: 3, MemoryMiB: 2304, RootDiskMiB: 4096}},
 	} {
 		actual, err := validateStoredAllocation(test.input)
 		if err != nil || actual != test.expected {
@@ -135,6 +135,43 @@ func TestValidateStoredAllocationPreservesLegacyAndRecordedGuestSize(t *testing.
 	} {
 		if _, err := validateStoredAllocation(allocation); err == nil {
 			t.Errorf("accepted invalid recorded allocation: %+v", allocation)
+		}
+	}
+}
+
+func TestPodRootDiskSizeIsExplicitImmutableGeometry(t *testing.T) {
+	for _, scenario := range []struct {
+		value string
+		want  int
+	}{
+		{"1Gi", 1024}, {"1.5Gi", 1536}, {"8Gi", 8192}, {"1073741825", 1025},
+	} {
+		pod := resourcePod(nil, nil)
+		pod.Annotations = map[string]string{rootDiskAnnotation: scenario.value}
+		allocation, err := derivePodAllocation(pod)
+		if err != nil || allocation.RootDiskMiB != scenario.want {
+			t.Fatalf("size %q: %+v, %v", scenario.value, allocation, err)
+		}
+		pod.Annotations[rootDiskAnnotation] = "64Gi"
+		recovered, err := validateStoredAllocation(allocation)
+		if err != nil || recovered != allocation {
+			t.Fatalf("stored geometry changed after annotation change: %+v, %v", recovered, err)
+		}
+	}
+	for _, value := range []string{"", "0", "-1Gi", "256Mi", "1e30", "large"} {
+		pod := resourcePod(nil, nil)
+		pod.Annotations = map[string]string{rootDiskAnnotation: value}
+		if _, err := derivePodAllocation(pod); err == nil {
+			t.Fatalf("invalid root disk %q accepted", value)
+		}
+	}
+	for _, allocation := range []podAllocation{
+		{Version: 2, VCPUs: 1, MemoryMiB: 768},
+		{Version: 2, VCPUs: 1, MemoryMiB: 768, RootDiskMiB: 1023},
+		{Version: 1, VCPUs: 1, MemoryMiB: 768, RootDiskMiB: 8192},
+	} {
+		if _, err := validateStoredAllocation(allocation); err == nil {
+			t.Fatalf("unrecorded or invalid root disk silently accepted: %+v", allocation)
 		}
 	}
 }

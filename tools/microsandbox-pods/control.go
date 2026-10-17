@@ -20,6 +20,7 @@ import (
 type lifecycleView struct {
 	VCPUs             int    `json:"vcpus,omitzero"`
 	MemoryMiB         int    `json:"memoryMiB,omitzero"`
+	RootDiskMiB       int    `json:"rootDiskMiB,omitzero"`
 	ProxyURL          string `json:"proxyUrl,omitempty"`
 	ProxyAvailability bool   `json:"proxyAvailability"`
 	ProxyProtocol     string `json:"proxyProtocol,omitempty"`
@@ -45,6 +46,7 @@ func view(e *podEntry) lifecycleView {
 	v := lifecycleView{ProxyAvailability: e.proxyAvailability, IdleOwner: e.idleOwner, ActiveConnections: e.activeConnections, UID: string(e.pod.UID), Namespace: e.pod.Namespace, Name: e.pod.Name, State: e.state,
 		Generation: e.generation, PodIP: e.ip, VM: e.vm, UDPPort: e.port, HTTPPort: e.httpPort, ApplicationPort: e.appPort}
 	v.VCPUs, v.MemoryMiB = e.allocation.VCPUs, e.allocation.MemoryMiB
+	v.RootDiskMiB = e.allocation.RootDiskMiB
 	if e.proxyAvailability {
 		v.ProxyProtocol = proxyProtocol(e.pod)
 	}

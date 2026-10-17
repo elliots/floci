@@ -298,7 +298,7 @@ func TestMemoryAdmissionNormalizesLegacyAllocation(t *testing.T) {
 	if err := p.reserveMemory(t.Context(), entry); err != nil {
 		t.Fatal(err)
 	}
-	if entry.allocation != (podAllocation{Version: 1, VCPUs: 1, MemoryMiB: 768}) || p.activeMemoryMiB != 768 {
+	if entry.allocation != (podAllocation{Version: 2, VCPUs: 1, MemoryMiB: 768, RootDiskMiB: 4096}) || p.activeMemoryMiB != 768 {
 		t.Fatalf("wrong legacy allocation: %+v, %d", entry.allocation, p.activeMemoryMiB)
 	}
 	p.releaseMemory(entry)

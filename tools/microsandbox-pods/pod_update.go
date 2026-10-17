@@ -39,7 +39,7 @@ func (p *provider) UpdatePod(ctx context.Context, pod *corev1.Pod) error {
 		}
 	}
 	for _, key := range []string{"microsandbox.dev/availability", "microsandbox.dev/on-demand",
-		"microsandbox.dev/idle-owner", "microsandbox.dev/idle-timeout-seconds", "microsandbox.dev/proxy-protocol"} {
+		"microsandbox.dev/idle-owner", "microsandbox.dev/idle-timeout-seconds", "microsandbox.dev/proxy-protocol", rootDiskAnnotation} {
 		if entry.pod.Annotations[key] != pod.Annotations[key] {
 			return errdefs.InvalidInput("runtime annotation changes require Pod recreation")
 		}
