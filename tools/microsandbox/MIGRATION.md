@@ -685,6 +685,13 @@ automatic pruning is performed, and lowering a limit never deletes workloads or
 revokes an already-prepared restore. Docker storage is unaffected. See the
 [shared adapter accounting details](../microsandbox-runtime/README.md#disk-admission).
 
+The shared adapter now resolves home-directory symlinks consistently for both
+SDK and CLI operations, without creating missing directories. This prevents
+duplicate snapshot identities caused by `/tmp` versus `/private/tmp` on macOS.
+Existing dangling alias entries are not silently discarded: SDK storage inventory
+continues to reject unknown sizes. Preserve the old home and reconcile those index
+entries, or preload a fresh dedicated home before enabling disk admission.
+
 ## Shared microVM capacity admission
 
 Rebuild both the Go host helper and every native pod controller. Helpers using one

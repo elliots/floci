@@ -73,7 +73,7 @@ func New(config Config) (*Client, error) {
 		}
 		config.Home = filepath.Join(home, ".microsandbox")
 	}
-	home, err := filepath.Abs(config.Home)
+	home, err := canonicalRuntimeHome(config.Home)
 	if err != nil {
 		return nil, errors.New("cannot resolve microsandbox home")
 	}
@@ -104,6 +104,38 @@ func New(config Config) (*Client, error) {
 		return boundary.completeBoot(ctx, request.name, config.Home, request.config.Network)
 	}
 	return c, nil
+}
+
+// The pinned SDK indexes snapshots by absolute path. An alias such as /tmp on
+// macOS must not create a second index entry beside the CLI's canonical path.
+// Resolve existing ancestors without creating a new runtime home.
+func canonicalRuntimeHome(home string) (string, error) {
+	current, err := filepath.Abs(home)
+	if err != nil {
+		return "", err
+	}
+	var suffix []string
+	for {
+		resolved, err := filepath.EvalSymlinks(current)
+		if err == nil {
+			for i := len(suffix) - 1; i >= 0; i-- {
+				resolved = filepath.Join(resolved, suffix[i])
+			}
+			return resolved, nil
+		}
+		if !errors.Is(err, os.ErrNotExist) {
+			return "", err
+		}
+		if _, statErr := os.Lstat(current); !errors.Is(statErr, os.ErrNotExist) {
+			return "", err
+		}
+		parent := filepath.Dir(current)
+		if parent == current {
+			return "", err
+		}
+		suffix = append(suffix, filepath.Base(current))
+		current = parent
+	}
 }
 
 // Execute captures bounded, separate stdout and stderr. An SDK/transport error

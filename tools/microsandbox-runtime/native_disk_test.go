@@ -89,6 +89,10 @@ func TestNativeDiskAdmissionProtectsCaptureAndRestore(t *testing.T) {
 				t.Error("cleanup owned checkpoint", err)
 			}
 		}
+		status, err := client.Capacity(cleanup)
+		if err != nil || status.Disk == nil || status.Disk.WritableBytes != 0 || len(status.Reservations) != 0 {
+			t.Errorf("disk accounting did not remain usable after capture/delete cleanup: %+v %v", status, err)
+		}
 		if err := client.SetCapacityLimits(cleanup, previous.Limits); err != nil {
 			t.Error("restore previous capacity limits", err)
 		}
@@ -140,7 +144,7 @@ func TestNativeDiskAdmissionProtectsCaptureAndRestore(t *testing.T) {
 	if err != nil || result.ExitCode != 0 {
 		t.Fatal("admitted capture failed", err)
 	}
-	snapshot = strings.TrimSpace(result.Stdout)
+	snapshot = name + ":budget"
 	execute("snap", "verify", snapshot)
 	execute("stop", "--force", name)
 	restore := []string{"snap", "restore", snapshot, "--name", name}

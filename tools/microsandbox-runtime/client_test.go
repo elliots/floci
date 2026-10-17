@@ -36,6 +36,53 @@ func TestNewDoesNotTouchRuntimeOrHome(t *testing.T) {
 	}
 }
 
+func TestNativeHomeCanonicalizesAliasesWithoutCreatingMissingChildren(t *testing.T) {
+	actual := t.TempDir()
+	alias := filepath.Join(t.TempDir(), "alias")
+	if err := os.Symlink(actual, alias); err != nil {
+		t.Fatal(err)
+	}
+	for _, suffix := range []string{"", "missing/nested/home"} {
+		throughAlias, err := New(Config{Executable: "/missing/msb", Home: filepath.Join(alias, suffix)})
+		if err != nil {
+			t.Fatal(err)
+		}
+		direct, err := New(Config{Executable: "/missing/msb", Home: filepath.Join(actual, suffix)})
+		if err != nil {
+			t.Fatal(err)
+		}
+		canonical, err := filepath.EvalSymlinks(actual)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if throughAlias.config.Home != filepath.Join(canonical, suffix) || throughAlias.config.Home != direct.config.Home || throughAlias.capacity.home != direct.capacity.home {
+			t.Fatalf("home aliases differ: %q %q", throughAlias.config.Home, direct.config.Home)
+		}
+		if suffix != "" {
+			if _, err := os.Stat(filepath.Join(actual, suffix)); !errors.Is(err, os.ErrNotExist) {
+				t.Fatal("New created a missing home", err)
+			}
+		}
+	}
+}
+
+func TestNativeHomeRejectsDanglingAndLoopingSymlinks(t *testing.T) {
+	for _, looping := range []bool{false, true} {
+		directory := t.TempDir()
+		alias := filepath.Join(directory, "alias")
+		target := filepath.Join(directory, "missing")
+		if looping {
+			target = alias
+		}
+		if err := os.Symlink(target, alias); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := New(Config{Home: filepath.Join(alias, "child")}); err == nil {
+			t.Fatal("invalid ancestor symlink accepted")
+		}
+	}
+}
+
 func TestReadOnlyFallbackAllowlistPreservesDiagnosticsAndReports(t *testing.T) {
 	c, err := New(Config{Home: t.TempDir()})
 	if err != nil {

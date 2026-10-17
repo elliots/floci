@@ -192,6 +192,16 @@ successful full RAM capture/restore and an already-prepared restore after a limi
 reduction. It restores the previous limits and removes only its owned guest and
 checkpoint. Serialize it with other native qualifications.
 
+The adapter canonicalizes the native home before both SDK and CLI calls, including
+the existing parent of a new home. This avoids duplicate snapshot index entries
+through aliases such as macOS `/tmp` and `/private/tmp`. It does not create the
+home during configuration. Previously created alias entries can still leave
+unmeasurable indexed artifacts after deletion: admission deliberately refuses
+those entries. Inspect SDK `StorageUsage` snapshot item paths, preserve a backup
+and reconcile the old runtime index before enabling limits. A fresh dedicated
+home with preloaded images is an alternative when that index cannot be repaired;
+existing workload disks are not automatically migrated or deleted.
+
 This is not a filesystem hard quota. Direct upstream CLI/SDK operations, writes
 outside the SDK home, host logs and unrelated host processes can bypass or consume
 the allowance. A prepared permit remains valid if limits are lowered, protecting
