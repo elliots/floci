@@ -344,7 +344,7 @@ def prepare(args):
             raise RuntimeError("recorded network peer is missing; refusing to replace a cluster with workload state")
         linux_host = ["--add-host", "host.docker.internal:host-gateway"] if platform.system() == "Linux" and not args.node_ip else []
         command("docker", "create", "--name", record["peer"], "--hostname", record["peer"], *linux_host,
-            *manage_environment.peer_options(record), "--label", LABEL+"="+record["owner"], "--privileged", "-p", "127.0.0.1::6443", "-p", "127.0.0.1::8472/udp",
+            *manage_environment.peer_options(record), "--label", LABEL+"="+record["owner"], "--privileged", "-p", "127.0.0.1::6443", "-p", "127.0.0.1:"+str(record.get("peerUDPPort", ""))+":8472/udp",
             K3S_IMAGE, "server", "--disable=traefik", "--disable=servicelb", "--disable=metrics-server",
             "--egress-selector-mode=disabled", timeout=600)
         manage_environment.stage_resolver(record, command, write_private)
@@ -525,6 +525,7 @@ def main():
     preparing.add_argument("--msb", required=True)
     preparing.add_argument("--msb-home", required=True)
     preparing.add_argument("--node-ip", help="host IPv4 address reachable from the owned cluster; bypasses automatic Docker host discovery")
+    preparing.add_argument("--peer-udp-port", type=int, help="fixed host UDP publication for the owned peer; required with environment-network")
     preparing.add_argument("--environment-network", help="existing protected Docker bridge; requires isolation-helper and environment-dns")
     preparing.add_argument("--isolation-helper", help="existing Floci isolation helper protecting that bridge")
     preparing.add_argument("--environment-dns", help="Floci DNS IPv4 address assigned on the protected bridge")

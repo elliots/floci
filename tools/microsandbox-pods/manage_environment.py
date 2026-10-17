@@ -51,12 +51,21 @@ def resolve(record, args, command, existing):
     if any(values) and not all(values):
         raise ValueError("environment-network, isolation-helper and environment-dns must be supplied together")
     previous = record.get("environment")
+    if existing and not previous and any(values):
+        raise RuntimeError("an existing unisolated cluster cannot change environment; prepare a new private directory")
+    port = getattr(args, "peer_udp_port", None)
+    if port is not None and (isinstance(port, bool) or not 1 <= port <= 65535):
+        raise ValueError("peer-udp-port must be between 1 and 65535")
+    if existing and port is not None and port != record.get("peerUDPPort"):
+        raise RuntimeError("peer-udp-port differs from the recorded cluster routing identity")
+    if not existing and port is not None:
+        record["peerUDPPort"] = port
     if not any(values):
         if not previous:
             return
         values = [previous["networkID"], previous["helperID"], previous["dns"]]
-    if existing and not previous:
-        raise RuntimeError("an existing unisolated cluster cannot change environment; prepare a new private directory")
+    if not record.get("peerUDPPort"):
+        raise ValueError("protected environments require an explicit peer-udp-port covered by the native UDP allowlist")
     observed = inspect(command, *values)
     if previous is not None and observed != previous:
         raise RuntimeError("protected environment identity changed; refusing to adopt replacement network, helper or policy")
@@ -65,6 +74,10 @@ def resolve(record, args, command, existing):
 
 
 def verify_peer(record, peer):
+    if port := record.get("peerUDPPort"):
+        bindings = peer.get("HostConfig", {}).get("PortBindings", {}).get("8472/udp", [])
+        if bindings != [{"HostIp": "127.0.0.1", "HostPort": str(port)}]:
+            raise RuntimeError("network peer UDP publication differs from its recorded port identity")
     environment = record.get("environment")
     if not environment:
         return

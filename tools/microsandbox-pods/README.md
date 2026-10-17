@@ -93,7 +93,7 @@ Use a dedicated development cluster: the controller still needs trusted access
 to application credentials and to the local Docker socket.
 
 For an existing isolated Floci environment, prepare a fresh private cluster directory
-with all three options:
+with the three environment options and a fixed peer UDP port:
 
 ```sh
 python3 tools/microsandbox-pods/manage.py prepare \
@@ -101,7 +101,7 @@ python3 tools/microsandbox-pods/manage.py prepare \
   --msb /path/to/msb --msb-home /path/to/private-runtime-home \
   --environment-network floci-protected \
   --isolation-helper floci-network-isolation \
-  --environment-dns 172.30.0.2
+  --environment-dns 172.30.0.2 --peer-udp-port 18472
 ```
 
 Use the existing protected Docker bridge, its running Floci isolation helper and
@@ -648,3 +648,10 @@ preview-only `prune` commands, and same-memory recovery after a supervised crash
 The supervisor forwards the explicit policy mode through child restarts and
 credential rotation. Include `--network-policy` on subsequent operator starts;
 a journal created in policy mode rejects recovery with that mode disabled.
+
+For protected peers, `--peer-udp-port` fixes the host UDP publication for the
+cluster's shared VXLAN transport. Choose an unused port before starting Floci
+and permit exactly that host UDP port in `network.native.allowed-egress` in the
+shared immutable network file. Reuse the recorded port on later prepare runs.
+This avoids granting a broad host UDP range. Plain peers retain ephemeral ports
+unless this option is supplied explicitly.

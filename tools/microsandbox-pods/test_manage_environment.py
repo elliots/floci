@@ -20,7 +20,7 @@ class EnvironmentTest(unittest.TestCase):
             "floci.network.table": "floci_iso_abcdef"}}, "State": {"Running": True}, "HostConfig": {"NetworkMode": "host"}}
         self.metadata = {"version": 1, "owner": "fixture/4566", "table": "floci_iso_abcdef", "fingerprint": "c" * 64,
             "bridges": [{"name": "protected", "networkId": "a" * 64, "bridge": "owned-bridge"}]}
-        self.args = argparse.Namespace(environment_network="protected", isolation_helper="helper", environment_dns="172.30.0.2")
+        self.args = argparse.Namespace(environment_network="protected", isolation_helper="helper", environment_dns="172.30.0.2", peer_udp_port=18472)
 
     def command(self, *args):
         if args[:3] == ("docker", "network", "inspect"):
@@ -57,6 +57,18 @@ class EnvironmentTest(unittest.TestCase):
         with self.assertRaisesRegex(RuntimeError, "existing unisolated"):
             environment.resolve({}, self.args, self.command, True)
 
+    def test_fixed_peer_port_is_required_and_cannot_change_after_prepare(self):
+        for port in (None, 0, 65536):
+            self.args.peer_udp_port = port
+            with self.assertRaises(ValueError):
+                self.resolved()
+        self.args.peer_udp_port = 18472
+        record = self.resolved()
+        self.args.peer_udp_port = 18473
+        with self.assertRaisesRegex(RuntimeError, "routing identity"):
+            environment.resolve(record, self.args, self.command, True)
+        self.assertEqual(18472, record["peerUDPPort"])
+
     def test_refuses_unassigned_dns_uncovered_bridge_and_bad_helper_metadata(self):
         cases = [(self.network, "Containers", {}), (self.network, "Driver", "overlay"),
             (self.helper["State"], "Running", False), (self.metadata, "version", 2),
@@ -78,12 +90,13 @@ class EnvironmentTest(unittest.TestCase):
     def test_peer_requires_exact_single_network_and_controlled_resolver(self):
         record = self.resolved()
         peer = {"NetworkSettings": {"Networks": {"protected": {"NetworkID": "a" * 64}}},
-            "HostConfig": {"Dns": ["172.30.0.2"]}, "Config": {"Env": ["K3S_RESOLV_CONF=" + environment.RESOLVER]}}
+            "HostConfig": {"Dns": ["172.30.0.2"], "PortBindings": {"8472/udp": [{"HostIp": "127.0.0.1", "HostPort": "18472"}]}}, "Config": {"Env": ["K3S_RESOLV_CONF=" + environment.RESOLVER]}}
         environment.verify_peer(record, peer)
         for change in (
                 lambda p: p["NetworkSettings"]["Networks"].update(outside={"NetworkID": "d" * 64}),
                 lambda p: p["HostConfig"].update(Dns=["172.30.0.2", "8.8.8.8"]),
-                lambda p: p["Config"].update(Env=[])):
+                lambda p: p["Config"].update(Env=[]),
+                lambda p: p["HostConfig"]["PortBindings"].update({"8472/udp": [{"HostIp": "127.0.0.1", "HostPort": "9999"}]})):
             changed = copy.deepcopy(peer)
             change(changed)
             with self.assertRaises(RuntimeError):
@@ -103,7 +116,7 @@ class EnvironmentTest(unittest.TestCase):
             with patch.object(manage, "command", side_effect=command), \
                     patch.object(manage, "inspect_peer", return_value=None), \
                     patch.object(manage.os, "access", return_value=True), \
-                    patch.object(environment, "resolve", side_effect=lambda record, *_: record.update(environment=owned)), \
+                    patch.object(environment, "resolve", side_effect=lambda record, *_: record.update(environment=owned, peerUDPPort=18472)), \
                     patch.object(manage, "wait", side_effect=RuntimeError("stop before API")):
                 with self.assertRaisesRegex(RuntimeError, "stop before API"):
                     manage.prepare(args)
@@ -113,6 +126,7 @@ class EnvironmentTest(unittest.TestCase):
             self.assertEqual("a" * 64, create[create.index("--network") + 1])
             self.assertEqual("172.30.0.2", create[create.index("--dns") + 1])
             self.assertIn("K3S_RESOLV_CONF=" + environment.RESOLVER, create)
+            self.assertIn("127.0.0.1:18472:8472/udp", create)
             self.assertFalse(any("io.floci.owner" in str(value) for value in create))
             resolver = Path(temporary) / "environment-resolv.conf"
             self.assertEqual("nameserver 172.30.0.2\noptions timeout:2 attempts:2\n", resolver.read_text())

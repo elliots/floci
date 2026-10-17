@@ -1112,3 +1112,10 @@ Subsequent policy refresh preserves registrations owned by the native controller
 incompatible existing tuple-set schema fails installation instead of replacing its contents.
 Native controller versions requiring this contract refuse older or mismatched helpers. No
 AWS endpoint, response shape or application sidecar is added.
+
+For protected peers, `--peer-udp-port` fixes the host UDP publication for the
+cluster's shared VXLAN transport. Choose an unused port before starting Floci
+and permit exactly that host UDP port in `network.native.allowed-egress` in the
+shared immutable network file. Reuse the recorded port on later prepare runs.
+This avoids granting a broad host UDP range. Plain peers retain ephemeral ports
+unless this option is supplied explicitly.
