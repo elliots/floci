@@ -115,6 +115,60 @@ public class MicrosandboxRdsRuntime implements RdsBackendRuntime {
     }
 
     @Override
+    public RdsContainerHandle recover(String runtimeId) {
+        List<MicrosandboxMachine> owned = machines.values().stream()
+                .filter(candidate -> runtimeId.equals(candidate.runtimeId)).toList();
+        if (owned.size() != 1) {
+            throw new IllegalStateException("Persisted native database requires exactly one owned storage journal");
+        }
+        MicrosandboxMachine machine = owned.getFirst();
+        if (!manager.isAvailable()) {
+            return null;
+        }
+        synchronized (machine) {
+            if (!List.of("RUNNING", "STOPPED", "STARTING", "STOPPING", "CAPTURING", "HIBERNATED", "RESTORING")
+                    .contains(machine.phase)) {
+                throw new IllegalStateException("Persisted native database has an incomplete or unknown lifecycle state");
+            }
+            boolean present = exists(machine.vm);
+            String recoveredTarget = machine.id + "-" + (machine.generation + 1);
+            boolean hibernatedTarget = !present && "HIBERNATED".equals(machine.phase) && exists(recoveredTarget);
+            if (!present && !hibernatedTarget && !"RESTORING".equals(machine.phase)) {
+                throw new IllegalStateException("Persisted native database guest is missing; refusing empty recovery");
+            }
+            if (!present && !hibernatedTarget && machine.retiredVms.stream().noneMatch(this::exists)) {
+                throw new IllegalStateException("Native database source and restored guest are both missing");
+            }
+            String status = present ? inspect(machine.vm).path("status").asText()
+                    : hibernatedTarget ? inspect(recoveredTarget).path("status").asText() : "Stopped";
+            if (!List.of("Running", "Paused", "Stopped").contains(status)) {
+                throw new IllegalStateException("Native database guest has an uncertain runtime state");
+            }
+            if ("Paused".equals(status) && !List.of("CAPTURING", "HIBERNATED").contains(machine.phase)) {
+                throw new IllegalStateException("Native database is paused outside a recorded capture");
+            }
+            boolean sourcesActive = false;
+            for (String source : machine.retiredVms) {
+                if (exists(source)) {
+                    String sourceStatus = inspect(source).path("status").asText();
+                    if (!List.of("Running", "Paused", "Stopped").contains(sourceStatus)) {
+                        throw new IllegalStateException("Native database source has an uncertain runtime state");
+                    }
+                    sourcesActive |= !"Stopped".equals(sourceStatus);
+                }
+            }
+            if (!"Stopped".equals(status) || sourcesActive) {
+                capacity.observeRunning(machine.id, machine.memoryMib);
+            } else {
+                capacity.release(machine.id);
+            }
+            boolean needsWake = !"RUNNING".equals(machine.phase) || !"Running".equals(status);
+            controllers.computeIfAbsent(machine.id, ignored -> controller(machine, needsWake));
+            return handle(machine);
+        }
+    }
+
+    @Override
     public RdsContainerHandle tryStart(String runtimeId, String instanceId, String storageResourceId,
                                        String storageName, DatabaseEngine engine, String image,
                                        String username, String password, String dbName) {
@@ -148,6 +202,10 @@ public class MicrosandboxRdsRuntime implements RdsBackendRuntime {
             created.host = config.services().rds().microsandboxBackendHost();
             created.port = client.port();
             created.memoryMib = config.services().rds().microsandboxMemoryMib();
+            created.rootDiskMib = config.services().rds().microsandboxRootDiskMib();
+            if (created.rootDiskMib < 1024) {
+                throw new IllegalArgumentException("floci.services.rds.microsandbox-root-disk-mib must be at least 1024");
+            }
             created.vm = id + "-0";
             created.phase = "CREATING";
             capacity.reserve(id, created.memoryMib, Duration.ofSeconds(90));
@@ -206,7 +264,7 @@ public class MicrosandboxRdsRuntime implements RdsBackendRuntime {
     private void createGuest(MicrosandboxMachine machine, String image, String password, String dbName) {
         String database = dbName == null || dbName.isBlank() ? machine.username : dbName;
         List<String> command = new ArrayList<>(List.of("run", "-d", "--name", machine.vm, "--cpus", "1", "--memory",
-                machine.memoryMib + "M", "--root-disk", "4G"));
+                machine.memoryMib + "M", "--root-disk", machine.rootDiskMib + "M"));
         if (machine.engine == DatabaseEngine.POSTGRES) {
             command.addAll(List.of("-e", "POSTGRES_USER=" + machine.username,
                     "-e", "POSTGRES_PASSWORD=" + password, "-e", "POSTGRES_DB=" + database));
@@ -231,6 +289,10 @@ public class MicrosandboxRdsRuntime implements RdsBackendRuntime {
     }
 
     private AutoPauseController controller(MicrosandboxMachine machine) {
+        return controller(machine, false);
+    }
+
+    private AutoPauseController controller(MicrosandboxMachine machine, boolean initiallyPaused) {
         AutoPauseController.Freezer freezer = new AutoPauseController.Freezer() {
             @Override
             public void pause(String id) {
@@ -247,18 +309,24 @@ public class MicrosandboxRdsRuntime implements RdsBackendRuntime {
         return new AutoPauseController(machine.id, machine.host, machine.port, freezer,
                 (task, delay) -> timer.schedule(() -> Thread.ofVirtual().start(task),
                         delay.toMillis(), TimeUnit.MILLISECONDS),
-                events, Clock.systemUTC(), Duration.ofMillis(config.services().rds().auroraResumeDelayMillis()));
+                events, Clock.systemUTC(), Duration.ofMillis(config.services().rds().auroraResumeDelayMillis()),
+                initiallyPaused);
     }
 
     private void hibernate(MicrosandboxMachine machine) {
         synchronized (machine) {
-            machine.phase = "CAPTURING";
-            machine.snapshot = machine.vm + ":sleep-" + UUID.randomUUID();
-            save(machine);
+            String snapshotName = "sleep-" + UUID.randomUUID();
+            List<String> capture = List.of("snap", "create", snapshotName,
+                    "--sandbox", machine.vm, "--full", "--integrity");
+            String permit = client.prepareAdmission(capture);
+            boolean captureDispatched = false;
             try {
+                machine.phase = "CAPTURING";
+                machine.snapshot = machine.vm + ":" + snapshotName;
+                save(machine);
                 client.command("pause", machine.vm);
-                client.command("snap", "create", machine.snapshot.substring(machine.snapshot.indexOf(':') + 1),
-                        "--sandbox", machine.vm, "--full", "--integrity");
+                captureDispatched = true;
+                client.commandAdmitted(permit, capture);
                 client.command("snap", "verify", machine.snapshot);
                 // Journal the verified recovery point before the source can disappear.
                 machine.phase = "HIBERNATED";
@@ -269,6 +337,13 @@ public class MicrosandboxRdsRuntime implements RdsBackendRuntime {
                 }
                 capacity.release(machine.id);
             } catch (RuntimeException failure) {
+                if (!captureDispatched || failure instanceof MicrosandboxCapacity.CapacityUnavailableException) {
+                    try {
+                        client.cancelAdmission(permit);
+                    } catch (RuntimeException cancelFailure) {
+                        failure.addSuppressed(cancelFailure);
+                    }
+                }
                 try {
                     wake(machine);
                 } catch (RuntimeException recoveryFailure) {
@@ -607,6 +682,10 @@ public class MicrosandboxRdsRuntime implements RdsBackendRuntime {
             return ContainerLiveness.NOT_RUNNING;
         }
         synchronized (machine) {
+            AutoPauseController controller = controllers.get(machine.id);
+            if (controller != null && controller.state() != AutoPauseController.State.RUNNING) {
+                return ContainerLiveness.RUNNING;
+            }
             if ("HIBERNATED".equals(machine.phase)) {
                 try {
                     if (exists(machine.vm) && "Stopped".equals(inspect(machine.vm).path("status").asText())) {
@@ -639,7 +718,18 @@ public class MicrosandboxRdsRuntime implements RdsBackendRuntime {
     public void stopAll() {
         for (MicrosandboxMachine machine : machines.values()) {
             try {
-                stop(handle(machine));
+                AutoPauseController controller = controllers.remove(machine.id);
+                if (controller != null) {
+                    controller.closeWithoutResume();
+                }
+                synchronized (machine) {
+                    if ("HIBERNATED".equals(machine.phase) && exists(machine.vm)
+                            && "Stopped".equals(inspect(machine.vm).path("status").asText())) {
+                        capacity.release(machine.id);
+                    } else {
+                        stop(handle(machine));
+                    }
+                }
             } catch (RuntimeException e) {
                 LOG.warnv("Could not stop microsandbox backend {0}: {1}", machine.id, e.getMessage());
             }

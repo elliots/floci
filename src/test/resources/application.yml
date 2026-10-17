@@ -237,6 +237,7 @@ floci:
       microsandbox-backend-host: 127.0.0.1
       microsandbox-bind-host: 127.0.0.1
       microsandbox-memory-mib: 512
+      microsandbox-root-disk-mib: 4096
       enabled: true
       mock: false
       tls-hostnames: ${FLOCI_SERVICES_RDS_TLS_HOSTNAMES:}

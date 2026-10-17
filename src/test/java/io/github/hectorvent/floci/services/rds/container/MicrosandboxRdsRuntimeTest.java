@@ -13,6 +13,9 @@ import io.github.hectorvent.floci.services.rds.model.DatabaseEngine;
 import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
+import org.junit.jupiter.params.ParameterizedTest;
+import org.junit.jupiter.params.provider.EnumSource;
+import org.mockito.InOrder;
 
 import java.util.LinkedHashMap;
 import java.util.List;
@@ -50,6 +53,7 @@ class MicrosandboxRdsRuntimeTest {
         when(config.services().rds().microsandboxBackendHost()).thenReturn("localhost");
         when(config.services().rds().microsandboxBindHost()).thenReturn("127.0.0.1");
         when(config.services().rds().microsandboxMemoryMib()).thenReturn(512);
+        when(config.services().rds().microsandboxRootDiskMib()).thenReturn(4096);
         when(config.microsandbox().maxActiveMemoryMib()).thenReturn(8192);
         when(config.services().rds().auroraAutoPauseEnabled()).thenReturn(true);
         manager = mock(MicrosandboxSidecarManager.class);
@@ -60,6 +64,7 @@ class MicrosandboxRdsRuntimeTest {
                         ? journal : AccountAwareStorageBackend.inMemory("000000000000"));
         client = mock(MicrosandboxSidecarClient.class);
         when(client.port()).thenReturn(15432);
+        when(client.prepareAdmission(anyList())).thenReturn("snapshot-permit");
         when(client.command(any(String[].class))).thenAnswer(invocation -> {
             List<String> args = List.of(invocation.getArguments()).stream().map(String.class::cast).toList();
             switch (args.getFirst()) {
@@ -125,6 +130,58 @@ class MicrosandboxRdsRuntimeTest {
     }
 
     @Test
+    void snapshotAdmissionPrecedesFreezingAndUsesTheExactPreparedCommand() {
+        String source = machine().vm;
+        assertTrue(runtime.pauseIfIdle(arn));
+        List<String> capture = List.of("snap", "create", machine().snapshot.split(":", 2)[1],
+                "--sandbox", source, "--full", "--integrity");
+        InOrder order = inOrder(client);
+        order.verify(client).prepareAdmission(capture);
+        order.verify(client).command("pause", source);
+        order.verify(client).commandAdmitted("snapshot-permit", capture);
+        verify(client, never()).cancelAdmission(anyString());
+    }
+
+    @Test
+    void snapshotCapacityRefusalLeavesTheDatabaseRunningAndUnfrozen() {
+        when(client.prepareAdmission(anyList())).thenThrow(
+                new MicrosandboxCapacity.CapacityUnavailableException("checkpoint disk budget full"));
+        String source = machine().vm;
+        assertFalse(runtime.pauseIfIdle(arn));
+        assertEquals("RUNNING", machine().phase);
+        assertNull(machine().snapshot);
+        assertEquals("Running", guests.get(source));
+        verify(client, never()).command("pause", source);
+        verify(client, never()).commandAdmitted(anyString(), anyList());
+    }
+
+    @Test
+    void failedFreezeCancelsTheUndispatchedSnapshotPermit() {
+        doThrow(new IllegalStateException("pause failed")).when(client).command("pause", machine().vm);
+        assertFalse(runtime.pauseIfIdle(arn));
+        verify(client).cancelAdmission("snapshot-permit");
+        verify(client, never()).commandAdmitted(anyString(), anyList());
+        assertEquals("RUNNING", machine().phase);
+    }
+
+    @Test
+    void uncertainSnapshotCaptureRetainsItsPermit() {
+        when(client.commandAdmitted(anyString(), anyList())).thenThrow(new IllegalStateException("response lost"));
+        assertFalse(runtime.pauseIfIdle(arn));
+        verify(client, never()).cancelAdmission(anyString());
+    }
+
+    @Test
+    void explicitSnapshotDispatchRefusalCancelsItsPermitAndRecoversTheDatabase() {
+        when(client.commandAdmitted(anyString(), anyList())).thenThrow(
+                new MicrosandboxCapacity.CapacityUnavailableException("disk capacity changed"));
+        assertFalse(runtime.pauseIfIdle(arn));
+        verify(client).cancelAdmission("snapshot-permit");
+        assertEquals("RUNNING", machine().phase);
+        assertEquals("Running", guests.get(machine().vm));
+    }
+
+    @Test
     void failedVerificationDoesNotDestroySource() {
         failVerify = true;
         assertFalse(runtime.pauseIfIdle(arn));
@@ -132,6 +189,116 @@ class MicrosandboxRdsRuntimeTest {
         assertEquals(1, guests.size());
         assertEquals("Running", guests.get(machine().vm));
         assertEquals(0, restores);
+    }
+
+    @ParameterizedTest
+    @EnumSource(value = DatabaseEngine.class, names = {"POSTGRES", "MYSQL"})
+    void restartKeepsHibernatedDatabaseColdUntilFirstConnection(DatabaseEngine engine) throws Exception {
+        String runtimeId = arn;
+        if (engine == DatabaseEngine.MYSQL) {
+            runtime.stop(handle);
+            runtimeId = "arn:aws:rds:us-east-1:000000000000:cluster:mysql";
+            handle = runtime.tryStart(runtimeId, "mysql", "mysql-volume", "mysql-volume",
+                    engine, "mysql:8.0.45", "master", "secret", "appdb");
+            AutoPauseListener listener = mock(AutoPauseListener.class);
+            when(listener.mayPause()).thenReturn(true);
+            runtime.configureAutoPause(runtimeId, 300, listener);
+        }
+        assertTrue(runtime.pauseIfIdle(runtimeId));
+        runtime.stopAll();
+        assertEquals(0, restores, "Host shutdown must preserve a sleeping database checkpoint");
+        restart();
+        clearInvocations(client);
+        RdsContainerHandle recovered = runtime.recover(runtimeId);
+        runtime.configureAutoPause(runtimeId, 300, AutoPauseListener.NONE);
+        assertEquals(handle.getContainerId(), recovered.getContainerId());
+        assertEquals(handle.getPort(), recovered.getPort());
+        assertEquals(ContainerLiveness.RUNNING, runtime.probeContainer(recovered.getContainerId()));
+        assertEquals(0, capacity.reservedMemoryMib());
+        verify(client, never()).command(any(String[].class));
+        try (RdsBackendGate.Lease first = runtime.enter(recovered.getHost(), recovered.getPort());
+             RdsBackendGate.Lease second = runtime.enter(recovered.getHost(), recovered.getPort())) {
+            assertEquals(1, restores);
+            assertEquals(512, capacity.reservedMemoryMib());
+        }
+    }
+
+    @Test
+    void restartRegistersColdDatabaseWithoutStartingIt() throws Exception {
+        runtime.stop(handle);
+        restart();
+        clearInvocations(client);
+        RdsContainerHandle recovered = runtime.recover(arn);
+        runtime.configureAutoPause(arn, null, AutoPauseListener.NONE);
+        assertEquals(ContainerLiveness.RUNNING, runtime.probeContainer(handle.getContainerId()));
+        assertEquals("STOPPED", machine().phase);
+        verify(client, never()).command(any(String[].class));
+        try (RdsBackendGate.Lease ignored = runtime.enter(recovered.getHost(), recovered.getPort())) {
+            assertEquals("RUNNING", machine().phase);
+            assertEquals(0, restores);
+            verify(client).command("start", machine().vm);
+        }
+    }
+
+    @Test
+    void recoveryNeverCreatesMissingDatabaseStorage() throws Exception {
+        runtime.stop(handle);
+        restart();
+        guests.clear();
+        clearInvocations(client);
+        assertThrows(IllegalStateException.class, () -> runtime.recover(arn));
+        assertThrows(IllegalStateException.class, () -> runtime.recover(arn + "-missing"));
+        verify(client, never()).command(any(String[].class));
+    }
+
+    @Test
+    void recoveryRejectsAnUnrecordedPause() throws Exception {
+        guests.put(machine().vm, "Paused");
+        restart();
+        clearInvocations(client);
+        assertThrows(IllegalStateException.class, () -> runtime.recover(arn));
+        verify(client, never()).command(any(String[].class));
+    }
+
+    @Test
+    void recoveryRetainsCapacityForAStillActiveRestoreSource() throws Exception {
+        MicrosandboxMachine machine = machine();
+        machine.retiredVms.add(machine.vm);
+        machine.vm = machine.id + "-1";
+        machine.generation = 1;
+        machine.phase = "RESTORING";
+        machine.snapshot = machine.id + "-0:sleep";
+        restart();
+        clearInvocations(client);
+        assertNotNull(runtime.recover(arn));
+        assertEquals(512, capacity.reservedMemoryMib());
+        verify(client, never()).command(any(String[].class));
+    }
+
+    @Test
+    void nativeDiskSizeIsPersistedForNewDatabasesAndNeverResizesExistingOnes() throws Exception {
+        when(config.services().rds().microsandboxRootDiskMib()).thenReturn(8192);
+        String mysqlArn = "arn:aws:rds:us-east-1:000000000000:db:mysql";
+        RdsContainerHandle mysql = runtime.tryStart(mysqlArn, "mysql", "mysql-volume", "mysql-volume",
+                DatabaseEngine.MYSQL, "mysql:8.0.45", "master", "secret", "appdb");
+        MicrosandboxMachine saved = journal.scanAllAccounts().stream()
+                .filter(candidate -> candidate.runtimeId.equals(mysqlArn)).findFirst().orElseThrow();
+        assertEquals(8192, saved.rootDiskMib);
+        assertTrue(mockingDetails(client).getInvocations().stream()
+                .filter(invocation -> invocation.getMethod().getName().equals("command"))
+                .map(invocation -> List.of(invocation.getArguments()))
+                .anyMatch(args -> args.contains("--root-disk") && args.contains("8192M")));
+        runtime.stop(mysql);
+        when(config.services().rds().microsandboxRootDiskMib()).thenReturn(16384);
+        restart();
+        clearInvocations(client);
+        runtime.recover(mysqlArn);
+        assertEquals(8192, journal.scanAllAccounts().stream()
+                .filter(candidate -> candidate.runtimeId.equals(mysqlArn)).findFirst().orElseThrow().rootDiskMib);
+        verify(client, never()).command(any(String[].class));
+        ObjectNode legacy = mapper.valueToTree(machine());
+        legacy.remove("rootDiskMib");
+        assertEquals(4096, mapper.treeToValue(legacy, MicrosandboxMachine.class).rootDiskMib);
     }
 
     @Test

@@ -18,6 +18,11 @@ import io.github.hectorvent.floci.services.rds.model.DatabaseEngine;
  */
 public interface RdsBackendRuntime extends RdsBackendGate, Resettable {
 
+    /** Re-registers an owned endpoint without starting execution; null uses the normal startup path. */
+    default RdsContainerHandle recover(String runtimeId) {
+        return null;
+    }
+
     /**
      * Starts a database, retaining cleanup identity on partial failure. Returns null only when
      * the execution provider is unreachable, preserving metadata-only operation.

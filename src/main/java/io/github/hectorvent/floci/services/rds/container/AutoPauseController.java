@@ -84,10 +84,18 @@ final class AutoPauseController {
     private boolean resumeRequested;
     private boolean pauseCanceled;
     private boolean closed;
+    private boolean recoveredPaused;
+    private boolean preservePauseOnClose;
     private Instant lastSignal = Instant.EPOCH;
 
     AutoPauseController(String containerId, String host, int port, Freezer freezer,
                         Scheduler scheduler, Executor notifier, Clock clock, Duration resumeDelay) {
+        this(containerId, host, port, freezer, scheduler, notifier, clock, resumeDelay, false);
+    }
+
+    AutoPauseController(String containerId, String host, int port, Freezer freezer,
+                        Scheduler scheduler, Executor notifier, Clock clock, Duration resumeDelay,
+                        boolean initiallyPaused) {
         this.containerId = containerId;
         this.host = host;
         this.port = port;
@@ -96,6 +104,8 @@ final class AutoPauseController {
         this.notifier = notifier;
         this.clock = clock;
         this.resumeDelay = resumeDelay;
+        this.recoveredPaused = initiallyPaused;
+        this.state = initiallyPaused ? State.PAUSED : State.RUNNING;
     }
 
     boolean serves(String backendHost, int backendPort) {
@@ -136,6 +146,14 @@ final class AutoPauseController {
                 return;
             }
             listener = newListener != null ? newListener : AutoPauseListener.NONE;
+            if (recoveredPaused) {
+                recoveredPaused = false;
+                secondsUntilAutoPause = seconds;
+                if (seconds != null) {
+                    armPausedReport();
+                }
+                return;
+            }
             if (Objects.equals(secondsUntilAutoPause, seconds)) {
                 return;
             }
@@ -206,19 +224,29 @@ final class AutoPauseController {
      * controller closed.
      */
     void close() {
+        close(false);
+    }
+
+    /** Native checkpoints can remain stopped when only the host controller is shutting down. */
+    void closeWithoutResume() {
+        close(true);
+    }
+
+    private void close(boolean preservePause) {
         lock.lock();
         try {
             if (closed) {
                 return;
             }
             closed = true;
+            preservePauseOnClose = preservePause;
             // A resume whose timer is set has already thawed the container and only waits out
             // the resume delay; cancelling that timer must not leave its waiters behind.
             boolean resumeDelayPending = state == State.RESUMING && timer != null;
             cancelTimer();
             if (resumeDelayPending) {
                 finishResume();
-            } else if (state == State.PAUSED) {
+            } else if (state == State.PAUSED && !preservePause) {
                 state = State.RESUMING;
                 RuntimeException failure = withoutLock(() -> freezer.unpause(containerId));
                 if (failure != null) {
@@ -306,7 +334,7 @@ final class AutoPauseController {
     /** Freezes the container. Entered and left holding the lock, in PAUSING. */
     private void pause() {
         RuntimeException pauseFailure = withoutLock(() -> freezer.pause(containerId));
-        if (pauseFailure == null && !pauseCanceled && !closed) {
+        if (pauseFailure == null && !pauseCanceled && (!closed || preservePauseOnClose)) {
             state = State.PAUSED;
             signal(AutoPauseListener.Event.PAUSED);
             armPausedReport();
@@ -376,6 +404,7 @@ final class AutoPauseController {
 
     private void finishResume() {
         cancelTimer();
+        recoveredPaused = false;
         state = State.RUNNING;
         signal(AutoPauseListener.Event.RESUMED);
         settled.signalAll();

@@ -79,6 +79,7 @@ Floci storage intentionally does not retain the runtime journal across restart.
 | `microsandbox-backend-host` | `127.0.0.1` | Helper host address reachable from Floci |
 | `microsandbox-bind-host` | `127.0.0.1` | Helper host interface publishing database ports |
 | `microsandbox-memory-mib` | `512` | Guest RAM per database runtime |
+| `microsandbox-root-disk-mib` | `4096` | Root and database disk for newly created native runtimes, in MiB; minimum 1024 |
 
 Each setting has the corresponding `FLOCI_SERVICES_RDS_*` environment variable.
 If Floci runs in Docker on a Mac, the URL and backend host usually need
@@ -94,6 +95,22 @@ configured guest RAM, so leave additional memory for the host and emulator.
 Existing journals retain their guest's original RAM size even if the default
 changes. Older journals recover that size from the owned VM configuration;
 missing runtime state requires recovery rather than guessing a new allocation.
+
+On Floci restart, existing native databases register their original endpoints
+without starting stopped guests or restoring RAM checkpoints. The first database
+connection, Data API request, or maintenance operation acquires the existing
+activity lease and wakes the database. Describe calls and endpoint registration
+do not wake it. A database already running in the helper remains running.
+Ordinary Floci shutdown preserves verified hibernated guests; it cleanly stops
+running databases. Explicit AWS stop and start operations retain their existing
+cold shutdown and startup behavior.
+When the helper's shared disk budget is enabled, checkpoint capacity is reserved
+before freezing the database. A capacity refusal leaves the running database
+available; uncertain capture outcomes keep their reservation until reconciled.
+
+Recovery requires the original runtime journal and owned guest storage. Missing,
+ambiguous, or uncertain recovery state fails closed instead of creating an empty
+replacement database. See the [Aurora recovery migration notes](../../tools/microsandbox/AURORA_RECOVERY_MIGRATION.md).
 
 Native helper mutations also have an opaque completion journal in
 `microsandbox-commands.json`. A lost response can leave a command running after
@@ -114,7 +131,13 @@ data. Keep the original Docker installation until migration has been checked.
 Do not switch a microsandbox installation back to Docker in place.
 
 The provider uses official PostgreSQL and MySQL OCI image conventions, one vCPU,
-a 4 GiB root disk, and the configured RAM. PostgreSQL SQL backups and restores,
+and the configured RAM and root disk. The disk defaults to 4 GiB and includes the
+image filesystem and database data. `microsandbox-root-disk-mib` is a local runtime
+setting, independent of AWS `AllocatedStorage`; changing either does not resize
+an existing native disk. Each runtime keeps its journaled size, including across
+cold starts and RAM restores. Older journals retain the original 4 GiB default.
+Create a new database and migrate its data to change its disk size.
+PostgreSQL SQL backups and restores,
 password rotation, and ordinary stop/start use the same service operations as Docker.
 MySQL AWS database snapshots remain unsupported, as with the Docker provider;
 internal hibernation checkpoints do preserve MySQL memory and disk state.
@@ -137,8 +160,8 @@ Use one Floci process and one helper for each runtime home.
 
 Apple Silicon JVM integration is tested with real AWS SDK requests and PostgreSQL/MySQL
 connections. Linux/KVM workload testing and native Floci qualification are still
-required before treating this provider as production-ready. This runtime does
-not yet implement EC2 or Kubernetes execution.
+required before treating this provider as production-ready. EC2 execution remains
+outside the native runtime scope; Kubernetes uses its separate opt-in pod provider.
 
 ## Supported Management Actions
 

@@ -4939,6 +4939,34 @@ class RdsServiceTest {
     }
 
     @Test
+    void startupRegistersRecoveredDatabaseEndpointsWithoutStartingTheBackends() {
+        StorageBackend<String, DbInstance> instances = new InMemoryStorage<>();
+        StorageBackend<String, DbCluster> clusters = new InMemoryStorage<>();
+        DbCluster cluster = persistedCluster("123456789012", "secret", 7001);
+        DbInstance instance = persistedInstance("standalone", "123456789012", "secret", 7002);
+        clusters.put("us-east-1::cluster1", cluster);
+        instances.put("us-east-1::standalone", instance);
+        RdsBackendRuntime recovered = mock(RdsBackendRuntime.class);
+        when(recovered.recover(cluster.getDbClusterArn()))
+                .thenReturn(new RdsContainerHandle("sleeping-cluster", cluster.getDbClusterArn(),
+                        "cluster1", "127.0.0.1", 15432));
+        when(recovered.recover(instance.getDbInstanceArn()))
+                .thenReturn(new RdsContainerHandle("cold-instance", instance.getDbInstanceArn(),
+                        "standalone", "127.0.0.1", 15433));
+        RdsService service = newService(recovered, proxyManager, instances, clusters,
+                new InMemoryStorage<>(), new InMemoryStorage<>(), new InMemoryStorage<>());
+        clearInvocations(proxyManager);
+        service.restorePersistedRuntime();
+        assertEquals("sleeping-cluster", service.getDbCluster("cluster1").getContainerId());
+        assertEquals("cold-instance", service.getDbInstance("standalone").getContainerId());
+        verify(recovered, never()).tryStart(any(), any(), any(), any(), any(), any(), any(), any(), any());
+        verify(proxyManager).startProxy(eq("rds-resource:" + cluster.getDbClusterArn()), any(), anyBoolean(),
+                eq(7001), eq("127.0.0.1"), eq(15432), any(), any(), any(), any(), any(), any());
+        verify(proxyManager).startProxy(eq("rds-resource:" + instance.getDbInstanceArn()), any(), anyBoolean(),
+                eq(7002), eq("127.0.0.1"), eq(15433), any(), any(), any(), any(), any(), any());
+    }
+
+    @Test
     void createDbInstanceAcceptsMasterUsernameWithUnderscores() {
         DbInstance instance = rdsService.createDbInstance("mydb", "postgres", "13",
                 "my_master_user", "password", "dbname", "db.t3.micro",

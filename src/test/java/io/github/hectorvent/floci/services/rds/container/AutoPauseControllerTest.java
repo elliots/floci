@@ -39,6 +39,47 @@ class AutoPauseControllerTest {
     private final RecordingListener listener = new RecordingListener();
 
     @Test
+    void initialRecoveredConfigurationDoesNotWakeButLaterPolicyChangeDoes() {
+        AutoPauseController controller = new AutoPauseController("recovered", "localhost", 5432,
+                freezer, scheduler, Runnable::run, scheduler.clock(), Duration.ZERO, true);
+        controller.configure(300, listener);
+        scheduler.advance(Duration.ofHours(1));
+        assertEquals(State.PAUSED, controller.state());
+        assertEquals(0, freezer.unpauses.get());
+        controller.configure(null, listener);
+        scheduler.advance(Duration.ZERO);
+        assertEquals(State.RUNNING, controller.state());
+        assertEquals(1, freezer.unpauses.get());
+    }
+
+    @Test
+    void nativeShutdownKeepsAnAlreadyPausedBackendStopped() throws Exception {
+        AutoPauseController controller = pausedController(Duration.ZERO);
+        controller.closeWithoutResume();
+        scheduler.advance(Duration.ofDays(1));
+        assertEquals(State.PAUSED, controller.state());
+        assertEquals(0, freezer.unpauses.get());
+        assertSame(RdsBackendGate.Lease.NONE, controller.acquire());
+    }
+
+    @Test
+    void nativeShutdownPreservesAPauseAlreadyInProgress() throws Exception {
+        AutoPauseController controller = controller(Duration.ZERO);
+        controller.configure(300, listener);
+        freezer.blockPause();
+        Thread pausing = Thread.ofVirtual().start(() -> scheduler.advance(IDLE));
+        freezer.awaitPauseEntered();
+        try {
+            controller.closeWithoutResume();
+        } finally {
+            freezer.releasePause();
+            pausing.join(5000);
+        }
+        assertEquals(State.PAUSED, controller.state());
+        assertEquals(0, freezer.unpauses.get());
+    }
+
+    @Test
     void pausesOnceIdleForSecondsUntilAutoPause() {
         AutoPauseController controller = controller(Duration.ZERO);
         controller.configure(300, listener);

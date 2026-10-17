@@ -1760,6 +1760,10 @@ public interface EmulatorConfig {
         @WithDefault("512")
         int microsandboxMemoryMib();
 
+        /** Local disk size for newly created native databases; existing database disks retain their size. */
+        @WithDefault("4096")
+        int microsandboxRootDiskMib();
+
         @WithDefault("7000")
         int proxyBasePort();
 

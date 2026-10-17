@@ -8110,10 +8110,13 @@ public class RdsService implements Resettable, ResourceProvider {
                 cluster.setEndpoint(endpoint);
                 cluster.setReaderEndpoint(endpoint);
                 String image = imageForEngine(cluster.getEngine(), cluster.getEngineVersion());
-                restoredHandle = containerManager.tryStart(
-                        cluster.getDbClusterArn(), cluster.getDbClusterIdentifier(),
-                        storageResourceId, dockerVolumeName, cluster.getEngine(), image,
-                        cluster.getMasterUsername(), cluster.getMasterPassword(), cluster.getDatabaseName());
+                restoredHandle = containerManager.recover(cluster.getDbClusterArn());
+                if (restoredHandle == null) {
+                    restoredHandle = containerManager.tryStart(
+                            cluster.getDbClusterArn(), cluster.getDbClusterIdentifier(),
+                            storageResourceId, dockerVolumeName, cluster.getEngine(), image,
+                            cluster.getMasterUsername(), cluster.getMasterPassword(), cluster.getDatabaseName());
+                }
                 cluster.setContainerId(restoredHandle != null ? restoredHandle.getContainerId() : null);
                 cluster.setContainerHost(restoredHandle != null ? restoredHandle.getHost() : null);
                 cluster.setContainerPort(restoredHandle != null ? restoredHandle.getPort() : 0);
@@ -8251,11 +8254,14 @@ public class RdsService implements Resettable, ResourceProvider {
                     instance.setContainerPort(cluster.getContainerPort());
                 } else {
                     String image = imageForEngine(instance.getEngine(), instance.getEngineVersion());
-                    restoredHandle = containerManager.tryStart(
-                            instance.getDbInstanceArn(), instance.getDbInstanceIdentifier(),
-                            instance.getContainerStorageResourceId(),
-                            instance.getDockerVolumeName(), instance.getEngine(), image,
-                            instance.getMasterUsername(), instance.getMasterPassword(), instance.getDbName());
+                    restoredHandle = containerManager.recover(instance.getDbInstanceArn());
+                    if (restoredHandle == null) {
+                        restoredHandle = containerManager.tryStart(
+                                instance.getDbInstanceArn(), instance.getDbInstanceIdentifier(),
+                                instance.getContainerStorageResourceId(),
+                                instance.getDockerVolumeName(), instance.getEngine(), image,
+                                instance.getMasterUsername(), instance.getMasterPassword(), instance.getDbName());
+                    }
                     backendHost = restoredHandle != null ? restoredHandle.getHost() : null;
                     backendPort = restoredHandle != null ? restoredHandle.getPort() : 0;
                     instance.setContainerId(restoredHandle != null ? restoredHandle.getContainerId() : null);

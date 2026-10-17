@@ -21,6 +21,7 @@ public class MicrosandboxMachine {
     public String host;
     public int port;
     public int memoryMib;
+    public int rootDiskMib = 4096;
     public String vm;
     public String phase;
     public String snapshot;
