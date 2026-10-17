@@ -53,6 +53,7 @@ func TestForwardCancellationClosesNetworkAndOwnedInput(t *testing.T) {
 	ctx, cancel := context.WithCancel(t.Context())
 	defer cancel()
 	input, writer := io.Pipe()
+	defer input.Close()
 	defer writer.Close()
 	result := make(chan error, 1)
 	go func() { result <- Forward(ctx, listener.Addr().String(), input, io.Discard) }()
@@ -70,13 +71,41 @@ func TestForwardCancellationClosesNetworkAndOwnedInput(t *testing.T) {
 	case <-time.After(3 * time.Second):
 		t.Fatal("cancelled forward retained blocked streams")
 	}
-	if _, err := writer.Write([]byte("late")); !errors.Is(err, io.ErrClosedPipe) {
-		t.Fatalf("owned input remained open: %v", err)
-	}
+	assertInputClosed(t, writer)
 	connection.SetReadDeadline(time.Now().Add(time.Second))
 	if _, err := connection.Read(make([]byte, 1)); !errors.Is(err, io.EOF) {
 		t.Fatalf("network connection remained open: %v", err)
 	}
+}
+
+func assertInputClosed(t *testing.T, writer *io.PipeWriter) {
+	t.Helper()
+	written := make(chan error, 1)
+	go func() {
+		_, err := writer.Write([]byte("late"))
+		written <- err
+	}()
+	select {
+	case err := <-written:
+		if !errors.Is(err, io.ErrClosedPipe) {
+			t.Fatalf("owned input remained open: %v", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("owned input retained a blocked writer after completion")
+	}
+}
+
+func TestForwardClosesOwnedInputWhenDialIsCanceled(t *testing.T) {
+	ctx, cancel := context.WithCancel(t.Context())
+	cancel()
+	input, writer := io.Pipe()
+	defer input.Close()
+	defer writer.Close()
+	err := Forward(ctx, "127.0.0.1:1", input, io.Discard)
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("dial cancellation lost: %v", err)
+	}
+	assertInputClosed(t, writer)
 }
 
 func TestForwardRejectsDNSAndInvalidDestinations(t *testing.T) {

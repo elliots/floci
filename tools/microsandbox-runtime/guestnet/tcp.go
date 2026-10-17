@@ -26,20 +26,20 @@ func Forward(ctx context.Context, address string, input io.Reader, output io.Wri
 	if output == nil {
 		output = io.Discard
 	}
-	dialer := net.Dialer{Timeout: 10 * time.Second}
-	connection, err := dialer.DialContext(ctx, "tcp4", target.String())
-	if err != nil {
-		return err
-	}
 	closeInput := func() {
 		if closer, ok := input.(io.Closer); ok {
 			closer.Close()
 		}
 	}
+	defer closeInput()
+	dialer := net.Dialer{Timeout: 10 * time.Second}
+	connection, err := dialer.DialContext(ctx, "tcp4", target.String())
+	if err != nil {
+		return err
+	}
 	stop := context.AfterFunc(ctx, func() { connection.Close(); closeInput() })
 	defer stop()
 	defer connection.Close()
-	defer closeInput()
 	writing := make(chan error, 1)
 	go func() {
 		_, err := io.Copy(connection, input)
