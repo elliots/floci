@@ -2,6 +2,7 @@ package io.github.hectorvent.floci.core.common.microsandbox;
 
 import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
+import com.fasterxml.jackson.databind.node.ObjectNode;
 
 import java.io.IOException;
 import java.net.URI;
@@ -54,9 +55,27 @@ public class PodControllerClient {
     }
 
     public record Pod(String uid, String namespace, String name, String state, long generation,
-                      boolean proxyAvailability, String idleOwner, int activeConnections) {
+                      boolean proxyAvailability, String idleOwner, int activeConnections, int activeRequests,
+                      long activitySequence, boolean activitySequenceKnown) {
         public Pod(String uid, String namespace, String name, String state, long generation) {
-            this(uid, namespace, name, state, generation, false, "external", 0);
+            this(uid, namespace, name, state, generation, false, "external", 0, 0, 0, false);
+        }
+
+        public Pod(String uid, String namespace, String name, String state, long generation,
+                   boolean proxyAvailability, String idleOwner, int activeConnections) {
+            this(uid, namespace, name, state, generation, proxyAvailability, idleOwner, activeConnections, 0, 0, false);
+        }
+
+        public Pod(String uid, String namespace, String name, String state, long generation,
+                   boolean proxyAvailability, String idleOwner, int activeConnections, int activeRequests) {
+            this(uid, namespace, name, state, generation, proxyAvailability, idleOwner, activeConnections, activeRequests, 0, false);
+        }
+
+        public Pod(String uid, String namespace, String name, String state, long generation,
+                   boolean proxyAvailability, String idleOwner, int activeConnections, int activeRequests,
+                   long activitySequence) {
+            this(uid, namespace, name, state, generation, proxyAvailability, idleOwner, activeConnections,
+                    activeRequests, activitySequence, true);
         }
     }
 
@@ -162,10 +181,13 @@ public class PodControllerClient {
 
     private Pod transition(Pod observed, String operation, Duration timeout) {
         invalidateObservations();
-        String body = mapper.createObjectNode().put("expectedGeneration", observed.generation()).toString();
+        ObjectNode body = mapper.createObjectNode().put("expectedGeneration", observed.generation());
+        if ("hibernate".equals(operation) && observed.activitySequenceKnown()) {
+            body.put("expectedActivitySequence", observed.activitySequence());
+        }
         Pod result;
         try {
-            result = pod(request("POST", "/v1/pods/" + segment(observed.uid()) + "/" + operation, body, timeout));
+            result = pod(request("POST", "/v1/pods/" + segment(observed.uid()) + "/" + operation, body.toString(), timeout));
         } finally {
             invalidateObservations();
         }
@@ -196,11 +218,22 @@ public class PodControllerClient {
             throw new IllegalStateException("Pod controller returned an invalid active connection count");
         }
         int connections = connectionsValue.asInt(0);
+        JsonNode requestsValue = value.path("activeRequests");
+        if (!requestsValue.isMissingNode()
+                && (!requestsValue.isIntegralNumber() || !requestsValue.canConvertToInt() || requestsValue.asInt() < 0)) {
+            throw new IllegalStateException("Pod controller returned an invalid active request count");
+        }
+        JsonNode sequenceValue = value.path("activitySequence");
+        if (!sequenceValue.isMissingNode()
+                && (!sequenceValue.isIntegralNumber() || !sequenceValue.canConvertToLong() || sequenceValue.asLong() < 0)) {
+            throw new IllegalStateException("Pod controller returned an invalid activity sequence");
+        }
         if (connections < 0 || proxy && !Set.of("controller", "external").contains(idleOwner)) {
             throw new IllegalStateException("Pod controller returned invalid proxy lifecycle ownership");
         }
         return new Pod(requiredText(value, "uid"), requiredText(value, "namespace"), requiredText(value, "name"),
-                state, generation(value), proxy, idleOwner, connections);
+                state, generation(value), proxy, idleOwner, connections, requestsValue.asInt(0), sequenceValue.asLong(0),
+                !sequenceValue.isMissingNode());
     }
 
     private static long generation(JsonNode value) {

@@ -14,6 +14,7 @@ import java.util.stream.Collectors;
 final class KubernetesWorkloadRuntime implements WorkloadRuntime {
     private final WorkloadDefinition definition;
     private final PodControllerClient controller;
+    private Map<String, Long> activitySequences = Map.of();
     private Deployment starting;
 
     KubernetesWorkloadRuntime(WorkloadDefinition definition, PodControllerClient controller) {
@@ -38,7 +39,10 @@ final class KubernetesWorkloadRuntime implements WorkloadRuntime {
     public synchronized boolean hasActivity() {
         Deployment observed = validateDeployment(controller.observedDeployment(definition.namespace(),
                 definition.target(), Duration.ofSeconds(10)));
-        return observed.pods().stream().anyMatch(pod -> pod.activeConnections() > 0);
+        boolean active = observed.pods().stream().anyMatch(pod -> pod.activeRequests() > 0 || pod.activeConnections() > 0
+                || activitySequences.getOrDefault(pod.uid(), 0L) != pod.activitySequence());
+        activitySequences = observed.pods().stream().collect(Collectors.toUnmodifiableMap(Pod::uid, Pod::activitySequence));
+        return active;
     }
 
     @Override
@@ -67,6 +71,10 @@ final class KubernetesWorkloadRuntime implements WorkloadRuntime {
         long deadline = deadline(timeout);
         controller.checkAvailable(remaining(deadline));
         Deployment observed = stable(deployment(remaining(deadline)), deadline);
+        if (!activitySequences.isEmpty() && observed.pods().stream()
+                .anyMatch(pod -> activitySequences.getOrDefault(pod.uid(), -1L) != pod.activitySequence())) {
+            throw new IllegalStateException("Kubernetes workload activity changed before hibernation");
+        }
         for (Pod pod : observed.pods()) {
             if (!inactive(pod)) {
                 controller.hibernate(pod, remaining(deadline));

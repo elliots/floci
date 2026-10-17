@@ -4,6 +4,7 @@ import com.fasterxml.jackson.databind.ObjectMapper;
 import io.github.hectorvent.floci.core.common.microsandbox.PodControllerClient;
 import io.github.hectorvent.floci.core.common.microsandbox.PodControllerClient.Deployment;
 import io.github.hectorvent.floci.core.common.microsandbox.PodControllerClient.Pod;
+import io.github.hectorvent.floci.runtime.ondemand.ActivationCoordinator.State;
 import io.github.hectorvent.floci.runtime.ondemand.WorkloadDefinition.BackendProtocol;
 import io.github.hectorvent.floci.runtime.ondemand.WorkloadDefinition.RuntimeType;
 import org.junit.jupiter.api.BeforeEach;
@@ -15,19 +16,23 @@ import java.util.ArrayList;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.concurrent.Executors;
+import java.util.concurrent.atomic.AtomicLong;
 
+import static org.awaitility.Awaitility.await;
 import static org.junit.jupiter.api.Assertions.*;
 
 class KubernetesWorkloadRuntimeServiceTest {
     private static final Duration TIMEOUT = Duration.ofSeconds(2);
     private final FakeController controller = new FakeController();
+    private WorkloadDefinition definition;
     private KubernetesWorkloadRuntime runtime;
 
     @BeforeEach
     void setup() {
         controller.pods.put("pod-a", pod("pod-a", "SLEEPING", 1));
         controller.pods.put("pod-b", pod("pod-b", "SLEEPING", 4));
-        WorkloadDefinition definition = new WorkloadDefinition("workers", true, "000000000000", "us-east-1",
+        definition = new WorkloadDefinition("workers", true, "000000000000", "us-east-1",
                 "workers.local", RuntimeType.KUBERNETES, "workers", "apps", 1,
                 URI.create("http://workers-service.local:8080"), 8080, Duration.ofSeconds(1), TIMEOUT,
                 List.of("jobs"), List.of(), null, "/health", 200, "dev", BackendProtocol.HTTP1);
@@ -178,12 +183,104 @@ class KubernetesWorkloadRuntimeServiceTest {
     }
 
     @Test
-    void directProxyStreamsCountAsActivityOutsideTheFlociGateway() {
+    void legacyTcpProxyStreamsCountAsActivityOutsideTheFlociGateway() {
         controller.pods.put("pod-a", new Pod("pod-a", "apps", "pod-a", "READY", 2, true, "external", 1));
         assertTrue(runtime.isRunning());
         assertTrue(runtime.hasActivity());
         controller.pods.put("pod-a", new Pod("pod-a", "apps", "pod-a", "READY", 2, true, "external", 0));
         assertFalse(runtime.hasActivity());
+    }
+
+    @Test
+    void directHttpRequestsCountAsActivityWithoutLegacyTcpConnections() {
+        controller.pods.put("pod-a", new Pod("pod-a", "apps", "pod-a", "READY", 2, true, "external", 0, 1));
+        assertTrue(runtime.hasActivity());
+        controller.pods.put("pod-a", new Pod("pod-a", "apps", "pod-a", "READY", 2, true, "external", 0, 0));
+        assertFalse(runtime.hasActivity());
+    }
+
+    @Test
+    void directHttpRequestPinsDeploymentUntilCompletionAndIdleTimeout() {
+        controller.pods.replaceAll((uid, current) -> pod(uid, "READY", current.generation()));
+        controller.pods.put("pod-a", new Pod("pod-a", "apps", "pod-a", "READY", 1, true, "external", 0, 1, 1));
+        AtomicLong time = new AtomicLong(1);
+        try (ActivationCoordinator coordinator = new ActivationCoordinator(Executors.newSingleThreadExecutor(),
+                (workload, backend, timeout) -> {}, 1, 2, 2, time::get)) {
+            coordinator.register(definition, runtime);
+            coordinator.reconcile("workers", false, true);
+            await().atMost(TIMEOUT).until(() -> coordinator.state("workers") == State.READY);
+            time.addAndGet(Duration.ofSeconds(5).toNanos());
+            coordinator.reconcile("workers", false, true);
+            assertEquals(State.READY, coordinator.state("workers"));
+            assertTrue(controller.operations.isEmpty(), "The active direct HTTP request must prevent hibernation");
+
+            // An idle HTTP keep-alive socket contributes to neither activity count.
+            controller.pods.put("pod-a", new Pod("pod-a", "apps", "pod-a", "READY", 1, true, "external", 0, 0, 2));
+            coordinator.reconcile("workers", false, true);
+            time.addAndGet(Duration.ofMillis(999).toNanos());
+            coordinator.reconcile("workers", false, true);
+            assertEquals(State.READY, coordinator.state("workers"));
+            time.addAndGet(Duration.ofMillis(1).toNanos());
+            coordinator.reconcile("workers", false, true);
+            await().atMost(TIMEOUT).until(() -> coordinator.state("workers") == State.SLEEPING);
+            assertEquals(List.of("hibernate:pod-a:1", "hibernate:pod-b:4"), controller.operations);
+        }
+    }
+
+    @Test
+    void completedDirectHttpRequestBetweenPollsRestartsTheIdleTimer() {
+        controller.pods.replaceAll((uid, current) -> pod(uid, "READY", current.generation()));
+        AtomicLong time = new AtomicLong(1);
+        try (ActivationCoordinator coordinator = new ActivationCoordinator(Executors.newSingleThreadExecutor(),
+                (workload, backend, timeout) -> {}, 1, 2, 2, time::get)) {
+            coordinator.register(definition, runtime);
+            coordinator.reconcile("workers", false, true);
+            await().atMost(TIMEOUT).until(() -> coordinator.state("workers") == State.READY);
+            time.addAndGet(Duration.ofMillis(900).toNanos());
+            controller.pods.put("pod-a", new Pod("pod-a", "apps", "pod-a", "READY", 1, true, "external", 0, 0, 2));
+            coordinator.reconcile("workers", false, true);
+            time.addAndGet(Duration.ofMillis(999).toNanos());
+            coordinator.reconcile("workers", false, true);
+            assertEquals(State.READY, coordinator.state("workers"), "The completed request starts a fresh idle interval");
+            assertTrue(controller.operations.isEmpty());
+            time.addAndGet(Duration.ofMillis(1).toNanos());
+            coordinator.reconcile("workers", false, true);
+            await().atMost(TIMEOUT).until(() -> coordinator.state("workers") == State.SLEEPING);
+            assertEquals(List.of("hibernate:pod-a:1", "hibernate:pod-b:4"), controller.operations);
+        }
+    }
+
+    @Test
+    void failedRequestActivityObservationDoesNotPermitIdleHibernation() {
+        controller.pods.replaceAll((uid, current) -> pod(uid, "READY", current.generation()));
+        AtomicLong time = new AtomicLong(1);
+        try (ActivationCoordinator coordinator = new ActivationCoordinator(Executors.newSingleThreadExecutor(),
+                (workload, backend, timeout) -> {}, 1, 2, 2, time::get)) {
+            coordinator.register(definition, runtime);
+            coordinator.reconcile("workers", false, true);
+            await().atMost(TIMEOUT).until(() -> coordinator.state("workers") == State.READY);
+            controller.failObservation = true;
+            time.addAndGet(Duration.ofSeconds(5).toNanos());
+            coordinator.tick("workers");
+            assertEquals(State.READY, coordinator.state("workers"));
+            assertTrue(controller.operations.isEmpty());
+        }
+    }
+
+    @Test
+    void requestCompletedAfterIdleObservationPreventsAnyHibernateMutation() throws Exception {
+        runtime.start(TIMEOUT);
+        runtime.awaitReady(TIMEOUT);
+        assertFalse(runtime.hasActivity());
+        controller.operations.clear();
+        controller.pods.put("pod-b", new Pod("pod-b", "apps", "pod-b", "READY", 5, true, "external", 0, 0, 2));
+        IllegalStateException failure = assertThrows(IllegalStateException.class, () -> runtime.stop(TIMEOUT));
+        assertTrue(failure.getMessage().contains("activity changed"));
+        assertTrue(controller.operations.isEmpty(), "Activity must be checked before hibernating any deployment member");
+        assertTrue(runtime.hasActivity());
+        assertFalse(runtime.hasActivity());
+        runtime.stop(TIMEOUT);
+        assertFalse(runtime.isRunning());
     }
 
     @Test
@@ -207,6 +304,7 @@ class KubernetesWorkloadRuntimeServiceTest {
         private boolean failSecondHibernate;
         private boolean deferReadiness;
         private boolean readyOnSecondObservation;
+        private boolean failObservation;
         private int observations;
 
         private FakeController() {
@@ -220,6 +318,9 @@ class KubernetesWorkloadRuntimeServiceTest {
 
         @Override
         public Deployment observedDeployment(String namespace, String name, Duration timeout) {
+            if (failObservation) {
+                throw new IllegalStateException("Controller observation is unavailable");
+            }
             return deployment(namespace, name, timeout);
         }
 

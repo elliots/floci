@@ -20,6 +20,7 @@ from qualification_operations import qualify_operations
 from qualification_sidecars import qualify_sidecars
 from qualification_identity import qualify_identity
 from qualification_groups import qualify_groups
+from qualification_http_activity import qualify_http_activity, verify_http_activity
 
 LABEL = "io.floci.pod-probe"
 
@@ -186,6 +187,12 @@ def qualify(args):
                     "tolerations":[{"key":"microsandbox.dev/runtime","operator":"Equal","value":"native","effect":"NoSchedule"}],
                     "automountServiceAccountToken":False, "restartPolicy":"Never",
                     "containers":[{"name":"app","image":"public.ecr.aws/docker/library/busybox:1.37.0","command":["sh","-ec",script]}]}}
+            if args.http_activity_only:
+                if not args.network_relay_binary:
+                    raise RuntimeError("HTTP activity qualification requires --network-relay-binary")
+                qualify_http_activity(pod=pod, apply=apply, resource=resource, kubectl=kubectl,
+                    ready=ready, lifecycle=lifecycle, control_get=control_get, wait=wait, report=report)
+                raise QualificationComplete()
             if args.groups_only:
                 if not args.guest_fs_binary:
                     raise RuntimeError("group qualification requires --guest-fs-binary")
@@ -650,18 +657,8 @@ def qualify(args):
                 marker="proxy-ram-"+owner
                 kubectl("exec",chosen["name"],"--","sh","-ec",f"printf '%s' '{marker}' >/dev/shm/marker")
                 boot=kubectl("exec",chosen["name"],"--","cat","/proc/sys/kernel/random/boot_id")
-                from urllib.parse import urlparse
-                target=urlparse(chosen["proxyUrl"])
-                held=socket.create_connection((target.hostname,target.port),timeout=10)
-                wait("proxy activity lease",lambda:lifecycle(proxy_uid)["activeConnections"]==1)
-                try:
-                    state=lifecycle(proxy_uid)
-                    try: lifecycle(proxy_uid,"hibernate",state["generation"])
-                    except RuntimeError as failure: assert "proxy connections are active" in str(failure)
-                    else: raise AssertionError("active TCP stream allowed hibernation")
-                    time.sleep(22)
-                    assert lifecycle(proxy_uid)["state"]=="READY"
-                finally: held.close()
+                verify_http_activity(name=chosen["name"], uid=proxy_uid, lifecycle=lifecycle,
+                    kubectl=kubectl, wait=wait, report=report, idle_seconds=20)
                 wait("controller automatically hibernates idle proxy",lambda:lifecycle(proxy_uid)["state"]=="SLEEPING",90)
                 assert ready(chosen["name"])
                 crash_and_restart()
@@ -1011,6 +1008,7 @@ if __name__ == "__main__":
     parser.add_argument("--network-relay-binary")
     parser.add_argument("--guest-fs-binary")
     parser.add_argument("--groups-only", action="store_true", help="run the same group and volume permission fixture on Docker and native pods")
+    parser.add_argument("--http-activity-only", action="store_true", help="qualify HTTP request leases and same-connection wake through the shared owned fixture")
     parser.add_argument("--scheduling-cpu", help="virtual CPU capacity advertised to the Kubernetes scheduler")
     parser.add_argument("--scheduling-memory", help="virtual memory capacity advertised to the Kubernetes scheduler")
     raise SystemExit(0 if qualify(parser.parse_args()) else 1)

@@ -92,12 +92,21 @@ readiness does not fabricate a running VM.
 The Linux `network-relay` process runs once in the owned Docker peer. It binds
 public PodIP aliases and forwards declared TCP ports to shared host listeners.
 This socket remains reachable after kube-proxy translates a ClusterIP to PodIP.
-The host gate acquires an activity lease, cold-boots or restores the exact Pod
-UID, waits for actual app readiness, then connects its native published port.
-The application receives no bytes before readiness. Connections retain their
-lease until both directions finish; keepalive and long-lived streams therefore
-prevent hibernation. Both relay and host gate bound active and waiting streams
-at 1024, and a four-minute startup deadline bounds waiting. Overload closes TCP.
+The host gate defaults to HTTP request processing, selected by
+`microsandbox.dev/proxy-protocol: http`. Each HTTP/1 or prior-knowledge
+cleartext HTTP/2/gRPC request acquires activity, cold-boots or restores the exact Pod UID and waits
+for actual app readiness before forwarding. The request retains its lease through
+the complete response body or upgraded stream. Idle frontend keepalive connections
+do not acquire activity and can remain open while the VM sleeps; the next request
+wakes it again. The relay and HTTP handling are shared, with no resident proxy
+sidecar in each pod. The backend protocol matches the incoming request protocol;
+there is no automatic HTTP/2-to-HTTP/1 translation.
+
+Explicit `proxy-protocol: tcp` retains the previous raw TCP/TLS path. Its
+connections hold activity until both directions finish, so idle connections
+prevent hibernation. HTTPS needs TLS termination before the HTTP listener or this
+TCP passthrough mode. The mode applies to all declared proxy ports. Admission
+remains bounded and startup waits have a four-minute deadline.
 
 Proxy guests use a separately reserved private /22, default `10.42.204.0/22`,
 inside the cluster Pod CIDR. Their public PodIP remains on the shared relay.
@@ -113,13 +122,17 @@ slots, independently of the two VM boot/restore slots and active RAM admission.
 
 `microsandbox.dev/idle-owner: "controller"` is the default for proxy Pods, with
 `microsandbox.dev/idle-timeout-seconds: "120"`. The controller hibernates stable running
-guests after inactivity, guarded atomically against active connections. An app
-that remains unready also releases RAM after its failed requests drain.
-External queue-aware coordinators must set `idle-owner: "external"`; they own
-idle decisions and observe `activeConnections` plus actual lifecycle state.
-There must be one idle owner. External HTTP, TLS and other TCP health requests
-through the wake proxy count as traffic and wake a sleeping app; Kubernetes
-probes do not wake sleeping guests. This generic proxy does not invent health
+guests after inactivity, guarded atomically against `activeRequests` and
+`activeConnections`. An app that remains unready also releases RAM after its failed
+requests drain. External queue-aware coordinators must set `idle-owner: "external"`;
+they own idle decisions and observe both counters plus actual lifecycle state.
+The entry's `activitySequence` also advances on activity acquisition/release,
+allowing an external poller to notice work completed between observations.
+HTTP requests and response/upgrade streams use `activeRequests`; TCP-mode and
+port-forward sessions use `activeConnections`. There must be one idle owner.
+Direct HTTP health requests count as requests, and TCP-mode connections count
+as connections; the proxy does not infer health URLs. Kubernetes probes do not
+wake sleeping guests or renew normal idle time. This proxy does not invent health
 responses. Deployment/Helm status checks can complete from proxy availability
 without waking the application. Container waiting reasons still identify COLD or
 hibernated guests rather than inventing a running application process.
@@ -174,12 +187,12 @@ pull policies. This extended run used two lazy replicas; it did not repeat the
 | OCI | Image ENTRYPOINT/CMD/USER defaults, command/args overrides and expansion, working directory, env and ConfigMap/Secret env references, image pull policies | Registry credentials |
 | Status | Real task state; exec/HTTP/HTTPS/TCP/gRPC readiness, startup and liveness; Always/OnFailure/Never | Probe host overrides, independent probe workers, hooks |
 | Logs/exec | Actual logs, tail/byte limit, standard exec with TTY/resize, localhost port-forward | Follow, previous, timestamps, rotation, attach |
-| Network | Strict PodIP/Service/DNS with source IP; opt-in TCP wake relay | NetworkPolicy, IPv6, arbitrary CNIs |
+| Network | Strict PodIP/Service/DNS with source IP; opt-in HTTP wake proxy and explicit TCP compatibility mode | NetworkPolicy, IPv6, arbitrary CNIs |
 | Containers | Multiple regular OCI containers with sequential init containers | Restartable init sidecars, ephemeral containers |
 | Volumes | Disk/memory emptyDir, ConfigMap/Secret mounts, subPath/subPathExpr, atomic directory refresh | Projected tokens, PVC/CSI, host paths, disk quotas |
 | Security | VM boundary, mTLS/RBAC, token control, ownership fences, UID/GID, non-root validation, read-only root, privilege escalation, capabilities and RuntimeDefault/Unconfined seccomp | fsGroup, supplemental groups, privileged containers, custom seccomp, SELinux and AppArmor profiles |
 | Resources | Request/limit-derived profiles, CPU shares/quota, memory cgroups, kernel OOM attribution, bounded starts and active RAM budget | Metrics, eviction and shared host budgets |
-| Wake | Generic UID API, cold boot, retained replicas, opt-in Service TCP wake | Protocol-aware health responses, UDP |
+| Wake | Generic UID API, cold boot, retained replicas, Service HTTP request wake and explicit TCP connection wake | Protocol-aware health responses, UDP |
 | Scale | Configurable tracked count and RAM, bounded checkpoints | 500 checkpointed apps, disk admission, shared host budget |
 
 Defaults: 512 tracked Pods and 4096 MiB active RAM. Guests have a 4 GiB flat root

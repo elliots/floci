@@ -73,6 +73,8 @@ func (p *provider) RunInContainer(ctx context.Context, namespace, name, containe
 		}
 	}
 	e.lastActivity = time.Now()
+	e.activitySequence++
+	refreshView(e)
 	if ctx.Err() != nil {
 		return errors.Join(err, ctx.Err())
 	}
@@ -136,6 +138,7 @@ func (p *provider) PortForward(ctx context.Context, namespace, name string, port
 		return err
 	}
 	e.activeConnections++
+	e.activitySequence++
 	e.lastActivity = time.Now()
 	refreshView(e)
 	e.op.Unlock()
@@ -143,6 +146,7 @@ func (p *provider) PortForward(ctx context.Context, namespace, name string, port
 		e.op.Lock()
 		defer e.op.Unlock()
 		e.activeConnections--
+		e.activitySequence++
 		e.lastActivity = time.Now()
 		refreshView(e)
 	}()

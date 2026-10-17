@@ -402,16 +402,18 @@ func TestDeletionCancelsProxyAdmissionBeforeWaitingForMonitor(t *testing.T) {
 	}
 }
 
-func TestControllerIdleRequiresOwnershipAndNoActiveConnection(t *testing.T) {
+func TestControllerIdleRequiresOwnershipAndNoActiveWork(t *testing.T) {
 	for _, scenario := range []struct {
 		name, owner, state string
 		connections        int
+		requests           int
 		recent             bool
 		want               bool
 	}{
 		{name: "controller idle", owner: "controller", state: "READY", want: true},
 		{name: "external queue owner", owner: "external", state: "READY"},
 		{name: "open TCP connection", owner: "controller", state: "READY", connections: 1},
+		{name: "active HTTP request", owner: "controller", state: "READY", requests: 1},
 		{name: "recent activity", owner: "controller", state: "READY", recent: true},
 		{name: "cold", owner: "controller", state: "COLD"},
 		{name: "unready app after failed request", owner: "controller", state: "RUNNING", want: true},
@@ -423,7 +425,7 @@ func TestControllerIdleRequiresOwnershipAndNoActiveConnection(t *testing.T) {
 	} {
 		t.Run(scenario.name, func(t *testing.T) {
 			entry := &podEntry{idleOwner: scenario.owner, state: scenario.state, activeConnections: scenario.connections,
-				idleTimeout: time.Minute, lastActivity: time.Now().Add(-time.Hour)}
+				activeRequests: scenario.requests, idleTimeout: time.Minute, lastActivity: time.Now().Add(-time.Hour)}
 			if scenario.recent {
 				entry.lastActivity = time.Now()
 			}
@@ -482,7 +484,7 @@ func TestColdWakeChecksCurrentPodLabelsForNetworkPolicies(t *testing.T) {
 }
 
 func TestProxySettingsRequireDeclaredTCPRoutes(t *testing.T) {
-	for _, scenario := range []string{"no ports", "UDP", "duplicate port", "invalid owner", "invalid timeout"} {
+	for _, scenario := range []string{"no ports", "UDP", "duplicate port", "invalid owner", "invalid timeout", "invalid protocol"} {
 		t.Run(scenario, func(t *testing.T) {
 			pod := validPod()
 			pod.Annotations = map[string]string{"microsandbox.dev/availability": "proxy"}
@@ -498,6 +500,8 @@ func TestProxySettingsRequireDeclaredTCPRoutes(t *testing.T) {
 				pod.Annotations["microsandbox.dev/idle-owner"] = "both"
 			case "invalid timeout":
 				pod.Annotations["microsandbox.dev/idle-timeout-seconds"] = "0"
+			case "invalid protocol":
+				pod.Annotations["microsandbox.dev/proxy-protocol"] = "https"
 			}
 			if _, _, _, err := proxySettings(pod); err == nil {
 				t.Fatal("unsupported proxy availability accepted")
@@ -512,6 +516,48 @@ func TestProxySettingsRequireDeclaredTCPRoutes(t *testing.T) {
 	pod.Spec.Containers[0].Ports = []corev1.ContainerPort{{ContainerPort: 8080}, {ContainerPort: 8443, Protocol: corev1.ProtocolTCP}}
 	if enabled, owner, _, err := proxySettings(pod); err != nil || !enabled || owner != "external" {
 		t.Fatalf("external idle ownership was not retained: %v", err)
+	}
+	if proxyProtocol(pod) != "http" {
+		t.Fatal("proxy must default to request-aware HTTP")
+	}
+	pod.Annotations["microsandbox.dev/proxy-protocol"] = "tcp"
+	if enabled, _, _, err := proxySettings(pod); err != nil || !enabled || proxyProtocol(pod) != "tcp" {
+		t.Fatalf("explicit TCP compatibility mode was rejected: %v", err)
+	}
+}
+
+func TestHTTPRequestLeaseProtectsResponseAndPublishesCompletedActivity(t *testing.T) {
+	entry := availabilityEntry(t)
+	entry.state, entry.actualReady, entry.idleOwner = "READY", true, "controller"
+	entry.idleTimeout, entry.lastActivity = time.Minute, time.Now().Add(-time.Hour)
+	p := &provider{}
+	backend, release, err := p.acquireHTTP(t.Context(), entry, 18080)
+	if err != nil || backend != "127.0.0.1:18080" || release == nil {
+		t.Fatalf("acquire HTTP backend: %q, %v", backend, err)
+	}
+	t.Cleanup(release)
+	observed := entry.publishedView.Load()
+	if observed.ActiveRequests != 1 || observed.ActiveConnections != 0 || observed.ActivitySequence != 1 {
+		t.Fatalf("HTTP request was not published separately from connections: %+v", observed)
+	}
+	entry.op.Lock()
+	err = p.hibernate(t.Context(), entry)
+	entry.op.Unlock()
+	if err == nil || !strings.Contains(err.Error(), "HTTP requests are active") || idleEligible(entry) {
+		t.Fatalf("HTTP response was allowed to sleep: %v", err)
+	}
+	release()
+	release()
+	observed = entry.publishedView.Load()
+	if observed.ActiveRequests != 0 || observed.ActiveConnections != 0 || observed.ActivitySequence != 2 {
+		t.Fatalf("completed HTTP request was not visible or release was not idempotent: %+v", observed)
+	}
+	if idleEligible(entry) {
+		t.Fatal("completed request did not restart idle timer")
+	}
+	entry.lastActivity = time.Now().Add(-time.Hour)
+	if !idleEligible(entry) {
+		t.Fatal("completed HTTP request prevented later hibernation")
 	}
 }
 

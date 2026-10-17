@@ -63,6 +63,8 @@ type podEntry struct {
 	idleTimeout                                      time.Duration
 	lastActivity                                     time.Time
 	activeConnections                                int
+	activeRequests                                   int
+	activitySequence                                 uint64
 	publishedView                                    atomic.Pointer[lifecycleView]
 	wake                                             chan struct{}
 	snapshotIDs                                      map[string]string

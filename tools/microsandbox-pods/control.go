@@ -24,6 +24,8 @@ type lifecycleView struct {
 	ProxyAvailability bool   `json:"proxyAvailability"`
 	IdleOwner         string `json:"idleOwner,omitempty"`
 	ActiveConnections int    `json:"activeConnections"`
+	ActiveRequests    int    `json:"activeRequests"`
+	ActivitySequence  uint64 `json:"activitySequence"`
 	UID               string `json:"uid"`
 	Namespace         string `json:"namespace"`
 	Name              string `json:"name"`
@@ -42,6 +44,7 @@ func view(e *podEntry) lifecycleView {
 	v := lifecycleView{ProxyAvailability: e.proxyAvailability, IdleOwner: e.idleOwner, ActiveConnections: e.activeConnections, UID: string(e.pod.UID), Namespace: e.pod.Namespace, Name: e.pod.Name, State: e.state,
 		Generation: e.generation, PodIP: e.ip, VM: e.vm, UDPPort: e.port, HTTPPort: e.httpPort, ApplicationPort: e.appPort}
 	v.VCPUs, v.MemoryMiB = e.allocation.VCPUs, e.allocation.MemoryMiB
+	v.ActiveRequests, v.ActivitySequence = e.activeRequests, e.activitySequence
 	if e.httpPort != 0 {
 		v.BackendURL = fmt.Sprintf("http://127.0.0.1:%d", e.httpPort)
 	}
@@ -105,7 +108,8 @@ func (p *provider) serveControl(address, tokenFile string) (*http.Server, error)
 			return
 		}
 		var request struct {
-			ExpectedGeneration *uint64 `json:"expectedGeneration"`
+			ExpectedGeneration       *uint64 `json:"expectedGeneration"`
+			ExpectedActivitySequence *uint64 `json:"expectedActivitySequence"`
 		}
 		decoder := json.NewDecoder(http.MaxBytesReader(w, r.Body, 4096))
 		decoder.DisallowUnknownFields()
@@ -123,6 +127,10 @@ func (p *provider) serveControl(address, tokenFile string) (*http.Server, error)
 		}
 		if *request.ExpectedGeneration != e.generation {
 			writeJSON(w, 409, map[string]string{"error": "lifecycle generation changed"})
+			return
+		}
+		if operation == "hibernate" && request.ExpectedActivitySequence != nil && *request.ExpectedActivitySequence != e.activitySequence {
+			writeJSON(w, 409, map[string]string{"error": "pod activity changed"})
 			return
 		}
 		var err error
@@ -258,6 +266,9 @@ func (p *provider) hibernate(ctx context.Context, e *podEntry) error {
 	}
 	if e.activeConnections > 0 {
 		return errors.New("proxy connections are active")
+	}
+	if e.activeRequests > 0 {
+		return errors.New("HTTP requests are active")
 	}
 	if e.state == "COLD" {
 		_, exists, err := p.inspectOwned(ctx, e)

@@ -257,12 +257,13 @@ Kubernetes and other service boundaries. Those paths are not enabled by the RDS 
   the public native Pod CIDR. Both must be unused ranges inside the cluster CIDR.
 - With a Floci Kubernetes wake rule, proxy pods must set
   `microsandbox.dev/idle-owner: external`. Standalone proxy pods default to the
-  controller's connection-based idle timer, which does not inspect queues.
+  controller's activity-based idle timer, which does not inspect queues.
   Keeping these owners separate prevents HTTP idleness from suspending queue work.
-- Floci's wake gateway releases backend HTTP connections after each exchange, and
-  its readiness probes release their connections when finished. Direct persistent
-  connections through the native TCP proxy still keep their pod awake, including
-  idle HTTP keepalive; active gateway streams and WebSockets do too.
+- Floci's gateway request accounting is unchanged. The native pod proxy now
+  defaults to HTTP request activity, allowing idle frontend keepalive connections
+  to remain open while the VM sleeps. Explicit `proxy-protocol: tcp` retains the
+  previous connection-based behavior. See the HTTP proxy migration below before
+  upgrading existing raw TCP/TLS workloads.
 - Existing pods retain their resolved environment across hibernation and controller
   restarts. Roll replacement pods to consume changed ConfigMap, Secret or Service
   environment values. Consider `enableServiceLinks: false` when applications use
@@ -279,8 +280,9 @@ Kubernetes and other service boundaries. Those paths are not enabled by the RDS 
   while the application keeps ownership of AMQP consumption and acknowledgements.
 - Route IoT MQTT messages through an ordinary IoT rule's SQS action. Direct MQTT
   subscriptions inside a sleeping guest are not a durable wake mechanism.
-- Applications must reconnect network clients after restore. RAM resumes, but
-  host-side TCP connections are not migrated with the checkpoint.
+- Applications must reconnect outbound network clients after restore. RAM resumes,
+  but backend TCP connections are not migrated with the checkpoint. Idle frontend
+  HTTP connections owned by the shared pod proxy can survive VM hibernation.
 - Existing Docker application filesystems are not converted into VM disks.
   Migrate durable data before switching runtime providers.
 - The shared `FLOCI_MICROSANDBOX_MAX_ACTIVE_MEMORY_MIB` setting defaults to
@@ -711,3 +713,61 @@ them. Ordinary running Pods can create new checkpoints with the new controller.
 Interrupted freeze/thaw operations require their recorded guest completion proof;
 missing or ambiguous completion leaves the workload unavailable instead of starting
 an application with stale credentials. No new guest daemon or AWS endpoint is added.
+
+## Kubernetes HTTP request activity
+
+Rebuild Floci and the native pod controller together. Proxy availability now
+defaults to `microsandbox.dev/proxy-protocol: http`, replacing the previous raw
+TCP activity rule for both new and recovered unannotated proxy Pods. Strict
+availability is unchanged. HTTP/1 and prior-knowledge cleartext HTTP/2 (h2c/gRPC)
+requests through Services or Pod IPs wake the selected pod regardless of whether
+they came through Floci's gateway. Activity lasts through the complete response
+or upgraded stream, including WebSockets. An idle frontend HTTP keepalive
+connection does not wake or pin the VM. It can stay open during hibernation, and
+its next request wakes the pod. This uses the shared controller, without adding
+a resident proxy sidecar to every pod. The application endpoint must support
+the incoming HTTP protocol; HTTP/2-to-HTTP/1 translation is not provided.
+
+Before upgrading a Deployment that serves raw TCP or encrypted TLS, explicitly
+set `microsandbox.dev/proxy-protocol: tcp` on its Pod template. This retains the
+previous behavior, where a connection wakes the pod and keeps it awake until it
+closes. The mode applies to all declared proxy ports. For HTTPS request accounting,
+terminate TLS before the HTTP listener and forward cleartext HTTP; TCP passthrough
+cannot inspect encrypted requests. Port-forward remains connection-based.
+Roll replacement Pods when changing proxy protocol, following the existing
+runtime-annotation immutability rule.
+
+Lifecycle responses add `activeRequests` separately from `activeConnections`.
+External coordinators must consider both counters before hibernation. The first
+covers direct HTTP requests and their response/upgrade streams; the second covers
+TCP-mode proxy and port-forward sessions. `activitySequence` advances on activity
+acquisition and release, letting Floci detect requests completed between polls
+and reset idle time even when both current counts are zero. This requires no
+extra workload configuration. Floci sends the observed sequence as
+`expectedActivitySequence` on hibernate; newer activity causes a conflict before
+mutation. External coordinators should use the same fence when that field is
+available. Floci's gateway HTTP activity, SQS
+visible/in-flight counts and RabbitMQ ready/unacknowledged counts are unchanged.
+Kubernetes health probes do not reset the normal idle timer. Direct HTTP health
+requests through the pod proxy are ordinary activity unless a separately configured
+gateway handles them synthetically; no health path is guessed by the pod proxy.
+
+Idle frontend HTTP connections have a ten-minute timeout and a shared limit of
+1024, separate from the 1024 in-flight request limit; they do not keep guest RAM
+allocated.
+
+Native qualification passed on 2026-10-17 on macOS arm64 with microsandbox 0.7.8
+and k3s v1.35.0-k3s1, using `qualify.py --http-activity-only`. It verified that a
+bare connection leaves the VM cold, HTTP through a Service wakes it, an unfinished
+response blocks both manual and automatic hibernation, and idle keepalive permits
+automatic hibernation. The next request reused that same connection and retained
+the RAM marker, kernel boot ID and application process identity. Docker and native
+pod clients both reached the application through Service names and Pod IPs.
+Owned resources were cleaned up and guest RAM returned to zero. This native run
+used HTTP/1; HTTP/2, gRPC trailers, WebSockets and forwarding headers are covered
+by Go race tests. Native Linux qualification was not repeated for this change.
+
+This run also exposed and fixed shared restore admission reopening checkpoints
+by an ambiguous raw ID. Revalidation now uses the original checkpoint selector
+and checks its immutable ID, digest and memory size. Rebuild the Go host helper
+as well as the pod controller to apply that fix to Aurora restores.

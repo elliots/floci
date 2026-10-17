@@ -35,6 +35,7 @@ spec:
     metadata:
       annotations:
         microsandbox.dev/availability: proxy
+        microsandbox.dev/proxy-protocol: http
         microsandbox.dev/idle-owner: external
     spec:
       nodeSelector:
@@ -82,10 +83,12 @@ Use exactly one idle owner for a Deployment:
 
 - With a Floci workload definition, including any SQS/RabbitMQ triggers, set
   `microsandbox.dev/idle-owner: external`. Floci accounts for gateway requests,
-  direct proxy connections, queued and in-flight messages before hibernating.
+  direct proxy requests, active TCP/port-forward connections, queued and in-flight
+  messages before hibernating.
 - For a standalone HTTP/TCP Deployment without a Floci workload definition, leave
   the proxy mode's default `idle-owner: controller`. The native controller
-  hibernates after its last proxy connection closes and the idle interval passes.
+  hibernates after its last HTTP request or stream finishes and the idle interval
+  passes. With `proxy-protocol: tcp`, it waits for connections to close instead.
   Set `microsandbox.dev/idle-timeout-seconds: "120"` to change that interval,
   from 1 to 86400 seconds. This mode does not inspect message queues.
 
@@ -132,15 +135,38 @@ The SQS, RabbitMQ and IoT-to-SQS rules use the shared wake coordinator. Queue-on
 disable HTTP readiness. Proxy availability currently requires at least one
 declared TCP port, so queue-only pods without a port use strict availability.
 
-Raw TCP and TLS connections count as traffic and trigger activation. Direct
-persistent connections, including idle HTTP keepalive, keep the pod awake. The
-Floci gateway releases its backend connection after each completed exchange;
-active streams and WebSockets retain their connections until they finish.
-This adds a backend connection, and a TLS handshake for HTTPS, per exchange;
-client connections to the gateway can still use keepalive.
-Configure synthetic HTTP health responses at the Floci gateway when health polling
-should stay green without waking an application. The TCP proxy does not inspect
-encrypted health requests or infer which URLs are health checks.
+### HTTP requests and TCP compatibility
+
+Proxy availability defaults to `microsandbox.dev/proxy-protocol: http`. Each HTTP
+request through a Service or Pod IP wakes its selected pod and waits for actual
+application readiness. This applies to requests from any reachable client,
+including other pods; a request need not pass through the Floci gateway.
+HTTP/1 and prior-knowledge cleartext HTTP/2 (h2c), including gRPC, use request
+activity. The application endpoint must support the incoming HTTP protocol; the
+proxy does not translate HTTP/2 requests to an HTTP/1 backend. Streaming
+responses and upgraded connections such as WebSockets keep the pod awake until
+that response or stream ends. An idle frontend HTTP keepalive connection neither
+wakes the pod nor prevents hibernation. It can remain connected while the pod
+sleeps; its next request wakes the pod again. The shared host controller handles
+this behavior without a resident proxy sidecar in each pod.
+
+For existing raw TCP or TLS listeners, explicitly set
+`microsandbox.dev/proxy-protocol: tcp` on the Pod template. This retains the
+previous connection-based behavior: connecting wakes the pod, and the entire
+connection, including idle HTTP keepalive carried over it, keeps the pod awake.
+The setting applies to all declared proxy ports in the pod. This compatibility
+mode does not add support for further protocols or change port-forward behavior.
+Strict availability is unchanged.
+Encrypted HTTPS cannot use request accounting at the HTTP listener. Terminate
+TLS before that listener and forward cleartext HTTP, or select `tcp` for TLS
+passthrough. TLS passthrough cannot distinguish idle connections from requests.
+
+Floci's gateway request and message accounting is unchanged. Configure synthetic
+HTTP health responses at that gateway when health polling should stay green
+without waking an application. Direct HTTP monitoring requests through the pod
+proxy are ordinary requests and count as activity; the proxy does not infer
+health URLs or synthesize healthy application responses. Kubernetes probes use
+their existing internal path and do not renew the normal idle timer.
 
 Floci verifies the actual Deployment and its ReplicaSet ownership chain before
 changing a pod. Hibernation retains its replica count and Pod UIDs. Strict sleeping
@@ -179,7 +205,7 @@ container-runtime and Kubernetes integration work.
 | Execution | Multiple regular OCI containers per pod, sequential init containers, restartable init sidecars, image ENTRYPOINT/CMD defaults, command/args overrides and environment expansion | Ephemeral debugging containers |
 | Lifecycle | Configurable lazy or strict availability, Pod UID ownership, Deployment discovery, RAM/disk hibernation, Always/OnFailure task restart | Broader rollout and failure qualification |
 | Environment | Literal values and resolved ConfigMap/Secret environment sources | In-place environment refresh requires Pod replacement |
-| Networking | IPv4 Pod IPs, cluster DNS, Services through an owned bridge; shared wake proxy for 1 to 16 declared TCP ports | NetworkPolicy enforcement, IPv6, UDP/SCTP wake and arbitrary CNI plugins |
+| Networking | IPv4 Pod IPs, cluster DNS, Services through an owned bridge; shared HTTP request wake proxy for 1 to 16 declared ports, with explicit TCP compatibility mode | NetworkPolicy enforcement, IPv6, UDP/SCTP wake and arbitrary CNI plugins |
 | Health checks | Exec, HTTP/HTTPS, TCP and gRPC readiness, startup and liveness probes; named TCP ports and thresholds | Host overrides and lifecycle hooks |
 | Operations | Kubernetes logs, exec with TTY/resize and localhost port-forward | Attach, previous/follow/timestamp logs and log rotation |
 | Storage | Private VM disk, disk/memory emptyDir, ConfigMap and Secret mounts, combined projected volumes, subPath and subPathExpr | PVCs, CSI, disk quotas, projected resource fields and certificate bundles |
@@ -191,9 +217,9 @@ Most-feature support should build on the shared controller and the guest
 container runtime. Adding a full kubelet to each application would make hundreds
 of sleeping workloads substantially more expensive.
 
-Proxy mode terminates and forwards TCP connections, so applications see the
-proxy's connection source instead of the original client Pod IP. Strict direct
-networking preserves the original Pod IP. The controller's owned Linux peer runs
+Proxy mode forwards requests or TCP streams through shared host listeners, so
+applications see the proxy's connection source instead of the original client
+Pod IP. Strict direct networking preserves the original Pod IP. The controller's owned Linux peer runs
 one shared network relay for all proxy-mode pods, with a separate private backend
 CIDR for actual guests; it does not start one relay process per pod.
 

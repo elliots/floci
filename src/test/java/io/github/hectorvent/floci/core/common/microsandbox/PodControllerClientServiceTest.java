@@ -235,12 +235,61 @@ class PodControllerClientServiceTest {
     @Test
     void readsProxyActivitySeparatelyFromApplicationReadinessAndRejectsInvalidOwnership() {
         deployment = deployment.replace("\"state\":\"SLEEPING\"",
-                "\"state\":\"COLD\",\"proxyAvailability\":true,\"idleOwner\":\"external\",\"activeConnections\":2");
+                "\"state\":\"COLD\",\"proxyAvailability\":true,\"idleOwner\":\"external\",\"activeConnections\":2,\"activeRequests\":3,\"activitySequence\":9");
         Pod observed = client.deployment("apps", "worker", TIMEOUT).pods().getFirst();
         assertEquals("COLD", observed.state());
         assertTrue(observed.proxyAvailability());
         assertEquals(2, observed.activeConnections());
+        assertEquals(3, observed.activeRequests());
+        assertEquals(9, observed.activitySequence());
+        assertTrue(observed.activitySequenceKnown());
         deployment = deployment.replace("\"idleOwner\":\"external\"", "\"idleOwner\":\"unknown\"");
         assertThrows(IllegalStateException.class, () -> client.deployment("apps", "worker", TIMEOUT));
+    }
+
+    @Test
+    void earlierControllersKeepLegacyConnectionActivityWithoutRequestCounts() {
+        deployment = deployment.replace("\"state\":\"SLEEPING\"",
+                "\"state\":\"READY\",\"proxyAvailability\":true,\"idleOwner\":\"external\",\"activeConnections\":2");
+        Pod observed = client.deployment("apps", "worker", TIMEOUT).pods().getFirst();
+        assertEquals(2, observed.activeConnections());
+        assertEquals(0, observed.activeRequests());
+        assertEquals(0, observed.activitySequence());
+        assertFalse(observed.activitySequenceKnown());
+        client.hibernate(observed, TIMEOUT);
+        assertFalse(transitionBody.has("expectedActivitySequence"), "Earlier controllers reject unknown request fields");
+    }
+
+    @Test
+    void hibernateUsesTheObservedActivitySequenceIncludingZero() {
+        String original = deployment;
+        for (long sequence : List.of(0L, 9L)) {
+            deployment = original.replace("\"state\":\"SLEEPING\"", "\"state\":\"READY\",\"activitySequence\":" + sequence);
+            Pod observed = client.deployment("apps", "worker", TIMEOUT).pods().getFirst();
+            client.hibernate(observed, TIMEOUT);
+            assertTrue(transitionBody.has("expectedActivitySequence"));
+            assertEquals(sequence, transitionBody.path("expectedActivitySequence").asLong());
+            assertEquals(observed.generation(), transitionBody.path("expectedGeneration").asLong());
+            client.resume(observed, TIMEOUT);
+            assertFalse(transitionBody.has("expectedActivitySequence"));
+        }
+    }
+
+    @Test
+    void rejectsInvalidRequestCountsInsteadOfTreatingUnknownActivityAsIdle() {
+        String original = deployment;
+        for (String value : List.of("-1", "1.5", "\"1\"", "true", "null", "2147483648")) {
+            deployment = original.replace("\"state\":\"SLEEPING\"", "\"state\":\"READY\",\"activeRequests\":" + value);
+            assertThrows(IllegalStateException.class, () -> client.deployment("apps", "worker", TIMEOUT), value);
+        }
+    }
+
+    @Test
+    void rejectsInvalidActivitySequencesInsteadOfLosingCompletedRequests() {
+        String original = deployment;
+        for (String value : List.of("-1", "1.5", "\"1\"", "true", "null", "9223372036854775808")) {
+            deployment = original.replace("\"state\":\"SLEEPING\"", "\"state\":\"READY\",\"activitySequence\":" + value);
+            assertThrows(IllegalStateException.class, () -> client.deployment("apps", "worker", TIMEOUT), value);
+        }
     }
 }

@@ -86,8 +86,14 @@ request after forwarding it to the application.
 For opted-in Kubernetes Deployments, see
 [native Kubernetes pods](microsandbox-kubernetes.md). Their wake rules use the
 same HTTP and queue coordinator, while the pod controller preserves Pod UIDs and
-replicas across hibernation. EC2 wake integration is parked separately and is not
-available in this branch.
+replicas across hibernation. Their shared pod proxy defaults to HTTP request
+accounting, so direct Service/PodIP requests from other pods also wake the selected
+application. Responses and upgraded streams hold it awake; idle frontend HTTP
+keepalive connections do not. Explicit `microsandbox.dev/proxy-protocol: tcp`
+retains the previous connection-based behavior for raw TCP/TLS listeners. HTTPS
+needs TLS termination before an HTTP-mode listener or TCP mode. This changes
+neither the Floci gateway's request accounting nor the queue rules below.
+EC2 wake integration is parked separately and is not available in this branch.
 
 ## Queue and MQTT behavior
 

@@ -105,6 +105,7 @@ Use this in a Deployment's Pod template:
 metadata:
   annotations:
     microsandbox.dev/availability: proxy
+    microsandbox.dev/proxy-protocol: http
     microsandbox.dev/idle-owner: controller
     microsandbox.dev/idle-timeout-seconds: "120"
 spec:
@@ -127,7 +128,7 @@ spec:
 ```
 
 Proxy availability delays first boot and makes a Deployment available through
-actual shared TCP routes. Omit it (or use `availability: strict`) to start normally
+actual shared wake routes. Omit it (or use `availability: strict`) to start normally
 with guest readiness. Advanced `on-demand: "true"` without proxy availability
 creates COLD, not-Ready Pods for an external gateway. Unsupported fields
 fail explicitly, including PVC/CSI volumes and extended
@@ -329,10 +330,25 @@ its token before the next proxy request.
 
 An awake gateway or durable-queue coordinator calls the authenticated [lifecycle
 API](API.md). Set `idle-owner: external` for proxy Pods managed by that coordinator,
-so queue activity and direct connections share one idle decision. Proxy mode wakes
-through Service or PodIP TCP traffic; strict mode requires an external wake route.
+so queue activity and direct requests share one idle decision. Proxy mode defaults
+to `microsandbox.dev/proxy-protocol: http`: HTTP/1 and prior-knowledge cleartext
+HTTP/2 (h2c/gRPC) requests through a Service or PodIP wake the pod, and each
+response or upgraded stream holds it awake until completion. Idle frontend keepalive connections do
+not wake or pin the VM and can survive hibernation. The next request on the same
+connection wakes it. The shared controller implements this without a per-pod
+resident proxy. The backend must support the incoming HTTP protocol; the proxy
+does not translate HTTP/2 to HTTP/1.
+
+Set `microsandbox.dev/proxy-protocol: tcp` for existing raw TCP/TLS listeners to
+retain connection-based wake and activity. This setting applies to every declared
+proxy port in the pod. HTTPS must be terminated before an HTTP-mode listener or
+use TCP mode; encrypted traffic cannot receive request-level idle accounting.
+Port-forward remains connection-based. Strict mode requires an external wake route.
 Scaling a Deployment to zero deletes RAM identity, so hibernation retains replicas.
-Proxy TCP translates client source IPs. External health requests through the wake
-proxy wake apps; Kubernetes probes and status checks do not wake sleeping guests.
+Both proxy modes translate client source IPs. Direct HTTP health requests wake apps
+and count as requests; configure synthetic health handling at the Floci gateway
+when they should not. Kubernetes probes and status checks do not wake sleeping
+guests or extend their normal idle timer. SQS visible/in-flight and RabbitMQ
+ready/unacknowledged message accounting is unchanged.
 Reserve both /22 ranges without overlap
 with existing nodes, and preserve those network settings across controller restart.

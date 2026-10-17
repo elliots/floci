@@ -43,6 +43,20 @@ func TestMetadataUpdateAcceptsResolvedEnvironmentReordering(t *testing.T) {
 	}
 }
 
+func TestProxyProtocolChangeRequiresPodReplacement(t *testing.T) {
+	entry := availabilityEntry(t)
+	entry.pod.Annotations = map[string]string{"microsandbox.dev/availability": "proxy"}
+	p := &provider{pods: map[string]*podEntry{"default/app": entry}}
+	updated := entry.pod.DeepCopy()
+	updated.Annotations["microsandbox.dev/proxy-protocol"] = "tcp"
+	if err := p.UpdatePod(t.Context(), updated); err == nil {
+		t.Fatal("proxy protocol was changed without replacing its listener and pod")
+	}
+	if proxyProtocol(entry.pod) != "http" {
+		t.Fatal("rejected update changed the retained proxy protocol")
+	}
+}
+
 func TestMetadataUpdateKeepsOriginalResolvedEnvironment(t *testing.T) {
 	entry := availabilityEntry(t)
 	entry.proxyAvailability = false

@@ -67,7 +67,8 @@ def qualify_identity(*, peer, temporary, pod, apply, resource, kubectl, ready,
     kubectl("label", "pod", name, "identity-version=updated", "--overwrite")
     wait("DownwardAPI updates current labels", lambda: identity()["label"] == "updated", 90)
     report["checks"]["projected_downward_metadata_refreshes_while_awake"] = True
-    wait("identity request releases proxy activity", lambda: lifecycle(uid)["activeConnections"] == 0)
+    wait("identity request releases proxy activity", lambda:
+        (state := lifecycle(uid))["activeRequests"] == 0 and state["activeConnections"] == 0)
     state = lifecycle(uid)
     lifecycle(uid, "hibernate", state["generation"])
     assert control_get("health")["activeMemoryMiB"] == 0

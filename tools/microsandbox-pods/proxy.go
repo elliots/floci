@@ -11,8 +11,8 @@ import (
 	"time"
 )
 
-// An acquired backend is actually ready. Its lease remains held until both TCP
-// directions finish, including a response following a client's write half-close.
+// An acquired backend is actually ready. HTTP leases cover one exchange; raw TCP
+// leases cover both stream directions, including responses after a write half-close.
 type proxyAcquire func(context.Context) (backend string, release func(), err error)
 
 type proxyKey struct {
@@ -21,13 +21,14 @@ type proxyKey struct {
 }
 
 type wakeProxy struct {
-	ctx      context.Context
-	cancel   context.CancelFunc
-	timeout  time.Duration
-	slots    chan struct{}
-	mu       sync.Mutex
-	closed   bool
-	bindings map[proxyKey]*wakeProxyBinding
+	ctx             context.Context
+	cancel          context.CancelFunc
+	timeout         time.Duration
+	slots           chan struct{}
+	httpConnections chan struct{}
+	mu              sync.Mutex
+	closed          bool
+	bindings        map[proxyKey]*wakeProxyBinding
 }
 
 type wakeProxyBinding struct {
@@ -45,10 +46,15 @@ func newWakeProxy(ctx context.Context, maxConnections int, startupTimeout time.D
 	}
 	lifetime, cancel := context.WithCancel(ctx)
 	return &wakeProxy{ctx: lifetime, cancel: cancel, timeout: startupTimeout,
-		slots: make(chan struct{}, maxConnections), bindings: make(map[proxyKey]*wakeProxyBinding)}, nil
+		slots: make(chan struct{}, maxConnections), httpConnections: make(chan struct{}, maxConnections),
+		bindings: make(map[proxyKey]*wakeProxyBinding)}, nil
 }
 
 func (p *wakeProxy) listen(uid string, containerPort int, bindHost string, requestedPort int, acquire proxyAcquire) (int, error) {
+	return p.listenWith(uid, containerPort, bindHost, requestedPort, acquire, p.accept)
+}
+
+func (p *wakeProxy) listenWith(uid string, containerPort int, bindHost string, requestedPort int, acquire proxyAcquire, serve func(*wakeProxyBinding)) (int, error) {
 	if uid == "" || containerPort < 1 || containerPort > 65535 || net.ParseIP(bindHost) == nil ||
 		requestedPort < 0 || requestedPort > 65535 || acquire == nil {
 		return 0, errors.New("invalid wake proxy listener")
@@ -69,7 +75,7 @@ func (p *wakeProxy) listen(uid string, containerPort int, bindHost string, reque
 	ctx, cancel := context.WithCancel(p.ctx)
 	binding := &wakeProxyBinding{ctx: ctx, cancel: cancel, listener: listener, acquire: acquire, done: make(chan struct{})}
 	p.bindings[key] = binding
-	binding.jobs.Go(func() { p.accept(binding) })
+	binding.jobs.Go(func() { serve(binding) })
 	go func() {
 		binding.jobs.Wait()
 		close(binding.done)

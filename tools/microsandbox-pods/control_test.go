@@ -28,7 +28,7 @@ func TestControlRequiresBearerAndGenerationBeforeMutation(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	entry := &podEntry{pod: validPod(), state: "COLD", generation: 7, lifetime: t.Context()}
+	entry := &podEntry{pod: validPod(), state: "COLD", generation: 7, activitySequence: 3, lifetime: t.Context()}
 	p := &provider{pods: map[string]*podEntry{"default/app": entry}}
 	server, err := p.serveControl(fmt.Sprintf("127.0.0.1:%d", port), file)
 	if err != nil {
@@ -36,15 +36,17 @@ func TestControlRequiresBearerAndGenerationBeforeMutation(t *testing.T) {
 	}
 	t.Cleanup(func() { server.Close() })
 	for _, test := range []struct {
-		auth, body string
-		want       int
+		auth, body, operation string
+		want                  int
 	}{
-		{"", "{\"expectedGeneration\":7}", 401},
-		{token, "{\"expectedGeneration\":6}", 401},
-		{"Bearer " + token, "{}", 400},
-		{"Bearer " + token, "{\"expectedGeneration\":6}", 409},
+		{"", "{\"expectedGeneration\":7}", "resume", 401},
+		{token, "{\"expectedGeneration\":6}", "resume", 401},
+		{"Bearer " + token, "{}", "resume", 400},
+		{"Bearer " + token, "{\"expectedGeneration\":6}", "resume", 409},
+		{"Bearer " + token, `{"expectedGeneration":7,"expectedActivitySequence":2}`, "hibernate", 409},
+		{"Bearer " + token, `{"expectedGeneration":7,"expectedActivitySequence":-1}`, "hibernate", 400},
 	} {
-		request, err := http.NewRequestWithContext(t.Context(), http.MethodPost, fmt.Sprintf("http://127.0.0.1:%d/v1/pods/%s/resume", port, entry.pod.UID), strings.NewReader(test.body))
+		request, err := http.NewRequestWithContext(t.Context(), http.MethodPost, fmt.Sprintf("http://127.0.0.1:%d/v1/pods/%s/%s", port, entry.pod.UID, test.operation), strings.NewReader(test.body))
 		if err != nil {
 			t.Fatal(err)
 		}

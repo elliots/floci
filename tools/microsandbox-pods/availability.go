@@ -26,6 +26,9 @@ func proxySettings(pod *corev1.Pod) (bool, string, time.Duration, error) {
 	if mode != "proxy" {
 		return false, "external", 0, nil
 	}
+	if protocol := proxyProtocol(pod); protocol != "http" && protocol != "tcp" {
+		return false, "", 0, errors.New("proxy-protocol must be http or tcp")
+	}
 	owner := pod.Annotations["microsandbox.dev/idle-owner"]
 	if owner == "" {
 		owner = "controller"
@@ -57,6 +60,13 @@ func proxySettings(pod *corev1.Pod) (bool, string, time.Duration, error) {
 	return true, owner, time.Duration(seconds) * time.Second, nil
 }
 
+func proxyProtocol(pod *corev1.Pod) string {
+	if protocol := pod.Annotations["microsandbox.dev/proxy-protocol"]; protocol != "" {
+		return protocol
+	}
+	return "http"
+}
+
 func (p *provider) prepareProxy(ctx context.Context, e *podEntry) error {
 	if !e.proxyAvailability {
 		return nil
@@ -74,7 +84,11 @@ func (p *provider) prepareProxy(ctx context.Context, e *podEntry) error {
 		return err
 	}
 	for _, binding := range e.proxyPorts {
-		_, err := p.proxy.listen(string(e.pod.UID), binding.ContainerPort, "127.0.0.1", binding.ProxyPort, func(ctx context.Context) (string, func(), error) { return p.acquireProxy(ctx, e, binding.BackendPort) })
+		listen, acquire := p.proxy.listenHTTP, p.acquireHTTP
+		if proxyProtocol(e.pod) == "tcp" {
+			listen, acquire = p.proxy.listen, p.acquireProxy
+		}
+		_, err := listen(string(e.pod.UID), binding.ContainerPort, "127.0.0.1", binding.ProxyPort, func(ctx context.Context) (string, func(), error) { return acquire(ctx, e, binding.BackendPort) })
 		if err != nil {
 			return err
 		}
@@ -92,6 +106,14 @@ func (p *provider) prepareProxy(ctx context.Context, e *podEntry) error {
 }
 
 func (p *provider) acquireProxy(ctx context.Context, e *podEntry, backendPort int) (string, func(), error) {
+	return p.acquireProxyActivity(ctx, e, backendPort, false)
+}
+
+func (p *provider) acquireHTTP(ctx context.Context, e *podEntry, backendPort int) (string, func(), error) {
+	return p.acquireProxyActivity(ctx, e, backendPort, true)
+}
+
+func (p *provider) acquireProxyActivity(ctx context.Context, e *podEntry, backendPort int, request bool) (string, func(), error) {
 	e.op.Lock()
 	if err := ctx.Err(); err != nil {
 		e.op.Unlock()
@@ -101,7 +123,12 @@ func (p *provider) acquireProxy(ctx context.Context, e *podEntry, backendPort in
 		e.op.Unlock()
 		return "", nil, errors.New("pod availability route is unavailable")
 	}
-	e.activeConnections++
+	if request {
+		e.activeRequests++
+	} else {
+		e.activeConnections++
+	}
+	e.activitySequence++
 	e.lastActivity = time.Now()
 	refreshView(e)
 	e.op.Unlock()
@@ -110,7 +137,12 @@ func (p *provider) acquireProxy(ctx context.Context, e *podEntry, backendPort in
 		once.Do(func() {
 			e.op.Lock()
 			defer e.op.Unlock()
-			e.activeConnections--
+			if request {
+				e.activeRequests--
+			} else {
+				e.activeConnections--
+			}
+			e.activitySequence++
 			e.lastActivity = time.Now()
 			refreshView(e)
 		})
@@ -127,6 +159,7 @@ func (p *provider) acquireProxy(ctx context.Context, e *podEntry, backendPort in
 		}
 		if e.state == "COLD" || e.state == "SLEEPING" {
 			if err := p.resume(ctx, e); err != nil {
+				slog.Warn("pod request activation failed", "namespace", e.pod.Namespace, "pod", e.pod.Name, "uid", e.pod.UID, "error", err)
 				e.op.Unlock()
 				return "", release, err
 			}
@@ -269,7 +302,7 @@ func idleEligible(e *podEntry) bool {
 			return false
 		}
 	}
-	return e.idleOwner == "controller" && (e.state == "READY" || e.state == "RUNNING") && e.applicationMissingSince.IsZero() && e.activeConnections == 0 && time.Since(e.lastActivity) >= e.idleTimeout
+	return e.idleOwner == "controller" && (e.state == "READY" || e.state == "RUNNING") && e.applicationMissingSince.IsZero() && e.activeConnections == 0 && e.activeRequests == 0 && time.Since(e.lastActivity) >= e.idleTimeout
 }
 
 func (p *provider) removeProxy(ctx context.Context, e *podEntry) error {
