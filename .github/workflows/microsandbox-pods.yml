@@ -8,6 +8,7 @@ on:
       - 'tools/microsandbox-pods/**'
       - 'tools/microsandbox-host/**'
       - 'tools/microsandbox-runtime/**'
+      - 'src/main/resources/docker/network-helper.Dockerfile'
       - '.github/workflows/microsandbox-pods.yml'
   push:
     branches:
@@ -16,6 +17,7 @@ on:
       - 'tools/microsandbox-pods/**'
       - 'tools/microsandbox-host/**'
       - 'tools/microsandbox-runtime/**'
+      - 'src/main/resources/docker/network-helper.Dockerfile'
       - '.github/workflows/microsandbox-pods.yml'
 
 permissions:
@@ -64,3 +66,13 @@ jobs:
       - name: Check managed setup and qualification ownership
         if: matrix.module == 'microsandbox-pods'
         run: python3 -m unittest discover -p 'test_*.py'
+
+      - name: Build the stock network test helper
+        if: matrix.module == 'microsandbox-pods'
+        run: docker build -f ../../src/main/resources/docker/network-helper.Dockerfile -t floci/network-helper:local ../..
+
+      - name: Verify protected peer egress after Service translation
+        if: matrix.module == 'microsandbox-pods'
+        env:
+          FLOCI_TEST_DOCKER_ENVIRONMENT: '1'
+        run: go test -race -run '^TestDockerEnvironmentPeerEgressBeforeSourceNAT$' -count=1 .
