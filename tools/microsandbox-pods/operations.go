@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"crypto/rand"
 	"crypto/sha256"
 	"errors"
 	"fmt"
@@ -16,7 +17,7 @@ import (
 	"github.com/virtual-kubelet/virtual-kubelet/node/api"
 )
 
-// An attached stream must release the lifecycle lock when its Pod is deleted.
+// Attached streams terminate with their Pod, even when their client stays open.
 func podOperationContext(ctx context.Context, e *podEntry) (context.Context, context.CancelFunc) {
 	ctx, cancel := context.WithCancel(ctx)
 	if e.lifetime == nil {
@@ -24,6 +25,32 @@ func podOperationContext(ctx context.Context, e *podEntry) (context.Context, con
 	}
 	stop := context.AfterFunc(e.lifetime, cancel)
 	return ctx, func() { stop(); cancel() }
+}
+
+type containerExec struct {
+	task   string
+	cancel context.CancelFunc
+	done   chan struct{}
+}
+
+// Called under e.op before replacing a container or removing its VM. Completion
+// is signalled before reacquiring e.op, so cleanup can drain under this lock.
+func stopContainerExecs(ctx context.Context, e *podEntry, task string) error {
+	var pending []*containerExec
+	for operation := range e.execs {
+		if task == "" || operation.task == task {
+			operation.cancel()
+			pending = append(pending, operation)
+		}
+	}
+	for _, operation := range pending {
+		select {
+		case <-operation.done:
+		case <-ctx.Done():
+			return ctx.Err()
+		}
+	}
+	return nil
 }
 
 func (p *provider) RunInContainer(ctx context.Context, namespace, name, container string, args []string, attach api.AttachIO) error {
@@ -37,16 +64,40 @@ func (p *provider) RunInContainer(ctx context.Context, namespace, name, containe
 	ctx, cancel := podOperationContext(ctx, e)
 	defer cancel()
 	e.op.Lock()
-	defer e.op.Unlock()
 	if err := ctx.Err(); err != nil {
+		e.op.Unlock()
 		return err
+	}
+	if e.deleted || e.lifetime != nil && e.lifetime.Err() != nil {
+		e.op.Unlock()
+		return errdefs.InvalidInput("pod is terminating")
 	}
 	task, err := executingContainerTask(e, container)
 	if err != nil {
+		e.op.Unlock()
 		return err
 	}
-	execID := "exec-" + strconv.FormatInt(time.Now().UnixNano(), 10)
-	command := []string{"exec", "--stream", e.vm, "--", "ctr", "--address", "/run/containerd/containerd.sock", "tasks", "exec", "--exec-id", execID}
+	vm := e.vm
+	operation := &containerExec{task: task, cancel: cancel, done: make(chan struct{})}
+	if e.execs == nil {
+		e.execs = make(map[*containerExec]struct{})
+	}
+	e.execs[operation] = struct{}{}
+	e.lastActivity = time.Now()
+	e.activitySequence++
+	refreshView(e)
+	e.op.Unlock()
+	defer func() {
+		close(operation.done)
+		e.op.Lock()
+		defer e.op.Unlock()
+		delete(e.execs, operation)
+		e.lastActivity = time.Now()
+		e.activitySequence++
+		refreshView(e)
+	}()
+	execID := "exec-" + rand.Text()
+	command := []string{"exec", "--stream", vm, "--", "ctr", "--address", "/run/containerd/containerd.sock", "tasks", "exec", "--exec-id", execID}
 	if attach.TTY() {
 		command = append(command, "--tty")
 	}
@@ -65,16 +116,13 @@ func (p *provider) RunInContainer(ctx context.Context, namespace, name, containe
 		// container. Address only this invocation, never the application task.
 		cleanup, stop := context.WithTimeout(context.WithoutCancel(ctx), 5*time.Second)
 		defer stop()
-		_, cleanupErr := p.runner.guest(cleanup, e.vm, ctr+" tasks kill --exec-id "+quote(execID)+" --signal SIGKILL "+quote(task))
+		_, cleanupErr := p.runner.guest(cleanup, vm, ctr+" tasks kill --exec-id "+quote(execID)+" --signal SIGKILL "+quote(task))
 		if cleanupErr != nil {
 			// A completed command already removed its exec process. Transport
 			// failures are still reported to the caller with the original error.
 			slog.Debug("exec process cleanup did not find a live process", "pod", name, "container", container)
 		}
 	}
-	e.lastActivity = time.Now()
-	e.activitySequence++
-	refreshView(e)
 	if ctx.Err() != nil {
 		return errors.Join(err, ctx.Err())
 	}

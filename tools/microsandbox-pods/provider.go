@@ -71,6 +71,7 @@ type podEntry struct {
 	lastActivity                                     time.Time
 	activeConnections                                int
 	activeRequests                                   int
+	execs                                            map[*containerExec]struct{}
 	activitySequence                                 uint64
 	publishedView                                    atomic.Pointer[lifecycleView]
 	wake                                             chan struct{}
@@ -521,6 +522,9 @@ func (p *provider) startApplication(ctx context.Context, e *podEntry) error {
 
 func (p *provider) containerLaunch(ctx context.Context, e *podEntry, container corev1.Container, task, stateRoot string) ([]string, applicationOOMTracking, error) {
 	var empty applicationOOMTracking
+	if err := stopContainerExecs(ctx, e, task); err != nil {
+		return nil, empty, err
+	}
 	image := normalizeImage(container.Image)
 	if err := p.ensureApplicationImage(ctx, e, container); err != nil {
 		return nil, empty, err
@@ -811,6 +815,9 @@ func (p *provider) terminated(e *podEntry, code int32) error {
 }
 
 func (p *provider) stopTerminal(ctx context.Context, e *podEntry) error {
+	if err := stopContainerExecs(ctx, e, ""); err != nil {
+		return err
+	}
 	p.network.closeIngress(e)
 	status, exists, err := p.inspectOwned(ctx, e)
 	if err != nil {
@@ -955,6 +962,9 @@ func (p *provider) DeletePod(ctx context.Context, pod *corev1.Pod) error {
 	}
 	e.op.Lock()
 	defer e.op.Unlock()
+	if err := stopContainerExecs(ctx, e, ""); err != nil {
+		return err
+	}
 	if err := p.runner.checkPending(); err != nil {
 		return err
 	}
@@ -1135,6 +1145,9 @@ func (p *provider) close(ctx context.Context) error {
 		var errs []error
 		for _, e := range entries {
 			e.op.Lock()
+			if err := stopContainerExecs(ctx, e, ""); err != nil {
+				errs = append(errs, err)
+			}
 			if err := p.journal(e); err != nil {
 				errs = append(errs, err)
 			}

@@ -454,6 +454,9 @@ func (p *provider) stopNamedUnhealthy(ctx context.Context, e *podEntry, index in
 }
 
 func (p *provider) stopManagedUnhealthy(ctx context.Context, e *podEntry, managed managedContainer, probe *corev1.Probe, reason string) error {
+	if err := stopContainerExecs(ctx, e, managed.task(e)); err != nil {
+		return err
+	}
 	progress := managed.progress(e)
 	progress.probeFailure = reason
 	progress.ready = false

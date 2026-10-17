@@ -352,8 +352,12 @@ RAM cycle and controller recovery, reverse sidecar shutdown, and a real Job's
 ## Interactive operations
 
 `kubectl exec -it` supports terminal allocation, live resize, stdin and guest exit
-status. Pod deletion cancels attached exec. Non-TTY exec retains separate stdout
-and stderr streams. `kubectl port-forward` connects inside the Pod VM, including
+status. Active exec sessions keep the Pod awake and can call its own ordinary
+Service URLs. Client cancellation, Pod deletion and container replacement cancel
+the affected exec process; VM removal and replacement wait for its cleanup.
+The controller reports these sessions as `activeExecs`, separately from HTTP
+requests and TCP connections. Non-TTY exec retains separate stdout and stderr
+streams. `kubectl port-forward` connects inside the Pod VM, including
 to applications bound only to localhost. It wakes a cold or sleeping Pod on the
 first connection and pins the guest against hibernation until the stream closes.
 Forwarding requires the Linux relay binary; the controller installs its exact

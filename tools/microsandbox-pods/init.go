@@ -329,6 +329,9 @@ func (p *provider) monitorInit(ctx context.Context, e *podEntry) error {
 		}
 	}
 	if codeText, exited := strings.CutPrefix(output, "EXIT "); exited {
+		if err := stopContainerExecs(ctx, e, initTask(index)); err != nil {
+			return err
+		}
 		reason := ""
 		if trimmed, oom := strings.CutSuffix(codeText, "\nOOMKilled"); oom {
 			codeText, reason = trimmed, "OOMKilled"

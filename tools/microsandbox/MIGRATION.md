@@ -1142,3 +1142,14 @@ and permit exactly that host UDP port in `network.native.allowed-egress` in the
 shared immutable network file. Reuse the recorded port on later prepare runs.
 This avoids granting a broad host UDP range. Plain peers retain ephemeral ports
 unless this option is supplied explicitly.
+
+## Exec sessions and hibernation
+
+Rebuild the Pod controller to allow `kubectl exec` commands to call HTTP Services
+that route back to the same Pod. Exec streaming no longer holds the Pod lifecycle
+lock. An active exec session instead keeps the Pod awake until its stream and
+bounded process cleanup finish, including during explicit hibernation requests.
+Deletion cancels and drains exec sessions before removing their VM. Replacing a
+container cancels only that container's exec sessions. These leases appear as
+`activeExecs` in the local controller status; ordinary HTTP and TCP activity
+semantics are unchanged. No Pod manifest or journal migration is required.

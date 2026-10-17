@@ -331,7 +331,7 @@ func idleEligible(e *podEntry) bool {
 			return false
 		}
 	}
-	return e.idleOwner == "controller" && (e.state == "READY" || e.state == "RUNNING") && e.applicationMissingSince.IsZero() && e.activeConnections == 0 && e.activeRequests == 0 && time.Since(e.lastActivity) >= e.idleTimeout
+	return e.idleOwner == "controller" && (e.state == "READY" || e.state == "RUNNING") && e.applicationMissingSince.IsZero() && e.activeConnections == 0 && e.activeRequests == 0 && len(e.execs) == 0 && time.Since(e.lastActivity) >= e.idleTimeout
 }
 
 func (p *provider) removeProxy(ctx context.Context, e *podEntry) error {

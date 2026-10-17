@@ -159,6 +159,9 @@ func (p *provider) releaseInactiveMemory(ctx context.Context, e *podEntry) error
 }
 
 func (p *provider) restart(ctx context.Context, e *podEntry, code int32) error {
+	if err := stopContainerExecs(ctx, e, "application"); err != nil {
+		return err
+	}
 	e.generation++
 	e.state = "RESTARTING"
 	e.mu.Lock()

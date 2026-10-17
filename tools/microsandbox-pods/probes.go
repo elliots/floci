@@ -262,6 +262,9 @@ func (p *provider) containerHealthChecks(ctx context.Context, e *podEntry, conta
 }
 
 func (p *provider) stopUnhealthy(ctx context.Context, e *podEntry, probe *corev1.Probe, reason string) error {
+	if err := stopContainerExecs(ctx, e, "application"); err != nil {
+		return err
+	}
 	e.probeFailure = reason
 	if err := p.journal(e); err != nil {
 		return err

@@ -28,6 +28,7 @@ type lifecycleView struct {
 	IdleOwner         string `json:"idleOwner,omitempty"`
 	ActiveConnections int    `json:"activeConnections"`
 	ActiveRequests    int    `json:"activeRequests"`
+	ActiveExecs       int    `json:"activeExecs"`
 	ActivitySequence  uint64 `json:"activitySequence"`
 	UID               string `json:"uid"`
 	Namespace         string `json:"namespace"`
@@ -52,6 +53,7 @@ func view(e *podEntry) lifecycleView {
 		v.ProxyProtocol = proxyProtocol(e.pod)
 	}
 	v.ActiveRequests, v.ActivitySequence = e.activeRequests, e.activitySequence
+	v.ActiveExecs = len(e.execs)
 	if e.httpPort != 0 {
 		v.BackendURL = fmt.Sprintf("http://127.0.0.1:%d", e.httpPort)
 	}
@@ -266,6 +268,9 @@ func (p *provider) unavailable(e *podEntry, reason string) {
 func (p *provider) hibernate(ctx context.Context, e *podEntry) error {
 	if err := ctx.Err(); err != nil {
 		return err
+	}
+	if len(e.execs) > 0 {
+		return errors.New("container exec sessions are active")
 	}
 	if e.probeFailure != "" {
 		return errors.New("cannot hibernate a container awaiting probe-triggered termination")
