@@ -190,5 +190,8 @@ func (p *provider) GetMetricsResource(ctx context.Context) ([]*dto.MetricFamily,
 		errorValue = 1
 	}
 	scrape := &dto.MetricFamily{Name: new("scrape_error"), Help: new("Whether one or more active Pod metrics could not be collected."), Type: new(dto.MetricType_GAUGE), Metric: []*dto.Metric{{Gauge: &dto.Gauge{Value: new(errorValue)}}}}
+	if len(cpu.Metric) == 0 {
+		return []*dto.MetricFamily{scrape}, nil
+	}
 	return []*dto.MetricFamily{cpu, memory, started, scrape}, nil
 }

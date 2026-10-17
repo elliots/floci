@@ -3,11 +3,13 @@ package main
 import (
 	"context"
 	"errors"
+	"io"
 	"strings"
 	"testing"
 	"time"
 
 	msbruntime "github.com/floci-io/floci/tools/microsandbox-runtime"
+	"github.com/prometheus/common/expfmt"
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	stats "k8s.io/kubelet/pkg/apis/stats/v1alpha1"
@@ -22,8 +24,13 @@ func TestResourceMetricsNeverWakeOrExtendActivity(t *testing.T) {
 				return msbruntime.Result{}, nil
 			}}}}
 			families, err := p.GetMetricsResource(t.Context())
-			if err != nil || len(families[0].Metric) != 0 || families[3].Metric[0].Gauge.GetValue() != 0 {
+			if err != nil || len(families) != 1 || families[0].GetName() != "scrape_error" || families[0].Metric[0].Gauge.GetValue() != 0 {
 				t.Fatalf("sleeping guest metrics: %v, %v", families, err)
+			}
+			for _, family := range families {
+				if _, err := expfmt.MetricFamilyToText(io.Discard, family); err != nil {
+					t.Fatalf("kubelet cannot encode metrics: %v", err)
+				}
 			}
 			if e.activeRequests != 0 || e.activeConnections != 0 || e.lastActivity != time.Unix(100, 0) {
 				t.Fatal("metrics changed application activity")
@@ -61,7 +68,7 @@ func TestResourceMetricsUseCgroupCountersAndExposePartialFailure(t *testing.T) {
 	e.op.Lock()
 	families, err = p.GetMetricsResource(t.Context())
 	e.op.Unlock()
-	if err != nil || len(families[0].Metric) != 0 || families[3].Metric[0].Gauge.GetValue() != 1 {
+	if err != nil || len(families) != 1 || families[0].GetName() != "scrape_error" || families[0].Metric[0].Gauge.GetValue() != 1 {
 		t.Fatal("busy guest failed to report partial scrape")
 	}
 	failure = true
