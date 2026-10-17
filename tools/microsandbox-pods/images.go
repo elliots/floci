@@ -48,8 +48,21 @@ func (p *provider) ensureApplicationImage(ctx context.Context, e *podEntry, cont
 	if len(credentials) != 0 {
 		return p.pullWithCredentials(ctx, e.vm, image, credentials)
 	}
-	if _, err := p.runner.guest(ctx, e.vm, ctr+" images pull "+quote(image)+" >/tmp/image-pull.log 2>&1"); err != nil {
+	if _, err := p.runner.guest(ctx, e.vm, imagePullCommand(p.runner.guestCAPath(), false)+" "+quote(image)+" >/tmp/image-pull.log 2>&1"); err != nil {
 		return fmt.Errorf("pull application image: %w", err)
 	}
 	return nil
+}
+
+// A configured environment CA belongs to this pull client only. The daemon and
+// ordinary guests keep their existing trust roots and TLS verification behavior.
+func imagePullCommand(caPath string, local bool) string {
+	command := ctr + " images pull"
+	if local || caPath != "" {
+		command += " --local"
+	}
+	if caPath != "" {
+		command += " --tlscacert " + quote(caPath)
+	}
+	return command
 }

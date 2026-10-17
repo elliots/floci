@@ -1,12 +1,17 @@
 package main
 
 import (
+	"context"
+	"encoding/base64"
+	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
 	"testing"
 
+	msbruntime "github.com/floci-io/floci/tools/microsandbox-runtime"
 	corev1 "k8s.io/api/core/v1"
+	"k8s.io/client-go/kubernetes/fake"
 )
 
 func TestImagePullPoliciesRespectCompleteGuestCache(t *testing.T) {
@@ -59,6 +64,53 @@ func TestImageDefaultsMatchTagAndDigestSemantics(t *testing.T) {
 	} {
 		if actual := effectivePullPolicy(corev1.Container{Image: image}); actual != want {
 			t.Fatalf("%s: %s", image, actual)
+		}
+	}
+}
+
+func TestRegistryPullUsesOnlyConfiguredReservedEnvironmentCA(t *testing.T) {
+	for _, ca := range []string{"", reservedCAPath, "/private/host/signing.key"} {
+		for _, authenticated := range []bool{false, true} {
+			t.Run(ca+"/authenticated="+fmt.Sprint(authenticated), func(t *testing.T) {
+				p, e := probeFixture(t)
+				container := e.pod.Spec.Containers[0]
+				container.Image = "registry.test/app:v1"
+				container.ImagePullPolicy = corev1.PullAlways
+				p.client = fake.NewClientset()
+				if authenticated {
+					e.pod.Spec.ImagePullSecrets = []corev1.LocalObjectReference{{Name: "pull"}}
+					p.client = fake.NewClientset(registrySecret(t, e.pod.Namespace, "pull", map[string]dockerAuthEntry{
+						"registry.test": {Username: "user", Password: "secret"},
+					}))
+				}
+				calls := 0
+				p.runner.runtime = boundaryRuntime{caPath: ca, stubNativeRuntime: stubNativeRuntime{
+					execute: func(_ context.Context, args []string, input []byte) (msbruntime.Result, error) {
+						calls++
+						script := args[len(args)-1]
+						trusted := ca == reservedCAPath
+						if strings.Contains(script, "--tlscacert "+quote(reservedCAPath)) != trusted ||
+							strings.Contains(script, "--local") != (trusted || authenticated) {
+							t.Fatalf("incorrect isolated image pull: %s", script)
+						}
+						for _, unsafe := range []string{"--skip-verify", "--plain-http", "/private/host", "user:secret", "update-ca-certificates"} {
+							if strings.Contains(script, unsafe) {
+								t.Fatalf("pull changed trust or exposed credentials: %s", unsafe)
+							}
+						}
+						if authenticated && string(input) != base64.StdEncoding.EncodeToString([]byte("user:secret"))+"\n" {
+							t.Fatal("registry secret did not use the existing stdin transport")
+						}
+						return msbruntime.Result{}, nil
+					},
+				}}
+				if err := p.ensureApplicationImage(t.Context(), e, container); err != nil {
+					t.Fatal(err)
+				}
+				if calls != 1 {
+					t.Fatalf("unexpected guest operations: %d", calls)
+				}
+			})
 		}
 	}
 }

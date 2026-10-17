@@ -109,6 +109,12 @@ Floci's DNS address on that bridge. Setup verifies the helper's ownership metada
 then pins the full network/helper IDs, policy fingerprint, bridge and DNS address.
 It creates the peer directly on that single network and copies the controlled
 resolver before starting k3s. It does not attach an unprotected network temporarily.
+Native application image pulls use the configured public environment CA through
+`ctr --local --tlscacert`. This applies to anonymous and authenticated pulls,
+retains TLS hostname verification, and does not change daemon-wide trust. A
+protected registry can be reached through a configured HTTPS origin route;
+application TLS clients still need to select the public CA themselves.
+
 Every controller restart receives those recorded identities; the controller checks
 the live isolation rules before accepting native workloads.
 

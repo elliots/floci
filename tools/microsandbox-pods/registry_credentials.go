@@ -198,7 +198,7 @@ func registryCredentialMatches(key, image string) bool {
 	return true
 }
 
-func authenticatedPullScript(image string) string {
+func authenticatedPullScript(image, caPath string) string {
 	// Secret bytes travel only on msb's stdin. The terminal-free ctr interface
 	// still puts credentials in its guest process argv during the pull. Pod
 	// containers have a separate PID namespace and cannot inspect this process.
@@ -212,13 +212,13 @@ func authenticatedPullScript(image string) string {
 		"pull_credential=${pull_credential%.}\n" +
 		"unset pull_encoded\n" +
 		"trap 'unset pull_credential' EXIT HUP INT TERM\n" +
-		ctr + " images pull --local --user \"$pull_credential\" " + quote(image) + " </dev/null >/dev/null 2>&1\n"
+		imagePullCommand(caPath, true) + " --user \"$pull_credential\" " + quote(image) + " </dev/null >/dev/null 2>&1\n"
 }
 
 func (p *provider) pullWithCredentials(ctx context.Context, vm, image string, credentials []registryCredential) error {
 	for _, credential := range credentials {
 		input := []byte(base64.StdEncoding.EncodeToString([]byte(credential.username+":"+credential.password)) + "\n")
-		err := p.runner.guestInput(ctx, vm, authenticatedPullScript(image), input)
+		err := p.runner.guestInput(ctx, vm, authenticatedPullScript(image, p.runner.guestCAPath()), input)
 		clear(input)
 		if err == nil {
 			return nil
