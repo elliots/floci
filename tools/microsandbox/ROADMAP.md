@@ -48,6 +48,10 @@ compatibility remain priorities for ordinary Kubernetes application manifests.
   runtime inspection proves the guest is absent or stopped.
 - Sequential init containers, Docker registry pull secrets, and `subPath` /
   `subPathExpr` mounts are implemented in the current compatibility tranche.
+- Application lifecycle hooks and projected Downward API resource fields are
+  implemented. Current/previous/follow/timestamp-filtered logs retain bounded
+  output across sleep and controller recovery; one shared Event broadcaster
+  reports lifecycle failures. See [application operations](../microsandbox-pods/OPERATIONS.md).
 - Multiple regular containers, restartable init sidecars, projected service-account
   tokens, default automount, interactive exec/resize, localhost port-forward and
   gRPC probes and AWS identity admission are implemented. The shared SDK fixture
@@ -88,8 +92,9 @@ compatibility remain priorities for ordinary Kubernetes application manifests.
 
 ## Operating hundreds of applications
 
-- Shared guest RAM admission now coordinates pod and host runtimes. Add working-set
-  metrics and policies for workloads waiting on dependencies; do not evict active
+- Shared guest RAM admission now coordinates pod and host runtimes. Container
+  working-set metrics are available without waking sleeping guests. Broaden
+  policies for workloads waiting on dependencies; do not evict active
   applications merely because another wake is queued.
 - Interrupted native commands now have durable terminal receipts. Startup clears
   a receipt only after read-only proof of its owner and runtime outcome; it does

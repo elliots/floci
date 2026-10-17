@@ -38,6 +38,13 @@ Declared application sidecars remain application processes and count toward pod
 resources. They share the pod VM. Floci does not create a separate VM for each
 container or inject an observability/service-mesh sidecar into every pod.
 
+Timestamped logs use one small capture process per active application container
+inside its existing guest supervisor tree. The measured helper RSS was about
+3.1 MiB in the qualification fixture. It sleeps with the VM and retains bounded
+output on disk. Events, metrics collection, network listeners and optional
+controller supervision are shared host processes, with no extra Pod containers.
+Metric scrapes omit sleeping containers and never wake them.
+
 Cold proxy availability lets a deployment become available through a working wake
 route. It does not prove its application has booted successfully. Strict readiness
 remains available when deployment must verify actual application health.
@@ -66,7 +73,10 @@ checkpoint retention, host page cache and filesystem allocation also matter.
 Shared disk admission now accounts for cached images, guest disks, checkpoints
 and outstanding reservations, with an optional free-space reserve. This is
 conservative admission accounting, not a filesystem quota or an automatic
-retention policy.
+retention policy. Explicit storage maintenance can remove unused RAM backing and
+old images using SDK ownership checks. Durable checkpoints remain until their
+workload owner releases them; cold Pod base images are retained. Managed
+controller logs and credential generations also have bounded retention.
 
 The existing 500-pod fixture validates one synthetic application shape, cold
 deployment, selective wake and recovery. It does not establish the footprint or

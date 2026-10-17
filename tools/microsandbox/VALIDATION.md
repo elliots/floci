@@ -264,6 +264,23 @@ resource tests cover cgroup counter decoding, working-set calculation, incomplet
 scrapes and no activity or guest execution for cold/sleeping Pods. Native metric
 endpoint behavior is covered separately by the installed-path qualification.
 
+## Shared lifecycle and log operations: 17 October 2026
+
+The final format-8 controller passed all 12 checks in the shared Docker/native
+operations fixture and completed ownership cleanup. Both worker types exercised
+postStart side effects, HTTP preStop before SIGTERM, resource projections and
+current/previous/follow/timestamp/time-filter/tail/byte-limit log behavior.
+Native checks additionally read logs while asleep, recovered the sleeping Pod
+after a controller crash without replaying hooks, and resumed for graceful
+deletion. Controller recovery took 2.038 seconds in this fixture. The log capture
+process used 3184 KiB RSS in the running guest. These are fixture observations.
+
+The complete Pod race suite passed in 45.610 seconds and both Pod/runtime vet
+checks passed. Guest, snapshot and owned peer cleanup completed. The installed
+mixed graph later found an empty Prometheus-family encoding error when every
+guest slept; the fix omits absent container families and adds a regression through
+the actual Prometheus text encoder. This does not fabricate zero usage samples.
+
 The current Docker host exposes no KVM device. These new native VM results are
 Apple Silicon results; native Linux/KVM qualification still requires a suitable
 Linux host. Linux unit tests and cross-builds do not replace that qualification.

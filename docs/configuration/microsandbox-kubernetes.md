@@ -238,14 +238,14 @@ container-runtime and Kubernetes integration work.
 | Area | Initial implementation | Remaining compatibility work |
 | --- | --- | --- |
 | Execution | Multiple regular OCI containers per pod, sequential init containers, restartable init sidecars, image ENTRYPOINT/CMD defaults, command/args overrides and environment expansion | Ephemeral debugging containers |
-| Lifecycle | Configurable lazy or strict availability, Pod UID ownership, Deployment discovery, RAM/disk hibernation, Always/OnFailure task restart | Broader rollout and failure qualification |
+| Lifecycle | Configurable lazy or strict availability, Pod UID ownership, Deployment discovery, RAM/disk hibernation, Always/OnFailure task restart, exec/HTTP postStart and exec/HTTP/sleep preStop hooks | Custom stop signals and broader rollout qualification |
 | Environment | Literal values and resolved ConfigMap/Secret environment sources | In-place environment refresh requires Pod replacement |
 | Networking | IPv4 Pod IPs, cluster DNS, Services through an owned bridge; shared HTTP request wake proxy for 1 to 16 declared ports, with explicit TCP compatibility mode | NetworkPolicy enforcement, IPv6, UDP/SCTP wake and arbitrary CNI plugins |
-| Health checks | Exec, HTTP/HTTPS, TCP and gRPC readiness, startup and liveness probes; named TCP ports and thresholds | Host overrides and lifecycle hooks |
-| Operations | Kubernetes logs, exec with TTY/resize and localhost port-forward | Attach, previous/follow/timestamp logs and log rotation |
-| Storage | Configurable private VM disk, disk/memory emptyDir, ConfigMap and Secret mounts, combined projected volumes, subPath and subPathExpr, opt-in local persistent volumes | CSI, disk quotas, projected resource fields and certificate bundles |
+| Health checks | Exec, HTTP/HTTPS, TCP and gRPC readiness, startup and liveness probes; named TCP ports and thresholds | Host overrides |
+| Operations | Current/previous/follow/timestamp-filtered bounded logs, Events, exec with TTY/resize and localhost port-forward | Attach and ephemeral debugging |
+| Storage | Configurable private VM disk, disk/memory emptyDir, ConfigMap and Secret mounts, projected volumes including resourceFieldRef, subPath and subPathExpr, opt-in local persistent volumes | CSI, disk quotas and certificate bundles |
 | Identity | Namespaced registry pull secrets; real Pod-bound TokenRequest projections, default automount, IRSA injection and EKS Pod Identity routing | Target-role chaining and downstream session-tag ABAC |
-| Resources | Request/limit-based guest sizes, CPU shares/quotas, memory limits, kernel OOM attribution, shared native RAM/disk/start admission | Resource metrics, eviction, Pod-level resources and in-place resizing |
+| Resources | Request/limit-based guest sizes, CPU shares/quotas, memory limits, kernel OOM attribution, container CPU/working-set metrics, shared native RAM/disk/start admission | Eviction, Pod-level resources and in-place resizing |
 | Security | VM isolation, authenticated controller transport, UID/GID, fsGroup and supplemental groups, non-root checks, read-only root filesystems, privilege escalation, capabilities and RuntimeDefault/Unconfined seccomp | Privileged containers, custom seccomp, SELinux and AppArmor profiles |
 
 Most-feature support should build on the shared controller and the guest
@@ -441,16 +441,23 @@ and liveness/startup failures restart only that sidecar. They restart even when
 the Pod uses `Never`; completed init stages are not replayed after a restart.
 After all regular applications finish, sidecars stop in reverse declaration
 order so Jobs can complete. Pod deletion stops regular applications before
-sidecars, using one shared termination grace deadline. Lifecycle hooks and
-ephemeral debugging containers remain planned compatibility work.
+sidecars, using one shared termination grace deadline. Lifecycle hooks run before
+readiness (`postStart`) or SIGTERM (`preStop`), and never on ordinary RAM sleep or
+restore. Graceful deletion can resume a sleeping Pod to run its `preStop` hook
+within the remaining grace period. Cold and zero-grace deletions never boot for
+hooks. Ephemeral debugging containers remain unsupported.
 
 Status exposes `initContainerStatuses` and the `Initialized` condition. Init logs
 are available through `kubectl logs POD -c INIT_NAME`. Completed initialization
 survives regular application restart, RAM hibernation and controller recovery.
 An uncertain interrupted launch fails closed rather than repeating its effects.
-Completed init logs retain the last 1 MiB per container in the controller's
-private state directory. Follow, previous and timestamp-filtered logs are not
-supported. Named exec is available while an init container is running.
+Logs retain bounded current and previous attempts and support following,
+timestamps, time filters, tails and byte limits. Reading sleeping logs never
+wakes a VM. Older checkpoints without timestamp capture keep readable raw logs
+until their container restarts with the updated helper. Named exec is available
+while an init container is running. See
+[application operations](../../tools/microsandbox-pods/OPERATIONS.md) for retention
+bounds, hook recovery and projection semantics.
 Initialization must complete before the Pod can hibernate.
 
 Proxy availability can report a cold Pod Ready while `Initialized` is still
