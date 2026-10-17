@@ -10,8 +10,9 @@ identity. Standard logs/exec use mutual TLS and Kubernetes authorization.
 ## Lifecycle and ownership
 
 The annotation `microsandbox.dev/on-demand: "true"` creates a journal-only COLD
-Pod: Pending, not Ready, with no VM, disk or RAM allocation. Its first resume boots
-the application. Unannotated opted-in Pods start normally. Cold and sleeping
+Pod: Pending, not Ready, with no VM, root disk or guest RAM allocation. Bound
+PVCs can allocate storage independently. Its first resume boots the application.
+Unannotated opted-in Pods start normally. Cold and sleeping
 monitors wait on wake channels instead of polling guests.
 
 The VM primary process supervises containerd and foreground `ctr run`. Short
@@ -58,12 +59,12 @@ proves the guest is absent or stopped; uncertain or still-running guests remain
 charged until their lifecycle is resolved.
 
 Mutating SDK operations finish under the lifecycle lock after client disconnect.
-A durable `native-command.pending` marker precedes each mutation and is removed
-only after successful completion. A controller crash during a command or uncertain
-runtime failure leaves that marker. Startup, mutations and deletion then stop until
-an operator reconciles the native outcome. Blind marker deletion can replay work
-or miss a late-created VM. Automatic interrupted-command recovery remains future
-work.
+A durable `native-command.pending` marker precedes each mutation. Completed
+commands publish a terminal receipt tied to the owner, operation and immutable
+runtime identities. Startup clears a pending marker only after read-only proof
+of that receipt and outcome. It never replays the mutation. Unknown or conflicting
+outcomes still require operator reconciliation. Blind marker deletion can replay
+work or miss a late-created VM.
 
 ## Networking
 
@@ -189,31 +190,37 @@ pull policies. This extended run used two lazy replicas; it did not repeat the
 
 | Area | Implemented | Remaining |
 | --- | --- | --- |
-| Lifecycle | Real UIDs, COLD, RAM sleep/resume, restart adoption, delete | Interrupted-command reconciliation, in-place updates |
-| OCI | Image ENTRYPOINT/CMD/USER defaults, command/args overrides and expansion, working directory, env and ConfigMap/Secret env references, image pull policies | Registry credentials |
+| Lifecycle | Real UIDs, COLD, RAM sleep/resume, restart adoption, delete, verified terminal-command recovery | Ambiguous-command reconciliation, in-place updates |
+| OCI | Image ENTRYPOINT/CMD/USER defaults, command/args overrides and expansion, working directory, env and ConfigMap/Secret env references, image pull policies and registry credentials | Broader OCI image compatibility |
 | Status | Real task state; exec/HTTP/HTTPS/TCP/gRPC readiness, startup and liveness; Always/OnFailure/Never | Probe host overrides, independent probe workers, hooks |
 | Logs/exec | Actual logs, tail/byte limit, standard exec with TTY/resize, localhost port-forward | Follow, previous, timestamps, rotation, attach |
 | Network | Strict PodIP/Service/DNS with source IP; opt-in HTTP wake proxy and explicit TCP compatibility mode | NetworkPolicy, IPv6, arbitrary CNIs |
-| Containers | Multiple regular OCI containers with sequential init containers | Restartable init sidecars, ephemeral containers |
-| Volumes | Disk/memory emptyDir, ConfigMap/Secret mounts, subPath/subPathExpr, atomic directory refresh | Projected tokens, PVC/CSI, host paths, disk quotas |
-| Security | VM boundary, mTLS/RBAC, token control, ownership fences, UID/GID, non-root validation, read-only root, privilege escalation, capabilities and RuntimeDefault/Unconfined seccomp | fsGroup, supplemental groups, privileged containers, custom seccomp, SELinux and AppArmor profiles |
-| Resources | Request/limit-derived profiles, CPU shares/quota, memory cgroups, kernel OOM attribution, bounded starts and active RAM budget | Metrics, eviction and shared host budgets |
+| Containers | Multiple regular OCI containers, sequential init containers and restartable init sidecars | Ephemeral containers |
+| Volumes | Disk/memory emptyDir, ConfigMap/Secret/token projections, subPath/subPathExpr, atomic directory refresh, local RWO PVCs | CSI, expansion, broader access modes, host paths, disk quotas |
+| Security | VM boundary, mTLS/RBAC, token control, ownership fences, UID/GID, non-root validation, read-only root, privilege escalation, capabilities, fsGroup, supplemental groups and RuntimeDefault/Unconfined seccomp | Privileged containers, custom seccomp, SELinux and AppArmor profiles |
+| Resources | Request/limit-derived profiles, CPU shares/quota, memory cgroups, kernel OOM attribution, bounded starts and shared native RAM admission | Metrics, eviction, Pod-level resources and resizing |
 | Wake | Generic UID API, cold boot, retained replicas, Service HTTP request wake and explicit TCP connection wake | Protocol-aware health responses, UDP |
-| Scale | Configurable tracked count and RAM, bounded checkpoints | 500 checkpointed apps, disk admission, shared host budget |
+| Scale | Configurable tracked count and RAM, bounded checkpoints, shared RAM/start/disk admission | Mixed application graphs, 500 checkpointed apps, automatic cache pruning |
 
-Defaults: 512 tracked Pods and 4096 MiB active RAM. Guests have a 4 GiB flat root
-disk and at least one vCPU/768 MiB. New sizes follow the greater of CPU/memory
-requests and limits, with 256 MiB guest headroom and 2 MiB memory alignment.
+Defaults: 512 tracked Pods and 4096 MiB active RAM. Guests have a configurable
+flat root disk (default 4 GiB) and at least one vCPU/768 MiB. New sizes follow the
+greater of CPU/memory requests and limits, with 256 MiB guest headroom and 2 MiB
+memory alignment.
 Sleeping Pods retain snapshots and disk. Cold/sleeping Pods retain Kubernetes
 resource requests; `--scheduling-cpu` and `--scheduling-memory` advertise virtual
 capacity independently of active memory admission. Their defaults remain four
-CPUs and the active RAM budget. This controller budget is separate from any emulator budget. A
+CPUs and the active RAM budget. The controller budget is an additional limit
+alongside the shared SDK adapter ledger used by native Pods and Aurora. A
 500-COLD-identity or proxy-Ready test does not establish 500 running or checkpointed app capacity.
 
-Single-application Pod journals use version 2, or version 3 with sequential init containers. Multiple applications use version 4 with separate per-container start, probe-failure, termination and backoff state. Older controllers reject version 4; do not downgrade while those Pods exist. All versions after version 1 require an allocation. Version 1 journals
-migrate as their original one-vCPU/768-MiB size, regardless of current sizing
-rules. Older controllers reject version 2 rather than undercounting larger
-guests. Admission grants both a start slot and sufficient RAM together; a large
+New and recovered Pod journals use format 6, or format 7 when mounting PVCs.
+Format 6 fences older networking; format 7 also fences destructive PVC cleanup
+by controllers without writeback support. Non-PVC formats 1 through 6 remain
+readable; resource sizing, init state, multiple applications and sidecars retain
+their original semantics during upgrade. Version 1 records retain their original
+one-vCPU/768-MiB allocation. Older allocation records retain their original
+4 GiB root disk. Do not downgrade while upgraded Pod journals or checkpoints
+remain. Admission grants both a start slot and sufficient RAM together; a large
 waiter cannot occupy a start slot while a smaller guest could fit.
 
 Each fresh application process receives a unique parent cgroup. CPU/memory limits
@@ -230,7 +237,7 @@ Volume backing directories live in the Pod VM outside the application's
 containerd snapshot. Replacing an application container therefore preserves
 disk and memory `emptyDir` contents; deleting the Pod removes its VM and volume
 identity. Memory `emptyDir` is a tmpfs with its configured capacity, at most the
-guest RAM allocation. Disk `emptyDir` shares the VM's 4 GiB disk and currently
+guest RAM allocation. Disk `emptyDir` shares the VM's configured root disk and currently
 rejects `sizeLimit` because there is no disk quota or eviction implementation.
 
 ConfigMap and Secret sources are read from the Pod's namespace through the
@@ -250,8 +257,9 @@ errors and missing required sources retain the last successful projection.
 
 The controller refreshes about every 30 seconds while awake and attempts a
 refresh after RAM restore before forwarding wake-proxy traffic. It does not
-poll cold/sleeping pods. The VM's application processes have already resumed
-before that post-restore refresh, and source failures preserve old contents.
+poll cold/sleeping pods. Without renewable identity, application processes can
+resume before that post-restore refresh. Configuration source failures preserve
+old contents; identity refresh failures block thaw and forwarding.
 RAM checkpoints include Secret tmpfs data and any credentials in process memory;
 the controller's private state and runtime directories must remain protected.
 Checkpoint encryption is not implemented.
@@ -260,12 +268,18 @@ Directory mounts update atomically; supported subpaths pin their selected conten
 Combined projections support ConfigMap, Secret, DownwardAPI metadata and real
 Pod-bound TokenRequest credentials. The shared controller caches tokens only in
 memory and rotates at 80% TTL or 24 hours. Sleep does not poll the API. Wake issues
-fresh identity before VM restore and writes it before forwarding traffic;
-running-controller recovery requires identity refresh before opening controller proxy routes.
-Background processes resume before the write, so they may briefly see an expired
-snapshot token. Token subpaths remain pinned, as in Kubernetes.
-Host paths, PVC/CSI, certificate projections, resource-field projections, mount
-propagation, recursive read-only options and ownership changes are rejected.
+fresh identity before VM restore. Identity-bearing checkpoints freeze application
+processes before capture and refresh their projected files before thaw. Legacy
+identity checkpoints without freeze proof require Pod replacement. Running-controller
+recovery requires identity refresh before opening proxy routes. Token subpaths
+remain pinned, as in Kubernetes. Tokens already cached by an application must
+still follow its normal refresh behavior.
+
+The shared controller also provisions [local RWO PVCs](STORAGE.md). An attachment
+remains fenced through sleep and recovery until Pod deletion removes the guest
+and every restorable checkpoint. Local persistent volumes support fsGroup and
+OnRootMismatch. Host paths, CSI, certificate projections, resource-field projections,
+mount propagation and recursive read-only options remain unsupported.
 See the [migration notes](../microsandbox/MIGRATION.md#kubernetes-mounted-configuration-and-temporary-storage)
 for manifest changes.
 

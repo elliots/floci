@@ -7,7 +7,7 @@ The [completion plan](../microsandbox/ROADMAP.md) tracks the remaining Kubernete
 Aurora and shared-runtime work.
 
 Requirements: Go1.26+, CGO and a C compiler, native microsandbox **0.7.8** with matching runtime library,
-Docker/OrbStack, Python3 and OpenSSL. Qualification creates an isolated privileged
+Docker, Python3 and OpenSSL. Qualification creates an isolated privileged
 k3s container and native VMs, then removes its uniquely owned fixture resources.
 The controller uses the official Go SDK through the adjacent
 `tools/microsandbox-runtime` module. Keep both directories in the checkout.
@@ -83,8 +83,9 @@ python3 tools/microsandbox-pods/manage.py run --directory /private/native-cluste
 
 Use the generated `admin.kubeconfig` to deploy applications. The controller uses
 its separate `controller.kubeconfig` and the generated `controller-rbac.json`.
-Its role can read Pods, ConfigMaps and Secrets across the cluster, mint bound
-service-account tokens, publish status and manage its named node and lease.
+Its role can read Pods, ConfigMaps, Secrets, PVCs and StorageClasses across the
+cluster, mint bound service-account tokens, publish status and manage its named
+node and lease. The shared local provisioner also creates and manages PVs.
 It cannot create workloads, change Secrets, administer RBAC or change other nodes.
 Use a dedicated development cluster: the controller still needs trusted access
 to application credentials and to the local Docker socket.
@@ -205,7 +206,7 @@ Proxy availability delays first boot and makes a Deployment available through
 actual shared wake routes. Omit it (or use `availability: strict`) to start normally
 with guest readiness. Advanced `on-demand: "true"` without proxy availability
 creates COLD, not-Ready Pods for an external gateway. Unsupported fields
-fail explicitly, including PVC/CSI volumes and extended
+fail explicitly, including unsupported CSI volumes and extended
 resources. Scheduler requests survive sleeping independently of active VM
 admission. New guests size themselves from CPU/memory requests and limits, with
 one vCPU/768 MiB minimum and 256 MiB guest memory headroom. Declared limits use
@@ -231,8 +232,10 @@ for actual application readiness.
 The VM allocation covers the peak of concurrently running applications and init
 sidecars, including each ordinary init stage, plus guest headroom. Named `kubectl logs -c` and
 `kubectl exec -c` select the corresponding container. Container logs preserve raw
-bytes. Multi-container journals use version 4; older controllers reject them.
-The existing single-container and sequential-init journals remain readable.
+bytes. The controller reads legacy single-container, sequential-init and
+multi-container journals, then writes format 6, or 7 for local PVCs, to fence
+older controllers from upgraded networking and persistent-volume cleanup. Do not
+downgrade against upgraded state.
 Ephemeral containers remain an explicit rejection pending debugging support.
 
 The real Kubernetes qualification includes these scenarios. Use
@@ -252,9 +255,10 @@ completed init stages and running applications retain their state.
 When regular applications finish, sidecars receive termination signals in
 reverse declaration order and the Pod can complete. Pod deletion signals regular
 applications first. One Pod grace deadline covers shutdown and survives
-controller recovery. Sidecar Pods use journal version 5; delete their Pods and
-snapshots before downgrading the controller. Use `--sidecars-only --cold-pods 0`
-for the focused real Kubernetes qualification.
+controller recovery. Legacy sidecar journals use version 5 and upgrade to format
+6, or 7 when mounting local PVCs; delete their Pods and snapshots before
+downgrading the controller. Use `--sidecars-only --cold-pods 0` for the focused
+real Kubernetes qualification.
 
 On Apple Silicon, that qualification passed startup/readiness gating,
 independent restart under Pod `Never`, preserved process memory through a full
@@ -295,13 +299,17 @@ use the same initial identity, also exposed as `containerStatuses[].user.linux`.
 Volume directories receive setgid and group access. Read-only projections gain
 group read permission before atomic publication, including refreshed Secrets.
 Temporary and projected volumes ignore `fsGroupChangePolicy`, matching kubelet.
-Persistent volume policy support belongs to the separate persistent storage work.
+Native local persistent volumes also honor `fsGroupChangePolicy`, including
+`OnRootMismatch`; ownership is applied before init and application containers.
 
 `qualify.py --groups-only --guest-fs-binary /tmp/guestfs-linux` runs the same
 permission assertions against Docker k3s and native Pods, then checks native RAM
 restore and controller recovery. Existing controller flags are also required.
 
-Pods can mount ConfigMap, Secret and `emptyDir` volumes. ConfigMap and Secret
+Pods can mount [native local PVCs](STORAGE.md), ConfigMap, Secret and `emptyDir`
+volumes. The local provisioner supports Filesystem RWO, node affinity and
+Delete/Retain reclaim policies. A sleeping Pod keeps its single-Pod attachment;
+ordinary CSI volumes remain unsupported. ConfigMap and Secret
 mounts support `items`, nested relative paths, binary data, `optional`,
 `defaultMode` and per-item modes. They are always read-only inside the application,
 including when `volumeMounts[].readOnly` is omitted. `subPath` and `subPathExpr`
@@ -343,9 +351,10 @@ projected directory atomically; applications must reopen files to consume update
 descriptors can keep the previous content. Environment references retain their
 original values until Pod replacement.
 
-Refresh errors preserve the last good contents and are retried. Background
-application processes have already resumed when the controller refreshes after
-restore, so they may observe the previous configuration first.
+Configuration refresh errors preserve the last good contents and are retried.
+Pods without renewable identity can resume background processes before the
+post-restore refresh and briefly observe previous configuration. Identity-bearing
+Pods use the freeze/refresh/thaw sequence described below.
 
 Both `emptyDir` variants survive container restart and RAM hibernation, and belong
 only to their Pod UID. Pod deletion removes them with its VM. Disk-backed
@@ -391,7 +400,7 @@ Configure the cluster OIDC provider and role trust for IRSA, or install the
 Pod Identity addon and create an association. The TLS webhook requirements and
 annotation settings are described in [EKS documentation](../../docs/services/eks.md).
 DownwardAPI resource fields,
-ClusterTrustBundle and PodCertificate projections, ownership overrides, PVC/CSI,
+ClusterTrustBundle and PodCertificate projections, ownership overrides, CSI,
 host paths, mount propagation and recursive read-only options remain unsupported. Secret
 projection data lives on guest tmpfs, but RAM checkpoints retain its contents and
 any secrets in process memory. Protect the runtime home and checkpoint backups;
@@ -404,6 +413,22 @@ On Apple Silicon/OrbStack with microsandbox 0.7.8 and k3s 1.35, the isolated
 identity run passed all six checks and cleanup on 2026-10-17. Both sleeping and
 running controller recovery retained the application process while reissuing
 its token before the next proxy request.
+
+`--aws-identity-only --floci-checkout /path/to/floci --java-home /path/to/jdk25`
+runs one real AWS Go SDK probe on both Docker and native workers. It exercises
+IRSA and EKS Pod Identity, exact-role SSM allow/deny policies, explicit credential
+precedence, and rejected token audiences and subjects. Native checks preserve the
+application process through controller restart and RAM resume while replacing its
+projected token and cached AWS credentials. The fixture uses a standard Service
+for AWS API access and one shared node relay for the Pod Identity endpoint.
+
+Add `--identity-expiry-wait` to wait for the actual ten-minute projected tokens
+to expire while the native guests sleep. The probe deliberately shortens the SDK
+credential cache window; it does not wait for the issued one-hour AWS sessions to
+expire. The fixture calls Floci's real admission handler and applies its patch to
+both worker types, but does not qualify installation of the TLS webhook. The probe
+reports hashes and role identities without token bodies or secret keys. As with the Java
+gateway qualification, reserve the checkout's Maven test process for this run.
 
 ## Wake coordination
 

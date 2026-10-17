@@ -98,3 +98,152 @@ RBAC binding creation and modification of another node, while permitting require
 Pod reads. Seven Python tests cover file permissions, setup exclusion, ownership
 and image validation, cleanup refusal and role boundaries. This is a local
 development-cluster workflow, not a production Kubernetes installer.
+
+## Capacity, database lifecycle and selective wake: 17 October 2026
+
+After the shared disk-admission, immutable database recovery and Aurora version
+checks landed, the same database matrix passed again on both Docker and native
+microsandbox: 29 cases per backend with no failures, errors or skips. The matrix
+includes PostgreSQL and MySQL. This is the shared workload matrix, not the full
+repository test suite.
+
+The packaged-Floci restart fixture also passed with persistent storage. After
+the actual 300-second Aurora idle interval, ordinary JVM shutdown and restart
+retained the stopped guest, immutable RAM checkpoint and AWS endpoint. Metadata
+reads left it asleep; first SQL restored the same PostgreSQL process and its
+committed row. This run measured 0.882 seconds for cold wake after JVM restart
+and 0.630 seconds for RAM wake, with the artificial resume delay disabled. Its
+6 GiB native root geometry survived recovery. Cleanup left no VMs or checkpoints.
+These are fixture observations, not latency guarantees. The script also accepts
+hybrid storage, but this run used persistent storage only.
+
+The native disk-admission fixture denied launch, capture and restore before
+mutation when the budget was exhausted. It preserved a full RAM checkpoint,
+retained a prepared restore reservation across a lowered limit and verified
+cleanup of VMs, checkpoints and permits. Measured runtime storage remained
+accounted after cleanup. Admission uses conservative logical sizes, not assumed
+copy-on-write savings, and does not impose a filesystem quota.
+
+A separate two-replica native Deployment ran with capacity for only one guest.
+Real Java HTTP and queue wake selected one replica, health polling did not retain
+it awake, and two hibernate/resume cycles preserved its RAM. The other replica
+remained cold with the same Pod UID. Cleanup passed. This run covers selected
+replica activation; ordinary Kubernetes Services still choose endpoints using
+their normal routing policy.
+
+Race tests and vet passed for the shared runtime, host helper and pod controller.
+A repeated cancellation regression found and fixed an input-stream ownership
+leak when forwarding was canceled during dialing. The setup helper's ten Python
+tests passed, including explicit host-IP selection and unavailable-capacity
+reporting. Native VM evidence remains Apple Silicon only; Linux kernel networking
+checks and cross-platform builds do not establish native Linux/KVM qualification.
+
+## SDK-backed 500-pod qualification: 17 October 2026
+
+The expanded fixture passed 70 native checks and cleanup with controller
+`b375c17c0`, including the SDK adapter, bounded reconciliation workers and terminal
+command recovery. It advertised 600 CPUs/512 GiB for scheduling while admitting
+at most 4 GiB of active guest RAM. All 500 proxy-ready replicas retained their
+requests for 500 CPUs/375 GiB without creating any VM.
+
+| Observation | Result |
+| --- | ---: |
+| Register 500 cold, Ready replicas | 50.740 seconds |
+| Controller and shared relay RSS | 183.6 MiB combined |
+| First Service wake, including deferred init | 18.718 seconds |
+| Service RAM resume | 5.556 seconds |
+| Controller recovery with 500 declared replicas | 56.180 seconds |
+| Deployment deletion through complete ownership-journal cleanup | 83.369 seconds |
+
+The memory figure excludes Floci, k3s, Docker, runtime libraries, host page cache
+and active guests. This is 500 replicas of one synthetic application, not 500
+different applications or 500 checkpointed guests. The run also checked
+multi-container Pods, sidecars, projected identity, private images, probes,
+volumes, security settings, ordinary Service/PodIP HTTP wake, idle keep-alive
+sleep and two strict-readiness RAM cycles. It did not run the Java suite.
+
+The later reused-guest-IP network fix, generic host binding and persistent-volume
+work have separate qualification; this scale result does not claim those later
+changes were included in the 500-pod binary.
+
+## Generic host networking: 17 October 2026
+
+The controller uses the explicit node address and verifies peer reachability.
+It can bind a specific local interface when host loopback is not reachable,
+without exposing the SDK backend or controller control API. Owned UDP ingress
+accepts only the peer address, the Pod's source port and its VXLAN identity.
+Linux Docker namespace checks passed forwarding and rejection cases. A separate
+kernel check covered legacy route migration, reused guest addresses and cleanup
+that preserves other Pods' routes.
+
+A real Apple Silicon smoke with controller `be184d03c` passed seven checks:
+cold Ready without a VM, Service HTTP wake, full RAM sleep to zero active guest
+memory, controller restart retaining sleep, and HTTP resume with the same process
+nonce, start time and kernel boot ID. Guest, snapshot and volume inventories were
+empty after deletion, and the owned peer was removed. The fixture stopped its
+controller before Kubernetes finished deleting the Pod API object; after proving
+its exact UID and empty native inventory, cleanup removed that remaining API
+object. No native guest force cleanup was needed.
+
+The generic-networking controller passed 303 top-level tests and 471 subcases
+under race detection, plus vet. Eight host/platform/opt-in tests and nine subcases
+were skipped. These Linux peer tests and Apple Silicon VM checks do not establish
+native Linux/KVM qualification. No vendor-specific Docker hostname is required.
+
+## Shared AWS SDK credential providers: 17 October 2026
+
+One AWS Go SDK probe passed on both Docker k3s and native Pods for IRSA and EKS
+Pod Identity. The same assertions checked the expected provider, assumed-role
+identity, an allowed SSM parameter, denial of a different existing parameter and
+explicit environment-credential precedence. Eight negative cases covered wrong
+audiences and service-account subjects on both backends; network errors could
+not satisfy those assertions.
+
+Both native processes hibernated with zero active guest RAM while their actual
+ten-minute projected tokens expired. After controller restart, the first HTTP
+request resumed the same process nonce with a new projected token and fresh SDK
+credentials. This proves successful refresh on the first request after resume;
+the probe itself does not independently establish before-thaw ordering. The
+probe shortens the SDK cache window rather than waiting for the one-hour AWS
+session to expire. All native guests and the disposable cluster were cleaned.
+
+The Java fixture passed with no failures, errors or skips. It served real Floci
+OIDC/STS, Pod Identity and IAM enforcement using the disposable cluster's public
+signing key. The test calls the real admission handler and applies its patch,
+but does not qualify installation of the TLS webhook. Native controller
+`8ba7973df` included the reused-guest-IP routing fix. This was Apple Silicon
+qualification, not a native Linux/KVM run.
+
+## Shared persistent-volume qualification: 17 October 2026
+
+The shared Docker/native fixture passed all 13 checks and cleanup. Both backends
+preserved data across Pod replacement and completed Jobs, including buffered
+writes without an application-issued sync. Delete reclaimed storage; Retain
+preserved the same PV for explicit rebinding to a new claim before final cleanup.
+
+Native-only checks preserved both data and the application RAM marker through
+hibernation and controller restart. Replacement retained data with a new process
+marker. A sleeping Pod held its disk attachment and prevented a second writer
+from starting a VM. The Retain case also deleted an already sleeping Pod before
+replacement. The 128 MiB requests produced the documented 256 MiB native minimum,
+with unchanged disk identity and geometry throughout. Final guest, snapshot and
+volume inventories were empty, and the owned peer was removed.
+
+The run exposed a writeback gap during Pod replacement, which was fixed before
+this successful rerun. Hibernation freezes managed application writers and
+flushes the attached filesystems before capture. Deletion and terminal completion
+seal the external ext4 filesystems before guest removal. A failed or uncertain
+seal preserves recovery state rather than replaying the operation blindly. The
+one-shot helper exits after each operation; no storage sidecar is required.
+
+This native run used the completed lifecycle implementation before its journal
+format was raised from 6 to 7 for PVC Pods. Separate recovery regressions verified
+the format-7 guard, including rejection of older PVC journals before orphan
+cleanup. Linux guest-filesystem race tests and ARM64/AMD64 static builds passed.
+The native VM run was on Apple Silicon; it does not establish Linux/KVM support.
+
+After integration with generic host networking and the format-7 ownership guard,
+the complete Pod-controller and shared-runtime Go race suites and vet passed.
+The host-helper race suite and vet also passed, along with Java test compilation,
+Checkstyle and 11 managed-setup Python tests. Platform-gated native tests remain
+opt-in; these checks do not imply a run of every repository test.

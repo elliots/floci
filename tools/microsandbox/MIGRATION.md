@@ -18,6 +18,30 @@ can finish first.
 reservations, including disk accounting when enabled. Unknown inventory remains
 explicitly unavailable. No workload or AWS protocol changes are required.
 
+## Native local persistent volumes
+
+Existing storage classes keep their meaning. To place persistent data in native
+Pod disks, add the explicit `microsandbox.dev/local` StorageClass from the
+[storage guide](../microsandbox-pods/STORAGE.md) and select it in the application's
+PVCs or Helm values. It requires `WaitForFirstConsumer`, Filesystem and RWO.
+It is local storage rather than an EBS or CSI implementation.
+
+One Pod can attach a disk at a time, including while sleeping. For a
+single-replica Deployment sharing one PVC, use `strategy.type: Recreate` to avoid
+a rolling surge waiting for the old Pod's attachment. Normal replacement Pods
+retain data in the same PVC. Disk expansion is unsupported; select its size at
+creation. Use a fresh PVC and application-level data migration when changing
+storage backends. Existing Docker volumes are not imported automatically.
+
+Rebuild the controller and Linux `guestfs` helper together; local PVCs require
+the helper even without `fsGroup`, for verified filesystem writeback. With the
+controller stopped, rerun `manage.py prepare` to update its role with
+PVC/StorageClass reads and PV management permissions. Keep the generated cluster
+and runtime directories. The controller adds no per-Pod storage service. PVC Pods
+use journal format 7 to prevent destructive cleanup by older controllers; other
+Pods retain format 6.
+Do not downgrade while PVC Pods or their checkpoints remain.
+
 ## Checkout consolidation
 
 Use `feat/microsandbox` in the main Floci checkout. The host helper now builds
@@ -99,7 +123,7 @@ and the pod controller's `--state` directory do not move automatically.
    [host helper instructions](../microsandbox-host/API.md).
 2. Install native microsandbox 0.7.8 with matching runtime libraries. Run its
    authenticated helper on the hypervisor host, with a dedicated, short,
-   durable `MSB_HOME`. On macOS this is a host process, outside OrbStack.
+   durable `MSB_HOME`. On macOS this is a host process, outside Docker's Linux VM.
 3. Start Floci with fresh persistent metadata storage and these settings:
 
 ```sh
@@ -149,9 +173,11 @@ applications and dependencies that need to run together.
   resume
   through Floci, with the configured artificial resume delay set to zero.
   These are Apple Silicon observations, not guarantees for larger databases.
-- The initial provider has one vCPU and a 4 GiB root disk per runtime, with
-  512 MiB RAM by default. The AWS allocated-storage field does not resize that
-  experimental disk. SQL backup transport is limited to 64 MiB and commands to
+- The provider defaults to one vCPU, a 4 GiB root disk and 512 MiB RAM per
+  runtime. Set `FLOCI_SERVICES_RDS_MICROSANDBOX_ROOT_DISK_MIB` before creating a
+  database to choose its native disk size. Existing guests retain their recorded
+  geometry. The AWS allocated-storage field does not resize that experimental
+  disk. SQL backup transport is limited to 64 MiB and commands to
   180 seconds. Guest CloudWatch log forwarding is not implemented.
 
 ## Standard pod image startup and security
@@ -185,8 +211,9 @@ report `OOMKilled`. Applications see their own limits through a read-only cgroup
 mount. Requests remain scheduler reservations, not hard limits.
 
 Existing pods keep their original one-vCPU/768-MiB allocation. Recreate a Pod to
-change its size. The upgraded controller reads old journals and writes version 2
-with the persisted allocation. Older controllers reject this format. Do not
+change its size. Journal version 2 introduced persisted allocations; the current
+controller reads legacy records and writes format 6, or 7 for PVC Pods. Older controllers reject
+the upgraded format. Do not
 downgrade against upgraded state; keep a backup if you need to revert the runtime.
 The private lifecycle API adds `vcpus` and `memoryMiB`; its contract remains 1 and
 the existing Floci client tolerates these additive fields.
@@ -300,8 +327,9 @@ Kubernetes and other service boundaries. Those paths are not enabled by the RDS 
   in this runtime branch. Use the existing ECS provider or an explicit standalone
   microsandbox workload until an ECS runtime adapter is added. Lambda retains
   its existing execution providers and warm-pool behaviour.
-- SQS wake detection polls visible and in-flight counts. It does not consume
-  messages or require changes to `SendMessage`. RabbitMQ uses management counts
+- SQS enqueue notifications trigger immediate wake, with visible and in-flight
+  count polling as a fallback. Wake detection does not consume messages or
+  require application changes to `SendMessage`. RabbitMQ uses management counts
   while the application keeps ownership of AMQP consumption and acknowledgements.
 - Route IoT MQTT messages through an ordinary IoT rule's SQS action. Direct MQTT
   subscriptions inside a sleeping guest are not a durable wake mechanism.
@@ -315,8 +343,11 @@ Kubernetes and other service boundaries. Those paths are not enabled by the RDS 
   total host RSS. Leave additional RAM for Floci, the Kubernetes control plane,
   Docker, brokers and native runtime overhead. Zero disables admission limiting.
   The Java RDS and generic standalone application providers share this budget.
-  A separate native pod controller has its own allocation limit; divide the
-  host's available RAM between the two controllers.
+  The native pod controller also has its own allocation limit. Both now use the
+  shared SDK adapter ledger when configured with the same canonical runtime home;
+  set `FLOCI_MICROSANDBOX_MEMORY_LIMIT_MIB` and
+  `FLOCI_MICROSANDBOX_START_LIMIT` for the combined native budget. The Java and
+  controller limits remain additional bounds.
 - A deployment with hundreds of applications is the design target, not a measured
   capacity claim. Most applications must be idle to fit within the host memory budget. Snapshot
   storage and the working set of simultaneously active applications still matter.
@@ -342,8 +373,8 @@ Rebuild Floci and the pod controller together for this update. The controller
 now reports `WAITINGVOLUMES` for strict pods awaiting required mounted sources
 before VM allocation. Older Floci clients reject that state. It is an additive
 state in controller contract version 1; no manual configuration or journal
-migration is required. The current controller's [resource update](#pod-resource-sizes-and-limits)
-automatically upgrades journals to version 2.
+migration is required. The current controller reads legacy resource journals
+and writes format 6, or 7 for PVC Pods; older controllers cannot read upgraded state.
 
 Mounted source values are fetched when a cold pod first starts, refreshed
 periodically while awake, and refreshed after RAM restore before wake-proxy
@@ -356,13 +387,16 @@ does not change environment-variable behavior: roll replacement pods to refresh
 environment references. The controller kubeconfig needs `get` access to the
 ConfigMaps and Secrets referenced by the pod.
 
-Source/API errors during refresh preserve the last good mounted contents and
-are retried. Application and background processes have already resumed before
-the post-restore refresh, so they can see the previous configuration first.
+Configuration source/API errors during refresh preserve the last good mounted
+contents and are retried. Pods without renewable identity can resume background
+processes before the post-restore refresh and briefly see previous configuration.
+Identity-bearing Pods now freeze before capture and refresh before thaw, as
+described in the identity migration below.
 
 Disk-backed and `medium: Memory` `emptyDir` volumes retain files across container
 restarts and RAM sleep. They are scoped to the Pod UID and are removed when that
-pod is deleted. Disk-backed `emptyDir` shares the 4 GiB VM disk and does not yet
+pod is deleted. Disk-backed `emptyDir` shares the configurable VM root disk
+(default 4 GiB) and does not yet
 support `sizeLimit`. Memory-backed `emptyDir` uses guest tmpfs, with an optional
 positive size limit no greater than the guest RAM allocation. Its contents
 still consume RAM and checkpoint storage, so hibernation does not make large
@@ -372,8 +406,9 @@ temporary datasets free to store.
 File and directory mounts are supported for the existing volume types, with
 container environment expansion for `subPathExpr`. ConfigMap/Secret subPath
 mounts are pinned and do not receive live source updates. Regular directory
-mounts continue to refresh. Generic `projected` volumes, service-account tokens,
-PVC/CSI, host paths, mount propagation and recursive read-only options remain
+mounts continue to refresh. Combined projections and service-account tokens
+are supported, as are opt-in [local PVCs](../microsandbox-pods/STORAGE.md).
+CSI, host paths, mount propagation and recursive read-only options remain
 unsupported and are rejected. Alpha `emptyDir.mode`, volume `defaultUser` and
 per-item ownership overrides are also unsupported. Secret files live on guest tmpfs, but their bytes
 and secrets held in process memory are included in RAM checkpoints. Keep the
@@ -385,9 +420,9 @@ checkpoint encryption.
 Rebuild Floci and the pod controller together. Sequential init containers are
 now supported alongside one regular application container. Their lifecycle adds
 `INITSTARTING` and `INITIALIZING` states to the private controller contract;
-older Floci clients reject those states. Pods with init containers use journal
-version 3, retaining completion and retry status. Existing journals remain
-readable, but older controllers cannot read init-pod journals. Do not downgrade
+older Floci clients reject those states. Journal version 3 introduced init
+completion and retry status. The current controller reads those records and
+writes format 6, or 7 for PVC Pods; older controllers cannot read upgraded journals. Do not downgrade
 against upgraded state.
 
 Init containers run on first activation. A cold proxy Pod can be Ready with
@@ -522,8 +557,8 @@ forwarded traffic.
 New VM allocations use the sum of regular-container CPU/memory declarations,
 compared with the largest sequential init stage, plus the existing guest
 headroom. An existing single-container Pod keeps its journaled allocation.
-Multi-container Pods use journal version 4. Do not downgrade the controller
-until those Pods and their snapshots have been deleted. No manifest changes are
+Journal version 4 introduced multi-container state; current writes use format 6, or 7 for PVC Pods.
+Do not downgrade the controller until those Pods and their snapshots have been deleted. No manifest changes are
 needed for existing single-container Pods. Ephemeral containers are still
 rejected explicitly.
 
@@ -536,9 +571,9 @@ gate actual Pod readiness, and sidecars restart independently even with Pod
 reverse order so Jobs can finish. Deletion signals applications before sidecars.
 The single Pod termination grace deadline persists across controller recovery.
 
-Sidecar Pods use journal version 5 and include sidecars in guest resource
-allocation. Older single-container, sequential-init and multi-application
-journals remain readable. Delete sidecar Pods and their snapshots before
+Journal version 5 introduced sidecar state; current writes use format 6, or 7 for PVC Pods.
+Sidecars are included in guest resource allocation. Older single-container,
+sequential-init and multi-application journals remain readable. Delete sidecar Pods and their snapshots before
 downgrading the controller. Existing manifests need no changes.
 
 ## Environment isolation and simulator routing
@@ -633,7 +668,8 @@ owned peer link against its Pod journal before replacing a legacy link with the
 same VNI, addresses, bridge and MTU. It removes only that Pod's exact legacy DNAT
 rule and UDP conntrack tuple. The owned Linux peer must provide `conntrack` (the
 pinned k3s image includes it). A changed or unowned peer link blocks migration.
-New and recovered Pod journals use format 6 before changing peer network state.
+New and recovered Pod journals use format 6, or 7 for PVC Pods, before changing
+peer network state.
 Older controllers reject that version, so do not downgrade a controller while
 these journals and their native resources remain. Guest application data and RAM
 checkpoints do not change during the peer-link migration.
@@ -685,8 +721,9 @@ added. Tokens travel through stdin and are not stored in lifecycle journals.
 Wake reissues identity before VM restore and refreshes projected directories
 before forwarding requests. Running-controller recovery also requires successful
 identity refresh before controller proxy routes reopen. API or projection failures block these
-paths. Background processes resume before the directory refresh and may briefly
-read the previous token, including an expired token after a long sleep. Reopen
+paths. Identity-bearing Pods now freeze their application processes before
+capture and refresh projected tokens before thaw. Legacy identity checkpoints
+without freeze proof require Pod replacement. Reopen
 projected files instead of retaining file descriptors. Token `subPath` mounts stay
 pinned and do not rotate, matching Kubernetes; use a directory mount for renewable
 credentials. RAM checkpoints contain projected credentials and process memory,
@@ -777,8 +814,9 @@ Native Pods now apply `fsGroup` to disk/memory `emptyDir` and projected
 ConfigMap/Secret/DownwardAPI/token volumes. A Secret with mode `0400` becomes
 group-readable (`0440`) when `fsGroup` is set, as it does under kubelet. Refreshed
 projections receive their group permissions before publication. These volume
-types ignore `fsGroupChangePolicy`, matching Kubernetes. Persistent volumes remain
-a separate addition.
+types ignore `fsGroupChangePolicy`, matching Kubernetes. Local persistent volumes
+apply the selected policy, including `OnRootMismatch`, before init and application
+containers start.
 
 `Merge` retains image-defined memberships; `Strict` excludes them. Initial
 containers, sidecars, application startup, exec and probes use the same resolved

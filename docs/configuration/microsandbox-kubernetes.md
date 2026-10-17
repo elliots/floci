@@ -243,10 +243,10 @@ container-runtime and Kubernetes integration work.
 | Networking | IPv4 Pod IPs, cluster DNS, Services through an owned bridge; shared HTTP request wake proxy for 1 to 16 declared ports, with explicit TCP compatibility mode | NetworkPolicy enforcement, IPv6, UDP/SCTP wake and arbitrary CNI plugins |
 | Health checks | Exec, HTTP/HTTPS, TCP and gRPC readiness, startup and liveness probes; named TCP ports and thresholds | Host overrides and lifecycle hooks |
 | Operations | Kubernetes logs, exec with TTY/resize and localhost port-forward | Attach, previous/follow/timestamp logs and log rotation |
-| Storage | Private VM disk, disk/memory emptyDir, ConfigMap and Secret mounts, combined projected volumes, subPath and subPathExpr | PVCs, CSI, disk quotas, projected resource fields and certificate bundles |
-| Identity | Namespaced registry pull secrets; real Pod-bound TokenRequest projections and default service-account automount | IRSA annotation injection and EKS Pod Identity credentials routing |
-| Resources | Request/limit-based guest sizes, CPU shares/quotas, memory limits, kernel OOM attribution, bounded starts and active guest RAM | Resource metrics, eviction and shared budgets across runtime providers |
-| Security | VM isolation, authenticated controller transport, UID/GID, non-root checks, read-only root filesystems, privilege escalation, capabilities and RuntimeDefault/Unconfined seccomp | fsGroup, supplemental groups, privileged containers, custom seccomp, SELinux and AppArmor profiles |
+| Storage | Configurable private VM disk, disk/memory emptyDir, ConfigMap and Secret mounts, combined projected volumes, subPath and subPathExpr, opt-in local persistent volumes | CSI, disk quotas, projected resource fields and certificate bundles |
+| Identity | Namespaced registry pull secrets; real Pod-bound TokenRequest projections, default automount, IRSA injection and EKS Pod Identity routing | Target-role chaining and downstream session-tag ABAC |
+| Resources | Request/limit-based guest sizes, CPU shares/quotas, memory limits, kernel OOM attribution, shared native RAM/disk/start admission | Resource metrics, eviction, Pod-level resources and in-place resizing |
+| Security | VM isolation, authenticated controller transport, UID/GID, fsGroup and supplemental groups, non-root checks, read-only root filesystems, privilege escalation, capabilities and RuntimeDefault/Unconfined seccomp | Privileged containers, custom seccomp, SELinux and AppArmor profiles |
 
 Most-feature support should build on the shared controller and the guest
 container runtime. Adding a full kubelet to each application would make hundreds
@@ -307,12 +307,20 @@ containers:
 ```
 
 Use writable volume mounts for application scratch space when the root filesystem
-is read-only. `fsGroup`, supplemental groups, SELinux, AppArmor, `Localhost` seccomp, Windows
+is read-only. `fsGroup`, supplemental groups and their `Merge`/`Strict` policies
+are supported through the short-lived guest filesystem helper. SELinux, AppArmor, `Localhost` seccomp, Windows
 security settings and privileged containers remain rejected. Omitting
 `allowPrivilegeEscalation` uses Kubernetes's permissive default; set it to `false`
 when the application should be unable to gain privileges through exec.
 
 ## Volumes
+
+For persistent data, use the opt-in
+[native local StorageClass](../../tools/microsandbox-pods/STORAGE.md). Its
+Filesystem RWO volumes retain data across Pod replacement and remain attached
+through RAM sleep. This local provisioner does not implement EBS or CSI. It
+enforces one Pod attachment at a time, including sleeping Pods, and supports
+`Delete` and `Retain` reclaim policies.
 
 ConfigMap and Secret directory mounts support `items`, nested relative paths,
 `optional`, `defaultMode`, per-item modes and binary data. These source volumes
@@ -376,17 +384,19 @@ RAM checkpoints contain mounted tokens and any copies in process memory.
 
 Sleeping Pods do not poll the API. Wake requests new tokens before restoring the
 VM and requires projection before forwarded traffic; running-controller recovery
-also refreshes identity before controller proxy routes reopen. Background application processes can
-read the snapshot's previous, possibly expired token before that refresh finishes.
-Projected directories update atomically; applications must reopen files.
+also refreshes identity before controller proxy routes reopen. For token-bearing
+Pods, capture freezes application processes and restartable init sidecars. Restore
+refreshes their projections before thawing those exact processes, so background
+applications read fresh projected files after resume. Tokens already cached by
+an application still depend on its normal refresh behavior. Projected directories
+update atomically; applications must reopen files.
 As in Kubernetes, `subPath` pins the selected file and does not rotate tokens.
 
 DownwardAPI supports Pod name, namespace, UID, labels and annotations, including
 individual label and annotation keys. Resource fields, ClusterTrustBundle,
-PodCertificate, PVC/CSI, host paths, mount propagation and recursive read-only
-options are rejected. Volume ownership settings
-such as `fsGroup` remain unsupported; the common process security settings above
-are supported.
+PodCertificate, CSI, host paths, mount propagation and recursive read-only
+options are rejected. `fsGroup` and supplemental groups are supported. Native
+local PVC limits are documented in the storage guide above.
 
 ## Image pull policy
 

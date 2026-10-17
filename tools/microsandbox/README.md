@@ -155,18 +155,21 @@ small enough to rebase while the Docker implementation continues to evolve.
   a Linux Docker container does not give it direct access to macOS's hypervisor.
   Publish and pin a helper release before adding a managed-image default.
 
-For eventual reuse with the on-demand branch, keep the native helper's operations
-generic: create, readiness, acquire/release activity, suspend, resume, stop,
+The native helper keeps its operations generic: create, readiness, acquire/release activity, suspend, resume, stop,
 inspect, and delete. RDS owns AWS pause eligibility and events; Kubernetes owns scheduling. Do not put those
-policies into the helper. A future on-demand adapter can invoke the same runtime
-operations while its existing wake sources remain awake.
+policies into the helper. The current on-demand adapters invoke these operations
+while HTTP and queue wake infrastructure stays available.
 
 Freezing a Kubernetes worker while its control plane continues running also
 requires handling health checks and eviction. The database experiment does not
 establish Kubernetes or EC2 support, or cross-host/cross-architecture snapshot
 portability. Linux qualification remains required separately from macOS.
 
-## Qualify individual Kubernetes workers
+## Historical individual-worker experiment
+
+The current implementation runs one VM per Pod through the shared
+[Pod controller](../microsandbox-pods/README.md). The earlier whole-worker
+experiment below is retained for investigation; it is not required for Pod setup.
 
 `worker_probe.py` uses only Python's standard library. It creates a disposable
 Docker k3s control plane and native microsandbox workers, leaving existing

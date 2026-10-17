@@ -10,9 +10,11 @@ availability is an explicit local Kubernetes policy.
 Native pods support default service-account automount, real Pod-bound TokenRequest
 projections, IRSA annotation injection and EKS Pod Identity routing. New identity
 checkpoints freeze application processes before capture and refresh projections
-before thaw. Validate these paths with real AWS SDK credential providers, allowed
-and denied operations, wrong audiences and subjects, and credentials expiring
-while asleep. Keep the shared controller and avoid a credential daemon per Pod.
+before thaw. The shared AWS SDK qualification exercises allowed and denied
+operations, wrong audiences and subjects, explicit credential precedence and
+identity refresh across sleep. Its optional ten-minute expiry wait checks renewal
+after projected tokens expire. This uses the shared controller without a
+credential daemon per Pod; see the dated validation record for completed runs.
 
 Reuse Floci's existing OIDC/STS and Pod Identity services. Explicit application
 credentials retain their AWS SDK precedence. Target-role chaining and downstream
@@ -21,8 +23,8 @@ The contracts are [EKS Pod Identity](https://docs.aws.amazon.com/eks/latest/user
 and [SDK credential precedence](https://docs.aws.amazon.com/sdk-for-java/latest/developer-guide/credentials-chain.html).
 
 Multiple application containers and restartable init sidecars are implemented.
-Persistent storage and networking compatibility remain priorities for ordinary
-Kubernetes application manifests.
+Local persistent volumes are implemented. Broader storage and networking
+compatibility remain priorities for ordinary Kubernetes application manifests.
 
 ## Kubernetes compatibility and capacity
 
@@ -48,15 +50,20 @@ Kubernetes application manifests.
   `subPathExpr` mounts are implemented in the current compatibility tranche.
 - Multiple regular containers, restartable init sidecars, projected service-account
   tokens, default automount, interactive exec/resize, localhost port-forward and
-  gRPC probes and AWS identity admission are implemented. Qualify the complete identity flow. Preserve
-  the shared controller and one VM per Pod seam instead of adding a kubelet to
-  every guest. `fsGroup` and supplemental groups are implemented. Remaining security work includes
+  gRPC probes and AWS identity admission are implemented. The shared SDK fixture
+  covers identity on both worker backends. Preserve the shared controller and
+  one VM per Pod seam instead of adding a kubelet to every guest. `fsGroup` and supplemental groups are implemented. Remaining security work includes
   privileged containers, custom seccomp, AppArmor and SELinux profiles.
 - Resource compatibility still needs Pod-level resources, in-place resizing,
   resource metrics, and resource types beyond CPU/memory. Runtime overhead is a
   separate local allocation reserve, not an application resource request.
-- Storage: add persistent volumes and a defined local CSI story;
-  then disk sizing, quotas and image/checkpoint storage accounting.
+- Storage: native root disk sizes are configurable and persisted. Shared disk
+  admission accounts for image caches, guest disks, checkpoints and outstanding
+  reservations, with an optional free-space reserve. It is admission control,
+  not a filesystem quota or automatic image/checkpoint pruning. The opt-in
+  [local persistent-volume provisioner](../microsandbox-pods/STORAGE.md) adds
+  node-bound Filesystem RWO disks, guarded single-Pod attachments and Delete/Retain
+  reclaim. CSI drivers, expansion and broader access modes remain unsupported.
 - Networking: environment egress isolation and simulator routing are implemented.
   Reconcile policy changes, then broaden
   NetworkPolicy and networking compatibility. DNS overrides alone do not prevent
@@ -65,8 +72,12 @@ Kubernetes application manifests.
 ## Aurora and other AWS workloads
 
 - The retained RDS provider runs PostgreSQL and MySQL, including Aurora Serverless v2
-  scale-to-zero. Remaining work includes engine/version eligibility checks for
-  Aurora auto-pause, storage sizing and backup limitations.
+  scale-to-zero. Aurora zero-capacity engine/version eligibility and configurable
+  native root disk sizing are implemented. Database recovery now checks durable
+  ownership and immutable VM/checkpoint identities without eagerly waking the
+  guest. AWS allocated-storage resizing and MySQL logical snapshots remain
+  unsupported. See the [recovery migration](AURORA_RECOVERY_MIGRATION.md) and
+  [engine-version migration](AURORA_VERSION_MIGRATION.md).
 - Native execution work is limited to Kubernetes pods and Aurora. EC2, Lambda,
   ECS and ElastiCache retain their existing backends. All new EC2 work is parked
   in `parked/microsandbox-ec2-20261017`; baseline EC2 remains unchanged.
@@ -76,15 +87,19 @@ Kubernetes application manifests.
 - Shared guest RAM admission now coordinates pod and host runtimes. Add working-set
   metrics and policies for workloads waiting on dependencies; do not evict active
   applications merely because another wake is queued.
-- Make interrupted native-command recovery automatic where ownership and runtime
-  outcome can be proved. Ambiguous outcomes must continue to fail closed.
-- Improve bulk Pod cleanup throughput. Virtual Kubelet can remove cold Pod API
+- Interrupted native commands now have durable terminal receipts. Startup clears
+  a receipt only after read-only proof of its owner and runtime outcome; it does
+  not replay mutations. Ambiguous outcomes continue to fail closed.
+- Kubernetes reconciliation now has eight workers by default, configurable from
+  one to 64 independently of VM-start admission. Virtual Kubelet can remove cold Pod API
   objects before provider cleanup finishes; deleting hundreds of pods queues
   relay and runtime ownership checks alongside new Pod starts. Zero active guest
-  RAM does not mean that cleanup queue has drained.
-- Provide repeatable installation, least-privilege cluster manifests, diagnostics
-  and explicit disk/RAM reporting. Shared image caching and checkpoint retention
-  policies are needed to bound disk use across hundreds of previously used apps.
+  RAM does not mean that cleanup queue has drained. Qualification now waits for
+  the owned Pod journals to disappear and records cleanup time.
+- The setup helper provides repeatable owned-cluster installation, a restricted
+  controller identity, certificate renewal, diagnostics and explicit shared
+  disk/RAM reporting. Shared admission bounds new operations; cache and checkpoint
+  retention policies still need explicit operator management.
 - Qualify Linux hosts as well as Apple Silicon, and test real application graphs,
   persistent client connections, concurrent wakes and failure recovery.
 
@@ -103,3 +118,13 @@ The SDK migration subsequently passed 53 native checks and 73 Java tests using
 five proxy-ready pods and two cold declarations. The 29 shared RDS cases passed
 on both Docker and microsandbox. EC2 qualification belongs to the parked branch. See the dated
 [validation record](VALIDATION.md) for platform coverage and remaining limits.
+
+The 17 October SDK-backed rerun passed 70 native checks with 500 proxy-ready
+replicas, selective Service/PodIP HTTP wake, recovery and complete ownership
+cleanup. A separate shared AWS SDK run passed both identity methods on Docker
+and native workers, plus expired projected-token renewal after native sleep.
+Generic explicit-host networking also passed a native smoke and Linux peer
+kernel checks. The shared persistent-volume fixture passed replacement,
+completed-Job writeback, Delete/Retain reclaim, native RAM restore and controller
+recovery. These results still do not establish mixed 500-application graphs or
+native Linux/KVM operation.

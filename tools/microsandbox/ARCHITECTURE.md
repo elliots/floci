@@ -29,7 +29,7 @@ is no resident DNS server or DNS sidecar per VM.
 
 | State | Active guest RAM | Other retained resources |
 |---|---|---|
-| Cold declaration | None | Resource metadata and shared wake routes |
+| Cold declaration | None | Resource metadata, shared wake routes and any bound PVC storage |
 | Running Kubernetes pod | One guest allocation for the whole pod | Guest kernel, containerd, application containers and declared init sidecars |
 | Running database | Database guest allocation | Guest kernel, database processes and stable proxy |
 | RAM-hibernated workload | None | Root disk, checkpoint, ownership metadata and wake routes |
@@ -63,7 +63,10 @@ set. Guest and host measurements are needed before lowering these defaults.
 
 Full RAM checkpoints trade memory for disk use and restore latency. Image caching,
 checkpoint retention, host page cache and filesystem allocation also matter.
-They need explicit accounting alongside VM allocations.
+Shared disk admission now accounts for cached images, guest disks, checkpoints
+and outstanding reservations, with an optional free-space reserve. This is
+conservative admission accounting, not a filesystem quota or an automatic
+retention policy.
 
 The existing 500-pod fixture validates one synthetic application shape, cold
 deployment, selective wake and recovery. It does not establish the footprint or
