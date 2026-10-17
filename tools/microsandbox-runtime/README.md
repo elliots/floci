@@ -129,6 +129,9 @@ external runtime mutators.
 `PrepareAdmission` reserves before a compound restore deletes its stopped source.
 Its opaque permit binds the target, command hash, source identity and checkpoint
 identity, digest and captured memory size. `ExecuteAdmitted` consumes it once.
+Restore revalidation opens the original checkpoint selector and verifies its
+immutable ID, digest and memory size. A raw checkpoint ID can be ambiguous when
+microsandbox retains multiple local copies.
 New snapshot captures record geometry privately; legacy checkpoints without a
 geometry record are rejected before admission. Recreate checkpoints after upgrading.
 `ErrCapacityUnavailable` proves that this command was not dispatched. Callers

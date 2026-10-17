@@ -101,6 +101,48 @@ func TestCapacityPermitBindsArgumentsAndSnapshotIdentity(t *testing.T) {
 	}
 }
 
+func TestCapacityRestoreReopensOriginalSelectorAndRevalidatesImmutableIdentity(t *testing.T) {
+	for _, changed := range []string{"", "id", "digest", "memory"} {
+		t.Run("changed="+changed, func(t *testing.T) {
+			guests := []capacityGuest{{ID: "source-id", Name: "source", Status: "stopped", MemoryMiB: 512}}
+			m := fakeCapacity(t.TempDir(), CapacityLimits{MemoryMiB: 1024}, &guests)
+			snapshot := capacitySnapshot{ID: "snap-immutable-id", Digest: "immutable", MemoryMiB: 512}
+			reads := 0
+			m.snapshot = func(_ context.Context, selector string) (capacitySnapshot, error) {
+				if selector != "source:sleep" {
+					return capacitySnapshot{}, errors.New("snapshot identity is ambiguous across local copies")
+				}
+				reads++
+				return snapshot, nil
+			}
+			args := []string{"snap", "restore", "source:sleep", "--name", "source"}
+			token, err := prepareCapacity(t, m, args, "source")
+			if err != nil {
+				t.Fatal(err)
+			}
+			guests = nil
+			switch changed {
+			case "id":
+				snapshot.ID = "replacement-id"
+			case "digest":
+				snapshot.Digest = "replacement-digest"
+			case "memory":
+				snapshot.MemoryMiB = 1024
+			}
+			err = m.dispatch(t.Context(), token, args)
+			if changed == "" && err != nil {
+				t.Fatal("unchanged checkpoint was not admitted through its original selector", err)
+			}
+			if changed != "" && err == nil {
+				t.Fatal("changed checkpoint identity was admitted")
+			}
+			if reads != 2 {
+				t.Fatalf("expected original selector to be opened before and after source removal, got %d reads", reads)
+			}
+		})
+	}
+}
+
 func TestCapacityUnknownDispatchSurvivesRestartAndCannotExpire(t *testing.T) {
 	var guests []capacityGuest
 	home := t.TempDir()

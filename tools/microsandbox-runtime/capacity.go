@@ -270,8 +270,12 @@ func (m *capacityManager) dispatch(ctx context.Context, token string, args []str
 			}
 		}
 		if p.SnapshotID != "" {
-			snapshot, err := m.snapshot(ctx, p.SnapshotID)
-			if err != nil || snapshot.Digest != p.SnapshotDigest || snapshot.MemoryMiB != p.MemoryMiB {
+			request, err := parse(args)
+			if err != nil {
+				return err
+			}
+			snapshot, err := m.snapshot(ctx, request.selector)
+			if err != nil || snapshot.ID != p.SnapshotID || snapshot.Digest != p.SnapshotDigest || snapshot.MemoryMiB != p.MemoryMiB {
 				return errors.Join(errors.New("native checkpoint changed"), err)
 			}
 		}
