@@ -29,6 +29,8 @@ func run(args []string, input io.Reader, output io.Writer) error {
 		return errors.New("usage: network-relay serve|client|probe|connect [flags]")
 	}
 	switch args[0] {
+	case "policy":
+		return configurePolicy(args[1:])
 	case "connect":
 		return connectStdio(args[1:], input, output)
 	case "probe":
