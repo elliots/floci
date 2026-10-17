@@ -12,13 +12,17 @@ import java.util.Optional;
 public class NetworkConfiguration {
     private final NetworkDefinition network;
     private final boolean configured;
+    private final String fingerprint;
     private volatile String gatewayAddress;
 
     @Inject
     public NetworkConfiguration(EmulatorConfig config) {
         Optional<String> path = config.network().configFile();
         configured = path.isPresent();
-        network = path.map(value -> NetworkConfigLoader.load(Path.of(value))).orElse(NetworkDefinition.DISABLED);
+        NetworkConfigLoader.LoadedNetwork loaded = path.map(value -> NetworkConfigLoader.loadWithFingerprint(Path.of(value)))
+                .orElse(new NetworkConfigLoader.LoadedNetwork(NetworkDefinition.DISABLED, ""));
+        network = loaded.network();
+        fingerprint = loaded.fingerprint();
         if (network.isolated() && "kubernetes".equals(config.services().lambda().executor())) {
             throw new IllegalArgumentException("Workload isolation does not support the external Kubernetes Lambda executor; "
                     + "use the Docker executor");
@@ -31,6 +35,10 @@ public class NetworkConfiguration {
 
     public NetworkDefinition network() {
         return network;
+    }
+
+    public String fingerprint() {
+        return fingerprint;
     }
 
     public Optional<String> gatewayAddress() {

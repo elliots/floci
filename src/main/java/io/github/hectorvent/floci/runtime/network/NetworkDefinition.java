@@ -1,5 +1,7 @@
 package io.github.hectorvent.floci.runtime.network;
 
+import io.github.hectorvent.floci.core.common.CidrCanonicalizer;
+
 import java.net.URI;
 import java.util.Comparator;
 import java.util.List;
@@ -7,11 +9,47 @@ import java.util.Locale;
 import java.util.Optional;
 
 /** Network isolation policy and origin routes. */
-public record NetworkDefinition(boolean isolated, List<Route> routes) {
+public record NetworkDefinition(boolean isolated, List<Route> routes, List<Egress> allowedEgress) {
     public static final NetworkDefinition DISABLED = new NetworkDefinition(false, List.of());
 
     public NetworkDefinition {
         routes = List.copyOf(routes);
+        allowedEgress = List.copyOf(allowedEgress);
+    }
+
+    public NetworkDefinition(boolean isolated, List<Route> routes) {
+        this(isolated, routes, List.of());
+    }
+
+    /** An explicit address and transport exception, without authorizing public DNS resolution. */
+    public record Egress(String destination, String protocol, String ports) {
+        public Egress {
+            if (destination == null || !destination.matches("[0-9]{1,3}(\\.[0-9]{1,3}){3}/[0-9]{1,2}")
+                    || !destination.equals(CidrCanonicalizer.canonicalize(destination).orElse(""))
+                    || destination.endsWith("/0")) {
+                throw new IllegalArgumentException("Egress destination must be a canonical IPv4 CIDR with a nonzero prefix");
+            }
+            String address = destination.substring(0, destination.indexOf('/'));
+            for (String excluded : List.of("0.0.0.0/8", "127.0.0.0/8", "169.254.0.0/16", "224.0.0.0/4", "240.0.0.0/4")) {
+                if (CidrCanonicalizer.contains(excluded, address)
+                        || CidrCanonicalizer.contains(destination, excluded.substring(0, excluded.indexOf('/')))) {
+                    throw new IllegalArgumentException("Egress destination overlaps an unspecified, loopback, link-local or reserved range");
+                }
+            }
+            if (!"tcp".equals(protocol) && !"udp".equals(protocol)) {
+                throw new IllegalArgumentException("Egress protocol must be tcp or udp");
+            }
+            if (ports == null || !ports.matches("[1-9][0-9]{0,4}(-[1-9][0-9]{0,4})?")) {
+                throw new IllegalArgumentException("Egress ports must be a port or ordered port range");
+            }
+            String[] range = ports.split("-", 2);
+            int first = Integer.parseInt(range[0]);
+            int last = Integer.parseInt(range[range.length - 1]);
+            if (first > last || last > 65535) {
+                throw new IllegalArgumentException("Egress ports must be between 1 and 65535 in ascending order");
+            }
+            ports = first == last ? Integer.toString(first) : first + "-" + last;
+        }
     }
 
     /**

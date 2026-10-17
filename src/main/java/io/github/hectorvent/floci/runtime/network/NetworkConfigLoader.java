@@ -6,11 +6,16 @@ import com.fasterxml.jackson.databind.ObjectMapper;
 import com.fasterxml.jackson.dataformat.yaml.YAMLFactory;
 
 import java.io.IOException;
+import java.io.InputStream;
 import java.net.URI;
+import java.nio.file.Files;
 import java.nio.file.Path;
+import java.security.MessageDigest;
+import java.security.NoSuchAlgorithmException;
 import java.util.ArrayList;
 import java.util.HashMap;
 import java.util.HashSet;
+import java.util.HexFormat;
 import java.util.List;
 import java.util.Locale;
 import java.util.Map;
@@ -21,19 +26,31 @@ public final class NetworkConfigLoader {
     private NetworkConfigLoader() {}
 
     public static NetworkDefinition load(Path file) {
-        try {
-            return parse(new ObjectMapper(new YAMLFactory().enable(JsonParser.Feature.STRICT_DUPLICATE_DETECTION))
-                    .readTree(file.toFile()));
-        } catch (IOException e) {
+        return loadWithFingerprint(file).network();
+    }
+
+    static LoadedNetwork loadWithFingerprint(Path file) {
+        try (InputStream input = Files.newInputStream(file)) {
+            byte[] content = input.readNBytes(1_048_577);
+            if (content.length > 1_048_576) {
+                throw new IllegalArgumentException("Network configuration exceeds 1 MiB");
+            }
+            NetworkDefinition network = parse(new ObjectMapper(new YAMLFactory().enable(JsonParser.Feature.STRICT_DUPLICATE_DETECTION))
+                    .readTree(content));
+            return new LoadedNetwork(network, HexFormat.of().formatHex(MessageDigest.getInstance("SHA-256").digest(content)));
+        } catch (IOException | NoSuchAlgorithmException e) {
             throw new IllegalArgumentException("Cannot read network configuration: " + file, e);
         }
     }
 
+    record LoadedNetwork(NetworkDefinition network, String fingerprint) {}
+
     static NetworkDefinition parse(JsonNode root) {
         fields(root, "configuration", Set.of("network"));
         JsonNode node = root.path("network");
-        fields(node, "network", Set.of("isolation", "routes", "native"));
+        fields(node, "network", Set.of("isolation", "routes", "native", "allowed-egress"));
         nativeConfiguration(node.path("native"));
+        List<NetworkDefinition.Egress> allowedEgress = allowedEgress(node.path("allowed-egress"));
         JsonNode isolation = node.path("isolation");
         if (!isolation.isMissingNode()) {
             fields(isolation, "network.isolation", Set.of("enabled"));
@@ -41,7 +58,7 @@ public final class NetworkConfigLoader {
         boolean enabled = bool(isolation, "enabled", false);
         JsonNode routes = node.path("routes");
         if (routes.isMissingNode()) {
-            return new NetworkDefinition(enabled, List.of());
+            return new NetworkDefinition(enabled, List.of(), allowedEgress);
         }
         object(routes, "network.routes");
         Set<URI> seen = new HashSet<>();
@@ -91,13 +108,28 @@ public final class NetworkConfigLoader {
             URI backend = networkOrigin(text(target, "backend-url"), name);
             result.add(new NetworkDefinition.Route(name, origins, wildcards, backend, bool(target, "preserve-host", false)));
         }
-        NetworkDefinition network = new NetworkDefinition(enabled, result);
+        NetworkDefinition network = new NetworkDefinition(enabled, result, allowedEgress);
         for (NetworkDefinition.Route route : result) {
             if (hosts.contains(route.backendUrl().getHost()) || network.owns(route.backendUrl().getHost())) {
                 throw invalid(route.name(), "backend-url resolves to a network gateway hostname");
             }
         }
         return network;
+    }
+
+    private static List<NetworkDefinition.Egress> allowedEgress(JsonNode endpoints) {
+        if (endpoints.isMissingNode()) {
+            return List.of();
+        }
+        if (!endpoints.isArray()) {
+            throw invalid("network.allowed-egress", "must be an array");
+        }
+        List<NetworkDefinition.Egress> result = new ArrayList<>();
+        for (JsonNode endpoint : endpoints) {
+            fields(endpoint, "egress endpoint", Set.of("destination", "protocol", "ports"));
+            result.add(new NetworkDefinition.Egress(text(endpoint, "destination"), text(endpoint, "protocol"), text(endpoint, "ports")));
+        }
+        return result;
     }
 
     private static void nativeConfiguration(JsonNode node) {

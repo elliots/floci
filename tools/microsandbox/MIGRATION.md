@@ -1095,3 +1095,20 @@ or `ALL`. This is separate from the environment's destination allowlist and
 simulator routing. Older managers reject the record; retain the matching tools
 when restarting or renewing credentials. The manager never deletes the shared
 Floci environment or isolation helper when destroying its owned empty cluster.
+
+## Explicit environment egress and protected-peer metadata
+
+`network.allowed-egress` now accepts explicit public or private IPv4 CIDRs, TCP/UDP and a
+single port or inclusive port range. Unlisted traffic remains denied. Existing
+`network.native.allowed-egress` keeps its native-local meaning. Configure local Route 53 A
+records when an allowed external service needs a hostname: the shared address exception does
+not turn on public DNS forwarding or follow changing hostname addresses. Explicit DNS-server
+address/port rules are supported, with no default DNS exception.
+
+Restart Floci with the same resource namespace and network configuration file to upgrade the
+existing isolation helper. Successful policy installation publishes the exact-file fingerprint
+and protected bridge metadata in the helper, and adds empty exact native transport tuple sets.
+Subsequent policy refresh preserves registrations owned by the native controller. An
+incompatible existing tuple-set schema fails installation instead of replacing its contents.
+Native controller versions requiring this contract refuse older or mismatched helpers. No
+AWS endpoint, response shape or application sidecar is added.

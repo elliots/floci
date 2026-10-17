@@ -45,18 +45,23 @@ class NetworkIsolationDockerIntegrationTest {
                         .withConfig(new Network.Ipam.Config().withSubnet(ipv6Prefix + ":1::/64"))).exec().getId();
         String externalNetwork = docker.createNetworkCmd().withName("floci-outside-test-" + suffix)
                 .withEnableIpv6(true).withIpam(new Network.Ipam()
-                        .withConfig(new Network.Ipam.Config().withSubnet(ipv6Prefix + ":2::/64"))).exec().getId();
+                        .withConfig(new Network.Ipam.Config().withSubnet("198.18." + Integer.parseInt(suffix.substring(0, 2), 16) + ".0/24"),
+                                new Network.Ipam.Config().withSubnet(ipv6Prefix + ":2::/64"))).exec().getId();
         List<String> containers = new ArrayList<>();
         String helper = null;
         try {
-            helper = create(containers, "host", false, "sleep", "2147483647");
+            helper = create(containers, "host", false, "sh", "-c",
+                    "socat -d -d TCP4-LISTEN:0,fork,reuseaddr EXEC:cat 2>/tmp/native-tcp.log & "
+                            + "socat -d -d UDP4-RECVFROM:0,fork,reuseaddr EXEC:cat 2>/tmp/native-udp.log & wait");
             String client = create(containers, protectedNetwork, true, "sleep", "2147483647");
+            String otherClient = create(containers, protectedNetwork, false, "sleep", "2147483647");
             String local = create(containers, protectedNetwork, false, "socat", "TCP6-LISTEN:8080,ipv6only=0,fork,reuseaddr", "EXEC:cat");
             ExposedPort port = ExposedPort.tcp(8080);
             String external = docker.createContainerCmd("floci/network-helper:local")
                     .withExposedPorts(port).withHostConfig(HostConfig.newHostConfig().withNetworkMode(externalNetwork)
                             .withPortBindings(new PortBinding(Ports.Binding.bindPort(0), port)))
-                    .withCmd("socat", "TCP6-LISTEN:8080,ipv6only=0,fork,reuseaddr", "EXEC:cat").exec().getId();
+                    .withCmd("sh", "-c", "socat TCP6-LISTEN:8080,ipv6only=0,fork,reuseaddr EXEC:cat & "
+                            + "socat TCP6-LISTEN:8081,ipv6only=0,fork,reuseaddr EXEC:cat & wait").exec().getId();
             containers.add(external);
             docker.startContainerCmd(external).exec();
             String localAddress = address(local);
@@ -69,9 +74,9 @@ class NetworkIsolationDockerIntegrationTest {
             String publishedPort = docker.inspectContainerCmd(external).exec().getNetworkSettings().getPorts()
                     .getBindings().get(port)[0].getHostPortSpec();
             assertEquals(0, connect(client, host, publishedPort).exitCode(), "Host-published destination starts reachable");
-            String rules = NetworkIsolationRules.compile(table, List.of("br-" + protectedNetwork.substring(0, 12)));
-            RetryingTarCopier.copyBytes(docker, helper, "/tmp", "isolation.nft", rules.getBytes(StandardCharsets.UTF_8), 0600);
-            ContainerExec.Result applied = run(helper, "nft", "-f", "/tmp/isolation.nft");
+            String bridge = "br-" + protectedNetwork.substring(0, 12);
+            String rules = NetworkIsolationRules.compile(table, List.of(bridge));
+            ContainerExec.Result applied = apply(helper, rules);
             assertEquals(0, applied.exitCode(), applied.summary());
             assertEquals(0, connect(client, localAddress).exitCode(), "Local simulator remains reachable");
             assertEquals(0, connect(client, localIpv6).exitCode(), "Local IPv6 simulator remains reachable");
@@ -85,6 +90,45 @@ class NetworkIsolationDockerIntegrationTest {
             assertEquals(0, run(client, "nft", "flush", "ruleset").exitCode());
             assertNotEquals(0, connect(client, externalAddress).exitCode(), "Node firewall changes must not reopen egress");
             assertEquals(0, connect(client, localAddress).exitCode());
+            String hostTcp = listenerPort(helper, "/tmp/native-tcp.log");
+            String hostUdp = listenerPort(helper, "/tmp/native-udp.log");
+            assertNotEquals(0, connect(client, host, hostTcp).exitCode(), "Native listeners are denied until registered");
+            String tcpTuple = "{ " + address(client) + " . " + host + " . " + hostTcp + " }";
+            String udpTuple = "{ " + address(client) + " . " + host + " . " + hostUdp + " }";
+            assertEquals(0, run(helper, "nft", "add", "element", "inet", table, "native_tcp", tcpTuple).exitCode());
+            assertEquals(0, run(helper, "nft", "add", "element", "inet", table, "native_udp", udpTuple).exitCode());
+            assertEquals(0, connect(client, host, hostTcp).exitCode(), "Only the registered native TCP listener opens");
+            assertEquals("allowed", udpEcho(client, host, hostUdp).stdout().strip());
+            assertNotEquals(0, connect(otherClient, host, hostTcp).exitCode(), "Another source cannot use a native tuple");
+            assertEquals("", udpEcho(otherClient, host, hostUdp).stdout().strip());
+            assertNotEquals(0, connect(client, host, publishedPort).exitCode(), "Another host port remains denied");
+            assertEquals(0, apply(helper, rules).exitCode(), "Repeated protect must preserve native tuple sets atomically");
+            assertEquals(0, connect(client, host, hostTcp).exitCode());
+            assertEquals("allowed", udpEcho(client, host, hostUdp).stdout().strip());
+            assertEquals(0, run(helper, "nft", "delete", "element", "inet", table, "native_tcp", tcpTuple).exitCode());
+            assertEquals(0, run(helper, "nft", "delete", "element", "inet", table, "native_udp", udpTuple).exitCode());
+            assertNotEquals(0, connect(client, host, hostTcp).exitCode(), "Removing a registration revokes it");
+            assertEquals("", udpEcho(client, host, hostUdp).stdout().strip());
+
+            String allowed = NetworkIsolationRules.compile(table, List.of(bridge), List.of(
+                    new NetworkDefinition.Egress(externalAddress + "/32", "tcp", "8080")));
+            assertEquals(0, apply(helper, allowed).exitCode());
+            assertEquals(0, connect(client, externalAddress).exitCode(), "Explicit non-private destination is permitted");
+            assertNotEquals(0, connect(client, externalAddress, "8081").exitCode(), "A listening unlisted port stays denied");
+            assertNotEquals(0, connect(client, externalIpv6).exitCode(), "An IPv4 exception does not authorize IPv6");
+            assertEquals(0, apply(helper, rules).exitCode());
+            assertNotEquals(0, connect(client, externalAddress).exitCode(), "Removing global permission revokes it");
+
+            String incompatible = table + "bad";
+            try {
+                assertEquals(0, run(helper, "nft", "add", "table", "inet", incompatible).exitCode());
+                assertEquals(0, run(helper, "nft", "add", "set", "inet", incompatible, "native_tcp",
+                        "{ type ipv4_addr; }").exitCode());
+                assertNotEquals(0, apply(helper, NetworkIsolationRules.compile(incompatible, List.of(bridge))).exitCode(),
+                        "An incompatible existing tuple set must fail policy installation");
+            } finally {
+                run(helper, "nft", "delete", "table", "inet", incompatible);
+            }
             assertEquals(0, run(helper, "nft", "delete", "table", "inet", table).exitCode());
             assertEquals(0, connect(client, host, publishedPort).exitCode(), "Removing only our policy restores connectivity");
         } finally {
@@ -97,6 +141,22 @@ class NetworkIsolationDockerIntegrationTest {
             docker.removeNetworkCmd(protectedNetwork).exec();
             docker.removeNetworkCmd(externalNetwork).exec();
         }
+    }
+
+    private ContainerExec.Result apply(String helper, String rules) {
+        RetryingTarCopier.copyBytes(docker, helper, "/tmp", "isolation.nft", rules.getBytes(StandardCharsets.UTF_8), 0600);
+        return run(helper, "nft", "-f", "/tmp/isolation.nft");
+    }
+
+    private String listenerPort(String helper, String path) {
+        String output = run(helper, "cat", path).stdout();
+        String listening = output.lines().filter(line -> line.contains("listening on") || line.contains("bound to"))
+                .findFirst().orElseThrow(() -> new AssertionError("Listener did not bind: " + output));
+        return listening.substring(listening.lastIndexOf(':') + 1).strip();
+    }
+
+    private ContainerExec.Result udpEcho(String client, String address, String port) {
+        return run(client, "sh", "-c", "printf allowed | socat -T1 - UDP4-DATAGRAM:" + address + ":" + port);
     }
 
     private String create(List<String> containers, String network, boolean privileged, String... command) {

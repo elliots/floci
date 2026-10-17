@@ -2,7 +2,7 @@
 
 Floci can resolve third-party hostnames locally and send their HTTP or HTTPS requests to your
 simulators. Optional network isolation blocks connections outside the environment's Docker
-networks and the native runtime's explicit local destinations. Isolation is disabled by
+networks except explicitly permitted destinations. Isolation is disabled by
 default and is independent of AWS security-group rules.
 
 Set `FLOCI_NETWORK_CONFIG_FILE` to the network YAML or JSON file. Floci reads and validates
@@ -51,6 +51,39 @@ Successful backend lookups are cached for one second, with at most 1,024 hostnam
 After expiry, Floci checks network membership again; failed lookups never reuse expired answers.
 A replaced container's old address can remain cached for up to one second. Requests are not
 automatically replayed if that address stops accepting connections.
+
+## Allow selected external destinations
+
+Add explicit exceptions under `network.allowed-egress`. They apply to Docker workloads and
+native microVMs using the same configuration file, while unlisted destinations remain denied:
+
+```yaml
+network:
+  isolation:
+    enabled: true
+  allowed-egress:
+    - destination: "203.0.113.17/32"
+      protocol: tcp
+      ports: "443"
+    - destination: "10.20.0.0/16"
+      protocol: udp
+      ports: "4000-4010"
+```
+
+Replace the example addresses with the service addresses you trust. Both public and private
+IPv4 destinations are supported. CIDRs must be canonical, with a prefix from 1 to 32 and no
+host bits. The unspecified, loopback, link-local, multicast and reserved address ranges are
+rejected, including larger prefixes overlapping them. `host` is reserved for native-local
+transport configuration and is not a global destination. Protocols are `tcp` or `udp`; ports
+are a decimal port or ordered inclusive range from 1 to 65535. IPv6 exceptions are not supported.
+
+These are address and port permissions. They do not authenticate a hostname or authorize every
+address later returned for it. Floci's resolver still answers simulator names and local records,
+and rejects unknown external names. Create local Route 53 A records for approved external
+services, or connect to their explicitly allowed addresses. Dynamic hostname authorization and
+public DNS forwarding are not enabled by an address exception. If your application needs a
+separate DNS server, explicitly allow that server's address and TCP/UDP port like any other
+service. There is no blanket exception for DNS traffic.
 
 ## Forward to an on-demand simulator
 
@@ -184,9 +217,10 @@ containers attach to their protected network before they start. Security groups 
 separate policy and cannot reopen outbound access through this boundary.
 
 Connections within protected networks and replies to incoming connections remain possible.
-New connections to other networks, the Docker host, or the internet are dropped. Direct IP
-connections, alternative DNS servers, and changes to a node's own firewall cannot bypass the
-outer bridge policy. Dedicated networks are required because every container on those bridges,
+New connections to other networks, the Docker host, or the internet are dropped unless an
+explicit address and port rule permits them. Direct IP connections, unlisted DNS servers, and
+changes to a node's own firewall cannot bypass the outer bridge policy. Dedicated networks are
+required because every container on those bridges,
 including independently started simulators, is affected. Do not attach those containers to
 additional unprotected networks or expose Docker administration to application workloads.
 
@@ -196,6 +230,15 @@ unmapped origins are rejected. Public DNS forwarding and Route 53 Resolver forwa
 are disabled in this mode. Existing local DNS records still resolve. Logs omit HTTP headers
 and bodies. Source addresses identify connections; shared resolvers, caches, and Kubernetes
 NAT can prevent attribution to an individual application or pod.
+
+The helper publishes private enforcement metadata at `/etc/floci/network-policy.json` only
+after installing the policy. Version 1 records its owner, nftables table, SHA-256 fingerprint
+of the exact configuration bytes, and protected Docker network IDs and bridge names. The
+native controller checks this metadata against the live Docker topology and firewall before
+using a shared Kubernetes peer. The helper declares initially empty `native_tcp` and `native_udp`
+sets for exact peer IPv4, host IPv4 and listener-port registrations. Policy refresh atomically
+rebuilds only the owned chains and preserves these registrations; it never grants whole-host
+access. This metadata is an internal helper contract, not an AWS API.
 
 The monitor continues writing Docker logs and the kernel policy remains installed when Floci
 stops, so surviving workloads do not regain external access. To disable isolation,

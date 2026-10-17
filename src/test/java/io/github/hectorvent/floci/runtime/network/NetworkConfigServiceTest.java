@@ -105,6 +105,46 @@ class NetworkConfigServiceTest {
         }
     }
 
+    @Test
+    void explicitPrivateAndPublicEgressPreserveDefaultDenyAndSimulatorRoutes() throws Exception {
+        NetworkDefinition network = parse(CONFIG + """
+                  allowed-egress:
+                    - destination: 203.0.113.17/32
+                      protocol: tcp
+                      ports: "443"
+                    - destination: 10.20.0.0/16
+                      protocol: udp
+                      ports: "4000-4010"
+                """);
+        assertTrue(network.isolated());
+        assertEquals(1, network.routes().size());
+        assertEquals(List.of(new NetworkDefinition.Egress("203.0.113.17/32", "tcp", "443"),
+                new NetworkDefinition.Egress("10.20.0.0/16", "udp", "4000-4010")), network.allowedEgress());
+        assertFalse(network.owns("unlisted.public.test"));
+        assertEquals("53", new NetworkDefinition.Egress("203.0.113.17/32", "udp", "53").ports());
+        assertEquals("853", new NetworkDefinition.Egress("203.0.113.17/32", "tcp", "853-853").ports());
+        assertEquals(1, parse("network: {allowed-egress: [{destination: 198.51.100.0/24, protocol: tcp, ports: '80-443'}]}")
+                .allowedEgress().size());
+    }
+
+    @Test
+    void egressRejectsAmbiguousDestinationsAndInjectionBeforeRuleCompilation() {
+        for (String destination : List.of("203.0.113.17", "203.0.113.17/24", "203.0.113.256/32", "203.0.113.17/33",
+                "0.0.0.0/0", "0.0.0.0/8", "127.0.0.1/32", "126.0.0.0/7", "169.254.0.0/16",
+                "224.0.0.0/4", "240.0.0.0/4", "255.255.255.255/32", "::/1", "host", "public.test", "203.0.113.17/32; accept")) {
+            assertThrows(IllegalArgumentException.class, () -> new NetworkDefinition.Egress(destination, "tcp", "443"), destination);
+        }
+        for (String ports : List.of("", "0", "65536", "443-80", "1-65536", "80,443", "443 accept", "0443")) {
+            assertThrows(IllegalArgumentException.class, () -> new NetworkDefinition.Egress("203.0.113.17/32", "tcp", ports), ports);
+        }
+        for (String protocol : List.of("all", "icmp", "TCP", "tcp;accept")) {
+            assertThrows(IllegalArgumentException.class, () -> new NetworkDefinition.Egress("203.0.113.17/32", protocol, "443"), protocol);
+        }
+        assertThrows(IllegalArgumentException.class, () -> parse("network: {allowed-egress: {destination: 203.0.113.17/32}}"));
+        assertThrows(IllegalArgumentException.class,
+                () -> parse("network: {allowed-egress: [{destination: 203.0.113.17/32, protocol: tcp, ports: '443', hostname: test}]}"));
+    }
+
     private static NetworkDefinition parse(String yaml) throws Exception {
         return NetworkConfigLoader.parse(new ObjectMapper(new YAMLFactory()).readTree(yaml));
     }

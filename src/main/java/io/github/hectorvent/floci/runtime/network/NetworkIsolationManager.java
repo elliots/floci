@@ -1,5 +1,7 @@
 package io.github.hectorvent.floci.runtime.network;
 
+import com.fasterxml.jackson.core.JsonProcessingException;
+import com.fasterxml.jackson.databind.ObjectMapper;
 import com.github.dockerjava.api.DockerClient;
 import com.github.dockerjava.api.command.InspectContainerResponse;
 import com.github.dockerjava.api.exception.NotFoundException;
@@ -54,6 +56,7 @@ public class NetworkIsolationManager {
     private static final String CA_DIRECTORY = "/etc/floci/certs";
     private static final String OWNER_LABEL = "floci.network.owner";
     private static final String TABLE_LABEL = "floci.network.table";
+    private static final ObjectMapper MAPPER = new ObjectMapper();
 
     private final NetworkConfiguration configuration;
     private final EmulatorConfig config;
@@ -64,7 +67,7 @@ public class NetworkIsolationManager {
     private final Instance<FlociCertificateAuthority> authority;
     private final ContainerLogStreamer logs;
     private final Instance<EmbeddedDnsServer> dns;
-    private final Map<String, String> bridges = new LinkedHashMap<>();
+    private final Map<String, ProtectedBridge> bridges = new LinkedHashMap<>();
     private final BackendAddressCache backendAddresses = new BackendAddressCache(
             Duration.ofSeconds(1), 1024, System::nanoTime);
     private String helper;
@@ -317,7 +320,8 @@ public class NetworkIsolationManager {
         }
         boolean added = !bridges.containsKey(network.getId());
         remember(network);
-        String script = NetworkIsolationRules.compile(table, bridges.values());
+        String script = NetworkIsolationRules.compile(table, bridges.values().stream().map(ProtectedBridge::bridge).toList(),
+                configuration.network().allowedEgress());
         RetryingTarCopier.copyBytes(docker, helper, "/tmp", "floci-isolation.nft",
                 script.getBytes(StandardCharsets.UTF_8), 0600);
         ContainerExec.Result result = ContainerExec.run(docker, helper,
@@ -325,15 +329,39 @@ public class NetworkIsolationManager {
         if (result.exitCode() != 0 || result.timedOut()) {
             throw new IllegalStateException("Cannot enforce workload isolation: " + result.summary());
         }
+        RetryingTarCopier.copyBytes(docker, helper, "/etc/floci", ".network-policy.json.tmp", policyContract(), 0600);
+        ContainerExec.Result published = ContainerExec.run(docker, helper,
+                new String[]{"mv", "-f", "/etc/floci/.network-policy.json.tmp", "/etc/floci/network-policy.json"}, 15);
+        if (published.exitCode() != 0 || published.timedOut()) {
+            throw new IllegalStateException("Cannot publish workload isolation metadata: " + published.summary());
+        }
         if (added || !initialized) {
-            LOG.infov("Network isolation protected network={0} bridge={1}", network.getName(), bridges.get(network.getId()));
+            LOG.infov("Network isolation protected network={0} bridge={1}", network.getName(), bridges.get(network.getId()).bridge());
         }
     }
 
     private void remember(Network network) {
         String bridge = network.getOptions() == null ? null : network.getOptions().get("com.docker.network.bridge.name");
-        bridges.put(network.getId(), bridge == null ? "br-" + network.getId().substring(0, 12) : bridge);
+        bridges.put(network.getId(), new ProtectedBridge(network.getName(), network.getId(),
+                bridge == null ? "br-" + network.getId().substring(0, 12) : bridge));
     }
+
+    private byte[] policyContract() {
+        Map<String, Object> contract = new LinkedHashMap<>();
+        contract.put("version", 1);
+        contract.put("owner", ContainerStorageHelper.ownerIdentity(config));
+        contract.put("table", table);
+        contract.put("fingerprint", configuration.fingerprint());
+        contract.put("bridges", bridges.values().stream().map(bridge -> Map.of(
+                "name", bridge.name(), "networkId", bridge.networkId(), "bridge", bridge.bridge())).toList());
+        try {
+            return MAPPER.writeValueAsBytes(contract);
+        } catch (JsonProcessingException e) {
+            throw new IllegalStateException("Cannot serialize network policy contract", e);
+        }
+    }
+
+    private record ProtectedBridge(String name, String networkId, String bridge) {}
 
     private Network requireBridge(String name) {
         Network network = docker.inspectNetworkCmd().withNetworkId(name).exec();
