@@ -91,6 +91,7 @@ type podEntry struct {
 	done                                             chan struct{}
 	created                                          bool
 	applicationMissingSince                          time.Time
+	sharedAdmissionRetry                             time.Time
 	volumeDigests                                    map[string][32]byte
 	volumesChecked                                   time.Time
 	initialVolumes                                   map[string]map[string]volumeFile

@@ -1025,3 +1025,12 @@ virtual node's advertised allocatable capacity, as Kubernetes does. This is not
 the guest's RAM allocation or the shared VM budget's current free capacity. See
 [Pod operations](../microsandbox-pods/OPERATIONS.md) for accepted handlers, log
 bounds, and remaining explicit compatibility limitations.
+
+## Shared-capacity HTTP waiting
+
+Pod HTTP wake requests now wait within their existing request deadline when the
+shared native budget is occupied by Aurora or another runtime client. A known
+pre-dispatch admission refusal leaves the Pod cold or sleeping, releases local
+start/RAM permits, and retries at most once per 250 ms per Pod. Concurrent HTTP
+requests share that retry deadline. Unknown native outcomes and other failures
+remain errors and are never replayed by this wait path.

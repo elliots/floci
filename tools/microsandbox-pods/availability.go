@@ -9,6 +9,7 @@ import (
 	"sync"
 	"time"
 
+	msbruntime "github.com/floci-io/floci/tools/microsandbox-runtime"
 	corev1 "k8s.io/api/core/v1"
 )
 
@@ -161,11 +162,17 @@ func (p *provider) acquireProxyActivity(ctx context.Context, e *podEntry, backen
 			e.op.Unlock()
 			return "", release, errors.New("pod availability route is unavailable")
 		}
-		if e.state == "COLD" || e.state == "SLEEPING" {
+		if (e.state == "COLD" || e.state == "SLEEPING") && !time.Now().Before(e.sharedAdmissionRetry) {
 			if err := p.resume(ctx, e); err != nil {
-				slog.Warn("pod request activation failed", "namespace", e.pod.Namespace, "pod", e.pod.Name, "uid", e.pod.UID, "error", err)
-				e.op.Unlock()
-				return "", release, err
+				if errors.Is(err, msbruntime.ErrCapacityUnavailable) && (e.state == "COLD" || e.state == "SLEEPING") {
+					// One retry deadline per Pod bounds ledger/journal work even
+					// when many requests wait on the same external RAM budget.
+					e.sharedAdmissionRetry = time.Now().Add(250 * time.Millisecond)
+				} else {
+					slog.Warn("pod request activation failed", "namespace", e.pod.Namespace, "pod", e.pod.Name, "uid", e.pod.UID, "error", err)
+					e.op.Unlock()
+					return "", release, err
+				}
 			}
 		}
 		if e.state == "READY" && e.actualReady {
