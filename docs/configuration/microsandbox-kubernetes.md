@@ -240,7 +240,7 @@ container-runtime and Kubernetes integration work.
 | Execution | Multiple regular OCI containers per pod, sequential init containers, restartable init sidecars, image ENTRYPOINT/CMD defaults, command/args overrides and environment expansion | Ephemeral debugging containers |
 | Lifecycle | Configurable lazy or strict availability, Pod UID ownership, Deployment discovery, RAM/disk hibernation, Always/OnFailure task restart, exec/HTTP postStart and exec/HTTP/sleep preStop hooks | Custom stop signals and broader rollout qualification |
 | Environment | Literal values and resolved ConfigMap/Secret environment sources | In-place environment refresh requires Pod replacement |
-| Networking | IPv4 Pod IPs, cluster DNS, Services through an owned bridge; shared HTTP request wake proxy for 1 to 16 declared ports, with explicit TCP compatibility mode | NetworkPolicy enforcement, IPv6, UDP/SCTP wake and arbitrary CNI plugins |
+| Networking | IPv4 Pod IPs, cluster DNS, Services through an owned bridge; shared HTTP request wake proxy for 1 to 16 declared ports, explicit TCP compatibility mode, opt-in node-wide TCP/UDP NetworkPolicy | Raw-socket policy workloads, IPv6 policies, UDP/SCTP wake and arbitrary CNI plugins |
 | Health checks | Exec, HTTP/HTTPS, TCP and gRPC readiness, startup and liveness probes; named TCP ports and thresholds | Host overrides |
 | Operations | Current/previous/follow/timestamp-filtered bounded logs, Events, exec with TTY/resize and localhost port-forward | Attach and ephemeral debugging |
 | Storage | Configurable private VM disk, disk/memory emptyDir, ConfigMap and Secret mounts, projected volumes including resourceFieldRef, subPath and subPathExpr, opt-in local persistent volumes | CSI, disk quotas and certificate bundles |
@@ -258,10 +258,14 @@ Pod IP. Strict direct networking preserves the original Pod IP. The controller's
 one shared network relay for all proxy-mode pods, with a separate private backend
 CIDR for actual guests; it does not start one relay process per pod.
 
-NetworkPolicy is unsupported. The controller rejects creation or resume when an
-existing policy selects the pod. It does not watch policy changes or enforce a
-new policy against an already running pod, so workloads requiring that isolation
-must remain on ordinary workers.
+Enable `--network-policy=true` on a dedicated native controller to enforce
+IPv4 TCP/UDP policies, default deny, selectors, IP blocks and port rules. Every
+native container on that node must explicitly drop `NET_RAW` or `ALL` and omit
+administrative capabilities, including Pods not currently selected by a policy.
+Live updates are watched; policy is installed before a sleeping application
+thaws. In ordinary mode, selecting policies remain unsupported and are fenced
+when added to running Pods. See the [scope, transport protections and migration
+rules](../../tools/microsandbox-pods/NETWORK_POLICY.md).
 
 ## Image startup and security
 

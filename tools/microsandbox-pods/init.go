@@ -146,7 +146,7 @@ func validateInitJournal(record journalRecord) error {
 	if hasRestartableInit(record.Pod) {
 		return validateSidecarInitJournal(record)
 	}
-	if record.Version != 3 && record.Version != 4 && record.Version != 6 && record.Version != 7 && record.Version != 8 || len(record.Pod.Spec.InitContainers) != len(record.Pod.Status.InitContainerStatuses) {
+	if record.Version != 3 && record.Version != 4 && record.Version != 6 && record.Version != 7 && record.Version != 8 && record.Version != 9 || len(record.Pod.Spec.InitContainers) != len(record.Pod.Status.InitContainerStatuses) {
 		return errors.New("init containers require a supported journal with complete statuses")
 	}
 	completed := true

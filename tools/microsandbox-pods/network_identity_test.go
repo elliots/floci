@@ -101,8 +101,9 @@ func TestPersistentPodJournalHostAdoptionStillRequiresItsOwnedRoute(t *testing.T
 	}{
 		{"persistentJournal", 7, "192.0.2.1", true},
 		{"lifecycleJournal", 8, "192.0.2.1", true},
+		{"policyJournal", 9, "192.0.2.1", true},
 		{"changedHost", 7, "192.0.2.99", false},
-		{"futureJournal", 9, "192.0.2.1", false},
+		{"futureJournal", 10, "192.0.2.1", false},
 	} {
 		t.Run(scenario.name, func(t *testing.T) {
 			n := &network{runner: commandRunner{cfg: config{state: t.TempDir(), peer: "owned-peer"}}, hostIP: "192.0.2.1", peerIP: "192.0.2.2"}

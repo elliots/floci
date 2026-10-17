@@ -142,6 +142,9 @@ class ManagementTest(unittest.TestCase):
         rules = {resource: rule for rule in role["rules"] for resource in rule["resources"]}
         self.assertEqual({"get", "list", "watch"}, set(rules["persistentvolumeclaims"]["verbs"]))
         self.assertEqual({"get", "list", "watch"}, set(rules["storageclasses"]["verbs"]))
+        for resource in ("namespaces", "networkpolicies"):
+            self.assertEqual({"get", "list", "watch"}, set(rules[resource]["verbs"]))
+            self.assertNotIn("resourceNames", rules[resource])
         self.assertEqual({"get", "list", "watch", "create", "update", "delete"}, set(rules["persistentvolumes"]["verbs"]))
         for binding in (value for value in resources if value["kind"].endswith("Binding")):
             self.assertEqual(self.record["accessName"], binding["roleRef"]["name"])

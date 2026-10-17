@@ -25,6 +25,7 @@ import (
 
 type provider struct {
 	events          record.EventRecorder
+	policies        *networkPolicyController
 	storage         persistentVolumeResolver
 	storageOwner    string
 	storageRun      func(context.Context)
@@ -61,6 +62,8 @@ type podEntry struct {
 	idleScheduled                                    bool
 	proxyAvailability, proxyRoutesReady, actualReady bool
 	proxyRouteFailed                                 atomic.Bool
+	policyUnavailable                                atomic.Bool
+	networkPolicyVersion                             int
 	publication                                      sync.Mutex
 	proxyPorts                                       []proxyPortBinding
 	backendIP, idleOwner, proxyHost                  string
@@ -148,10 +151,14 @@ func newProvider(ctx context.Context, cfg config, client kubernetes.Interface) (
 	if err := p.configurePersistentStorage(); err != nil {
 		return nil, err
 	}
+	if err := p.configureNetworkPolicies(ctx); err != nil {
+		return nil, err
+	}
 	if err := p.recover(ctx); err != nil {
 		return nil, err
 	}
 	p.jobs.Go(func() { p.storageRun(lifetime) })
+	p.jobs.Go(func() { p.policies.run(lifetime) })
 	p.jobs.Go(func() { p.watchAvailability(lifetime) })
 	succeeded = true
 	return p, nil
@@ -292,6 +299,9 @@ func (p *provider) CreatePod(ctx context.Context, pod *corev1.Pod) error {
 	lifetime, cancel := context.WithCancel(p.ctx)
 	e := &podEntry{wake: make(chan struct{}, 1), snapshotIDs: make(map[string]string), lifetime: lifetime, state: "WAITINGVOLUMES", httpPort: httpPort, appPort: int(appPort), pod: pod.DeepCopy(), vm: "fvp-" + uid[:20], link: "pv" + uid[:10], ip: p.network.address(slot), slot: slot, port: port, cancel: cancel, done: make(chan struct{})}
 	e.allocation = allocation
+	if p.runner.cfg.networkPolicy {
+		e.networkPolicyVersion = 1
+	}
 	e.declaredSpec = declared.Spec.DeepCopy()
 	e.pod.Status = corev1.PodStatus{Phase: corev1.PodPending, Reason: "NativeVMStarting", StartTime: new(metav1.Now())}
 	for _, container := range pod.Spec.Containers {
@@ -443,6 +453,17 @@ func (p *provider) startAdmitted(ctx context.Context, e *podEntry) (err error) {
 	if err := p.network.attach(ctx, e); err != nil {
 		return fmt.Errorf("attach native pod network: %w", err)
 	}
+	if e.networkPolicyVersion == 1 {
+		if err := p.installGuestConnector(ctx, e); err != nil {
+			return err
+		}
+		if _, err := p.runner.guest(ctx, e.vm, guestConnector+" policy node"); err != nil {
+			return fmt.Errorf("initialize node socket policy hook: %w", err)
+		}
+		if err := p.applyNetworkPolicy(ctx, e); err != nil {
+			return err
+		}
+	}
 	if len(e.pod.Spec.InitContainers) > 0 {
 		e.state = "INITIALIZING"
 		return p.advanceInit(ctx, e)
@@ -526,8 +547,10 @@ func (p *provider) containerLaunch(ctx context.Context, e *podEntry, container c
 	if err := p.prepareContainerSubpaths(ctx, e, container); err != nil {
 		return nil, empty, err
 	}
-	if _, err := p.runner.guest(ctx, e.vm, "cp /etc/pod-resolv.conf /etc/resolv.conf"); err != nil {
-		return nil, empty, fmt.Errorf("configure container DNS: %w", err)
+	if e.networkPolicyVersion == 0 {
+		if _, err := p.runner.guest(ctx, e.vm, "cp /etc/pod-resolv.conf /etc/resolv.conf"); err != nil {
+			return nil, empty, fmt.Errorf("configure container DNS: %w", err)
+		}
 	}
 	oom := newApplicationOOMTracking(e.generation)
 	if stateRoot != "/tmp" {
@@ -536,7 +559,14 @@ func (p *provider) containerLaunch(ctx context.Context, e *podEntry, container c
 	if _, err := p.runner.guest(ctx, e.vm, oom.Setup); err != nil {
 		return nil, empty, fmt.Errorf("initialize container resource accounting: %w", err)
 	}
-	args := []string{"ctr", "--address", "/run/containerd/containerd.sock", "run", "--rm", "--net-host", "--platform", launch.Platform, "--mount", "type=bind,src=/etc/pod-resolv.conf,dst=/etc/resolv.conf,options=rbind:ro"}
+	if e.networkPolicyVersion == 1 {
+		if _, err := p.runner.guest(ctx, e.vm, guestConnector+" policy application "+quote(oom.Name)+" "+strconv.Itoa(p.network.peerPort)); err != nil {
+			return nil, empty, fmt.Errorf("guard application socket marks: %w", err)
+		}
+	}
+	args := []string{"ctr", "--address", "/run/containerd/containerd.sock", "run", "--rm"}
+	args = append(args, containerNetworkArgs(e.networkPolicyVersion)...)
+	args = append(args, "--platform", launch.Platform, "--mount", "type=bind,src=/etc/pod-resolv.conf,dst=/etc/resolv.conf,options=rbind:ro")
 	args = append(args, volumeMountArgsForContainer(e.pod, container)...)
 	args = append(args, security...)
 	args = append(args, resources...)
@@ -855,6 +885,15 @@ func (p *provider) publish(e *podEntry) {
 		case "RUNNING":
 			p.event(e, corev1.EventTypeNormal, "Started", "Application is running; readiness is being checked")
 		}
+	}
+	if e.policyUnavailable.Load() {
+		e.mu.Lock()
+		e.pod.Status.Reason = "NetworkPolicyUnavailable"
+		e.pod.Status.Conditions = podConditionsFor(e.pod, false)
+		for i := range e.pod.Status.ContainerStatuses {
+			e.pod.Status.ContainerStatuses[i].Ready = false
+		}
+		e.mu.Unlock()
 	}
 	refreshView(e)
 	e.mu.Lock()

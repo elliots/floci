@@ -43,7 +43,7 @@ func (p *provider) monitorSidecars(ctx context.Context, e *podEntry) error {
 }
 
 func validateSidecarInitJournal(record journalRecord) error {
-	if record.Version != 5 && record.Version != 6 && record.Version != 7 && record.Version != 8 || len(record.Pod.Spec.InitContainers) != len(record.Pod.Status.InitContainerStatuses) {
+	if record.Version != 5 && record.Version != 6 && record.Version != 7 && record.Version != 8 && record.Version != 9 || len(record.Pod.Spec.InitContainers) != len(record.Pod.Status.InitContainerStatuses) {
 		return errors.New("restartable init sidecars require a supported journal with complete statuses")
 	}
 	completed := true

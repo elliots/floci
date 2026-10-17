@@ -27,6 +27,7 @@ const bridgeName = "pvkb0"
 const ctr = "ctr --address /run/containerd/containerd.sock"
 
 type config struct {
+	networkPolicy                                           bool
 	guestFSBinary                                           string
 	relayBinary, proxyBackendCIDR                           string
 	kubeconfig, nodeName, msb, home, state, peer, peerOwner string
@@ -340,7 +341,7 @@ func (n *network) prepareProxy(ctx context.Context, e *podEntry) error {
 	rules := []string{"FORWARD -s " + n.backendPrefix.String() + " -j ACCEPT", "FORWARD -d " + n.backendPrefix.String() + " -j ACCEPT"}
 	script := fmt.Sprintf("ip addr replace %s/22 dev %s; ip addr replace %s/32 dev %s; ", gateway, bridgeName, e.ip, bridgeName)
 	for _, rule := range rules {
-		script += "if ! iptables -C " + rule + " 2>/dev/null; then iptables -I " + rule + "; fi; "
+		script += "if ! iptables -C " + rule + " 2>/dev/null; then iptables -A " + rule + "; fi; "
 	}
 	rule := fmt.Sprintf("POSTROUTING -s %s -d %s -m mark ! --mark 0x4000/0x4000 -j RETURN", n.backendPrefix, n.runner.cfg.clusterCIDR)
 	script += "if ! iptables -t nat -C " + rule + " 2>/dev/null; then iptables -t nat -I " + rule + "; fi"

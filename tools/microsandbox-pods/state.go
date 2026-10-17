@@ -23,33 +23,37 @@ type stateIdentity struct {
 	Node, ClusterUID, PeerOwner, Peer, PodCIDR, ProxyBackendCIDR string
 }
 type journalRecord struct {
-	NextKill          time.Time                    `json:"nextKill,omitzero"`
-	Hooks             lifecycleProgress            `json:"hooks,omitzero"`
-	Writeback         *persistentWriteback         `json:"persistentWriteback,omitempty"`
-	PersistentVolumes []podPersistentVolume        `json:"persistentVolumes,omitempty"`
-	Freeze            *applicationFreeze           `json:"freeze,omitempty"`
-	CompletionPhase   corev1.PodPhase              `json:"completionPhase,omitempty"`
-	ShutdownDeadline  time.Time                    `json:"shutdownDeadline,omitzero"`
-	Applications      map[string]applicationRecord `json:"applications,omitempty"`
-	TerminationReason string                       `json:"terminationReason,omitempty"`
-	Allocation        podAllocation                `json:"allocation,omitzero"`
-	StartupComplete   bool                         `json:"startupComplete,omitzero"`
-	ProbeFailure      string                       `json:"probeFailure,omitempty"`
-	ProxyPorts        []proxyPortBinding           `json:"proxyPorts,omitempty"`
-	BackendIP         string                       `json:"backendIP,omitempty"`
-	SnapshotIDs       map[string]string            `json:"snapshotIDs,omitempty"`
-	RestoredParent    string                       `json:"restoredParent,omitempty"`
-	Version           int                          `json:"version"`
-	View              lifecycleView                `json:"view"`
-	Pod               *corev1.Pod                  `json:"pod"`
-	DeclaredSpec      *corev1.PodSpec              `json:"declaredSpec,omitempty"`
-	Slot              int                          `json:"slot"`
-	GuestIP           string                       `json:"guestIP"`
-	Started           time.Time                    `json:"started"`
-	Snapshots         []string                     `json:"snapshots,omitempty"`
+	NetworkPolicyVersion int                          `json:"networkPolicyVersion,omitzero"`
+	NextKill             time.Time                    `json:"nextKill,omitzero"`
+	Hooks                lifecycleProgress            `json:"hooks,omitzero"`
+	Writeback            *persistentWriteback         `json:"persistentWriteback,omitempty"`
+	PersistentVolumes    []podPersistentVolume        `json:"persistentVolumes,omitempty"`
+	Freeze               *applicationFreeze           `json:"freeze,omitempty"`
+	CompletionPhase      corev1.PodPhase              `json:"completionPhase,omitempty"`
+	ShutdownDeadline     time.Time                    `json:"shutdownDeadline,omitzero"`
+	Applications         map[string]applicationRecord `json:"applications,omitempty"`
+	TerminationReason    string                       `json:"terminationReason,omitempty"`
+	Allocation           podAllocation                `json:"allocation,omitzero"`
+	StartupComplete      bool                         `json:"startupComplete,omitzero"`
+	ProbeFailure         string                       `json:"probeFailure,omitempty"`
+	ProxyPorts           []proxyPortBinding           `json:"proxyPorts,omitempty"`
+	BackendIP            string                       `json:"backendIP,omitempty"`
+	SnapshotIDs          map[string]string            `json:"snapshotIDs,omitempty"`
+	RestoredParent       string                       `json:"restoredParent,omitempty"`
+	Version              int                          `json:"version"`
+	View                 lifecycleView                `json:"view"`
+	Pod                  *corev1.Pod                  `json:"pod"`
+	DeclaredSpec         *corev1.PodSpec              `json:"declaredSpec,omitempty"`
+	Slot                 int                          `json:"slot"`
+	GuestIP              string                       `json:"guestIP"`
+	Started              time.Time                    `json:"started"`
+	Snapshots            []string                     `json:"snapshots,omitempty"`
 }
 
 func (record journalRecord) guestAllocation() (podAllocation, error) {
+	if record.NetworkPolicyVersion < 0 || record.NetworkPolicyVersion > 1 || record.NetworkPolicyVersion == 1 && record.Version != 9 || record.Version == 9 && record.NetworkPolicyVersion != 1 {
+		return podAllocation{}, errors.New("NetworkPolicy socket hooks require journal version 9 and a supported capability version")
+	}
 	if record.Pod != nil && hasLifecycle(record.Pod) && record.Version < 8 {
 		return podAllocation{}, errors.New("lifecycle hooks require journal version 8 before recovery or orphan cleanup")
 	}
@@ -59,7 +63,7 @@ func (record journalRecord) guestAllocation() (podAllocation, error) {
 	if record.Version == 1 && record.Allocation == (podAllocation{}) {
 		return validateStoredAllocation(podAllocation{})
 	}
-	if (record.Version < 2 || record.Version > 8) || record.Allocation.Version == 0 {
+	if (record.Version < 2 || record.Version > 9) || record.Allocation.Version == 0 {
 		return podAllocation{}, errors.New("pod journal has an invalid version or missing guest allocation")
 	}
 	if record.Version == 3 && (record.Pod == nil || len(record.Pod.Spec.InitContainers) == 0) {
@@ -128,6 +132,9 @@ func (p *provider) recover(ctx context.Context) error {
 		if record.Pod == nil || string(record.Pod.UID) != record.View.UID || filepath.Base(path) != record.View.UID+".json" {
 			return fmt.Errorf("invalid ownership journal %s", filepath.Base(path))
 		}
+		if err := p.validatePolicyRecovery(record); err != nil {
+			return err
+		}
 		current, err := p.client.CoreV1().Pods(record.View.Namespace).Get(ctx, record.View.Name, metav1.GetOptions{})
 		orphan := apierrors.IsNotFound(err) || (err == nil && (current.UID != record.Pod.UID || current.DeletionTimestamp != nil || current.Spec.NodeName != p.runner.cfg.nodeName))
 		if err != nil && !apierrors.IsNotFound(err) {
@@ -137,6 +144,7 @@ func (p *provider) recover(ctx context.Context) error {
 		e := &podEntry{writeback: record.Writeback, freeze: record.Freeze, wake: make(chan struct{}, 1), snapshotIDs: record.SnapshotIDs, restoredParent: record.RestoredParent, pod: record.Pod, vm: record.View.VM, ip: record.View.PodIP, slot: record.Slot, port: record.View.UDPPort,
 			httpPort: record.View.HTTPPort, appPort: record.View.ApplicationPort, guestIP: record.GuestIP, applicationProgress: applicationProgress{started: record.Started},
 			generation: record.View.Generation, state: record.View.State, snapshots: record.Snapshots, lifetime: lifetime, cancel: cancel, done: make(chan struct{})}
+		e.networkPolicyVersion = record.NetworkPolicyVersion
 		e.allocation, err = record.guestAllocation()
 		if err != nil {
 			return fmt.Errorf("invalid allocation for Pod %s: %w", record.View.UID, err)
@@ -305,6 +313,12 @@ func (p *provider) recover(ctx context.Context) error {
 		var err error
 		if e.created && e.state != "SLEEPING" {
 			err = p.network.ensureIngress(e)
+		}
+		if err == nil && (e.state == "RUNNING" || e.state == "READY" || e.state == "INITIALIZING") {
+			err = p.applyNetworkPolicy(ctx, e)
+			if err != nil && p.policies != nil {
+				err = errors.Join(err, p.fencePolicyFailure(ctx, e))
+			}
 		}
 		if err == nil && e.freeze != nil && (e.state == "RUNNING" || e.state == "READY") {
 			err = p.refreshAndThaw(ctx, e)

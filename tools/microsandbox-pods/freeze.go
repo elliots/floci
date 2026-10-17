@@ -158,7 +158,7 @@ func (p *provider) freezeCompletion(ctx context.Context, e *podEntry, action str
 }
 
 func (p *provider) freezeApplications(ctx context.Context, e *podEntry) error {
-	if !renewableIdentity(e) && len(e.persistentVolumes) == 0 {
+	if !renewableIdentity(e) && len(e.persistentVolumes) == 0 && p.policies == nil {
 		return nil
 	}
 	if e.freeze != nil {

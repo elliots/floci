@@ -161,11 +161,11 @@ def access_resources(record):
         {"apiGroups": ["storage.k8s.io"], "resources": ["storageclasses"], "verbs": ["get", "list", "watch"]},
         {"apiGroups": [""], "resources": ["serviceaccounts"], "verbs": ["get"]},
         {"apiGroups": [""], "resources": ["serviceaccounts/token"], "verbs": ["create"]},
-        {"apiGroups": [""], "resources": ["namespaces"], "resourceNames": ["kube-system"], "verbs": ["get"]},
+        {"apiGroups": [""], "resources": ["namespaces"], "verbs": ["get", "list", "watch"]},
         {"apiGroups": [""], "resources": ["nodes", "nodes/status"], "resourceNames": [node], "verbs": ["get", "patch", "update"]},
         {"apiGroups": [""], "resources": ["events"], "verbs": ["create", "patch", "update"]},
         {"apiGroups": ["apps"], "resources": ["deployments", "replicasets"], "verbs": ["get", "list"]},
-        {"apiGroups": ["networking.k8s.io"], "resources": ["networkpolicies"], "verbs": ["get", "list"]},
+        {"apiGroups": ["networking.k8s.io"], "resources": ["networkpolicies"], "verbs": ["get", "list", "watch"]},
         {"apiGroups": ["authentication.k8s.io"], "resources": ["tokenreviews"], "verbs": ["create"]},
         {"apiGroups": ["authorization.k8s.io"], "resources": ["subjectaccessreviews"], "verbs": ["create"]},
     ]
@@ -408,7 +408,8 @@ def controller_arguments(record, args):
         "--client-ca", str(credentials/"client-ca.crt"), "--control-listen", "127.0.0.1:"+str(record["controlPort"]),
         "--control-token-file", str(directory/"control-token"), "--cluster-name", record["peer"],
         "--max-active-memory-mib", str(args.memory_mib), "--scheduling-cpu", args.scheduling_cpu,
-        "--scheduling-memory", args.scheduling_memory, "--pod-workers", str(args.pod_workers)]
+        "--scheduling-memory", args.scheduling_memory, "--pod-workers", str(args.pod_workers),
+        "--network-policy=" + str(getattr(args, "network_policy", False)).lower()]
 
 
 def status(args):
@@ -522,6 +523,7 @@ def main():
         running.add_argument("--scheduling-cpu", default="500")
         running.add_argument("--scheduling-memory", default="384Gi")
         running.add_argument("--pod-workers", type=int, default=8)
+        running.add_argument("--network-policy", action="store_true", help="require safe capabilities on every native Pod and enforce Kubernetes NetworkPolicies")
     for operation in ("status", "destroy", "stop", "renew", "storage"):
         commands.add_parser(operation).add_argument("--directory", required=True)
     pruning = commands.add_parser("prune", help="preview ownership-aware native storage cleanup; --apply performs it")

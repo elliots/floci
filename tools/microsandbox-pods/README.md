@@ -5,6 +5,8 @@ microsandbox VMs and preserves their Pod UID across RAM sleep/resume. See the
 [feature inventory and recovery rules](ARCHITECTURE.md) before using this preview.
 The [completion plan](../microsandbox/ROADMAP.md) tracks the remaining Kubernetes,
 Aurora and shared-runtime work.
+Opt-in [NetworkPolicy enforcement](NETWORK_POLICY.md) requires a dedicated
+native node with safe capabilities on every Pod, including unselected Pods.
 
 Requirements: Go1.26+, CGO and a C compiler, native microsandbox **0.7.8** with matching runtime library,
 Docker, Python3 and OpenSSL. Qualification creates an isolated privileged

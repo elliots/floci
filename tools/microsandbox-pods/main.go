@@ -47,6 +47,7 @@ func run() error {
 	flag.StringVar(&cfg.clusterDNS, "cluster-dns", "10.43.0.10", "Cluster DNS service address")
 	flag.StringVar(&cfg.proxyBackendCIDR, "proxy-backend-cidr", "10.42.204.0/22", "Reserved private guest CIDR for proxy availability")
 	flag.StringVar(&cfg.relayBinary, "network-relay-binary", "", "Linux network-relay executable matching the owned Docker peer architecture")
+	flag.BoolVar(&cfg.networkPolicy, "network-policy", false, "Enable node-wide NetworkPolicy enforcement; every native container must explicitly drop NET_RAW or ALL")
 	flag.StringVar(&cfg.guestFSBinary, "guest-fs-binary", "", "Linux guestfs executable for fsGroup and supplemental group policies")
 	flag.StringVar(&cfg.listen, "listen", "127.0.0.1:10250", "TLS kubelet listen address")
 	flag.StringVar(&cfg.nodeIP, "node-ip", "", "Host IPv4 address reachable from the API server and owned network peer")

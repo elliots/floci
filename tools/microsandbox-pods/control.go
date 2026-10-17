@@ -215,7 +215,11 @@ func (p *provider) journal(e *podEntry) error {
 		file.Close()
 		return err
 	}
-	if err := json.NewEncoder(file).Encode(journalRecord{NextKill: e.nextKill, Hooks: e.hooks, Writeback: e.writeback, PersistentVolumes: e.persistentVolumes, Freeze: e.freeze, Version: podJournalVersion(e.pod), CompletionPhase: e.completionPhase, ShutdownDeadline: e.shutdownDeadline, Applications: e.applicationRecords(), Allocation: allocation, StartupComplete: e.startupComplete, ProbeFailure: e.probeFailure, TerminationReason: e.terminationReason, DeclaredSpec: e.declaredSpec, ProxyPorts: e.proxyPorts, BackendIP: e.backendIP, SnapshotIDs: e.snapshotIDs, RestoredParent: e.restoredParent, View: view(e), Pod: pod, Slot: e.slot, GuestIP: e.guestIP, Started: e.started, Snapshots: e.snapshots}); err != nil {
+	version := podJournalVersion(e.pod)
+	if e.networkPolicyVersion != 0 {
+		version = 9
+	}
+	if err := json.NewEncoder(file).Encode(journalRecord{NextKill: e.nextKill, Hooks: e.hooks, NetworkPolicyVersion: e.networkPolicyVersion, Writeback: e.writeback, PersistentVolumes: e.persistentVolumes, Freeze: e.freeze, Version: version, CompletionPhase: e.completionPhase, ShutdownDeadline: e.shutdownDeadline, Applications: e.applicationRecords(), Allocation: allocation, StartupComplete: e.startupComplete, ProbeFailure: e.probeFailure, TerminationReason: e.terminationReason, DeclaredSpec: e.declaredSpec, ProxyPorts: e.proxyPorts, BackendIP: e.backendIP, SnapshotIDs: e.snapshotIDs, RestoredParent: e.restoredParent, View: view(e), Pod: pod, Slot: e.slot, GuestIP: e.guestIP, Started: e.started, Snapshots: e.snapshots}); err != nil {
 		file.Close()
 		return err
 	}
@@ -468,6 +472,12 @@ func (p *provider) resumeFor(ctx context.Context, e *podEntry, terminating bool)
 	if err := requireFrozenSnapshot(e); err != nil {
 		return err
 	}
+	if p.policies != nil {
+		plan := p.policies.plan(e.pod, p.policies.inventory())
+		if plan.egressIsolated && (e.freeze == nil || e.freeze.Phase != "FROZEN") {
+			return errors.New("NetworkPolicy egress requires a frozen application checkpoint; recreate this legacy Pod")
+		}
+	}
 	if err := p.preflightWakeTokens(ctx, e); err != nil {
 		return err
 	}
@@ -555,6 +565,14 @@ func (p *provider) resumeFor(ctx context.Context, e *podEntry, terminating bool)
 			return p.transitionFailed(e, err)
 		}
 		if err := p.network.attach(ctx, e); err != nil {
+			return p.transitionFailed(e, err)
+		}
+	}
+	if p.policies != nil {
+		p.policies.mu.Lock()
+		delete(p.policies.applied, string(e.pod.UID))
+		p.policies.mu.Unlock()
+		if err := p.applyNetworkPolicy(ctx, e); err != nil {
 			return p.transitionFailed(e, err)
 		}
 	}

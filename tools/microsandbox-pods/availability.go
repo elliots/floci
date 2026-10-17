@@ -72,6 +72,11 @@ func (p *provider) prepareProxy(ctx context.Context, e *podEntry) error {
 	if !e.proxyAvailability {
 		return nil
 	}
+	if p.policies != nil {
+		if err := p.policies.installPeer(ctx, p.policies.inventory()); err != nil {
+			return err
+		}
+	}
 	release, err := p.acquireRegistration(ctx)
 	if err != nil {
 		return err
@@ -127,7 +132,7 @@ func (p *provider) acquireProxyActivity(ctx context.Context, e *podEntry, backen
 		e.op.Unlock()
 		return "", nil, err
 	}
-	if e.deleted || e.lifetime.Err() != nil || !e.proxyRoutesReady || e.proxyRouteFailed.Load() {
+	if e.deleted || e.lifetime.Err() != nil || !e.proxyRoutesReady || e.proxyRouteFailed.Load() || e.policyUnavailable.Load() {
 		e.op.Unlock()
 		return "", nil, errors.New("pod availability route is unavailable")
 	}
@@ -161,7 +166,7 @@ func (p *provider) acquireProxyActivity(ctx context.Context, e *podEntry, backen
 			e.op.Unlock()
 			return "", release, err
 		}
-		if e.deleted || e.lifetime.Err() != nil || e.proxyRouteFailed.Load() {
+		if e.deleted || e.lifetime.Err() != nil || e.proxyRouteFailed.Load() || e.policyUnavailable.Load() {
 			e.op.Unlock()
 			return "", release, errors.New("pod availability route is unavailable")
 		}
@@ -199,7 +204,7 @@ func (p *provider) projectProxyAvailability(e *podEntry) {
 	if !e.proxyAvailability {
 		return
 	}
-	ready := e.proxyRoutesReady && !e.proxyRouteFailed.Load() && !e.deleted && e.lifetime.Err() == nil && e.state != "FAILED" && e.state != "TERMINATED" && e.state != "DRAINING" && e.applicationMissingSince.IsZero()
+	ready := e.proxyRoutesReady && !e.proxyRouteFailed.Load() && !e.policyUnavailable.Load() && !e.deleted && e.lifetime.Err() == nil && e.state != "FAILED" && e.state != "TERMINATED" && e.state != "DRAINING" && e.applicationMissingSince.IsZero()
 	e.mu.Lock()
 	defer e.mu.Unlock()
 	e.pod.Status.PodIP = e.ip
@@ -245,7 +250,7 @@ func (p *provider) watchAvailability(ctx context.Context) {
 			if !p.observeProxyRoutes(e, inventory, healthy) || !e.op.TryLock() {
 				continue
 			}
-			if !e.proxyRoutesReady || e.proxyRouteFailed.Load() {
+			if !e.proxyRoutesReady || e.proxyRouteFailed.Load() || e.policyUnavailable.Load() {
 				e.proxyRoutesReady = true
 				e.proxyRouteFailed.Store(false)
 				p.publish(e)
