@@ -391,7 +391,7 @@ func capacityUsage(state *capacityState, guests []capacityGuest) (CapacityStatus
 	}
 	for token, p := range state.Permits {
 		status.Reservations = append(status.Reservations, token)
-		if p.Operation == "snap create" {
+		if p.Operation != "run" && p.Operation != "start" && p.Operation != "snap restore" {
 			continue
 		}
 		status.PendingStarts++

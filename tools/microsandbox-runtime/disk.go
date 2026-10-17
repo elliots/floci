@@ -225,18 +225,25 @@ func (m *capacityManager) reserveDisk(ctx context.Context, state *capacityState,
 			}
 		}
 	}
+	return m.reserveDiskBytes(ctx, state, guests, permit.DiskBytes)
+}
+
+func (m *capacityManager) reserveDiskBytes(ctx context.Context, state *capacityState, guests []capacityGuest, bytes uint64) error {
+	if !diskBudgetEnabled(state.Limits) {
+		return nil
+	}
 	status, err := m.diskStatus(ctx, state, guests)
 	if err != nil {
 		return err
 	}
-	committed, err := addDisk(status.CommittedBytes, permit.DiskBytes)
+	committed, err := addDisk(status.CommittedBytes, bytes)
 	if err != nil {
 		return err
 	}
 	if state.Limits.DiskMiB != 0 && committed > state.Limits.DiskMiB*mib {
 		return errors.New("native disk admission budget reached")
 	}
-	needed, err := addDisk(state.Limits.MinFreeDiskMiB*mib, status.WritableBytes, status.ReservedBytes, permit.DiskBytes)
+	needed, err := addDisk(state.Limits.MinFreeDiskMiB*mib, status.WritableBytes, status.ReservedBytes, bytes)
 	if err != nil {
 		return err
 	}

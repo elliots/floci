@@ -222,6 +222,7 @@ func (b *sdkBackend) execute(ctx context.Context, r command, stdin io.Reader, st
 		}
 		options := msb.WithRestoreConfig(msb.RestoreConfig{
 			Ports: r.config.PortBindings, NetworkPolicy: policy,
+			Volumes: r.config.Volumes, ExternalMountPolicy: msb.ExternalMountStrict,
 		})
 		var sandbox *msb.Sandbox
 		if verifiedArtifact != nil {

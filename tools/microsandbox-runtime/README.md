@@ -172,8 +172,9 @@ an immutable manifest digest and explicit managed/flat root geometry. The adapte
 does not pull an unmeasurable image inside the budget. Preload images before enabling
 the budget. Saved checkpoints must include the new root-geometry record; recreate
 older checkpoints before enabling disk admission. Named volumes already present
-are counted, but the adapter does not expose volume creation or growth. Any future
-volume mutation needs its own admission hook.
+are counted. `CreateNamedDisk` reserves the full declared filesystem capacity plus
+16 MiB of metadata before dispatch; it consumes no RAM or guest-start permit.
+Expansion is not supported.
 
 SDK full restores can omit root geometry from their sandbox configuration. The
 adapter joins the restored sandbox's immutable `snapshot_parent` with its private
@@ -215,3 +216,34 @@ a restore whose stopped source was already removed. New work checks fresh SDK
 usage and filesystem free space. No images, volumes or checkpoints are pruned
 automatically, and reducing a limit never deletes workloads. Use dedicated host
 filesystem quotas if a strict disk boundary is required.
+
+## Persistent named disks
+
+`CreateNamedDisk`, `InspectNamedDisk`, `AttachNamedDisk`, `ReleaseNamedDisk` and
+`RemoveNamedDisk` support local ext4 disks for the Kubernetes provisioner. The
+minimum supported capacity is 256 MiB. Allocation intents and single-Pod
+attachment leases are private durable records in the shared runtime home. A
+failed dispatched create retains its capacity reservation: retry can reconcile
+an indexed disk with the recorded owner and geometry, but cannot blindly repeat
+creation or delete an unidentified partial artifact.
+
+The pinned local SDK exposes no immutable volume ID. Floci pins the never-reused
+name, owner labels, creation timestamp, canonical path, capacity and raw-file
+device/inode. A replacement or moved backing file fails verification. Names stay
+retired after deletion. Restored VMs explicitly receive the original named disk
+mount map with the SDK's strict external-mount policy. `run` and `snap restore`
+accept `--mount-named NAME:/guest/path:kind=disk,size=256M`, but reject any mount
+without a matching durable attachment to that VM.
+
+An attachment remains held while its guest exists, including stopped guests,
+while its checkpoints exist, or while an uncertain guest operation is recorded.
+Removing the guest and every checkpoint is required before another Pod can
+attach the same filesystem. The adapter never copies a filesystem on startup,
+resizes it during restore, or starts a storage daemon inside the guest.
+
+The gated `TestNativeNamedDiskFullRAMRestoreAndReplacement` test requires an empty
+dedicated `FLOCI_NATIVE_TEST_HOME`, `FLOCI_NATIVE_TEST_MSB` and a cached
+`FLOCI_NATIVE_TEST_IMAGE`. It verifies attachment fencing, strict full RAM restore,
+preserved process and filesystem state, replacement-Pod persistence and exact
+owned cleanup. Run it with `go test -tags native -run
+'^TestNativeNamedDiskFullRAMRestoreAndReplacement$' -count=1 -v .`.

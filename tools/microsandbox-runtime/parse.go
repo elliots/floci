@@ -44,12 +44,12 @@ func parse(args []string) (command, error) {
 	allowed := map[string]map[string]bool{
 		"--version": {}, "doctor": {},
 		"inspect": {"--format": true}, "ls": {"--format": true}, "metrics": {"--format": true},
-		"run":   {"--detach": false, "--name": true, "--cpus": true, "--memory": true, "--root-disk": true, "--label": true, "--env": true, "--port": true, "--entrypoint": true, "--init": true, "--init-arg": true, "--init-env": true, "--net": true, "--net-rule": true, "--net-default": true},
+		"run":   {"--detach": false, "--name": true, "--cpus": true, "--memory": true, "--root-disk": true, "--mount-named": true, "--label": true, "--env": true, "--port": true, "--entrypoint": true, "--init": true, "--init-arg": true, "--init-env": true, "--net": true, "--net-rule": true, "--net-default": true},
 		"exec":  {"--detach": false, "--no-tty": false, "--no-stdin": false, "--stream": false, "--user": true},
 		"start": {}, "pause": {}, "resume": {},
 		"stop": {"--force": false, "--timeout": true}, "rm": {"--force": false},
 		"snap create": {"--sandbox": true, "--full": false, "--integrity": false},
-		"snap verify": {}, "snap restore": {"--name": true, "--port": true, "--net": true, "--net-default": true, "--net-rule": true},
+		"snap verify": {}, "snap restore": {"--name": true, "--port": true, "--mount-named": true, "--net": true, "--net-default": true, "--net-rule": true},
 		"snap ls": {"--format": true}, "snap rm": {"--force": false},
 	}
 	spec, ok := allowed[r.op]
@@ -90,7 +90,7 @@ func parse(args []string) (command, error) {
 		if !ok {
 			return r, invalid("unsupported option")
 		}
-		if seen[flag] && flag != "--env" && flag != "--label" && flag != "--port" && flag != "--net-rule" && flag != "--net" && flag != "--init-arg" && flag != "--init-env" {
+		if seen[flag] && flag != "--env" && flag != "--label" && flag != "--port" && flag != "--net-rule" && flag != "--net" && flag != "--init-arg" && flag != "--init-env" && flag != "--mount-named" {
 			return r, invalid("duplicate option")
 		}
 		seen[flag] = true
@@ -155,6 +155,10 @@ func parse(args []string) (command, error) {
 				d = msb.RootDisk.Flat(msb.RootDiskFlatOptions{SizeMiB: n})
 			}
 			r.config.RootDisk = &d
+		case "--mount-named":
+			if err := parseNamedDiskMount(&r.config, value); err != nil {
+				return r, err
+			}
 		case "--entrypoint":
 			r.config.Entrypoint = []string{value}
 		case "--init", "--init-arg", "--init-env":
