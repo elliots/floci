@@ -1,6 +1,7 @@
 package main
 
 import (
+	"cmp"
 	"context"
 	"crypto/subtle"
 	"encoding/json"
@@ -55,7 +56,7 @@ func view(e *podEntry) lifecycleView {
 		v.BackendURL = fmt.Sprintf("http://127.0.0.1:%d", e.httpPort)
 	}
 	if len(e.proxyPorts) > 0 {
-		v.ProxyURL = fmt.Sprintf("http://127.0.0.1:%d", e.proxyPorts[0].ProxyPort)
+		v.ProxyURL = fmt.Sprintf("http://%s:%d", cmp.Or(e.proxyHost, "127.0.0.1"), e.proxyPorts[0].ProxyPort)
 	}
 	if len(e.snapshots) > 0 {
 		v.Snapshot = e.snapshots[len(e.snapshots)-1]
@@ -342,6 +343,7 @@ func (p *provider) hibernate(ctx context.Context, e *podEntry) error {
 	if err := p.journal(e); err != nil {
 		return p.transitionFailed(e, err)
 	}
+	p.network.closeIngress(e)
 	if _, err := p.runner.vm(ctx, "stop", "--force", e.vm); err != nil {
 		return p.transitionFailed(e, err)
 	}
@@ -487,6 +489,7 @@ func (p *provider) resume(ctx context.Context, e *podEntry) error {
 		return err
 	}
 	sourceRemovalStarted = true
+	p.network.closeIngress(e)
 	if _, err := p.runner.vm(ctx, "rm", e.vm); err != nil {
 		return p.transitionFailed(e, err)
 	}
@@ -503,6 +506,9 @@ func (p *provider) resume(ctx context.Context, e *podEntry) error {
 	}
 	e.created = true
 	if err := p.requireVMStatus(ctx, e, "Running"); err != nil {
+		return p.transitionFailed(e, err)
+	}
+	if err := p.network.ensureIngress(e); err != nil {
 		return p.transitionFailed(e, err)
 	}
 	guestIP, err := p.runner.guest(ctx, e.vm, "ip -4 -o addr show dev eth0 | awk '{print $4}' | cut -d/ -f1")

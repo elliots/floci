@@ -60,8 +60,12 @@ func (p *provider) ensureRelay(ctx context.Context) (*networkRelay, error) {
 	if p.runner.cfg.relayBinary == "" {
 		return nil, errors.New("proxy availability and network probes require --network-relay-binary")
 	}
-	if err := verifyPeerReachability(ctx, p.runner, p.network.hostIP); err != nil {
-		return nil, err
+	if p.network.proxyBindIP == "" {
+		bindIP, err := peerListenerAddress(ctx, p.runner, p.network.hostIP)
+		if err != nil {
+			return nil, err
+		}
+		p.network.proxyBindIP = bindIP
 	}
 	r := &networkRelay{runner: p.runner, directory: "/tmp/fvp-relay-" + p.runner.cfg.peerOwner}
 	if _, err := p.runner.peer(ctx, "umask 077; mkdir -p "+quote(r.directory)+"; chmod 700 "+quote(r.directory)); err != nil {

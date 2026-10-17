@@ -16,6 +16,8 @@ import (
 	"sync"
 	"time"
 
+	"github.com/floci-io/floci/tools/microsandbox-pods/internal/hosttransport"
+
 	msbruntime "github.com/floci-io/floci/tools/microsandbox-runtime"
 )
 
@@ -157,15 +159,23 @@ func joinCommand(args []string) string {
 }
 
 type network struct {
+	ingressMu      sync.Mutex
+	ingressClosed  bool
+	ingress        map[string]*hosttransport.VXLANIngress
 	backendPrefix  netip.Prefix
 	runner         commandRunner
 	prefix         netip.Prefix
 	gateway        netip.Addr
 	peerIP, hostIP string
+	proxyBindIP    string
 	peerPort       int
 }
 
 func newNetwork(ctx context.Context, runner commandRunner, reusing bool) (*network, error) {
+	hostIP, err := peerHostAddress(runner.cfg.nodeIP)
+	if err != nil {
+		return nil, err
+	}
 	out, err := runner.run(ctx, "docker", "inspect", runner.cfg.peer)
 	if err != nil {
 		return nil, err
@@ -194,14 +204,15 @@ func newNetwork(ctx context.Context, runner commandRunner, reusing bool) (*netwo
 	}
 	peerIP := ""
 	for _, attached := range peer.NetworkSettings.Networks {
-		peerIP = attached.IPAddress
+		if attached.IPAddress != "" {
+			if peerIP != "" && peerIP != attached.IPAddress {
+				return nil, errors.New("owned network peer has ambiguous IPv4 interfaces")
+			}
+			peerIP = attached.IPAddress
+		}
 	}
 	if net.ParseIP(peerIP) == nil {
 		return nil, fmt.Errorf("network peer has no IPv4 address")
-	}
-	hostIP, err := runner.peer(ctx, "nslookup host.docker.internal | awk '/^Address: / {print $2}' | tail -n1")
-	if err != nil || net.ParseIP(hostIP) == nil {
-		return nil, fmt.Errorf("network peer cannot resolve host.docker.internal: %w", err)
 	}
 	prefix, err := netip.ParsePrefix(runner.cfg.podCIDR)
 	if err != nil || !prefix.Addr().Is4() || prefix.Bits() != 22 {
@@ -225,6 +236,13 @@ func newNetwork(ctx context.Context, runner commandRunner, reusing bool) (*netwo
 	}
 	gateway := prefix.Masked().Addr().Next()
 	n := &network{runner: runner, prefix: prefix, backendPrefix: backendPrefix, gateway: gateway, peerIP: peerIP, hostIP: hostIP, peerPort: port}
+	n.proxyBindIP, err = peerListenerAddress(ctx, runner, hostIP)
+	if err != nil {
+		return nil, err
+	}
+	if err := n.pinHostIdentity(ctx); err != nil {
+		return nil, err
+	}
 	if reusing {
 		if _, err := runner.peer(ctx, "ip link show "+bridgeName); err == nil {
 			return n, nil
@@ -256,6 +274,9 @@ func addressAt(prefix netip.Prefix, slot int) string {
 }
 
 func (n *network) attach(ctx context.Context, e *podEntry) error {
+	if err := n.ensureIngress(e); err != nil {
+		return err
+	}
 	guestIP, err := n.runner.guest(ctx, e.vm, "ip -4 -o addr show dev eth0 | awk '{print $4}' | cut -d/ -f1")
 	if err != nil || net.ParseIP(guestIP) == nil {
 		return fmt.Errorf("cannot find guest address: %w", err)

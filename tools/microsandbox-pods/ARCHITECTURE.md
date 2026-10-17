@@ -112,12 +112,18 @@ Proxy guests use a separately reserved private /22, default `10.42.204.0/22`,
 inside the cluster Pod CIDR. Their public PodIP remains on the shared relay.
 This mode translates client source addresses and supports 1..16 declared TCP
 ports. UDP, SCTP, transparent source preservation and arbitrary CNIs are not
-supported. Direct strict-mode VXLAN traffic retains source Pod IPs. OrbStack's
-peer-to-host loopback reachability is qualified; other Docker hosts must verify
-that path before using proxy mode. Listeners require a Linux relay binary built
-for the peer architecture, supplied through `--network-relay-binary`. Before
-advertising availability, a bounded challenge verifies peer-to-host loopback
-reachability without activating an application. Setup uses eight registration
+supported. Direct strict-mode VXLAN traffic retains source Pod IPs. The explicit
+`--node-ip` supplies the host route; the controller does not require a Docker DNS
+alias. A bounded challenge chooses loopback if reachable through that address,
+otherwise a verified local interface at that exact address. It never falls back
+to a wildcard listener. Interface-bound VXLAN ingress accepts only the owned peer
+IP, the Pod's stable source port and VNI, then forwards to its loopback SDK port.
+These UDP sockets exist only for active guests and are rebuilt from journals
+before recovered workloads resume. Sleeping, deletion and controller shutdown
+close them. `proxyUrl` reports the selected HTTP frontend address; backend and
+authenticated management listeners stay on loopback. Listeners require a Linux
+relay binary built for the peer architecture, supplied through
+`--network-relay-binary`. Setup uses eight registration
 slots, independently of the two VM boot/restore slots and active RAM admission.
 
 `microsandbox.dev/idle-owner: "controller"` is the default for proxy Pods, with

@@ -7,6 +7,7 @@ import (
 	"io"
 	"net"
 	"os"
+	"slices"
 	"strings"
 	"testing"
 	"time"
@@ -77,10 +78,10 @@ func TestPeerReachabilityRejectsNonliteralHostAddresses(t *testing.T) {
 	}
 }
 
-func TestOwnedDockerPeerReachesHostLoopback(t *testing.T) {
-	peer, owner := os.Getenv("FLOCI_NATIVE_RELAY_PEER"), os.Getenv("FLOCI_NATIVE_RELAY_OWNER")
-	if peer == "" || owner == "" {
-		t.Skip("requires an explicitly owned disposable Docker peer")
+func TestOwnedDockerPeerReachesExplicitHostAddress(t *testing.T) {
+	peer, owner, host := os.Getenv("FLOCI_NATIVE_RELAY_PEER"), os.Getenv("FLOCI_NATIVE_RELAY_OWNER"), os.Getenv("FLOCI_NATIVE_RELAY_NODE_IP")
+	if peer == "" || owner == "" || host == "" {
+		t.Skip("requires an explicitly owned disposable Docker peer and reachable host IPv4 address")
 	}
 	runner := commandRunner{cfg: config{peer: peer, peerOwner: owner}}
 	ctx, cancel := context.WithTimeout(t.Context(), 10*time.Second)
@@ -89,12 +90,65 @@ func TestOwnedDockerPeerReachesHostLoopback(t *testing.T) {
 	if err != nil || actual != owner {
 		t.Fatalf("Docker peer ownership mismatch: %v", err)
 	}
-	host, err := runner.peer(ctx, "nslookup host.docker.internal | awk '/^Address: / {print $2}' | tail -n1")
+	listener, err := peerListenerAddress(ctx, runner, host)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := verifyPeerReachability(ctx, runner, host); err != nil {
-		t.Fatal(err)
+	t.Logf("owned Linux peer reached host listener %s through %s", listener, host)
+}
+
+func TestPeerListenerUsesOnlyVerifiedLoopbackOrOwnedInterface(t *testing.T) {
+	for _, scenario := range []struct {
+		name                      string
+		loopback, local, specific bool
+		want                      string
+		attempts                  []string
+	}{
+		{"loopback", true, false, false, "127.0.0.1", []string{"127.0.0.1"}},
+		{"specific interface", false, true, true, "192.0.2.10", []string{"127.0.0.1", "192.0.2.10"}},
+		{"unassigned address", false, false, true, "", []string{"127.0.0.1"}},
+		{"unreachable interface", false, true, false, "", []string{"127.0.0.1", "192.0.2.10"}},
+	} {
+		t.Run(scenario.name, func(t *testing.T) {
+			var attempts []string
+			actual, err := selectPeerListener("192.0.2.10", func(string) (bool, error) { return scenario.local, nil }, func(host string) error {
+				attempts = append(attempts, host)
+				if host == "127.0.0.1" && scenario.loopback || host == "192.0.2.10" && scenario.specific {
+					return nil
+				}
+				return errors.New("unreachable")
+			})
+			if actual != scenario.want || (err != nil) != (scenario.want == "") || !slices.Equal(attempts, scenario.attempts) {
+				t.Fatalf("address=%q error=%v attempts=%v", actual, err, attempts)
+			}
+		})
 	}
-	t.Logf("owned Linux peer reached host loopback through %s", host)
+}
+
+func TestPeerListenerNeverBindsWildcardAndUsesExplicitNodeIP(t *testing.T) {
+	for _, invalid := range []string{"", "0.0.0.0", "::", "::1", "host.docker.internal", "224.0.0.1"} {
+		if _, err := peerHostAddress(invalid); err == nil {
+			t.Fatalf("invalid node address accepted: %s", invalid)
+		}
+		if err := verifyBoundReachability(t.Context(), invalid, func(context.Context, int, string) error {
+			t.Fatal("invalid bind address reached network probe")
+			return nil
+		}); err == nil {
+			t.Fatalf("invalid bind address accepted: %s", invalid)
+		}
+	}
+	if actual, err := peerHostAddress("192.0.2.10"); err != nil || actual != "192.0.2.10" {
+		t.Fatal("explicit node address was not retained", actual, err)
+	}
+	if local, err := localHostAddress("127.0.0.1"); err != nil || !local {
+		t.Fatal("local loopback interface was not found", local, err)
+	}
+}
+
+func TestLifecycleProxyURLUsesSelectedFrontendOnly(t *testing.T) {
+	e := &podEntry{pod: validPod(), proxyHost: "192.0.2.10", httpPort: 18080, proxyPorts: []proxyPortBinding{{ProxyPort: 18081}}}
+	actual := view(e)
+	if actual.ProxyURL != "http://192.0.2.10:18081" || actual.BackendURL != "http://127.0.0.1:18080" {
+		t.Fatal("frontend selection changed backend exposure or reported the wrong URL", actual)
+	}
 }

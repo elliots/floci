@@ -59,7 +59,7 @@ type podEntry struct {
 	proxyRouteFailed                                 atomic.Bool
 	publication                                      sync.Mutex
 	proxyPorts                                       []proxyPortBinding
-	backendIP, idleOwner                             string
+	backendIP, idleOwner, proxyHost                  string
 	idleTimeout                                      time.Duration
 	lastActivity                                     time.Time
 	activeConnections                                int
@@ -131,6 +131,7 @@ func newProvider(ctx context.Context, cfg config, client kubernetes.Interface) (
 	defer func() {
 		if !succeeded {
 			stop()
+			network.closeIngresses()
 		}
 	}()
 	p := &provider{registrations: make(chan struct{}, 8), idleJobs: make(chan struct{}, 2), stop: stop, stateLock: stateLock, client: client, ctx: lifetime, runner: runner, network: network, pods: make(map[string]*podEntry), starts: make(chan struct{}, 2)}
@@ -724,6 +725,7 @@ func (p *provider) terminated(e *podEntry, code int32) {
 }
 
 func (p *provider) stopTerminal(ctx context.Context, e *podEntry) error {
+	p.network.closeIngress(e)
 	status, exists, err := p.inspectOwned(ctx, e)
 	if err != nil {
 		return err
@@ -832,6 +834,7 @@ func (p *provider) DeletePod(ctx context.Context, pod *corev1.Pod) error {
 		return err
 	}
 	e.deleted = true
+	p.network.closeIngress(e)
 	e.tokens.clear()
 	e.initialVolumes = nil
 	var errs []error
@@ -996,6 +999,7 @@ func (p *provider) close(ctx context.Context) error {
 	if p.stop != nil {
 		p.stop()
 	}
+	p.network.closeIngresses()
 	if p.proxy != nil {
 		if err := p.proxy.close(ctx); err != nil {
 			return err

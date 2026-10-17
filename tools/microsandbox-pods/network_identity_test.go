@@ -1,0 +1,85 @@
+package main
+
+import (
+	"encoding/json"
+	"os"
+	"path/filepath"
+	"strings"
+	"testing"
+)
+
+func TestPeerHostIdentityPinsDirectControllerRestarts(t *testing.T) {
+	n := &network{runner: commandRunner{cfg: config{state: t.TempDir()}}, hostIP: "192.0.2.1"}
+	if err := n.pinHostIdentity(t.Context()); err != nil {
+		t.Fatal(err)
+	}
+	if err := n.pinHostIdentity(t.Context()); err != nil {
+		t.Fatal("same host was not reusable", err)
+	}
+	pod := validPod()
+	record := journalRecord{Version: 6, Pod: pod, View: lifecycleView{UID: string(pod.UID), VM: "fvp-" + stringsWithoutHyphens(string(pod.UID))[:20], UDPPort: 40001}}
+	data, err := json.Marshal(record)
+	if err != nil {
+		t.Fatal(err)
+	}
+	journal := filepath.Join(n.runner.cfg.state, string(pod.UID)+".json")
+	if err := os.WriteFile(journal, data, 0600); err != nil {
+		t.Fatal(err)
+	}
+	n.hostIP = "192.0.2.2"
+	if err := n.pinHostIdentity(t.Context()); err == nil {
+		t.Fatal("changed host adopted existing Pod state")
+	}
+	if err := os.Remove(journal); err != nil {
+		t.Fatal(err)
+	}
+	if err := n.pinHostIdentity(t.Context()); err != nil {
+		t.Fatal("empty state could not move host", err)
+	}
+}
+
+func TestLegacyPeerHostIdentityRequiresOwnedDestinationAndTuple(t *testing.T) {
+	record := journalRecord{GuestIP: "172.16.0.6", Slot: 3, View: lifecycleView{UID: "owned", UDPPort: 40001}}
+	legacy := "-A OUTPUT -d 172.16.0.6/32 -p udp -m udp --dport 8472 -j DNAT --to-destination 192.0.2.1:40001"
+	current := "-A OUTPUT -s 192.0.2.2/32 -d 172.16.0.6/32 -p udp -m udp --sport 20003 --dport 8472 -j DNAT --to-destination 192.0.2.1:40001"
+	for _, rule := range []string{legacy, current, legacy + "\n" + current} {
+		if err := proveLegacyPeerHost(rule, "192.0.2.1", "192.0.2.2", record); err != nil {
+			t.Fatal(err)
+		}
+	}
+	for _, rules := range []string{"", strings.Replace(legacy, "40001", "40002", 1), strings.Replace(current, "20003", "20004", 1), strings.Replace(current, "192.0.2.2", "192.0.2.3", 1), strings.Replace(current, "-s ", "! -s ", 1), legacy + "\n" + strings.Replace(legacy, "192.0.2.1", "192.0.2.99", 1)} {
+		if err := proveLegacyPeerHost(rules, "192.0.2.1", "192.0.2.2", record); err == nil {
+			t.Fatal("unproven legacy destination accepted", rules)
+		}
+	}
+}
+
+func TestPeerHostIdentityRejectsSymlinksAndAdoptsOnlyNetworklessColdState(t *testing.T) {
+	n := &network{runner: commandRunner{cfg: config{state: t.TempDir()}}, hostIP: "192.0.2.1"}
+	path := filepath.Join(n.runner.cfg.state, "network-host")
+	other := filepath.Join(t.TempDir(), "unowned")
+	if err := os.WriteFile(other, []byte(`{"version":1,"nodeIP":"192.0.2.1"}`), 0600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(other, path); err != nil {
+		t.Fatal(err)
+	}
+	if err := n.pinHostIdentity(t.Context()); err == nil {
+		t.Fatal("symlink host identity accepted")
+	}
+	if err := os.Remove(path); err != nil {
+		t.Fatal(err)
+	}
+	pod := validPod()
+	record := journalRecord{Version: 5, Pod: pod, View: lifecycleView{UID: string(pod.UID), VM: "fvp-" + stringsWithoutHyphens(string(pod.UID))[:20], UDPPort: 40001}}
+	data, err := json.Marshal(record)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(n.runner.cfg.state, string(pod.UID)+".json"), data, 0600); err != nil {
+		t.Fatal(err)
+	}
+	if err := n.pinHostIdentity(t.Context()); err != nil {
+		t.Fatal("cold state without any guest route failed adoption", err)
+	}
+}

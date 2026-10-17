@@ -20,10 +20,16 @@ the public native Pod CIDR and other workers. Its default is `10.42.204.0/22`,
 alongside the default public `10.42.200.0/22`. Both ranges belong inside the
 cluster's Pod CIDR. See the controller setup instructions for the complete command.
 
-Proxy networking is qualified with OrbStack on Apple Silicon. Before advertising
-availability, the controller verifies that its Docker peer can reach a host
-listener bound to loopback. Docker setups without that path fail proxy setup;
-native Linux proxy networking has not been qualified yet.
+The controller uses the explicit `--node-ip` for peer-to-host routing. A bounded
+challenge selects loopback listeners when the peer can reach them. Otherwise,
+the address must belong to a specific local host interface and pass the same
+challenge. Frontend listeners never silently bind all host interfaces. On that
+interface, bounded in-process UDP forwarding accepts only the owned peer's source
+IP, each Pod's fixed VXLAN source port and its expected VNI, then forwards to the
+SDK's loopback publication. SDK application backends and authenticated controller
+endpoints remain on loopback. Ordinary socket behavior and source rejection are
+tested in a Linux Docker namespace; native Linux VM networking still requires
+qualification on a KVM host.
 
 ## Scheduling and waking
 

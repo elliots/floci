@@ -49,7 +49,7 @@ func run() error {
 	flag.StringVar(&cfg.relayBinary, "network-relay-binary", "", "Linux network-relay executable matching the owned Docker peer architecture")
 	flag.StringVar(&cfg.guestFSBinary, "guest-fs-binary", "", "Linux guestfs executable for fsGroup and supplemental group policies")
 	flag.StringVar(&cfg.listen, "listen", "127.0.0.1:10250", "TLS kubelet listen address")
-	flag.StringVar(&cfg.nodeIP, "node-ip", "", "Host IPv4 address reachable from the API server")
+	flag.StringVar(&cfg.nodeIP, "node-ip", "", "Host IPv4 address reachable from the API server and owned network peer")
 	flag.StringVar(&cfg.cert, "tls-cert", "", "Kubelet TLS serving certificate")
 	flag.StringVar(&cfg.key, "tls-key", "", "Kubelet TLS private key")
 	flag.StringVar(&cfg.ca, "client-ca", "", "Kubernetes kubelet-client certificate authority")

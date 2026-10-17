@@ -83,12 +83,16 @@ func (p *provider) prepareProxy(ctx context.Context, e *podEntry) error {
 	if err := p.network.prepareProxy(ctx, e); err != nil {
 		return err
 	}
+	e.proxyHost = p.network.proxyBindIP
+	if e.proxyHost == "" {
+		e.proxyHost = "127.0.0.1"
+	}
 	for _, binding := range e.proxyPorts {
 		listen, acquire := p.proxy.listenHTTP, p.acquireHTTP
 		if proxyProtocol(e.pod) == "tcp" {
 			listen, acquire = p.proxy.listen, p.acquireProxy
 		}
-		_, err := listen(string(e.pod.UID), binding.ContainerPort, "127.0.0.1", binding.ProxyPort, func(ctx context.Context) (string, func(), error) { return acquire(ctx, e, binding.BackendPort) })
+		_, err := listen(string(e.pod.UID), binding.ContainerPort, e.proxyHost, binding.ProxyPort, func(ctx context.Context) (string, func(), error) { return acquire(ctx, e, binding.BackendPort) })
 		if err != nil {
 			return err
 		}

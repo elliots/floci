@@ -275,9 +275,12 @@ func (p *provider) recover(ctx context.Context) error {
 	for _, e := range recovered {
 		e.op.Lock()
 		var err error
-		if e.freeze != nil && (e.state == "RUNNING" || e.state == "READY") {
+		if e.created && e.state != "SLEEPING" {
+			err = p.network.ensureIngress(e)
+		}
+		if err == nil && e.freeze != nil && (e.state == "RUNNING" || e.state == "READY") {
 			err = p.refreshAndThaw(ctx, e)
-		} else {
+		} else if err == nil {
 			err = p.refreshRecoveredTokens(ctx, e)
 		}
 		if err == nil {

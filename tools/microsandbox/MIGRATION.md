@@ -609,6 +609,22 @@ optional service field. No manifest changes are required for existing probes.
 
 ## Native Pod VXLAN address reuse
 
+The host controller now honors the explicit `--node-ip` for peer routing instead
+of resolving a fixed Docker hostname. A private `network-host` record pins that
+address while Pod journals remain, including direct controller CLI restarts.
+On first upgrade, existing guest routes must prove the same host address through
+their owned peer DNAT entries. Cold Pods with no guest network or checkpoints
+need no route migration. Missing or conflicting route evidence blocks startup;
+do not delete ownership records to force adoption. A different host address is
+accepted only after the controller has no Pod journals. A peer challenge prefers loopback HTTP listeners;
+when loopback is not reachable, only the same verified address on a local host
+interface may receive frontend traffic. `proxyUrl` reflects that address.
+Interface-bound UDP ingress is owned by the controller, checks the exact peer
+source IP, Pod source port and VXLAN VNI, and forwards only to the existing
+loopback SDK publication. No guest daemon or wildcard host bind is added. Native
+Linux VM qualification remains outstanding; the socket and source-fencing paths
+have a separate Linux Docker namespace regression.
+
 Native Pod peer VXLAN links now use `20000 + slot` as their fixed source port,
 derived from each Pod's persisted unique network slot. Peer DNAT and conntrack entries include that source port,
 so two Pods keep distinct routes when the runtime reuses a sleeping VM's guest IP.
