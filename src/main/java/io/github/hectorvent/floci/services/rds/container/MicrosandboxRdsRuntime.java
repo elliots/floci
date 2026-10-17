@@ -828,6 +828,12 @@ public class MicrosandboxRdsRuntime implements RdsBackendRuntime {
                 .findFirst().map(this::handle).orElse(null);
     }
 
+    @Override
+    public List<String> readLog(String backendId) {
+        throw new AwsException("UnsupportedOperation",
+                "RDS log retrieval is not supported by the microsandbox backend.", 400);
+    }
+
     private void releaseStoppedCapacity(MicrosandboxMachine machine) {
         for (String source : machine.retiredVms) {
             if (exists(source) && !"Stopped".equals(inspectOwned(machine, source).path("status").asText())) {

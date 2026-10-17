@@ -5,6 +5,7 @@ import com.fasterxml.jackson.databind.ObjectMapper;
 import com.fasterxml.jackson.databind.node.ArrayNode;
 import com.fasterxml.jackson.databind.node.ObjectNode;
 import io.github.hectorvent.floci.config.EmulatorConfig;
+import io.github.hectorvent.floci.core.common.AwsException;
 import io.github.hectorvent.floci.core.common.docker.ContainerLiveness;
 import io.github.hectorvent.floci.core.common.microsandbox.MicrosandboxCapacity;
 import io.github.hectorvent.floci.core.storage.AccountAwareStorageBackend;
@@ -15,6 +16,7 @@ import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.params.ParameterizedTest;
 import org.junit.jupiter.params.provider.EnumSource;
+import org.junit.jupiter.params.provider.ValueSource;
 import org.mockito.InOrder;
 
 import java.util.LinkedHashMap;
@@ -676,6 +678,24 @@ class MicrosandboxRdsRuntimeTest {
         assertThrows(IllegalStateException.class, () -> runtime.restorePostgresSnapshot(mysql.getContainerId(), "root", "SQL"));
         assertThrows(IllegalStateException.class, () -> runtime.renamePostgresDatabase(mysql.getContainerId(), "root", "a", "b"));
         verifyNoInteractions(client);
+    }
+
+    @ParameterizedTest
+    @ValueSource(booleans = {false, true})
+    void unsupportedLogReadsDoNotContactOrWakeTheGuest(boolean sleeping) {
+        if (sleeping) {
+            assertTrue(runtime.pauseIfIdle(arn));
+        }
+        String phase = machine().phase;
+        clearInvocations(client, manager);
+
+        assertFalse(runtime.supportsLogReads());
+        AwsException failure = assertThrows(AwsException.class, () -> runtime.readLog(handle.getContainerId()));
+
+        assertEquals("UnsupportedOperation", failure.getErrorCode());
+        assertEquals(400, failure.getHttpStatus());
+        assertEquals(phase, machine().phase);
+        verifyNoInteractions(client, manager);
     }
 
     private void restart() throws Exception {

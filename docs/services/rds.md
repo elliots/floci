@@ -485,16 +485,18 @@ not emulated.
 
 ## Local database TLS names
 
-PostgreSQL and MySQL proxies persist their public certificate at
-`<persistent-path>/tls/rds-ca.crt`. Copy that file into your client's trust store or
+PostgreSQL and MySQL proxies use Floci's shared root CA. Its public certificate is
+available at `<persistent-path>/tls/floci-root-ca.crt`, with a compatibility copy at
+`<persistent-path>/tls/rds-ca.crt`. Copy either file into your client's trust store or
 use it as PostgreSQL's `sslrootcert`. Copy only the public `.crt` file. A containerized
 Floci can export it with `docker cp <container>:<persistent-path>/tls/rds-ca.crt ./rds-ca.crt`.
-This database certificate is separate from Floci's HTTP and ElastiCache root CA.
+After upgrading from the separate RDS CA, refresh any previously exported client
+trust files. The proxy serves a separate server certificate signed by the shared CA.
 
 Set `FLOCI_SERVICES_RDS_TLS_HOSTNAMES=writer.example.test,reader.example.test` before
-starting Floci to include extra DNS names in the database certificate. Advertised
+starting Floci to include extra DNS names in the database server certificate. Advertised
 endpoint names are still added automatically. Restart after changing the configured
-names; existing learned names and the signing key are preserved. DNS routing and IAM
+names; existing learned names and the shared CA are preserved. DNS routing and IAM
 token endpoint validation remain separate from certificate names.
 
 The former on-demand branch's `GET /_aws/rds/tls/ca` and
@@ -813,6 +815,10 @@ container (`docker logs`, the most recent 100,000 lines), cut into files the way
 `error/postgresql.log.YYYY-MM-DD-HH` (UTC), MySQL and MariaDB keep `error/mysql-error.log`, and SQL
 Server keeps `log/ERROR`. An Aurora member reads its cluster's container. `LastWritten` is the time
 Docker recorded for the file's last line, and `Size` the bytes of its lines.
+
+The native microsandbox database runtime does not yet provide database log
+capture and retention. These operations return HTTP 400 `UnsupportedOperation`
+for native databases without starting or resuming them, including after recovery.
 
 `DescribeDBLogFiles` takes `FilenameContains`, `FileLastWritten` (files written at or after it) and
 `FileSize` (files larger than it), and pages by `MaxRecords` / `Marker`. `DownloadDBLogFilePortion`

@@ -4,6 +4,8 @@ import io.github.hectorvent.floci.core.common.Resettable;
 import io.github.hectorvent.floci.core.common.docker.ContainerLiveness;
 import io.github.hectorvent.floci.services.rds.model.DatabaseEngine;
 
+import java.util.List;
+
 /**
  * Database execution boundary used by RDS, its connection gate, and emulator shutdown.
  * AWS resource state and eligibility for auto-pause remain in the RDS service.
@@ -45,6 +47,14 @@ public interface RdsBackendRuntime extends RdsBackendGate, Resettable {
     ContainerLiveness probeContainer(String backendId);
 
     RdsContainerHandle getActiveHandle(String runtimeId);
+
+    /** Checked before recovering an execution handle, so unsupported reads cannot start a backend. */
+    default boolean supportsLogReads() {
+        return false;
+    }
+
+    /** Timestamped database stdout/stderr lines; null means the backend is missing. */
+    List<String> readLog(String backendId);
 
     void stopAll();
 

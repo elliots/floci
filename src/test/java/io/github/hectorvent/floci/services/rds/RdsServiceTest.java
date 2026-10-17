@@ -514,6 +514,7 @@ class RdsServiceTest {
 
     @Test
     void logFilesRecoverAMissingContainerOnceThenReportTheInstanceNotReady() {
+        when(containerManager.supportsLogReads()).thenReturn(true);
         when(rdsConfig.mock()).thenReturn(true);
         rdsService.createDbInstance("logs-db", "postgres", "16.3", "admin", "password", "appdb",
                 "db.t3.micro", 20, false, null, null, null, null, false, false, null,
@@ -541,6 +542,30 @@ class RdsServiceTest {
         when(containerManager.readLog("fresh-container")).thenThrow(new IllegalStateException("Timed out"));
         assertEquals("InternalFailure", assertThrows(AwsException.class,
                 () -> service.describeDbLogFiles(null, "logs-db", null, null, null, null, null)).getErrorCode());
+    }
+
+    @ParameterizedTest
+    @ValueSource(booleans = {false, true})
+    void unsupportedLogReadsNeverRecoverOrAccessTheBackend(boolean hasBackendId) {
+        RdsService service = spy(rdsService);
+        DbInstance instance = new DbInstance();
+        instance.setStatus(DbInstanceStatus.AVAILABLE);
+        instance.setContainerId(hasBackendId ? "msb-native-database" : null);
+        doReturn(instance).when(service).getDbInstance("native-logs", "us-east-1");
+
+        AwsException describe = assertThrows(AwsException.class,
+                () -> service.describeDbLogFiles(null, "native-logs", null, null, null, null, null));
+        AwsException download = assertThrows(AwsException.class,
+                () -> service.downloadDbLogFilePortion(null, "native-logs", "error/mysql-error.log", null, null));
+
+        assertEquals("UnsupportedOperation", describe.getErrorCode());
+        assertEquals(400, describe.getHttpStatus());
+        assertEquals("UnsupportedOperation", download.getErrorCode());
+        assertEquals(400, download.getHttpStatus());
+        verify(service, never()).ensureInstanceBackend(any(), any());
+        verify(containerManager, times(2)).supportsLogReads();
+        verifyNoMoreInteractions(containerManager);
+        verifyNoInteractions(proxyManager);
     }
 
     @Test

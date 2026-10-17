@@ -10012,6 +10012,10 @@ public class RdsService implements Resettable, ResourceProvider {
         if (config.services().rds().mock()) {
             return List.of();
         }
+        if (!containerManager.supportsLogReads()) {
+            throw new AwsException("UnsupportedOperation",
+                    "RDS log retrieval is not supported by the configured backend.", 400);
+        }
         // Container ids are not persisted, and a container can be removed outside Floci: when there is
         // no id, or Docker no longer knows it, the backend is found or started once before giving up.
         String containerId = instance.getContainerId();

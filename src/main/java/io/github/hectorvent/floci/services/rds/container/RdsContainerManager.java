@@ -901,12 +901,18 @@ public class RdsContainerManager implements RdsBackendRuntime {
     /** The most recent lines {@link #readLog} reads, so one call never holds an unbounded history. */
     public static final int MAX_LOG_LINES = 100_000;
 
+    @Override
+    public boolean supportsLogReads() {
+        return true;
+    }
+
     /**
      * The container's log as Docker keeps it, stdout and stderr, at most the last
      * {@link #MAX_LOG_LINES} lines, each with Docker's RFC 3339 timestamp in front. Null when Docker
      * no longer knows the container, so the caller can tell a missing backend from an empty log. A
      * read that does not finish in time fails rather than returning part of the log.
      */
+    @Override
     public List<String> readLog(String containerId) {
         return readLog(containerId, Duration.ofSeconds(10));
     }

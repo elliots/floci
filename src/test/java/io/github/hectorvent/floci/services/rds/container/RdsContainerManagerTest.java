@@ -290,6 +290,7 @@ class RdsContainerManagerTest {
 
         IllegalStateException timedOut = assertThrows(IllegalStateException.class,
                 () -> manager.readLog("slow", Duration.ofMillis(50)));
+        assertTrue(manager.supportsLogReads());
         assertTrue(timedOut.getMessage().contains("Timed out"), timedOut.getMessage());
         verify(stream).close();
     }
