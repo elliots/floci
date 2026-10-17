@@ -3,6 +3,7 @@ package main
 import (
 	"bytes"
 	"context"
+	"encoding/json"
 	"errors"
 	"io"
 	"os"
@@ -183,7 +184,8 @@ func TestNativeSDKMutationFenceRetainsUncertainResults(t *testing.T) {
 					t.Fatal("accepted native mutation inherited request cancellation")
 				}
 				data, err := os.ReadFile(marker)
-				if err != nil || string(data) != "snap restore\n" {
+				var record nativeCommandRecord
+				if err != nil || json.Unmarshal(data, &record) != nil || record.Phase != "intent" || record.Operation != "snap restore" || record.Nonce == "" || record.ArgumentHash == "" {
 					t.Fatalf("native mutation ran without durable fence: %q, %v", data, err)
 				}
 				if fail {

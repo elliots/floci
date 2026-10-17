@@ -72,27 +72,21 @@ func (r commandRunner) vm(ctx context.Context, args ...string) (string, error) {
 			return "", err
 		}
 		marker := filepath.Join(r.cfg.state, "native-command.pending")
-		file, err := os.OpenFile(marker, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0600)
-		if err != nil {
-			return "", err
-		}
-		_, writeErr := fmt.Fprintln(file, strings.Join(args[:min(len(args), 2)], " "))
-		syncErr := file.Sync()
-		file.Close()
-		if writeErr != nil {
-			return "", writeErr
-		}
-		if syncErr != nil {
-			return "", syncErr
-		}
-		if err := syncDirectory(r.cfg.state); err != nil {
+		record := r.commandIntent(ctx, args)
+		if err := r.writeCommandRecord(record, true); err != nil {
 			return "", err
 		}
 		output, err := r.nativeOutput(ctx, args, nil)
 		if err != nil {
 			if errors.Is(err, msbruntime.ErrCapacityUnavailable) {
+				if proofErr := r.completeCommand(ctx, &record, true); proofErr != nil {
+					return "", errors.Join(err, proofErr)
+				}
 				return "", errors.Join(err, os.Remove(marker), syncDirectory(r.cfg.state))
 			}
+			return "", err
+		}
+		if err := r.completeCommand(ctx, &record, false); err != nil {
 			return "", err
 		}
 		if err := os.Remove(marker); err != nil {

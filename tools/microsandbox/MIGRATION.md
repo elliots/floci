@@ -230,6 +230,18 @@ confirmed stale entries from the configured storage backend. Keep the runtime
 journals, guests and snapshots together. Deleting command records while a native
 operation is running can permit cleanup to race with late VM creation.
 
+The Kubernetes controller's separate `native-command.pending` file now contains
+a private intent and, after confirmed native completion, a durable terminal
+receipt. Startup automatically clears only terminal receipts whose controller
+owner, Pod UID/generation and immutable VM/checkpoint identities still match
+read-only runtime inspection. This closes the crash window between persisting a
+verified terminal result and removing its fence. It does not recover commands
+whose completion was never recorded, replay mutations, or infer completion from
+a matching name or an old timestamp. Existing plaintext fences and uncertain
+intents still require manual reconciliation; interrupted initial Pod startup can
+still become failed under the existing lifecycle recovery rules. No command
+arguments, environment values or guest configuration are persisted in the receipt.
+
 The database provider covers RDS PostgreSQL and MySQL. An additional local
 application provider uses the same host helper for HTTP and queue-driven
 hibernation. See [native workloads](../../docs/configuration/microsandbox-workloads.md)

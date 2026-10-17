@@ -107,7 +107,7 @@ func newProvider(ctx context.Context, cfg config, client kubernetes.Interface) (
 	if err != nil {
 		return nil, err
 	}
-	if err := runner.checkPending(); err != nil {
+	if err := runner.recoverCommand(ctx); err != nil {
 		return nil, err
 	}
 	if err := runner.verifyNetworkBoundary(ctx); err != nil {

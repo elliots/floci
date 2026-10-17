@@ -113,6 +113,23 @@ records and retains configuration for inspection. It never prunes runtime images
 or checkpoints. `python3 -m unittest discover -s tools/microsandbox-pods -p
 test_manage.py` checks these ownership and credential boundaries.
 
+The controller writes a private `native-command.pending` intent before each native
+mutation. Once a successful result or a confirmed admission refusal is checked,
+it durably records that terminal outcome before removing the fence. If the
+controller exits in that final window, startup can clear the fence using read-only
+checks of the original controller identity, Pod UID and generation, immutable VM
+IDs, and checkpoint IDs, digests and restored lineage. It never repeats the native
+operation during this check. Command arguments, environment values and guest
+configuration are not stored in this record.
+
+An intent without a terminal receipt, a legacy plaintext fence, changed ownership
+or an unprovable native state still blocks startup. A matching VM name, elapsed
+time or a stopped controller process does not prove that a delegated operation
+finished. Stop the controller and any surviving native commands, reconcile the
+owned guest and checkpoint state, then remove only a confirmed stale fence. This
+receipt recovery does not change the existing Pod lifecycle recovery rules; an
+interrupted initial startup can still leave that Pod failed.
+
 For an existing development cluster, configure the controller directly:
 
 `run --pod-workers 8` controls concurrent Kubernetes reconciliation, including
