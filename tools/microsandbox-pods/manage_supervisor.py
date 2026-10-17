@@ -240,8 +240,11 @@ def serve(args):
 
 
 def options(args):
-    return ["--memory-mib", str(args.memory_mib), "--scheduling-cpu", args.scheduling_cpu,
+    result = ["--memory-mib", str(args.memory_mib), "--scheduling-cpu", args.scheduling_cpu,
         "--scheduling-memory", args.scheduling_memory, "--pod-workers", str(args.pod_workers)]
+    if getattr(args, "network_policy", False):
+        result.append("--network-policy")
+    return result
 
 
 def start(args):

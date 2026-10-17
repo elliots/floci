@@ -605,3 +605,17 @@ python3 tools/microsandbox-pods/qualify_http_cancellation.py \
 
 Use a dedicated empty runtime home. The fixture removes only its owned workloads,
 VMs, checkpoints and managed cluster after successful qualification.
+
+Application lifecycle hooks, projected resources, bounded retained logs and
+Kubernetes Events are described in [OPERATIONS.md](OPERATIONS.md). Rebuild the
+controller, network relay and guestfs together to enable timestamp capture for new
+container attempts; existing raw-log checkpoints remain readable.
+
+`qualify_managed.py --installed-policy-only --network-policy` runs a smaller
+installed smoke with two ordinary clients and one native HTTP Pod that drops all
+capabilities. It checks policy denial before wake, live peer-label changes through
+the restricted controller watches, awake and sleeping metrics, the `storage` and
+preview-only `prune` commands, and same-memory recovery after a supervised crash.
+The supervisor forwards the explicit policy mode through child restarts and
+credential rotation. Include `--network-policy` on subsequent operator starts;
+a journal created in policy mode rejects recovery with that mode disabled.

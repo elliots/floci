@@ -30,6 +30,20 @@ class SupervisionTest(unittest.TestCase):
             scheduling_cpu="500", scheduling_memory="384Gi", pod_workers=8)
         self.supervisor = supervision.Supervisor(self.record, self.args, io.StringIO())
 
+    def test_background_start_forwards_explicit_network_policy_mode(self):
+        self.args.network_policy = True
+        child = Mock()
+        child.poll.return_value = None
+        with patch.object(supervision, "running", side_effect=[None, {"controllerReady": True}]), \
+                patch.object(supervision.subprocess, "Popen", return_value=child) as launch, \
+                patch("sys.stdout", io.StringIO()):
+            supervision.start(self.args)
+        command = launch.call_args.args[0]
+        self.assertEqual(1, command.count("--network-policy"))
+        self.assertIn("_supervise", command)
+        self.args.network_policy = False
+        self.assertNotIn("--network-policy", supervision.options(self.args))
+
     def test_private_management_files_and_generation_reject_symlinks(self):
         path = self.directory/"private"
         manage.write_private(path, "owned")

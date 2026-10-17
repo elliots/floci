@@ -31,7 +31,8 @@ class ManagedQualification:
         self.environment = dict(os.environ, MSB_HOME=str(Path(args.msb_home).resolve()))
         self.log = (self.root/"qualification.log").open("w")
         self.manager_args = argparse.Namespace(directory=str(self.directory), memory_mib=getattr(args, "memory_mib", 1536),
-            scheduling_cpu="500", scheduling_memory="384Gi", pod_workers=8)
+            scheduling_cpu="500", scheduling_memory="384Gi", pod_workers=8,
+            network_policy=getattr(args, "network_policy", False))
 
     def command(self, *values, env=None, **kwargs):
         return manage.command(*values, environment=env, **kwargs)
@@ -234,7 +235,7 @@ printf 'Content-Type: text/plain\\r\\n\\r\\n'
 
     def delete_workloads(self):
         label="floci-qualification="+self.record["owner"]
-        self.kubectl("delete","deployment,pod,service,configmap,serviceaccount","-l",label,"--ignore-not-found","--wait=false")
+        self.kubectl("delete","deployment,pod,service,configmap,serviceaccount,networkpolicy","-l",label,"--ignore-not-found","--wait=false")
         manage.wait("native Pod journals removed",lambda:not list((self.directory/"controller").glob("*.json")),timeout=240)
         manage.wait("Pod API objects removed",lambda:not json.loads(self.kubectl("get","pods","-A","--field-selector","spec.nodeName="+self.record["node"],"-o","json"))["items"],timeout=180)
 
@@ -256,6 +257,9 @@ printf 'Content-Type: text/plain\\r\\n\\r\\n'
             self.prepare()
             if scenario is not None:
                 scenario(self)
+            elif getattr(self.args, "installed_policy_only", False):
+                from qualification_installed import qualify_installed_policy
+                qualify_installed_policy(self)
             elif getattr(self.args, "termination_only", False):
                 from qualification_termination import qualify_plain_termination
                 qualify_plain_termination(self)
@@ -289,8 +293,12 @@ def main():
     modes=parser.add_mutually_exclusive_group()
     modes.add_argument("--identity-only",action="store_true")
     modes.add_argument("--termination-only",action="store_true",help="shared Docker/native ordinary and zero-grace shutdown checks")
+    modes.add_argument("--installed-policy-only",action="store_true",help="restricted installed policy, metrics and storage-preview smoke")
+    parser.add_argument("--network-policy",action="store_true",help="explicitly enable native node-wide NetworkPolicy enforcement")
     parser.add_argument("--java-home")
     args=parser.parse_args()
+    if args.installed_policy_only and not args.network_policy:
+        parser.error("installed-policy-only requires network-policy")
     if args.identity_only and not args.floci_checkout:
         parser.error("identity-only requires floci-checkout")
     return ManagedQualification(args).run()
