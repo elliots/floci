@@ -14,13 +14,24 @@ without a wake request or an idle-activity update. As in kubelet, a received HTT
 response completes an HTTP lifecycle handler even if its status is an error;
 HTTP readiness/liveness probes retain their usual status-code checks.
 
+Ordinary running applications receive SIGTERM and keep their network return path
+until exit or the Pod termination deadline, even when they have no hooks, sidecars
+or persistent volumes. When the controller observes a zero grace period, it skips
+application and hook waits.
+
 `preStop` runs before SIGTERM and consumes the existing termination grace period.
 A timed-out running hook receives Kubernetes' one-off two-second extension before
 forced termination. Restartable sidecars still stop after regular applications,
 in reverse declaration order. RAM hibernation and restore do not invoke either
 hook. Graceful deletion can resume a previously running sleeping Pod to execute
 `preStop`, subject to the remaining deletion grace and shared VM admission budget.
-A never-started cold Pod and a forced zero-grace deletion never boot for hooks.
+A never-started cold Pod and a deletion with an observed zero grace period never
+boot for hooks.
+API force deletion removes the object immediately and can leave only the saved Pod
+specification available to the controller. As with Kubernetes kubelet, it does not
+guarantee immediate process termination or that a saved nonzero grace is bypassed.
+Set `terminationGracePeriodSeconds: 0` on the Pod when zero grace must also apply
+to cleanup after the API object has disappeared.
 Admission or identity failure is reported as a Warning Event; an uncertain native
 restore retains ownership for recovery rather than deleting unknown state.
 
@@ -104,3 +115,13 @@ The 2026-10-17 macOS/Apple Silicon run passed all twelve shared/native checks an
 cleanup using journal version 8. The log helper used 3,184 KiB RSS for the fixture
 container. Controller recovery took 2.038 seconds; retained sleeping logs stayed
 identical and no startup hook replayed. Linux/KVM requires separate qualification.
+
+`qualify_managed.py --termination-only` submits the same plain application on
+Docker and native workers. Its SIGTERM handler reports both the start and finish
+of shutdown to an owned HTTP observer. It also checks that a Pod configured with
+zero grace completes cleanup promptly. The native case skips an explicit preStop
+hook. Kubelet applies a minimum effective grace and may run that hook even when
+the requested grace is zero; the report records this known difference separately
+([upstream discussion](https://github.com/kubernetes/kubernetes/issues/123408)).
+The fixture uses the normal managed installation and confirms native ownership
+cleanup.

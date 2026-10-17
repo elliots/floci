@@ -1010,7 +1010,7 @@ Ready=false, matching the existing multi-container behavior. Their VM remains
 stopped and consumes no active VM RAM. Proxy-ready mode remains available.
 Graceful deletion of a previously running sleeping Pod with `preStop` can restore
 it within the remaining deletion grace and shared admission budget to run its
-hook. Cold Pods and forced zero-grace deletion do not start execution.
+hook. Cold Pods and deletions with an observed zero grace period do not start execution.
 
 Completed `postStart`/`preStop` hooks are persisted per container attempt and are
 not replayed by RAM restore. An incomplete hook after a controller crash fails
@@ -1052,3 +1052,24 @@ disable isolation merely to make the controller start. Use the existing protecte
 Docker Kubernetes backend when this boundary is required until peer integration
 is implemented and qualified. Ordinary native Pods without environment isolation
 retain their existing runtime behavior.
+
+## Ordinary Pod termination
+
+Native running Pods now receive SIGTERM and their configured termination grace
+even without lifecycle hooks, sidecars or PVCs. Existing applications can use
+their normal shutdown handlers. The owned network return route remains available
+while those handlers run. An observed zero grace period skips the graceful wait;
+cold and sleeping Pods without preStop hooks remain stopped during deletion.
+PVC writeback and ownership checks still gate destructive cleanup.
+
+Immediate API force deletion can leave only the saved Pod specification for
+cleanup. It does not guarantee that processes stop immediately or bypass a saved
+nonzero grace period. Configure `terminationGracePeriodSeconds: 0` on the Pod
+when zero grace must survive removal of the API object. This matches the
+[Kubernetes force-deletion caveat](https://kubernetes.io/docs/reference/kubectl/generated/kubectl_delete/).
+
+The native provider keeps its existing explicit zero-grace hook skip. Kubernetes
+kubelet can still run preStop because it applies a minimum effective grace, as
+described in [the upstream discussion](https://github.com/kubernetes/kubernetes/issues/123408).
+The shared qualification records that difference instead of claiming exact
+zero-grace hook parity.

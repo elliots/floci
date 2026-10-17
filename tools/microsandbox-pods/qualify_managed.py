@@ -256,6 +256,9 @@ printf 'Content-Type: text/plain\\r\\n\\r\\n'
             self.prepare()
             if scenario is not None:
                 scenario(self)
+            elif getattr(self.args, "termination_only", False):
+                from qualification_termination import qualify_plain_termination
+                qualify_plain_termination(self)
             else:
                 if not self.args.identity_only:
                     self.graph()
@@ -283,7 +286,9 @@ def main():
     parser.add_argument("--node-ip")
     parser.add_argument("--work-directory",default="/tmp")
     parser.add_argument("--floci-checkout",help="also run installed TLS webhook and shared AWS SDK identity checks")
-    parser.add_argument("--identity-only",action="store_true")
+    modes=parser.add_mutually_exclusive_group()
+    modes.add_argument("--identity-only",action="store_true")
+    modes.add_argument("--termination-only",action="store_true",help="shared Docker/native ordinary and zero-grace shutdown checks")
     parser.add_argument("--java-home")
     args=parser.parse_args()
     if args.identity_only and not args.floci_checkout:

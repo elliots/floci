@@ -903,7 +903,7 @@ func (p *provider) DeletePod(ctx context.Context, pod *corev1.Pod) error {
 		e.shutdownDeadline = deadline
 	}
 	e.deleted = true
-	p.network.closeIngress(e)
+	defer p.network.closeIngress(e)
 	e.tokens.clear()
 	e.initialVolumes = nil
 	var errs []error
@@ -913,7 +913,7 @@ func (p *provider) DeletePod(ctx context.Context, pod *corev1.Pod) error {
 	if status, exists, err := p.inspectOwned(ctx, e); err != nil {
 		errs = append(errs, err)
 	} else if exists {
-		if status == "Running" && (hasRestartableInit(e.pod) || len(e.persistentVolumes) > 0 || hasLifecycle(e.pod)) {
+		if status == "Running" {
 			if err := p.drainBeforeDeletion(ctx, e, pod); err != nil {
 				if len(e.persistentVolumes) > 0 {
 					return errors.Join(errors.Join(errs...), err)
@@ -921,6 +921,7 @@ func (p *provider) DeletePod(ctx context.Context, pod *corev1.Pod) error {
 				errs = append(errs, err)
 			}
 		}
+		p.network.closeIngress(e)
 		if len(e.persistentVolumes) > 0 {
 			current, _, err := p.inspectOwned(ctx, e)
 			if err != nil {
