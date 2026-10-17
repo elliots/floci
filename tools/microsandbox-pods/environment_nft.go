@@ -19,6 +19,64 @@ import (
 var environmentTableName = regexp.MustCompile(`^floci_iso_[a-z0-9]+$`)
 var environmentBridgeName = regexp.MustCompile(`^[a-zA-Z0-9_-]{1,15}$`)
 
+type environmentNFTTransport struct {
+	Source, Destination, Protocol string
+	Port                          int
+}
+
+// environmentNFTTransports extracts exact tuple members after the caller has
+// verified the complete table with verifyEnvironmentNFT. It deliberately does
+// not infer ownership: that requires the caller's immutable peer identity.
+func environmentNFTTransports(data []byte) ([]environmentNFTTransport, error) {
+	decoder := json.NewDecoder(bytes.NewReader(data))
+	decoder.UseNumber()
+	var document map[string]any
+	if err := decoder.Decode(&document); err != nil || !nftFields(document, "nftables") || decoder.Decode(new(any)) != io.EOF {
+		return nil, errors.New("invalid environment nft tuple inventory")
+	}
+	objects, ok := document["nftables"].([]any)
+	if !ok {
+		return nil, errors.New("missing environment nft tuple inventory")
+	}
+	seen := map[string]bool{}
+	var result []environmentNFTTransport
+	for _, object := range objects {
+		entry, ok := object.(map[string]any)
+		if !ok || len(entry) != 1 {
+			return nil, errors.New("invalid environment nft tuple object")
+		}
+		value, exists := entry["set"]
+		if !exists {
+			continue
+		}
+		set, ok := value.(map[string]any)
+		if !ok {
+			return nil, errors.New("invalid environment nft tuple set")
+		}
+		name, _ := set["name"].(string)
+		if seen[name] {
+			return nil, errors.New("duplicate environment nft tuple set")
+		}
+		seen[name] = true
+		if err := verifyEnvironmentSet(set, name); err != nil {
+			return nil, err
+		}
+		values, _ := set["elem"].([]any)
+		for _, value := range values {
+			parts := value.(map[string]any)["concat"].([]any)
+			port, err := nftPort(parts[2])
+			if err != nil {
+				return nil, err
+			}
+			result = append(result, environmentNFTTransport{Source: parts[0].(string), Destination: parts[1].(string), Protocol: strings.TrimPrefix(name, "native_"), Port: port})
+		}
+	}
+	if !seen["native_tcp"] || !seen["native_udp"] {
+		return nil, errors.New("missing environment nft tuple set")
+	}
+	return result, nil
+}
+
 // verifyEnvironmentNFT verifies the complete table emitted by Floci's Docker
 // isolation compiler. It accepts live counter/handle values and other owners'
 // exact tuple entries, but never additional statements or broader accept rules.

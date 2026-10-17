@@ -3,6 +3,7 @@ package main
 import (
 	"bytes"
 	"encoding/json"
+	"reflect"
 	"testing"
 
 	msbruntime "github.com/floci-io/floci/tools/microsandbox-runtime"
@@ -41,6 +42,45 @@ func environmentNFTGlobals() []msbruntime.NetworkEgressEndpoint {
 func TestEnvironmentNFTRealKernelContract(t *testing.T) {
 	if err := verifyEnvironmentNFT([]byte(environmentNFTFixture), "floci_iso_sample", []string{"br-two", "br-one"}, environmentNFTGlobals()); err != nil {
 		t.Fatal(err)
+	}
+}
+
+func TestEnvironmentNFTTransportsPreservesExactForeignAndOwnedTuples(t *testing.T) {
+	data := mutateEnvironmentNFT(t, func(objects []any) []any {
+		environmentNFTEntry(objects, "set", "native_udp")["elem"] = []any{
+			map[string]any{"concat": []any{"10.0.0.9", "192.168.0.1", json.Number("31000")}},
+			map[string]any{"concat": []any{"10.0.0.1", "192.168.0.2", json.Number("32000")}},
+		}
+		return objects
+	})
+	tuples, err := environmentNFTTransports(data)
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := []environmentNFTTransport{
+		{Source: "10.0.0.1", Destination: "10.0.0.2", Protocol: "tcp", Port: 4566},
+		{Source: "10.0.0.9", Destination: "192.168.0.1", Protocol: "udp", Port: 31000},
+		{Source: "10.0.0.1", Destination: "192.168.0.2", Protocol: "udp", Port: 32000},
+	}
+	if !reflect.DeepEqual(tuples, want) {
+		t.Fatalf("tuples %#v", tuples)
+	}
+	for _, change := range []func([]any) []any{
+		func(objects []any) []any {
+			environmentNFTEntry(objects, "set", "native_tcp")["elem"] = []any{map[string]any{"concat": []any{"10.0.0.0/8", "10.0.0.2", json.Number("443")}}}
+			return objects
+		},
+		func(objects []any) []any {
+			environmentNFTEntry(objects, "set", "native_udp")["flags"] = []any{"dynamic"}
+			return objects
+		},
+		func(objects []any) []any {
+			return append(objects, map[string]any{"set": environmentNFTEntry(objects, "set", "native_tcp")})
+		},
+	} {
+		if _, err := environmentNFTTransports(mutateEnvironmentNFT(t, change)); err == nil {
+			t.Fatal("unsafe tuple inventory accepted")
+		}
 	}
 }
 
