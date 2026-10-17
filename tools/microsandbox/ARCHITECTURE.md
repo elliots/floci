@@ -82,9 +82,11 @@ controller logs and credential generations also have bounded retention.
 
 The existing 500-pod fixture validates one synthetic application shape, cold
 deployment, selective wake and recovery. It does not establish the footprint or
-compatibility of 500 distinct enterprise applications. Next capacity checks should
-measure mixed pod/database dependency chains, concurrent wakes, idle memory,
-checkpoint storage and cleanup backlog on both Apple Silicon and Linux/KVM.
+compatibility of 500 distinct enterprise applications. Small installed graphs
+now cover nested HTTP dependencies and a shared Docker/native SQS-to-Aurora
+application, including concurrent wakes, shared-budget refusal and zero active
+guest allocation between cycles. Broader mixed graphs, retained checkpoint
+storage and cleanup backlog still need measurements on Apple Silicon and Linux/KVM.
 
 See [validation evidence](VALIDATION.md), [remaining work](ROADMAP.md) and
 [project migration notes](MIGRATION.md).

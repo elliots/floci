@@ -121,6 +121,9 @@ compatibility remain priorities for ordinary Kubernetes application manifests.
   concurrent requests, capacity waiting, live credential rotation, controller
   crashes and a cold replacement rollout. This supplements the replica-scale
   fixture; it does not establish compatibility for 500 different applications.
+  A second installed graph now passes shared Docker/native HTTP and AWS SDK SQS
+  consumption against Aurora PostgreSQL, repeated process-preserving sleep/wake,
+  controller recovery and explicit shared-budget refusal before native dispatch.
 
 Native Linux qualification has a manual GitHub Actions entry point,
 `Microsandbox Native Linux Qualification`, for a trusted self-hosted runner

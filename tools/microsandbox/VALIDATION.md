@@ -311,3 +311,28 @@ not a 500-application graph or an Aurora/message integration result.
 The current Docker host exposes no KVM device. These new native VM results are
 Apple Silicon results; native Linux/KVM qualification still requires a suitable
 Linux host. Linux unit tests and cross-builds do not replace that qualification.
+
+## Installed Aurora and SQS application graph: 17 October 2026
+
+The installed graph passed all ten checks, including ownership cleanup. The same
+Go application and AWS SDK SQS consumer ran on ordinary Docker workers and native
+Pods, using a real native Aurora PostgreSQL database. HTTP requests and queued
+messages produced six committed SQL rows, verified through the Java AWS SDK/JDBC
+fixture. The Java fixture completed with no failures, errors or skips.
+
+Native application deployments became proxy-Ready without starting their VMs or
+Aurora. HTTP subsequently woke the application and its database dependency. SQS
+enqueue woke the worker, which consumed the message, committed its SQL write and
+returned to idle sleep. Both application RAM markers and PostgreSQL's original
+process start time survived sleep and controller recovery.
+
+The Pod controller and Aurora host helper shared a 1536 MiB runtime budget. With
+one 768 MiB Pod and Aurora active, two separate third-guest admission attempts
+returned `409` with `operationStarted=false`; VM inventory and reservations stayed
+unchanged. Shared active guest allocation returned to zero between cycles. All
+owned VMs, snapshots, volumes, AWS resources and the Kubernetes peer were removed.
+
+This run used macOS/Apple Silicon. It advanced Aurora's existing test idle clock
+instead of waiting its minimum five-minute auto-pause interval; Pod idleness used
+the real coordinator. It qualifies PostgreSQL/SQS and this application graph,
+not MySQL in this graph, 500 different applications or native Linux/KVM.
