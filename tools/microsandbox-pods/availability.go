@@ -72,6 +72,9 @@ func (p *provider) prepareProxy(ctx context.Context, e *podEntry) error {
 	if !e.proxyAvailability {
 		return nil
 	}
+	if p.runner.environment != nil && !p.runner.environment.healthy.Load() {
+		return errors.New("protected environment network is unavailable")
+	}
 	if p.policies != nil {
 		if err := p.policies.installPeer(ctx, p.policies.inventory()); err != nil {
 			return err
@@ -87,6 +90,13 @@ func (p *provider) prepareProxy(ctx context.Context, e *podEntry) error {
 		return err
 	}
 	if err := p.network.prepareProxy(ctx, e); err != nil {
+		return err
+	}
+	ports := make([]environmentPort, 0, len(e.proxyPorts))
+	for _, binding := range e.proxyPorts {
+		ports = append(ports, environmentPort{Protocol: "tcp", Port: binding.ProxyPort})
+	}
+	if err := p.runner.environment.changePorts(ctx, ports, true); err != nil {
 		return err
 	}
 	e.proxyHost = p.network.proxyBindIP
@@ -349,6 +359,13 @@ func (p *provider) removeProxy(ctx context.Context, e *podEntry) error {
 		}
 	}
 	e.proxyRoutesReady = false
+	ports := make([]environmentPort, 0, len(e.proxyPorts))
+	for _, binding := range e.proxyPorts {
+		ports = append(ports, environmentPort{Protocol: "tcp", Port: binding.ProxyPort})
+	}
+	if err := p.runner.environment.changePorts(ctx, ports, false); err != nil {
+		return err
+	}
 	return p.network.removeProxy(ctx, e)
 }
 

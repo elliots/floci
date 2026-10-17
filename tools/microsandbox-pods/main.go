@@ -41,6 +41,9 @@ func run() error {
 	flag.StringVar(&cfg.state, "state", "", "Private persistent controller state directory")
 	flag.StringVar(&cfg.peer, "network-peer", "", "Owned Docker k3s worker container")
 	flag.StringVar(&cfg.peerOwner, "peer-owner", "", "Expected io.floci.pod-probe label value")
+	flag.StringVar(&cfg.environmentNetwork, "environment-network", "", "Existing Floci protected Docker network")
+	flag.StringVar(&cfg.isolationHelper, "isolation-helper", "", "Existing Floci isolation helper")
+	flag.StringVar(&cfg.environmentDNS, "environment-dns", "", "Floci DNS IPv4 address on the protected network")
 	flag.StringVar(&cfg.podCIDR, "pod-cidr", "10.42.200.0/22", "Unused IPv4 Pod CIDR within cluster CIDR")
 	flag.StringVar(&cfg.clusterCIDR, "cluster-cidr", "10.42.0.0/16", "Cluster Pod CIDR")
 	flag.StringVar(&cfg.serviceCIDR, "service-cidr", "10.43.0.0/16", "Cluster Service CIDR")
@@ -165,6 +168,9 @@ func run() error {
 }
 
 func (c config) validate() error {
+	if err := c.validateEnvironment(); err != nil {
+		return err
+	}
 	if c.podWorkers < 1 || c.podWorkers > 64 {
 		return errors.New("pod-workers must be 1..64")
 	}

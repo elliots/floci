@@ -157,6 +157,7 @@ func newProvider(ctx context.Context, cfg config, client kubernetes.Interface) (
 	if err := p.recover(ctx); err != nil {
 		return nil, err
 	}
+	p.jobs.Go(func() { p.watchEnvironment(lifetime) })
 	p.jobs.Go(func() { p.storageRun(lifetime) })
 	p.jobs.Go(func() { p.policies.run(lifetime) })
 	p.jobs.Go(func() { p.watchAvailability(lifetime) })
@@ -1098,6 +1099,9 @@ func (p *provider) AttachToContainer(context.Context, string, string, string, ap
 	return errdefs.InvalidInput("attach is not qualified")
 }
 func (p *provider) Ping(ctx context.Context) error {
+	if p.runner.environment != nil && !p.runner.environment.healthy.Load() {
+		return errors.New("protected environment network is unavailable")
+	}
 	check, cancel := context.WithTimeout(ctx, 5*time.Second)
 	defer cancel()
 	if _, err := p.runner.vm(check, "ls", "--format", "json"); err != nil {
@@ -1109,6 +1113,7 @@ func (p *provider) Ping(ctx context.Context) error {
 func (p *provider) NotifyNodeStatus(context.Context, func(*corev1.Node)) {}
 func (p *provider) close(ctx context.Context) error {
 	defer p.stateLock.Close()
+	defer p.runner.environment.revokeAll()
 	if p.stop != nil {
 		p.stop()
 	}

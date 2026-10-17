@@ -34,6 +34,10 @@ func peerListenerAddress(ctx context.Context, runner commandRunner, hostIP strin
 	}
 	return selectPeerListener(hostIP, localHostAddress, func(bindIP string) error {
 		return verifyBoundReachability(ctx, bindIP, func(probe context.Context, port int, challenge string) error {
+			if err := runner.environment.changePorts(probe, []environmentPort{{Protocol: "tcp", Port: port}}, true); err != nil {
+				return err
+			}
+			defer runner.environment.revoke(environmentPort{Protocol: "tcp", Port: port})
 			url := fmt.Sprintf("http://%s:%d/%s", hostIP, port, challenge)
 			_, err := runner.peer(probe, "wget -Y off -T 3 -qO- "+quote(url))
 			return err

@@ -1,13 +1,22 @@
 package main
 
 import (
+	"context"
 	"errors"
 	"net/netip"
+	"time"
 
 	"github.com/floci-io/floci/tools/microsandbox-pods/internal/hosttransport"
 )
 
 func (n *network) ensureIngress(e *podEntry) error {
+	if n != nil && n.runner.environment != nil {
+		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+		defer cancel()
+		if err := n.runner.environment.changePorts(ctx, []environmentPort{{Protocol: "udp", Port: e.port}}, true); err != nil {
+			return err
+		}
+	}
 	if n == nil || n.proxyBindIP == "" || n.proxyBindIP == "127.0.0.1" {
 		return nil
 	}
@@ -42,6 +51,9 @@ func (n *network) ensureIngress(e *podEntry) error {
 }
 
 func (n *network) closeIngress(e *podEntry) {
+	if n != nil {
+		defer n.runner.environment.revoke(environmentPort{Protocol: "udp", Port: e.port})
+	}
 	if n == nil {
 		return
 	}

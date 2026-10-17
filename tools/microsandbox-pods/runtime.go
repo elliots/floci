@@ -27,6 +27,7 @@ const bridgeName = "pvkb0"
 const ctr = "ctr --address /run/containerd/containerd.sock"
 
 type config struct {
+	environmentNetwork, isolationHelper, environmentDNS     string
 	networkPolicy                                           bool
 	guestFSBinary                                           string
 	relayBinary, proxyBackendCIDR                           string
@@ -44,8 +45,9 @@ type config struct {
 }
 
 type commandRunner struct {
-	cfg     config
-	runtime nativeRuntime
+	cfg         config
+	runtime     nativeRuntime
+	environment *environmentBoundary
 }
 
 var nativeMutations sync.Mutex
@@ -65,6 +67,11 @@ func (r commandRunner) run(ctx context.Context, binary string, args ...string) (
 }
 
 func (r commandRunner) vm(ctx context.Context, args ...string) (string, error) {
+	if len(args) > 0 && (args[0] == "run" || args[0] == "start" || args[0] == "resume" || args[0] == "snap" && len(args) > 1 && args[1] == "restore") {
+		if err := r.environment.verify(ctx); err != nil {
+			return "", err
+		}
+	}
 	if nativeMutation(args) {
 		// Accepted HTTP wakes already have a bounded Pod lifetime context.
 		// Other lifecycle callers retain their existing mutation fence behavior.
@@ -320,6 +327,11 @@ func (n *network) attach(ctx context.Context, e *podEntry) error {
 		vni, guestIP, n.peerIP, podIP, n.runner.cfg.clusterCIDR, podGateway,
 		n.runner.cfg.serviceCIDR, podGateway, podGateway, n.peerIP, gateway, n.peerPort,
 		n.runner.cfg.clusterDNS, e.pod.Namespace)
+	if n.runner.environment != nil {
+		for _, prefix := range n.runner.environment.identity.Prefixes {
+			script += "; ip route replace " + prefix + " via " + podGateway.String() + " dev pod0"
+		}
+	}
 	_, err = n.runner.guest(ctx, e.vm, script)
 	return err
 }

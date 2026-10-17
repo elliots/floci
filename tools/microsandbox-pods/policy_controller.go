@@ -275,7 +275,8 @@ func (c *networkPolicyController) plan(pod *corev1.Pod, inventory policyInventor
 		plan.ingressIsolated, plan.egressIsolated = true, true
 		plan.unsupported = "NetworkPolicy requires explicit controller --network-policy=true and safe capabilities for every native Pod on its network peer"
 	}
-	if !c.ready() || inventory.observed && (!inventory.available || inventory.revision != c.revision.Load()) {
+	environmentUnavailable := c.provider.runner.environment != nil && !c.provider.runner.environment.healthy.Load()
+	if environmentUnavailable || !c.ready() || inventory.observed && (!inventory.available || inventory.revision != c.revision.Load()) {
 		plan.stale = true
 		if c.provider.runner.cfg.networkPolicy {
 			plan.ingress, plan.egress = nil, nil

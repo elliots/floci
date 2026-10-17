@@ -51,6 +51,9 @@ func (r commandRunner) nativeOutput(ctx context.Context, args []string, input []
 type nativeAdmissionKey struct{}
 
 func (r commandRunner) prepareAdmission(ctx context.Context, args []string, source string) (string, error) {
+	if err := r.environment.verify(ctx); err != nil {
+		return "", err
+	}
 	return r.runtime.PrepareAdmission(ctx, msbruntime.AdmissionRequest{Arguments: args, SourceName: source})
 }
 
