@@ -20,7 +20,7 @@ func main() {
 
 func run(args []string) error {
 	if len(args) == 0 {
-		return errors.New("expected ownership or runc")
+		return errors.New("expected ownership, writeback or runc")
 	}
 	flags := flag.NewFlagSet(args[0], flag.ContinueOnError)
 	switch args[0] {
@@ -36,6 +36,12 @@ func run(args []string) error {
 			return errors.New("ownership requires exactly one volume root")
 		}
 		return (guestfs.Ownership{Group: *group, ReadOnly: *readOnly, OnRootMismatch: *mismatch, RootOnly: *rootOnly}).Apply(flags.Arg(0))
+	case "writeback":
+		seal := flags.Bool("seal", false, "Leave persistent filesystems frozen for guest removal")
+		if err := flags.Parse(args[1:]); err != nil {
+			return err
+		}
+		return guestfs.Writeback(flags.Args(), *seal)
 	case "runc":
 		groups := flags.String("groups", "", "Comma-separated supplemental groups")
 		policy := flags.String("policy", "Merge", "Merge or Strict")
@@ -61,6 +67,6 @@ func run(args []string) error {
 		}
 		return syscall.Exec(resolved, append([]string{resolved}, flags.Args()...), os.Environ())
 	default:
-		return errors.New("expected ownership or runc")
+		return errors.New("expected ownership, writeback or runc")
 	}
 }

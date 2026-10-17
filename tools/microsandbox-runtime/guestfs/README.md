@@ -20,3 +20,11 @@ Run `go test -race ./guestfs ./cmd/guestfs` and `go vet ./guestfs ./cmd/guestfs`
 Ownership tests require Linux because filesystem setgid behavior differs on
 other hosts. The pod qualification shares its behavioral assertions between
 Docker k3s and native Pods.
+
+`writeback` uses Linux `syncfs` to surface filesystem writeback errors. Its
+optional `--seal` freezes each mounted ext4 filesystem after flushing, for guest
+removal only. It refuses the guest root, mount aliases, symlinks, duplicate devices
+and other filesystem types. The root filesystem and control agent stay writable.
+A seal is never undone: the controller records an operation-specific completion
+marker and retains uncertain guests/checkpoints instead of inferring success from
+an ioctl error. Rebuild this utility when enabling native persistent volumes.
