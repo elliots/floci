@@ -47,6 +47,9 @@ def qualify_aws_identity(*, args, peer, host_ip, temporary, pod, apply, resource
         "hostIP": host_ip, "issuer": issuer, "jwk": keys[0]}))
     environment = dict(os.environ, JAVA_HOME=args.java_home or os.environ.get("JAVA_HOME", ""),
         FLOCI_KUBERNETES_AWS_IDENTITY_TEST="true", FLOCI_KUBERNETES_AWS_IDENTITY_DIRECTORY=str(directory))
+    installed = getattr(args, "installed_webhook", False)
+    if installed:
+        environment["FLOCI_KUBERNETES_INSTALLED_WEBHOOK_TEST"] = "true"
     process = subprocess.Popen([str(Path(args.floci_checkout)/"mvnw"), "-o",
         "-Dtest=KubernetesAwsIdentityIntegrationTest", "test"], cwd=args.floci_checkout,
         env=environment, stdout=log, stderr=log, start_new_session=True)
@@ -59,6 +62,10 @@ def qualify_aws_identity(*, args, peer, host_ip, temporary, pod, apply, resource
             path = directory/"ready.json"
             return json.loads(path.read_text()) if path.is_file() else None
         settings = wait("AWS fixture ready", fixture_ready, 600)
+        if installed:
+            assert settings.get("webhookManifest"), "installed fixture did not publish its real TLS webhook"
+            kubectl("apply", "-f", "-", input_text=settings["webhookManifest"])
+            wait("TLS webhook installed", lambda: resource("mutatingwebhookconfiguration", "floci-eks-pod-identity"))
         destination = settings["endpoint"].removeprefix("http://")
         # One node listener forwards the unmodified SDK request, as the existing
         # EKS node relay does. It has no credential or AWS logic of its own.
@@ -99,7 +106,7 @@ def qualify_aws_identity(*, args, peer, host_ip, temporary, pod, apply, resource
                     "eks.amazonaws.com/token-expiration": "600"}
             apply({"apiVersion": "v1", "kind": "ServiceAccount", "metadata": metadata})
 
-        def injected(name, native, kind):
+        def injected(name, native, kind, forge_projection=False):
             value = pod(name, "until test -x /tmp/aws-identity-probe; do sleep .1; done; exec /tmp/aws-identity-probe", native)
             value["spec"]["serviceAccountName"] = "aws-"+kind
             value["spec"]["automountServiceAccountToken"] = False
@@ -111,6 +118,8 @@ def qualify_aws_identity(*, args, peer, host_ip, temporary, pod, apply, resource
                 "AWS_EC2_METADATA_DISABLED": "true", "QUALIFICATION_EXPIRY_WINDOW_SECONDS": "3595",
                 "QUALIFICATION_ALLOWED_PARAMETER": settings["allowed"],
                 "QUALIFICATION_DENIED_PARAMETER": settings["denied"]}.items()]
+            if installed and not forge_projection:
+                return value
             review = {"apiVersion": "admission.k8s.io/v1", "kind": "AdmissionReview", "request": {
                 "uid": name, "operation": "CREATE", "namespace": "default", "object": value}}
             url = settings["localEndpoint"].rstrip("/")+"/_floci/eks/clusters/"+cluster+"/pod-identity-webhook/scope/000000000000"
@@ -130,6 +139,10 @@ def qualify_aws_identity(*, args, peer, host_ip, temporary, pod, apply, resource
             apply(value)
             created.append(name)
             observed = wait("SDK Pod declared", lambda: resource("pod", name))
+            if installed and "-denied-" not in name:
+                injected_environment = {item["name"] for item in observed["spec"]["containers"][0].get("env", [])}
+                expected = "AWS_WEB_IDENTITY_TOKEN_FILE" if "-irsa" in name else "AWS_CONTAINER_AUTHORIZATION_TOKEN_FILE"
+                assert expected in injected_environment, "Kubernetes TLS admission did not inject "+expected
             uid = observed["metadata"]["uid"]
             if native:
                 def cold():
@@ -203,7 +216,7 @@ def qualify_aws_identity(*, args, peer, host_ip, temporary, pod, apply, resource
         for native in (False, True):
             for kind, mismatch in (("irsa", "audience"), ("irsa", "subject"), ("pod", "audience"), ("pod", "subject")):
                 name = ("native" if native else "docker")+"-denied-"+kind+"-"+mismatch
-                value = injected(name, native, kind)
+                value = injected(name, native, kind, forge_projection=True)
                 if mismatch == "subject":
                     value["spec"]["serviceAccountName"] = "aws-unassociated"
                 else:
@@ -220,6 +233,8 @@ def qualify_aws_identity(*, args, peer, host_ip, temporary, pod, apply, resource
                 created.remove(name)
                 wait("denied identity guest cleanup", lambda: control_get("health")["activeMemoryMiB"] == 0)
         result["success"] = True
+        if installed:
+            report["checks"]["installed_tls_webhook_injects_irsa_and_pod_identity_on_both_workers"] = True
         report["checks"]["shared_aws_sdk_irsa_and_pod_identity_enforce_role_policies"] = True
         report["checks"]["native_first_request_after_resume_uses_refreshed_identity_and_sdk_cache"] = True
         report["checks"]["shared_aws_credentials_reject_wrong_audiences_and_subjects"] = True
@@ -235,6 +250,11 @@ def qualify_aws_identity(*, args, peer, host_ip, temporary, pod, apply, resource
         pending_result.write_text(json.dumps(result))
         pending_result.replace(directory/"result.json")
         cleanup_errors = []
+        if installed:
+            try:
+                kubectl("delete", "mutatingwebhookconfiguration", "floci-eks-pod-identity", "--ignore-not-found")
+            except Exception as error:
+                cleanup_errors.append(str(error))
         for name in created:
             try:
                 kubectl("delete", "pod", name, "--ignore-not-found", "--wait=false")

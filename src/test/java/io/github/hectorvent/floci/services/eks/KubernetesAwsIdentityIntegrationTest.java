@@ -2,6 +2,9 @@ package io.github.hectorvent.floci.services.eks;
 
 import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
+import io.github.hectorvent.floci.config.FlociCertificateAuthority;
+import io.github.hectorvent.floci.services.acm.CertificateGenerator;
+import io.github.hectorvent.floci.services.acm.model.KeyAlgorithm;
 import io.github.hectorvent.floci.services.eks.model.Cluster;
 import io.github.hectorvent.floci.services.eks.model.ClusterIdentity;
 import io.github.hectorvent.floci.services.eks.model.ClusterOidcKey;
@@ -16,6 +19,7 @@ import io.quarkus.test.junit.QuarkusTest;
 import io.quarkus.test.junit.QuarkusTestProfile;
 import io.quarkus.test.junit.TestProfile;
 import jakarta.inject.Inject;
+import org.eclipse.microprofile.config.inject.ConfigProperty;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.Timeout;
 import org.junit.jupiter.api.condition.EnabledIfEnvironmentVariable;
@@ -30,6 +34,7 @@ import java.security.spec.RSAPublicKeySpec;
 import java.time.Duration;
 import java.time.Instant;
 import java.util.Base64;
+import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.concurrent.TimeUnit;
@@ -46,8 +51,29 @@ class KubernetesAwsIdentityIntegrationTest {
     public static final class Profile implements QuarkusTestProfile {
         @Override
         public Map<String, String> getConfigOverrides() {
-            return Map.of("floci.services.iam.enforcement-enabled", "true", "quarkus.http.host", "0.0.0.0",
-                    "quarkus.test.hang-detection-timeout", "21m");
+            Map<String, String> values = new HashMap<>(Map.of("floci.services.iam.enforcement-enabled", "true", "quarkus.http.host", "0.0.0.0",
+                    "quarkus.test.hang-detection-timeout", "21m"));
+            if (Boolean.parseBoolean(System.getenv("FLOCI_KUBERNETES_INSTALLED_WEBHOOK_TEST"))) {
+                Path directory = Path.of(System.getenv("FLOCI_KUBERNETES_AWS_IDENTITY_DIRECTORY"));
+                try {
+                    JsonNode fixture = new ObjectMapper().readTree(directory.resolve("fixture.json").toFile());
+                    Path tls = directory.resolve("tls");
+                    Files.createDirectories(tls);
+                    FlociCertificateAuthority ca = FlociCertificateAuthority.loadOrCreate(tls);
+                    CertificateGenerator.GeneratedCertificate leaf = ca.issueServerCertificate("localhost",
+                            List.of("localhost", "127.0.0.1", fixture.path("hostIP").asText()), KeyAlgorithm.RSA_2048, null);
+                    Files.writeString(tls.resolve("server.crt"), leaf.certificatePem());
+                    Files.writeString(tls.resolve("server.key"), leaf.privateKeyPem());
+                    values.putAll(Map.of("floci.tls.enabled", "true", "floci.tls.aws-https-port", "0",
+                            "floci.port", "0", "floci.storage.persistent-path", directory.toString(),
+                            "quarkus.http.test-ssl-port", "0", "quarkus.http.insecure-requests", "enabled",
+                            "quarkus.tls.key-store.pem.0.cert", tls.resolve("server.crt").toString(),
+                            "quarkus.tls.key-store.pem.0.key", tls.resolve("server.key").toString()));
+                } catch (Exception e) {
+                    throw new IllegalStateException("Could not prepare installed admission TLS", e);
+                }
+            }
+            return values;
         }
     }
 
@@ -70,6 +96,8 @@ class KubernetesAwsIdentityIntegrationTest {
     SsmService ssm;
     @TestHTTPResource
     URI endpoint;
+    @ConfigProperty(name = "quarkus.http.test-ssl-port", defaultValue = "0")
+    int sslPort;
 
     @Test
     @Timeout(value = 20, unit = TimeUnit.MINUTES)
@@ -126,10 +154,16 @@ class KubernetesAwsIdentityIntegrationTest {
                     null, null, null, null, null));
             associations.create(cluster, new CreatePodIdentityAssociationRequest(name, "default", "aws-pod",
                     "arn:aws:iam::" + ACCOUNT + ":role/" + podIdentity, null, null, null, null, null));
-            Map<String, Object> ready = Map.of("endpoint", "http://" + fixture.path("hostIP").asText() + ":" + endpoint.getPort(),
+            Map<String, Object> ready = new HashMap<>(Map.of("endpoint", "http://" + fixture.path("hostIP").asText() + ":" + endpoint.getPort(),
                     "localEndpoint", endpoint.toString(), "irsaRole", "arn:aws:iam::" + ACCOUNT + ":role/" + irsa,
                     "podRole", "arn:aws:iam::" + ACCOUNT + ":role/" + podIdentity,
-                    "allowed", allowed, "denied", denied);
+                    "allowed", allowed, "denied", denied));
+            if (Boolean.parseBoolean(System.getenv("FLOCI_KUBERNETES_INSTALLED_WEBHOOK_TEST"))) {
+                String ca = Files.readString(directory.resolve("tls/floci-root-ca.crt"));
+                String url = "https://" + fixture.path("hostIP").asText() + ":" + sslPort
+                        + EksClusterManager.podIdentityWebhookPath(name, ACCOUNT);
+                ready.put("webhookManifest", EksClusterManager.buildPodIdentityWebhookConfiguration(url, ca));
+            }
             Path pending = directory.resolve("ready.pending");
             mapper.writeValue(pending.toFile(), ready);
             Files.move(pending, directory.resolve("ready.json"), StandardCopyOption.ATOMIC_MOVE);

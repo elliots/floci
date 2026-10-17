@@ -518,3 +518,40 @@ Application lifecycle hooks, projected resources, bounded retained logs and
 Kubernetes Events are described in [OPERATIONS.md](OPERATIONS.md). Rebuild the
 controller, network relay and guestfs together to enable timestamp capture for new
 container attempts; existing raw-log checkpoints remain readable.
+
+## Installed-path qualification
+
+`qualify_managed.py` uses the actual `manage.py prepare/start` path, restricted
+controller identity and background supervision. Give it a dedicated empty SDK
+home with preloaded images and matching binaries from `manage.py build`:
+
+```sh
+python3 tools/microsandbox-pods/qualify_managed.py \
+  --binaries /private/native-tools --msb /path/to/msb \
+  --msb-home /private/qualification-runtime --report /tmp/managed-report.json
+```
+
+The representative graph contains a frontend calling a catalog through its
+Kubernetes Service, a ConfigMap-backed catalog, and an init-container counter
+using memory-backed emptyDir. It checks cold rollout, concurrent nested HTTP, a
+third guest waiting under a two-guest RAM budget, awake and sleeping kubelet
+metrics, credential rotation, supervised controller crash, same-memory resume
+and cold Deployment replacement. It verifies cleanup before removing its owned
+cluster and preserves ambiguous state for recovery. This fixture does not yet
+cover an Aurora or durable-queue dependency in the same graph.
+
+Add `--floci-checkout /path/to/floci --java-home /path/to/jdk25` to install the
+actual TLS `MutatingWebhookConfiguration` and run the existing AWS Go SDK checks
+on Docker and native workers. `--identity-only` selects just that installed-path
+identity suite. Positive IRSA and Pod Identity Pods are submitted without a local
+admission patch, so Kubernetes must call the TLS webhook to inject them. Negative
+identity cases deliberately submit forged audience/subject projections. The
+existing `qualify.py --aws-identity-only` path remains available for isolated
+admission-handler coverage. Reserve the checkout's Maven test process for either
+identity fixture.
+
+Other representative graphs can import `ManagedQualification` and call
+`run(scenario)`. The callback receives the owned installation and its Kubernetes,
+lifecycle, control and supervised-restart helpers. Clean any additional JVMs,
+Aurora databases or broker resources within the callback before returning, since
+the outer harness requires an empty native runtime before deleting its cluster.
