@@ -80,6 +80,7 @@ func (p *provider) serveControl(address, tokenFile string) (*http.Server, error)
 		return nil, errors.New("control token must have at least 32 bytes")
 	}
 	mux := http.NewServeMux()
+	mux.HandleFunc("GET /v1/capacity", p.capacityStatus)
 	mux.HandleFunc("GET /v1/health", func(w http.ResponseWriter, r *http.Request) {
 		p.budgetMu.Lock()
 		allocated := p.activeMemoryMiB

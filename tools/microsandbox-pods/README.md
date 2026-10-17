@@ -99,7 +99,14 @@ recovery instead of silently adopting a new identity.
 
 `manage.py status --directory /private/native-cluster` reports controller health,
 active RAM, journal states, uncertain native operations and runtime filesystem
-free space. `manage.py destroy --directory /private/native-cluster` removes only
+free space. Its `sharedCapacity` reports guest RAM, concurrent starts, outstanding
+reservations and limits across pods and Aurora using the same runtime home. When
+disk admission is enabled, it also reports observed, reserved and committed disk
+bytes. An unverifiable inventory is `unavailable`, never zero. This explicit
+diagnostic uses the authenticated private controller API; ordinary readiness
+checks do not scan disk usage.
+
+`manage.py destroy --directory /private/native-cluster` removes only
 the owned empty k3s peer. First delete its native Pods, wait for controller cleanup
 to drain, then stop the controller. Cleanup refuses remaining Pod or recovery
 records and retains configuration for inspection. It never prunes runtime images

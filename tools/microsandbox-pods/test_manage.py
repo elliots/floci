@@ -1,6 +1,7 @@
 """Ownership and credential boundaries for repeatable native cluster setup."""
 import argparse
 import importlib.util
+import io
 import json
 from pathlib import Path
 import tempfile
@@ -98,6 +99,21 @@ class ManagementTest(unittest.TestCase):
         for binding in (value for value in resources if value["kind"].endswith("Binding")):
             self.assertEqual(self.record["accessName"], binding["roleRef"]["name"])
             self.assertEqual(self.record["user"], binding["subjects"][0]["name"])
+
+    def test_status_keeps_unknown_shared_usage_separate_from_zero(self):
+        self.record["msb_home"] = str(self.directory)
+        manage.write_private(self.directory / "cluster.json", json.dumps(self.record))
+        manage.write_private(self.directory / "control-token", "a" * 32)
+        for capacity in ({"memoryMiB": 768, "reservations": ["pending-wake"]}, None):
+            replies = [io.BytesIO(b'{"activeMemoryMiB":0}'),
+                io.BytesIO(json.dumps(capacity).encode()) if capacity else OSError("unavailable")]
+            with patch.object(manage, "inspect_peer", return_value=None), \
+                    patch.object(manage.urllib.request, "urlopen", side_effect=replies), \
+                    patch("builtins.print") as output:
+                manage.status(self.args)
+                report = json.loads(output.call_args.args[0])
+                self.assertEqual(0, report["controller"]["activeMemoryMiB"])
+                self.assertEqual(capacity or "unavailable", report["sharedCapacity"])
 
 
 if __name__ == "__main__":

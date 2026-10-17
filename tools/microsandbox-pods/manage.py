@@ -311,6 +311,15 @@ def status(args):
             report["controller"] = json.load(response)
     except OSError:
         pass  # An absent controller is a normal diagnostic result, not proof of guest failure.
+    report["sharedCapacity"] = "unavailable"
+    if isinstance(report["controller"], dict):
+        request = urllib.request.Request("http://127.0.0.1:"+str(record["controlPort"])+"/v1/capacity",
+            headers={"Authorization": "Bearer "+token})
+        try:
+            with urllib.request.urlopen(request, timeout=35) as response:
+                report["sharedCapacity"] = json.load(response)
+        except OSError:
+            pass  # An unavailable inventory must not be reported as zero usage.
     print(json.dumps(report, indent=2))
 
 
