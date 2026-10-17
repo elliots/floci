@@ -15,6 +15,8 @@ operations, wrong audiences and subjects, explicit credential precedence and
 identity refresh across sleep. Its optional ten-minute expiry wait checks renewal
 after projected tokens expire. This uses the shared controller without a
 credential daemon per Pod; see the dated validation record for completed runs.
+The installed-path fixture also verifies Kubernetes calling the real TLS webhook
+for both worker backends, rather than relying only on direct handler invocation.
 
 Reuse Floci's existing OIDC/STS and Pod Identity services. Explicit application
 credentials retain their AWS SDK precedence. Target-role chaining and downstream
@@ -112,6 +114,10 @@ compatibility remain priorities for ordinary Kubernetes application manifests.
   durable checkpoints remain until their workload owner releases them.
 - Qualify Linux hosts as well as Apple Silicon, and test real application graphs,
   persistent client connections, concurrent wakes and failure recovery.
+  An installed three-application HTTP graph now covers nested Service wake,
+  concurrent requests, capacity waiting, live credential rotation, controller
+  crashes and a cold replacement rollout. This supplements the replica-scale
+  fixture; it does not establish compatibility for 500 different applications.
 
 Native Linux qualification has a manual GitHub Actions entry point,
 `Microsandbox Native Linux Qualification`, for a trusted self-hosted runner

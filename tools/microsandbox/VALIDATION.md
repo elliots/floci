@@ -281,6 +281,33 @@ mixed graph later found an empty Prometheus-family encoding error when every
 guest slept; the fix omits absent container families and adds a regression through
 the actual Prometheus text encoder. This does not fabricate zero usage samples.
 
+## Installed identity and mixed HTTP graph: 17 October 2026
+
+The managed installer and background supervisor passed the real TLS identity
+fixture's seven checks, followed by complete ownership cleanup. Kubernetes called
+the installed TLS webhook to mutate untouched positive Pods for IRSA and Pod
+Identity. The shared AWS Go SDK assertions passed on Docker and native workers:
+allowed/denied role operations, explicit credential precedence and forged
+audience/subject rejection. Native processes retained RAM and refreshed projected
+tokens and SDK credentials after supervisor-led controller recovery. This run did
+not wait for actual token expiry; that was qualified separately above. The Java
+fixture passed with no failures, errors or skips.
+
+A second installed-path fixture passed all 11 checks with the integrated metrics
+and operations helpers. Three different application shapes deployed cold: a
+ConfigMap-backed catalog, a frontend calling its ordinary Kubernetes Service,
+and an initialized memory-emptyDir counter. Concurrent frontend requests woke
+only its two dependencies. A third wake waited at the 1536 MiB guest budget and
+completed when an idle workload slept, without evicting active guests.
+
+TLS kubelet metrics reported active containers and omitted every sleeping
+container without waking them. Complete credential rotation and supervisor crash
+recovery preserved Pod identities and RAM markers. A replacement Deployment
+completed its rollout while cold and served its new version on first use. All
+owned VM, checkpoint and volume inventories were empty after both fixtures, and
+their separate Kubernetes peers were removed. This is a small mixed HTTP graph,
+not a 500-application graph or an Aurora/message integration result.
+
 The current Docker host exposes no KVM device. These new native VM results are
 Apple Silicon results; native Linux/KVM qualification still requires a suitable
 Linux host. Linux unit tests and cross-builds do not replace that qualification.
