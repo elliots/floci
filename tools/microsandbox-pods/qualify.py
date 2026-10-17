@@ -6,6 +6,7 @@ import json
 import ipaddress
 import os
 from pathlib import Path
+import platform
 import secrets
 import socket
 import subprocess
@@ -14,8 +15,10 @@ import time
 import urllib.request
 import urllib.error
 
+from manage import node_address
 from qualification_registry import QualificationRegistry
 from qualification_activation import qualify_activation
+from qualification_aws_identity import qualify_aws_identity
 from qualification_applications import qualify_applications
 from qualification_operations import qualify_operations
 from qualification_sidecars import qualify_sidecars
@@ -102,7 +105,8 @@ def qualify(args):
         directory = tempfile.mkdtemp(prefix="floci-vk-")
         if True:
             temporary = Path(directory)
-            docker("run", "-d", "--name", peer, "--hostname", peer, "--label", f"{LABEL}={owner}",
+            host_options = ["--add-host", "host.docker.internal:host-gateway"] if platform.system() == "Linux" and not args.node_ip else []
+            docker("run", "-d", "--name", peer, "--hostname", peer, "--label", f"{LABEL}={owner}", *host_options,
                    "--privileged", "-p", "127.0.0.1::6443", "-p", "127.0.0.1::8472/udp",
                    "rancher/k3s:v1.35.0-k3s1", "server", "--disable=traefik", "--disable=servicelb",
                    "--disable=metrics-server", "--egress-selector-mode=disabled", timeout=600)
@@ -122,7 +126,7 @@ def qualify(args):
             config_path = temporary / "kubeconfig"
             config_path.write_text(kubeconfig.replace("https://127.0.0.1:6443", f"https://127.0.0.1:{api_port}"))
             config_path.chmod(0o600)
-            host_ip = docker("exec", peer, "sh", "-c", "nslookup host.docker.internal | awk '/^Address: / {print $2}' | tail -n1")
+            host_ip = node_address({"peer": peer}, args.node_ip)
             for filename in ("server-ca.crt", "server-ca.key", "client-ca.crt"):
                 path = temporary / filename
                 path.write_text(docker("exec", peer, "cat", "/var/lib/rancher/k3s/server/tls/" + filename) + "\n")
@@ -194,6 +198,12 @@ def qualify(args):
                 qualify_activation(args=args, pod=pod, apply=apply, resource=resource,
                     control_get=control_get, wait=wait, report=report, log=log, control_port=control_port, token=token)
                 raise QualificationComplete()
+            if args.aws_identity_only:
+                qualify_aws_identity(args=args, peer=peer, host_ip=host_ip, temporary=temporary,
+                    pod=pod, apply=apply, resource=resource, kubectl=kubectl,
+                    lifecycle=lifecycle, control_get=control_get, crash_and_restart=crash_and_restart,
+                    wait=wait, command=command, report=report, log=log, failure=QualificationFailure)
+                raise QualificationComplete()
             if args.http_activity_only:
                 if not args.network_relay_binary:
                     raise RuntimeError("HTTP activity qualification requires --network-relay-binary")
@@ -261,8 +271,12 @@ def qualify(args):
                 assert sum(p.get("status",{}).get("reason")=="NativeVMCold" for p in remaining)==args.cold_pods-1
                 report["cold_declaration"]["first_wake_seconds"]=round(time.monotonic()-began,3)
                 report["checks"]["cold_declarations_allocate_only_on_first_wake"]=True
+                cleanup_started = time.monotonic()
                 kubectl("delete","pod","-l","qualification=cold","--wait=true",timeout=600)
+                wait("cold ownership cleanup drains", lambda: all(not (temporary/"state"/(value["metadata"]["uid"]+".json")).exists()
+                    for value in values), 600)
                 wait("cold fixture releases RAM",lambda:control_get("health")["activeMemoryMiB"]==0)
+                report["cold_declaration"]["cleanup_seconds"] = round(time.monotonic()-cleanup_started, 3)
             server_script = 'mkdir -p /www/cgi-bin; cat >/www/cgi-bin/source <<\'CGI\'\n#!/bin/sh\nprintf \'Content-Type: text/plain\\r\\n\\r\\n\'\nprintf \'%s\\n\' "$REMOTE_ADDR"\nCGI\nchmod +x /www/cgi-bin/source; echo native-pod-executed; exec httpd -f -p 8080 -h /www'
             image_default = pod("image-default", "unused")
             image_default["spec"]["containers"][0] = {
@@ -679,7 +693,11 @@ def qualify(args):
                 assert kubectl("exec",chosen["name"],"--","cat","/proc/sys/kernel/random/boot_id")==boot
                 assert kubectl("exec",chosen["name"],"--","cat","/www/initialization/runs")=="once"
                 report["checks"]["proxy_activity_guard_autoidle_and_ram_resume"]=True
+                cleanup_started = time.monotonic()
                 kubectl("delete","deployment","lazy-probe","--wait=true",timeout=900)
+                wait("proxy ownership cleanup drains", lambda: all(not (temporary/"state"/(value["uid"]+".json")).exists()
+                    for value in discovery["pods"]), 900)
+                report["proxy_declaration"]["cleanup_seconds"] = round(time.monotonic()-cleanup_started, 3)
                 kubectl("delete","pod","proxy-native","proxy-docker","--wait=true",timeout=120)
                 wait("proxy fixture releases RAM",lambda:control_get("health")["activeMemoryMiB"]==0,180)
             server = with_volumes(pod("native-server", "mkdir -p /www; httpd -p 9090 -h /www; " + server_script))
@@ -1019,6 +1037,9 @@ if __name__ == "__main__":
     parser.add_argument("--guest-fs-binary")
     parser.add_argument("--groups-only", action="store_true", help="run the same group and volume permission fixture on Docker and native pods")
     parser.add_argument("--activation-only", action="store_true", help="qualify Java HTTP/queue wake of one replica with a single-guest memory budget")
+    parser.add_argument("--aws-identity-only", action="store_true", help="qualify real AWS SDK IRSA and Pod Identity on both worker backends")
+    parser.add_argument("--node-ip", help="explicit host IPv4 address reachable from the disposable Docker peer")
+    parser.add_argument("--identity-expiry-wait", action="store_true", help="wait ten minutes for old projected tokens to expire while native guests sleep")
     parser.add_argument("--http-activity-only", action="store_true", help="qualify HTTP request leases and same-connection wake through the shared owned fixture")
     parser.add_argument("--scheduling-cpu", help="virtual CPU capacity advertised to the Kubernetes scheduler")
     parser.add_argument("--scheduling-memory", help="virtual memory capacity advertised to the Kubernetes scheduler")
