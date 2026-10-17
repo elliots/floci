@@ -230,10 +230,39 @@ def prepare_credentials(record):
                 "client-certificate-data": encode(read_private(directory/"controller.crt")),
                 "client-key-data": encode(read_private(directory/"controller.key"))}}]}
         write_private(directory / "controller.kubeconfig", json.dumps(kubeconfig, indent=2)+"\n")
-        return dict(record, credentialGeneration=generation)
+        write_private(directory / "owner", json.dumps({"owner":record["owner"],"generation":generation})+"\n")
+        return dict(record, credentialGeneration=generation, previousCredentialGeneration=record.get("credentialGeneration"))
     except BaseException:
         shutil.rmtree(directory)
         raise
+
+
+def remove_old_credentials(record):
+    keep = {record.get("credentialGeneration"), record.get("previousCredentialGeneration")}
+    expected = {"controller.crt","controller.key","kubelet.crt","kubelet.key","client-ca.crt","controller.kubeconfig","owner"}
+    root = Path(record["directory"])/"credentials"
+    if not root.exists():
+        return
+    if root.is_symlink() or not root.is_dir() or root.stat().st_mode & 0o077 or root.stat().st_uid != os.getuid():
+        raise RuntimeError("credential cleanup requires a private owned directory")
+    for directory in root.glob("*"):
+        if directory.name in keep or directory.is_symlink() or not directory.is_dir():
+            continue
+        if len(directory.name) != 32 or any(character not in "0123456789abcdef" for character in directory.name):
+            continue
+        if directory.stat().st_mode & 0o077 or directory.stat().st_uid != os.getuid():
+            continue
+        try:
+            identity = json.loads(read_private(directory/"owner"))
+            if identity != {"owner":record["owner"],"generation":directory.name}:
+                continue
+            if {path.name for path in directory.iterdir()} != expected:
+                continue
+            for path in directory.iterdir():
+                read_private(path)
+        except (OSError, RuntimeError, ValueError):
+            continue  # Unknown, partial or legacy directories are retained for inspection.
+        shutil.rmtree(directory)
 
 
 def credentials_due(record, seconds=7*86400):
@@ -336,6 +365,7 @@ def prepare(args):
     if not (directory / "control-token").exists():
         write_private(directory / "control-token", secrets.token_hex(32)+"\n")
     write_private(record_path, json.dumps(record, indent=2)+"\n")
+    remove_old_credentials(record)
     print("Prepared native cluster. Workload kubeconfig: "+str(directory / "admin.kubeconfig"))
     print("Run the controller with: python3 "+str(Path(__file__).resolve())+" run --directory "+str(directory))
 

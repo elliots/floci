@@ -65,6 +65,32 @@ def private_log(path):
     return os.fdopen(descriptor, "a", buffering=1)
 
 
+def rotate_log(log, path, limit=10 << 20):
+    if os.fstat(log.fileno()).st_size <= limit:
+        return
+    path = Path(path)
+    if path.is_symlink() or path.stat().st_ino != os.fstat(log.fileno()).st_ino:
+        raise RuntimeError("active log path ownership changed")
+    for backup in (path.with_name(path.name+".1"), path.with_name(path.name+".2")):
+        if backup.exists() or backup.is_symlink():
+            info = backup.lstat()
+            if not stat.S_ISREG(info.st_mode) or info.st_mode & 0o077 or info.st_uid != os.getuid():
+                raise RuntimeError("log backup is not a private owned file")
+    prior = path.with_name(path.name+".1")
+    if prior.exists():
+        os.replace(prior, path.with_name(path.name+".2"))
+    with os.fdopen(os.open(path, os.O_RDONLY | os.O_NOFOLLOW), "rb") as source:
+        if os.fstat(source.fileno()).st_ino != os.fstat(log.fileno()).st_ino:
+            raise RuntimeError("active log path ownership changed")
+        source.seek(max(0, os.fstat(source.fileno()).st_size-limit))
+        recent = source.read(limit).decode(errors="ignore")
+    manage.write_private(prior, recent)
+    # Keep the child's O_APPEND descriptor valid. Concurrent log lines at the
+    # copy/truncate boundary can be lost; workload and recovery files are separate.
+    log.flush()
+    os.ftruncate(log.fileno(), 0)
+
+
 class Supervisor:
     def __init__(self, record, args, log):
         self.record, self.args, self.log = record, args, log
@@ -107,11 +133,14 @@ class Supervisor:
         manage.write_private(Path(self.record["directory"])/"cluster.json", json.dumps(replacement, indent=2)+"\n")
         self.record = replacement
         self.launch()
+        manage.remove_old_credentials(self.record)
         self.last_error = None
         self.note("activated credential generation "+replacement["credentialGeneration"])
 
     def tick(self):
         now = time.monotonic()
+        if hasattr(self.log, "name"):
+            rotate_log(self.log, Path(self.record["directory"])/"controller.log")
         if self.child is not None and self.child.poll() is not None:
             while self.restarts and self.restarts[0] < now-300:
                 self.restarts.popleft()
@@ -183,6 +212,7 @@ def serve(args):
                     manage.write_private(directory/"cluster.json", json.dumps(replacement, indent=2)+"\n")
                     supervisor.record = replacement
                 supervisor.launch()
+                manage.remove_old_credentials(supervisor.record)
                 while not supervisor.stopping:
                     supervisor.tick()
                     try:
@@ -221,6 +251,7 @@ def start(args):
         return
     directory = Path(args.directory).resolve()
     with private_log(directory/"manager.log") as log:
+        rotate_log(log, directory/"manager.log")
         child = subprocess.Popen([sys.executable, str(Path(manage.__file__).resolve()), "_supervise",
             "--directory", str(directory), *options(args)], stdin=subprocess.DEVNULL,
             stdout=log, stderr=log, start_new_session=True)

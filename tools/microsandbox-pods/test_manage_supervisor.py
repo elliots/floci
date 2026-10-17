@@ -105,6 +105,64 @@ class SupervisionTest(unittest.TestCase):
                 self.supervisor.dispatch(request, "secret")
         self.assertFalse(self.supervisor.stopping)
 
+    def test_log_rotation_bounds_backups_and_preserves_child_append_descriptor(self):
+        path = self.directory/"controller.log"
+        with supervision.private_log(path) as log:
+            for text in ("first-data", "second-data", "third-data"):
+                log.write(text)
+                log.flush()
+                supervision.rotate_log(log, path, limit=8)
+            self.assertEqual("", path.read_text())
+            self.assertEqual("ird-data", path.with_name("controller.log.1").read_text())
+            self.assertEqual("ond-data", path.with_name("controller.log.2").read_text())
+            log.write("alive")
+            log.flush()
+            self.assertEqual("alive", path.read_text())
+        self.assertEqual(3, len(list(self.directory.glob("controller.log*"))))
+
+    def test_real_supervisor_tick_rotates_private_descriptor_at_owned_path(self):
+        path = self.directory/"controller.log"
+        original = supervision.rotate_log
+        with supervision.private_log(path) as log:
+            self.supervisor.log = log
+            log.write("controller-output")
+            log.flush()
+            with patch.object(supervision, "rotate_log", side_effect=lambda stream, location: original(stream, location, limit=8)), \
+                    patch.object(manage, "credentials_due", return_value=False):
+                self.supervisor.tick()
+        self.assertEqual("", path.read_text())
+        self.assertEqual("r-output", path.with_name("controller.log.1").read_text())
+
+    def test_log_rotation_refuses_unknown_backup_files(self):
+        path = self.directory/"controller.log"
+        target = self.directory/"unrelated"
+        target.write_text("keep")
+        path.with_name("controller.log.1").symlink_to(target)
+        with supervision.private_log(path) as log:
+            log.write("enough-data")
+            log.flush()
+            with self.assertRaisesRegex(RuntimeError, "private owned file"):
+                supervision.rotate_log(log, path, limit=8)
+        self.assertEqual("keep", target.read_text())
+        self.assertEqual("enough-data", path.read_text())
+
+    def test_credential_cleanup_keeps_current_previous_and_unknown_generations(self):
+        names = [character*32 for character in "abcdef"]
+        root = self.directory/"credentials"
+        root.mkdir(mode=0o700)
+        for name in names:
+            directory = root/name
+            directory.mkdir(mode=0o700)
+            for filename in ("controller.crt", "controller.key", "kubelet.crt", "kubelet.key", "client-ca.crt", "controller.kubeconfig"):
+                manage.write_private(directory/filename, "test")
+            manage.write_private(directory/"owner", json.dumps({"owner":"owned", "generation":name}))
+        manage.write_private(root/names[3]/"owner", json.dumps({"owner":"foreign", "generation":names[3]}))
+        (root/names[4]/"owner").unlink()
+        manage.write_private(root/names[5]/"unexpected", "retain")
+        record = dict(self.record, credentialGeneration=names[0], previousCredentialGeneration=names[1])
+        manage.remove_old_credentials(record)
+        self.assertEqual(set(names)-{names[2]}, {path.name for path in root.iterdir()})
+
     def test_manager_controls_only_its_real_child_and_recovers_child_crash(self):
         worker = self.directory/"worker.py"
         worker.write_text('''from http.server import HTTPServer,BaseHTTPRequestHandler

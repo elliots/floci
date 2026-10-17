@@ -114,6 +114,12 @@ selection and graceful restart preserve Pod journals and native guests. Failed
 certificate preparation leaves the running controller unchanged and retries in
 one minute. `renew --directory ...` requests the same rotation immediately.
 Logs are in `controller.log` and, for background startup, `manager.log`.
+The active controller log rotates after 10 MiB and retains two bounded backups;
+manager startup rotates its own log at the same threshold. Copy-and-truncate
+rotation keeps the child descriptor valid but can lose diagnostic lines at the
+rotation boundary. After a successful credential selection, cleanup retains the
+active and previous generations. Unknown, incomplete and older unmarked credential
+directories remain for inspection.
 
 The supervisor holds the cluster setup lock and stops only its own child process.
 Its private authenticated Unix socket handles status and stop requests; stored

@@ -987,3 +987,11 @@ The Pod helper always retains the base image needed by cold Pods. Operators usin
 the host helper should retain other preloaded images needed by never-started
 workloads. See [storage maintenance](../microsandbox-runtime/STORAGE.md) for exact
 accounting and cleanup limits. AWS endpoint shapes and Docker execution are unchanged.
+## Managed background retention
+
+New managed credential generations carry a private ownership marker. Successful
+selection retains the active and previous complete generations and removes only
+older complete generations with the same cluster owner. Existing unmarked
+generations remain untouched. Controller logs rotate after 10 MiB with two
+backups; manager logs rotate on startup. Copy-and-truncate log rotation can lose
+diagnostic lines at its boundary and never alters workload recovery records.
