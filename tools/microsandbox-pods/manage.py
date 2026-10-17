@@ -13,6 +13,7 @@ import platform
 import secrets
 import shutil
 import socket
+import stat
 import subprocess
 import tempfile
 import time
@@ -43,6 +44,11 @@ def write_private(path, data):
             stream.flush()
             os.fsync(stream.fileno())
         os.replace(temporary, path)
+        descriptor = os.open(path.parent, os.O_RDONLY | os.O_DIRECTORY)
+        try:
+            os.fsync(descriptor)
+        finally:
+            os.close(descriptor)
     finally:
         if os.path.exists(temporary):
             os.unlink(temporary)
@@ -69,20 +75,45 @@ def wait(description, operation, timeout=300):
 
 def load(directory):
     directory = Path(directory).resolve()
-    record = json.loads((directory / "cluster.json").read_text())
+    record = json.loads(read_private(directory / "cluster.json"))
     if record.get("version") != 1 or record.get("directory") != str(directory):
         raise RuntimeError("cluster record belongs to another directory or format")
     return record
+
+
+def read_private(path):
+    descriptor = os.open(path, os.O_RDONLY | os.O_NOFOLLOW)
+    with os.fdopen(descriptor) as source:
+        info = os.fstat(source.fileno())
+        if not stat.S_ISREG(info.st_mode) or info.st_mode & 0o077 or info.st_uid != os.getuid() or info.st_size > 1 << 20:
+            raise RuntimeError("invalid private management file: "+str(path))
+        return source.read()
+
+
+def credential_directory(record):
+    directory = Path(record["directory"])
+    generation = record.get("credentialGeneration")
+    if generation is None:
+        return directory
+    if len(generation) != 32 or any(character not in "0123456789abcdef" for character in generation):
+        raise RuntimeError("invalid credential generation")
+    path = directory / "credentials" / generation
+    if path.resolve() != path or not path.is_dir() or path.stat().st_mode & 0o077:
+        raise RuntimeError("credential generation is missing or not a private owned directory")
+    return path
 
 
 @contextlib.contextmanager
 def setup_lock(directory):
     directory = Path(directory).resolve()
     directory.mkdir(parents=True, exist_ok=True, mode=0o700)
-    if directory.stat().st_mode & 0o077:
+    if directory.stat().st_mode & 0o077 or directory.stat().st_uid != os.getuid():
         raise RuntimeError("cluster directory must be private (mode 0700)")
-    descriptor = os.open(directory / ".manage.lock", os.O_CREAT | os.O_RDWR, 0o600)
+    descriptor = os.open(directory / ".manage.lock", os.O_CREAT | os.O_RDWR | os.O_NOFOLLOW, 0o600)
     with os.fdopen(descriptor, "w") as lock:
+        info = os.fstat(lock.fileno())
+        if not stat.S_ISREG(info.st_mode) or info.st_mode & 0o077 or info.st_uid != os.getuid():
+            raise RuntimeError("cluster lock must be a private owned regular file")
         try:
             fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
         except BlockingIOError as error:
@@ -152,8 +183,8 @@ def access_resources(record):
     ]}
 
 
-def certificate(record, name, ca_name, common_name, usage, host=None):
-    directory = Path(record["directory"])
+def certificate(record, name, ca_name, common_name, usage, host=None, directory=None):
+    directory = Path(directory or record["directory"])
     with tempfile.TemporaryDirectory(prefix=".certificate-", dir=directory) as temporary:
         temporary = Path(temporary)
         for extension in ("crt", "key"):
@@ -170,6 +201,52 @@ def certificate(record, name, ca_name, common_name, usage, host=None):
             "-out", temporary/"certificate", "-days", "30", "-extfile", temporary/"extensions")
         write_private(directory / (name+".key"), (temporary/"key").read_text())
         write_private(directory / (name+".crt"), (temporary/"certificate").read_text())
+
+
+def prepare_credentials(record):
+    peer = inspect_peer(record)
+    if peer is None or not peer["State"]["Running"]:
+        raise RuntimeError("owned cluster must be running to renew credentials")
+    api_port = peer["NetworkSettings"]["Ports"]["6443/tcp"][0]["HostPort"]
+    generation = secrets.token_hex(16)
+    generations = Path(record["directory"]) / "credentials"
+    generations.mkdir(exist_ok=True, mode=0o700)
+    if generations.is_symlink() or generations.stat().st_mode & 0o077 or generations.stat().st_uid != os.getuid():
+        raise RuntimeError("credential generations require a private owned directory")
+    directory = generations / generation
+    directory.mkdir(mode=0o700)
+    try:
+        certificate(record, "kubelet", "server-ca", record["node"], "serverAuth", record["hostIP"], directory)
+        certificate(record, "controller", "client-ca", record["user"], "clientAuth", directory=directory)
+        client_ca = command("docker", "exec", record["peer"], "cat", "/var/lib/rancher/k3s/server/tls/client-ca.crt")
+        server_ca = command("docker", "exec", record["peer"], "cat", "/var/lib/rancher/k3s/server/tls/server-ca.crt")
+        write_private(directory / "client-ca.crt", client_ca+"\n")
+        encode = lambda data: base64.b64encode(data.encode()).decode()
+        kubeconfig = {"apiVersion": "v1", "kind": "Config", "current-context": "native",
+            "clusters": [{"name": "native", "cluster": {"server": "https://127.0.0.1:"+api_port,
+                "certificate-authority-data": encode(server_ca)}}],
+            "contexts": [{"name": "native", "context": {"cluster": "native", "user": "controller"}}],
+            "users": [{"name": "controller", "user": {
+                "client-certificate-data": encode(read_private(directory/"controller.crt")),
+                "client-key-data": encode(read_private(directory/"controller.key"))}}]}
+        write_private(directory / "controller.kubeconfig", json.dumps(kubeconfig, indent=2)+"\n")
+        return dict(record, credentialGeneration=generation)
+    except BaseException:
+        shutil.rmtree(directory)
+        raise
+
+
+def credentials_due(record, seconds=7*86400):
+    directory = credential_directory(record)
+    for name in ("controller.crt", "kubelet.crt"):
+        # Malformed or missing credentials are renewal failures, not proof of validity.
+        certificate = read_private(directory/name)
+        command("openssl", "x509", "-noout", input_text=certificate)
+        result = subprocess.run(["openssl", "x509", "-checkend", str(seconds), "-noout"],
+            input=certificate, text=True, capture_output=True, timeout=15)
+        if result.returncode:
+            return True
+    return False
 
 
 def node_address(record, supplied=None):
@@ -244,18 +321,7 @@ def prepare(args):
     record["hostIP"] = host
     admin = command("docker", "exec", record["peer"], "cat", "/etc/rancher/k3s/k3s.yaml")
     write_private(directory / "admin.kubeconfig", admin.replace("https://127.0.0.1:6443", "https://127.0.0.1:"+api_port)+"\n")
-    certificate(record, "kubelet", "server-ca", record["node"], "serverAuth", host)
-    certificate(record, "controller", "client-ca", record["user"], "clientAuth")
-    client_ca = command("docker", "exec", record["peer"], "cat", "/var/lib/rancher/k3s/server/tls/client-ca.crt")
-    server_ca = command("docker", "exec", record["peer"], "cat", "/var/lib/rancher/k3s/server/tls/server-ca.crt")
-    write_private(directory / "client-ca.crt", client_ca+"\n")
-    encode = lambda data: base64.b64encode(data.encode()).decode()
-    kubeconfig = {"apiVersion": "v1", "kind": "Config", "current-context": "native",
-        "clusters": [{"name": "native", "cluster": {"server": "https://127.0.0.1:"+api_port, "certificate-authority-data": encode(server_ca)}}],
-        "contexts": [{"name": "native", "context": {"cluster": "native", "user": "controller"}}],
-        "users": [{"name": "controller", "user": {"client-certificate-data": encode((directory/"controller.crt").read_text()),
-            "client-key-data": encode((directory/"controller.key").read_text())}}]}
-    write_private(directory / "controller.kubeconfig", json.dumps(kubeconfig, indent=2)+"\n")
+    record = prepare_credentials(record)
     resources = access_resources(record)
     write_private(directory / "controller-rbac.json", json.dumps(resources, indent=2)+"\n")
     apply(record, resources)
@@ -302,25 +368,28 @@ def build(args):
 
 def controller_arguments(record, args):
     directory, binaries = Path(record["directory"]), Path(record["binaries"])
-    return [str(binaries/"microsandbox-pods"), "--kubeconfig", str(directory/"controller.kubeconfig"),
+    credentials = credential_directory(record)
+    return [str(binaries/"microsandbox-pods"), "--kubeconfig", str(credentials/"controller.kubeconfig"),
         "--node", record["node"], "--msb", record["msb"], "--msb-home", record["msb_home"],
         "--state", str(directory/"controller"), "--network-peer", record["peer"], "--peer-owner", record["owner"],
         "--network-relay-binary", str(binaries/"network-relay"), "--guest-fs-binary", str(binaries/"guestfs"),
         "--listen", "0.0.0.0:"+str(record["kubeletPort"]), "--node-ip", record["hostIP"],
-        "--tls-cert", str(directory/"kubelet.crt"), "--tls-key", str(directory/"kubelet.key"),
-        "--client-ca", str(directory/"client-ca.crt"), "--control-listen", "127.0.0.1:"+str(record["controlPort"]),
+        "--tls-cert", str(credentials/"kubelet.crt"), "--tls-key", str(credentials/"kubelet.key"),
+        "--client-ca", str(credentials/"client-ca.crt"), "--control-listen", "127.0.0.1:"+str(record["controlPort"]),
         "--control-token-file", str(directory/"control-token"), "--cluster-name", record["peer"],
         "--max-active-memory-mib", str(args.memory_mib), "--scheduling-cpu", args.scheduling_cpu,
         "--scheduling-memory", args.scheduling_memory, "--pod-workers", str(args.pod_workers)]
 
 
 def status(args):
+    import manage_supervisor
     record = load(args.directory)
     peer = inspect_peer(record)
     directory = Path(record["directory"])
     report = {"peer": record["peer"], "peerRunning": bool(peer and peer["State"]["Running"]),
         "controller": "unavailable", "runtimeHome": record["msb_home"],
         "filesystemFreeBytes": shutil.disk_usage(record["msb_home"]).free}
+    report["manager"] = manage_supervisor.running(args.directory)
     states = collections.Counter()
     for path in (directory/"controller").glob("*.json"):
         value = json.loads(path.read_text())
@@ -389,26 +458,24 @@ def main():
     preparing.add_argument("--msb", required=True)
     preparing.add_argument("--msb-home", required=True)
     preparing.add_argument("--node-ip", help="host IPv4 address reachable from the owned cluster; bypasses automatic Docker host discovery")
-    running = commands.add_parser("run", help="run in foreground, retaining guests and cluster on exit")
-    running.add_argument("--directory", required=True)
-    running.add_argument("--memory-mib", type=int, default=4096)
-    running.add_argument("--scheduling-cpu", default="500")
-    running.add_argument("--scheduling-memory", default="384Gi")
-    running.add_argument("--pod-workers", type=int, default=8)
-    for operation in ("status", "destroy"):
+    for operation, description in (("run", "supervise in foreground and renew certificates automatically"),
+            ("start", "start an owned background supervisor"), ("_supervise", argparse.SUPPRESS)):
+        running = commands.add_parser(operation, help=description)
+        running.add_argument("--directory", required=True)
+        running.add_argument("--memory-mib", type=int, default=4096)
+        running.add_argument("--scheduling-cpu", default="500")
+        running.add_argument("--scheduling-memory", default="384Gi")
+        running.add_argument("--pod-workers", type=int, default=8)
+    for operation in ("status", "destroy", "stop", "renew"):
         commands.add_parser(operation).add_argument("--directory", required=True)
     args = parser.parse_args()
     try:
-        if args.operation == "run":
-            record = load(args.directory)
-            peer = inspect_peer(record)
-            if not peer or not peer["State"]["Running"]:
-                raise RuntimeError("owned network peer is not running; run prepare first")
-            with setup_lock(args.directory) as descriptor:
-                values = controller_arguments(record, args)
-                # Keep setup and cleanup excluded for the foreground controller's lifetime.
-                os.set_inheritable(descriptor, True)
-                os.execv(values[0], values)
+        if args.operation in ("run", "start", "stop", "renew", "_supervise"):
+            import manage_supervisor
+            operations = {"run": manage_supervisor.serve, "_supervise": manage_supervisor.serve,
+                "start": manage_supervisor.start, "stop": manage_supervisor.stop, "renew": manage_supervisor.renew}
+            operations[args.operation](args)
+            return 0
         operation = {"build": build, "prepare": prepare, "status": status, "destroy": destroy}[args.operation]
         if args.operation in ("prepare", "destroy"):
             with setup_lock(args.directory):

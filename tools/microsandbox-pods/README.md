@@ -98,9 +98,34 @@ keep the same identity. This is generic Docker networking, with no vendor-specif
 runtime mode.
 
 The directory must be private (0700); generated credential files are 0600.
-Keep it and the runtime home across restarts. `run` stays in the foreground and
-retains guests on exit. Stop it and rerun `prepare` before the 30-day certificates
-expire, then restart `run`. Repeated setup checks ownership and preserves the
+Keep it and the runtime home across restarts. `run` supervises the controller in
+the foreground and retains guests on exit. For optional background supervision:
+
+```sh
+python3 tools/microsandbox-pods/manage.py start --directory /private/native-cluster
+python3 tools/microsandbox-pods/manage.py status --directory /private/native-cluster
+python3 tools/microsandbox-pods/manage.py stop --directory /private/native-cluster
+```
+
+Both modes check the controller and kubelet certificates hourly and renew them
+within seven days of their 30-day expiry. Complete replacement credentials are
+prepared privately before the controller is stopped. An atomic generation
+selection and graceful restart preserve Pod journals and native guests. Failed
+certificate preparation leaves the running controller unchanged and retries in
+one minute. `renew --directory ...` requests the same rotation immediately.
+Logs are in `controller.log` and, for background startup, `manager.log`.
+
+The supervisor holds the cluster setup lock and stops only its own child process.
+Its private authenticated Unix socket handles status and stop requests; stored
+PIDs are never used to adopt or signal another process. A child crash permits
+three recovery starts in five minutes, each using the existing native ownership
+and pending-operation fences. Repeated failure stops supervision for inspection.
+If the supervisor itself crashes while its child survives, a new start refuses
+the occupied controller endpoint. Inspect and stop that surviving controller
+before restarting supervision; there is no automatic PID adoption or host
+startup service. Short private directory paths are needed for Unix socket limits.
+
+Repeated setup checks ownership and preserves the
 cluster, workload state and control token. It refuses a missing cluster when
 workload ownership state exists. Recreating that cluster requires deliberate
 recovery instead of silently adopting a new identity.

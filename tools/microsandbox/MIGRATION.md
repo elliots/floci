@@ -5,6 +5,25 @@ ported from `feat/on-demand-runtime`, without importing that branch's unrelated
 service and network changes.
 Docker remains the default. No AWS request or response shapes change.
 
+## Managed controller and certificate renewal
+
+`tools/microsandbox-pods/manage.py run` now supervises its controller child and
+renews the 30-day client and kubelet certificates within seven days of expiry.
+The optional `start`, `stop` and `renew` commands use the same supervisor through
+a private authenticated Unix socket. `stop` retains all workloads and journals.
+No host-specific service manager or automatic login startup is installed.
+
+New setup credentials live in complete private `credentials/<generation>`
+directories, selected atomically by `cluster.json`. The generated administrator
+kubeconfig stays at its existing path. Old flat controller credentials remain
+readable until their next renewal or `prepare`; custom scripts should use
+`manage.py run/start` instead of assuming a flat controller certificate path.
+Preparation failures preserve the existing process and credential selection.
+An interrupted controller can retry existing journal recovery up to three times
+in five minutes. Pending or ambiguous native mutations still fail closed.
+A supervisor crash does not authorize adoption or signalling of an orphaned
+controller PID. Logs and `status` identify what needs inspection before restart.
+
 ## Reconciliation and capacity diagnostics
 
 The native pod controller now defaults to eight Kubernetes reconciliation workers
