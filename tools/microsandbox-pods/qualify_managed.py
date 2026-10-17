@@ -80,7 +80,9 @@ class ManagedQualification:
             finally:
                 self.command("docker","rm","-f",probe)
         manage.prepare(argparse.Namespace(directory=str(self.directory), binaries=self.args.binaries,
-            msb=self.args.msb, msb_home=self.args.msb_home, node_ip=host))
+            msb=self.args.msb, msb_home=self.args.msb_home, node_ip=host,
+            **{name: getattr(self.args, name, None) for name in
+                ("environment_network", "isolation_helper", "environment_dns", "peer_udp_port", "peer_images")}))
         self.record = manage.load(self.directory)
         self.report.update(owner=self.record["owner"], nodeIP=host, peer=self.record["peer"])
         manage_supervisor.start(self.manager_args)
@@ -271,6 +273,7 @@ printf 'Content-Type: text/plain\\r\\n\\r\\n'
         except Exception as error:
             self.report["failure"]=type(error).__name__+": "+str(error)
             self.report["traceback"]=traceback.format_exc()
+            print(json.dumps({"failure":self.report["failure"],"traceback":self.report["traceback"]},indent=2),flush=True)
         finally:
             try:
                 self.cleanup()

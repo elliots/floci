@@ -677,3 +677,43 @@ start without public registry access. The saved copy is checked on every prepare
 and before every stopped-peer start. Ordinary peers may opt into the same option.
 Application images still need a reachable allowed registry, such as a protected
 registry exposed through Floci's HTTPS origin gateway.
+
+### Protected environment qualification
+
+`qualify_isolation.py` creates its own Floci container, protected Docker network,
+managed peer, private registry, simulator and external network canaries. It runs
+the installed controller with restricted Kubernetes credentials and one native
+application. The checks cover cold deployment, a verified TLS image pull,
+direct and Service-routed egress, exact TCP/UDP allowances including an explicitly
+allowed DNS server, HTTP/TLS origin routing, and the boundary after a controller
+restart and RAM resume. Every probe result is saved before assertions. Failure
+reports include owned firewall diagnostics; failed native cleanup retains the
+environment for recovery instead of removing its protection.
+
+Build the current Floci package and image with `./mvnw package -DskipTests` and
+`docker build -f docker/Dockerfile.jvm-package -t floci:qualification .`.
+Preload that image, `python:3.12-alpine`, `registry:2`, and
+`rancher/k3s:v1.35.0-k3s1` in Docker. Build matching native tools with
+`manage.py build`. Supply the official pinned k3s airgap archive for the host
+architecture and an initialized, dedicated microsandbox home with no sandboxes,
+volumes or snapshots. The fixture refuses occupied homes and overlapping canary
+subnets. Operator downloads and image preparation happen before workload
+isolation is enabled.
+
+```sh
+FLOCI_MICROSANDBOX_MEMORY_LIMIT_MIB=1536 \
+python3 tools/microsandbox-pods/qualify_isolation.py \
+  --binaries /absolute/native-tools --msb /absolute/path/to/msb \
+  --msb-home /absolute/qualification-runtime \
+  --peer-images /absolute/k3s-airgap-images-arm64.tar.zst \
+  --floci-image floci:qualification --node-ip <host-ip-reachable-from-docker> \
+  --report /tmp/native-isolation-report.json
+```
+
+Use the `amd64` archive on x86 hosts. When `--node-ip` is omitted, this fixture
+discovers it through a disposable, unprotected control-plane probe before
+creating the protected peer, then records and passes the explicit address to
+managed setup. The IPv4 canary uses an unused TEST-NET range, so successful
+allowed probes exercise public-address classification without contacting a real
+public service. IPv6 checks attempt denial against a live local canary; they do
+not independently prove an unrestricted native IPv6 route exists.
