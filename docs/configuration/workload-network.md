@@ -262,9 +262,11 @@ filters direct guest traffic. These layers prevent an allowed VXLAN tunnel from
 becoming unrestricted external access. Kubernetes NetworkPolicy remains a separate,
 additional restriction.
 
-Protected peer integration is implemented. Its end-to-end native isolation and
-simulator-routing qualification is still being run; see the
-[validation record](../../tools/microsandbox/VALIDATION.md) for completed evidence.
+Protected peer integration passed 51 installed-path checks and cleanup on Apple
+Silicon, including explicit external allowances, simulator TLS and repeated
+traffic checks after RAM sleep and controller restart. See the
+[validation record](../../tools/microsandbox/VALIDATION.md) for scope and platform
+limits; native Linux/KVM qualification remains outstanding.
 
 Set `FLOCI_NETWORK_CONFIG_FILE` for Floci and each native host helper or Pod
 controller using the environment. They must read identical file bytes. Add native

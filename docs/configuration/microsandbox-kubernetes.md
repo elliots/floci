@@ -661,6 +661,9 @@ described in [workload networking](workload-network.md#native-microvm-boundary).
 
 See the [managed setup commands](../../tools/microsandbox-pods/README.md#development-cluster-setup)
 and [migration instructions](../../tools/microsandbox/MIGRATION.md#native-pod-environment-isolation-requires-a-protected-peer).
-Protected-environment native qualification is still being run. The separate
-NetworkPolicy matrix has passed 21 checks, and its restricted installed smoke
-passed seven; those results do not substitute for the environment-boundary run.
+Protected-environment native qualification passed 51 checks and cleanup on Apple
+Silicon, including explicit external allowances, simulator TLS and repeated
+traffic checks after RAM sleep and controller restart. The separate NetworkPolicy
+matrix passed 21 checks and its restricted installed smoke passed seven. See the
+[validation record](../../tools/microsandbox/VALIDATION.md) for scope and platform
+limits; native Linux/KVM qualification remains outstanding.

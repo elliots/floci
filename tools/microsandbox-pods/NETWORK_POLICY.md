@@ -116,7 +116,10 @@ the outer Docker bridge firewall and the SDK boundary, with shared controlled
 DNS and exact host transport allowances. Setup requires a fresh protected record
 and enables the node-wide capability rules above. See the
 [environment setup](../../docs/configuration/workload-network.md#native-microvm-boundary).
-Its full native qualification is still being run; the independent NetworkPolicy
-matrix passed 21 checks and the restricted installed smoke passed seven.
+Its installed native qualification passed 51 checks and cleanup on Apple Silicon,
+including the same traffic matrix after RAM sleep and controller restart. The
+independent NetworkPolicy matrix passed 21 checks and the restricted installed
+smoke passed seven. Native Linux/KVM qualification remains outstanding; see the
+[validation record](../microsandbox/VALIDATION.md).
 
 The rule model follows the [Kubernetes NetworkPolicy contract](https://kubernetes.io/docs/concepts/services-networking/network-policies/).

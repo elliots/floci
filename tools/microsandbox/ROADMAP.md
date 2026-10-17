@@ -85,9 +85,10 @@ compatibility remain priorities for ordinary Kubernetes application manifests.
   IPv4 TCP/UDP global allowances supplement native-local transport rules;
   simulator routing and shared DNS remain independent of Pod policy. Fresh
   managed records pin environment identities and the peer UDP port, preload k3s
-  system images, and use the configured CA for registry pulls. The full native
-  isolation/simulator-routing fixture is still being run. After it passes,
-  broaden topology and failure-recovery qualification, then address application
+  system images, and use the configured CA for registry pulls. The installed
+  isolation/simulator-routing fixture passed 51 checks and cleanup on Apple
+  Silicon, including the same traffic matrix after RAM sleep and controller
+  restart. Broaden topology and Linux/KVM qualification, then address application
   network namespaces for raw-socket compatibility. DNS overrides alone are not
   an egress boundary.
 

@@ -336,3 +336,82 @@ This run used macOS/Apple Silicon. It advanced Aurora's existing test idle clock
 instead of waiting its minimum five-minute auto-pause interval; Pod idleness used
 the real coordinator. It qualifies PostgreSQL/SQS and this application graph,
 not MySQL in this graph, 500 different applications or native Linux/KVM.
+
+## Live Kubernetes NetworkPolicy: 17 October 2026
+
+The shared Docker/native policy fixture passed all 21 checks and ownership
+cleanup. The installed restricted-controller fixture passed seven checks and
+cleanup. These runs cover live IPv4 TCP/UDP policies in the explicit secure mode;
+they do not establish support for raw-socket applications, IPv6 policy, SCTP or
+arbitrary CNI implementations. Every native regular and init container in this
+mode must explicitly drop `NET_RAW` or `ALL`.
+
+## Environment firewall checks: 17 October 2026
+
+The actual Docker peer firewall test passed with race detection and removed its
+owned resources. It checks permitted TCP/UDP destinations, denied addresses and
+ports, host-gateway refusal, filtering after Kubernetes Service destination
+translation, exact peer-only host transport grants, reply traffic, live rule
+refresh and hook ordering. A follow-up regression verifies that explicit gateway
+TCP/UDP exceptions work while other gateway ports remain denied. Positive
+controls establish reachable TCP, UDP and
+IPv6 destinations before installing the boundary. These are Linux kernel checks
+inside Docker, not native Linux/KVM qualification.
+
+All 31 focused Java network configuration, isolation manager and firewall tests
+passed, including the real Docker outer-boundary matrix. The Pod controller's
+complete race suite and vet passed after protected-peer integration and the exec
+and gateway fixes; the main package completed in 58.579 seconds. Focused
+recovery regressions additionally cover interrupted transport grants, removal
+retries, exact tuple ownership and rejection of retries after environment
+identity changes. The shared SDK adapter race suite and vet also passed.
+
+Container exec now releases the lifecycle lock while holding a separate awake
+lease. Regression tests cover HTTP back to the same Pod, refusal to hibernate
+during exec, cancellation and draining before deletion, and cancellation limited
+to the container being replaced. These checks do not make ordinary idle TCP
+connections keep HTTP-mode Pods awake.
+
+The managed setup and qualification Python suite passed all 41 tests. Environment
+permissions use ordinary destination, protocol and port rules for DNS as for
+other traffic. The pinned SDK's documented direct DNS-port interception remains
+independent of these rules.
+
+## Protected native environment: 17 October 2026
+
+The installed native isolation fixture passed all 51 checks on Apple Silicon
+with microsandbox 0.7.8 and completed owned cleanup. It used the actual packaged
+Floci application, outer Docker firewall, protected managed k3s peer, restricted
+controller identity, shared DNS, private registry and HTTP/HTTPS simulators.
+The deployed Pod became proxy-Ready with no active VM. Its first HTTP request
+pulled its image through the verified HTTPS registry gateway and started the
+application.
+
+Twenty traffic probes passed both before and after full RAM sleep and supervised
+controller crash/restart. The same application memory marker survived. Explicit
+TCP/UDP exceptions reached an owned TEST-NET canary, exercising public-address
+classification without contacting a real public service. DNS queries to explicitly
+allowed TCP/UDP port 1054 succeeded; the same protocol on unlisted port 1053 failed.
+Host positive controls verified that these exact canary addresses and ports were
+reachable before native policy assertions.
+
+Unlisted direct addresses and ports, host-published ports, the SDK host alias,
+unknown external DNS names and a selectorless Service pointing outside the
+environment were denied. Ordinary HTTP to the Pod's own Service worked from
+exec. Controlled AWS hostname resolution and HTTP/HTTPS simulator routing worked,
+including binary bodies, paths and queries, replacement of a forged forwarded
+host, wildcard origins and preserved Host headers. Untrusted simulator TLS failed
+with an actual certificate-verification error.
+
+Native IPv6 attempts to a live canary were denied, but this fixture does not
+independently establish an unrestricted native IPv6 route; the separate Docker
+kernel matrix includes positive IPv6 routing controls. The DNS canaries use
+nonreserved ports and do not establish that the pinned SDK forwards direct
+port-53 traffic to an arbitrary explicitly allowed resolver.
+
+Final native VM, snapshot and volume inventories were empty. The owned managed
+cluster, Floci containers, canaries, registry, Docker networks and outer firewall
+were removed. This qualifies one protected native application and its recovery,
+not hundreds of different applications or native Linux/KVM. The
+[fixture instructions](../microsandbox-pods/README.md#protected-environment-qualification)
+describe reproduction and required preloaded images.

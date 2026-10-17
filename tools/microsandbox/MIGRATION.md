@@ -1072,9 +1072,11 @@ and controllers reject these records. Shared DNS remains infrastructure, with no
 DNS sidecar per Pod.
 
 This replaces the temporary blanket refusal of isolated native Pod startup.
-Protected-environment native qualification is still being run. The separate
-NetworkPolicy matrix passed 21 checks and its restricted installed smoke passed
-seven; see [VALIDATION.md](VALIDATION.md) for completed runs.
+Protected-environment native qualification passed 51 checks and cleanup on Apple
+Silicon, including explicit external allowances, simulator TLS and the same
+traffic matrix after RAM sleep and controller restart. The separate NetworkPolicy
+matrix passed 21 checks and its restricted installed smoke passed seven; see
+[VALIDATION.md](VALIDATION.md) for scope and remaining platform limits.
 
 ## Ordinary Pod termination
 
