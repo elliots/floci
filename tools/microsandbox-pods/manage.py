@@ -7,6 +7,7 @@ import contextlib
 import fcntl
 import ipaddress
 import json
+import manage_environment
 import os
 from pathlib import Path
 import platform
@@ -76,8 +77,10 @@ def wait(description, operation, timeout=300):
 def load(directory):
     directory = Path(directory).resolve()
     record = json.loads(read_private(directory / "cluster.json"))
-    if record.get("version") != 1 or record.get("directory") != str(directory):
+    if record.get("version") not in (1, 2) or record.get("directory") != str(directory):
         raise RuntimeError("cluster record belongs to another directory or format")
+    if record["version"] == 2 and not record.get("environment"):
+        raise RuntimeError("protected cluster record is missing its environment identity")
     return record
 
 
@@ -138,6 +141,7 @@ def inspect_peer(record):
         raise RuntimeError("network peer ownership changed; refusing to adopt or modify it")
     if values[0]["Config"]["Image"] != K3S_IMAGE:
         raise RuntimeError("network peer image differs from the recorded pinned cluster version")
+    manage_environment.verify_peer(record, values[0])
     return values[0]
 
 
@@ -307,7 +311,8 @@ def prepare(args):
     if directory.stat().st_mode & 0o077:
         raise RuntimeError("cluster directory must be private (mode 0700)")
     record_path = directory / "cluster.json"
-    if record_path.exists():
+    existing = record_path.exists()
+    if existing:
         record = load(directory)
         if controller_running(record):
             raise RuntimeError("stop the controller before renewing its cluster credentials")
@@ -325,7 +330,8 @@ def prepare(args):
             "peer": "floci-native-"+owner, "node": "native-pods", "user": "floci:microsandbox:"+owner,
             "accessName": "floci-native-"+owner, "kubeletPort": kubelet_port, "controlPort": control_port}
         record.update({option: str(Path(getattr(args, option)).resolve()) for option in ("binaries", "msb", "msb_home")})
-        write_private(record_path, json.dumps(record, indent=2)+"\n")
+    manage_environment.resolve(record, args, command, existing)
+    write_private(record_path, json.dumps(record, indent=2)+"\n")
     for name in ("microsandbox-pods", "network-relay", "guestfs"):
         if not os.access(Path(record["binaries"]) / name, os.X_OK):
             raise RuntimeError("missing executable "+name+"; run the build command first")
@@ -337,11 +343,14 @@ def prepare(args):
         if (directory / "controller" / "owner").exists():
             raise RuntimeError("recorded network peer is missing; refusing to replace a cluster with workload state")
         linux_host = ["--add-host", "host.docker.internal:host-gateway"] if platform.system() == "Linux" and not args.node_ip else []
-        command("docker", "run", "-d", "--name", record["peer"], "--hostname", record["peer"], *linux_host,
-            "--label", LABEL+"="+record["owner"], "--privileged", "-p", "127.0.0.1::6443", "-p", "127.0.0.1::8472/udp",
+        command("docker", "create", "--name", record["peer"], "--hostname", record["peer"], *linux_host,
+            *manage_environment.peer_options(record), "--label", LABEL+"="+record["owner"], "--privileged", "-p", "127.0.0.1::6443", "-p", "127.0.0.1::8472/udp",
             K3S_IMAGE, "server", "--disable=traefik", "--disable=servicelb", "--disable=metrics-server",
             "--egress-selector-mode=disabled", timeout=600)
+        manage_environment.stage_resolver(record, command, write_private)
+        command("docker", "start", record["peer"])
     elif not peer["State"]["Running"]:
+        manage_environment.stage_resolver(record, command, write_private)
         command("docker", "start", record["peer"])
     wait("Kubernetes API ready", lambda: kubectl(record, "get", "--raw=/readyz") == "ok")
     peer = inspect_peer(record)
@@ -409,7 +418,8 @@ def controller_arguments(record, args):
         "--control-token-file", str(directory/"control-token"), "--cluster-name", record["peer"],
         "--max-active-memory-mib", str(args.memory_mib), "--scheduling-cpu", args.scheduling_cpu,
         "--scheduling-memory", args.scheduling_memory, "--pod-workers", str(args.pod_workers),
-        "--network-policy=" + str(getattr(args, "network_policy", False)).lower()]
+        "--network-policy=" + str(bool(record.get("environment")) or getattr(args, "network_policy", False)).lower(),
+        *manage_environment.controller_options(record)]
 
 
 def status(args):
@@ -515,6 +525,9 @@ def main():
     preparing.add_argument("--msb", required=True)
     preparing.add_argument("--msb-home", required=True)
     preparing.add_argument("--node-ip", help="host IPv4 address reachable from the owned cluster; bypasses automatic Docker host discovery")
+    preparing.add_argument("--environment-network", help="existing protected Docker bridge; requires isolation-helper and environment-dns")
+    preparing.add_argument("--isolation-helper", help="existing Floci isolation helper protecting that bridge")
+    preparing.add_argument("--environment-dns", help="Floci DNS IPv4 address assigned on the protected bridge")
     for operation, description in (("run", "supervise in foreground and renew certificates automatically"),
             ("start", "start an owned background supervisor"), ("_supervise", argparse.SUPPRESS)):
         running = commands.add_parser(operation, help=description)

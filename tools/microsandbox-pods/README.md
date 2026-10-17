@@ -92,6 +92,35 @@ It cannot create workloads, change Secrets, administer RBAC or change other node
 Use a dedicated development cluster: the controller still needs trusted access
 to application credentials and to the local Docker socket.
 
+For an existing isolated Floci environment, prepare a fresh private cluster directory
+with all three options:
+
+```sh
+python3 tools/microsandbox-pods/manage.py prepare \
+  --directory /path/to/private-isolated-cluster --binaries /path/to/binaries \
+  --msb /path/to/msb --msb-home /path/to/private-runtime-home \
+  --environment-network floci-protected \
+  --isolation-helper floci-network-isolation \
+  --environment-dns 172.30.0.2
+```
+
+Use the existing protected Docker bridge, its running Floci isolation helper and
+Floci's DNS address on that bridge. Setup verifies the helper's ownership metadata,
+then pins the full network/helper IDs, policy fingerprint, bridge and DNS address.
+It creates the peer directly on that single network and copies the controlled
+resolver before starting k3s. It does not attach an unprotected network temporarily.
+Every controller restart receives those recorded identities; the controller checks
+the live isolation rules before accepting native workloads.
+
+Protected setup always enables secure NetworkPolicy mode. Every native application
+and init container must drop `NET_RAW` or `ALL`. Controlled DNS is the default;
+additional destinations, including other DNS servers, require explicit environment
+egress allowances. Re-running prepare may omit the three options to reuse the saved
+identities. A replaced helper, network or policy is rejected. Existing unisolated
+clusters cannot be converted in place. Protected records use manager format 2, so
+older managers reject them instead of restarting without the isolation settings.
+Setup owns only its peer, never the existing Floci environment or isolation helper.
+
 `prepare --node-ip <host-IPv4>` selects the host address reachable from the
 cluster explicitly. No special hostname is required with this setting. Otherwise
 setup discovers Docker's host address, honoring `/etc/hosts` entries before DNS.

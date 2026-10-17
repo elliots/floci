@@ -1080,3 +1080,18 @@ kubelet can still run preStop because it applies a minimum effective grace, as
 described in [the upstream discussion](https://github.com/kubernetes/kubernetes/issues/123408).
 The shared qualification records that difference instead of claiming exact
 zero-grace hook parity.
+
+### Managed protected Kubernetes peers
+
+For native Pods in an isolated Floci environment, prepare a new managed cluster
+with `--environment-network`, `--isolation-helper` and `--environment-dns`.
+These refer to existing environment resources. The manager records their immutable
+identities and starts k3s only after its controlled resolver is installed. Reusing
+a directory that previously created an unisolated peer is rejected.
+
+Protected records use manager format 2 and always enable secure NetworkPolicy
+mode. Every native application and init container must explicitly drop `NET_RAW`
+or `ALL`. This is separate from the environment's destination allowlist and
+simulator routing. Older managers reject the record; retain the matching tools
+when restarting or renewing credentials. The manager never deletes the shared
+Floci environment or isolation helper when destroying its owned empty cluster.
