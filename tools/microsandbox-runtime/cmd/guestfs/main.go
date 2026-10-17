@@ -9,6 +9,7 @@ import (
 	"syscall"
 
 	"github.com/floci-io/floci/tools/microsandbox-runtime/guestfs"
+	"github.com/floci-io/floci/tools/microsandbox-runtime/guestlog"
 )
 
 func main() {
@@ -24,6 +25,19 @@ func run(args []string) error {
 	}
 	flags := flag.NewFlagSet(args[0], flag.ContinueOnError)
 	switch args[0] {
+	case "log":
+		root := flags.String("root", "", "Private container output directory")
+		if err := flags.Parse(args[1:]); err != nil {
+			return err
+		}
+		code, err := guestlog.Run(*root, flags.Args())
+		if err != nil {
+			return err
+		}
+		if code != 0 {
+			os.Exit(code)
+		}
+		return nil
 	case "ownership":
 		group := flags.Int64("group", -1, "Filesystem group")
 		readOnly := flags.Bool("read-only", false, "Apply read-only volume permission mask")
