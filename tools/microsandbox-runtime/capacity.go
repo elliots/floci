@@ -23,15 +23,18 @@ import (
 var ErrCapacityUnavailable = errors.New("native capacity admission refused; operation not started")
 
 type CapacityLimits struct {
-	MemoryMiB uint64 `json:"memoryMiB"`
-	Starts    uint32 `json:"starts"`
+	MemoryMiB      uint64 `json:"memoryMiB"`
+	Starts         uint32 `json:"starts"`
+	DiskMiB        uint64 `json:"diskMiB"`
+	MinFreeDiskMiB uint64 `json:"minFreeDiskMiB"`
 }
 
 type CapacityStatus struct {
-	Limits        CapacityLimits `json:"limits"`
-	MemoryMiB     uint64         `json:"memoryMiB"`
-	PendingStarts int            `json:"pendingStarts"`
-	Reservations  []string       `json:"reservations"`
+	Limits        CapacityLimits      `json:"limits"`
+	MemoryMiB     uint64              `json:"memoryMiB"`
+	PendingStarts int                 `json:"pendingStarts"`
+	Reservations  []string            `json:"reservations"`
+	Disk          *DiskCapacityStatus `json:"disk,omitempty"`
 }
 
 // AdmissionRequest reserves before a compound wake consumes its stopped source.
@@ -44,6 +47,9 @@ type AdmissionRequest struct {
 type capacityPermit struct {
 	Hash, Name, Operation, SourceName, SourceID, TargetID, SnapshotID, SnapshotDigest string
 	MemoryMiB                                                                         uint64
+	RootDiskMiB, DiskBytes                                                            uint64
+	ImageRef, ImageDigest                                                             string
+	Full                                                                              bool
 	Dispatched                                                                        bool
 }
 
@@ -56,11 +62,13 @@ type capacityState struct {
 type capacityGuest struct {
 	ID, Name, Status string
 	MemoryMiB        uint64
+	RootDiskMiB      uint64
 }
 
 type capacitySnapshot struct {
-	ID, Digest string
-	MemoryMiB  uint64
+	ID, Digest  string
+	MemoryMiB   uint64
+	RootDiskMiB uint64
 }
 
 type capacityManager struct {
@@ -70,12 +78,15 @@ type capacityManager struct {
 	initError error
 	inventory func(context.Context) ([]capacityGuest, error)
 	snapshot  func(context.Context, string) (capacitySnapshot, error)
+	storage   func(context.Context) (diskObservation, error)
+	image     func(context.Context, string) (string, error)
 }
 
 type admissionContextKey struct{}
 
 func newCapacityManager(config Config) (*capacityManager, error) {
-	limits := CapacityLimits{MemoryMiB: config.MemoryLimitMiB, Starts: config.StartLimit}
+	limits := CapacityLimits{MemoryMiB: config.MemoryLimitMiB, Starts: config.StartLimit,
+		DiskMiB: config.DiskLimitMiB, MinFreeDiskMiB: config.MinFreeDiskMiB}
 	for _, field := range []struct {
 		name string
 		bits int
@@ -83,6 +94,8 @@ func newCapacityManager(config Config) (*capacityManager, error) {
 	}{
 		{"FLOCI_MICROSANDBOX_MEMORY_LIMIT_MIB", 63, func(n uint64) { limits.MemoryMiB = n }},
 		{"FLOCI_MICROSANDBOX_START_LIMIT", 32, func(n uint64) { limits.Starts = uint32(n) }},
+		{"FLOCI_MICROSANDBOX_DISK_LIMIT_MIB", 44, func(n uint64) { limits.DiskMiB = n }},
+		{"FLOCI_MICROSANDBOX_MIN_FREE_DISK_MIB", 44, func(n uint64) { limits.MinFreeDiskMiB = n }},
 	} {
 		if value := os.Getenv(field.name); value != "" {
 			n, err := strconv.ParseUint(value, 10, field.bits)
@@ -92,7 +105,22 @@ func newCapacityManager(config Config) (*capacityManager, error) {
 			field.set(n)
 		}
 	}
+	if limits.DiskMiB > maxDiskMiB || limits.MinFreeDiskMiB > maxDiskMiB {
+		return nil, invalid("native disk limits overflow byte accounting")
+	}
 	m := &capacityManager{home: config.Home, limits: limits}
+	m.storage = func(ctx context.Context) (diskObservation, error) {
+		if err := initializeSDK(config); err != nil {
+			return diskObservation{}, err
+		}
+		return observeNativeDisk(ctx, config.Home)
+	}
+	m.image = func(ctx context.Context, reference string) (string, error) {
+		if err := initializeSDK(config); err != nil {
+			return "", err
+		}
+		return cachedImageGeometry(ctx, config.Home, reference)
+	}
 	m.inventory = func(ctx context.Context) ([]capacityGuest, error) {
 		if err := initializeSDK(config); err != nil {
 			return nil, err
@@ -145,7 +173,7 @@ func (c *Client) ExecuteAdmitted(ctx context.Context, args []string, input []byt
 }
 
 func capacityOperation(op string) bool {
-	return op == "run" || op == "start" || op == "snap restore"
+	return op == "run" || op == "start" || op == "snap restore" || op == "snap create"
 }
 
 func (c *Client) admit(ctx context.Context, request command, args []string) (func(bool), error) {
@@ -189,7 +217,10 @@ func argumentsHash(args []string) string {
 
 func (m *capacityManager) prepare(ctx context.Context, r command, args []string, source string) (string, error) {
 	if !capacityOperation(r.op) || source != "" && r.op != "snap restore" {
-		return "", invalid("admission requires a native launch, start or restore")
+		return "", invalid("admission requires a native launch, start, capture or restore")
+	}
+	if r.op == "snap create" {
+		return m.prepareCapture(ctx, r, args)
 	}
 	token := rand.Text()
 	err := m.transaction(ctx, func(state *capacityState) error {
@@ -198,6 +229,7 @@ func (m *capacityManager) prepare(ctx context.Context, r command, args []string,
 			return err
 		}
 		p := capacityPermit{Hash: argumentsHash(args), Name: r.name, Operation: r.op, SourceName: source, MemoryMiB: uint64(r.config.MemoryMiB)}
+		p.RootDiskMiB = rootDiskGeometry(r.config)
 		for _, guest := range guests {
 			if guest.Name == source {
 				if guest.Status != "stopped" {
@@ -211,6 +243,7 @@ func (m *capacityManager) prepare(ctx context.Context, r command, args []string,
 				}
 				if r.op == "start" {
 					p.TargetID, p.MemoryMiB = guest.ID, guest.MemoryMiB
+					p.RootDiskMiB = guest.RootDiskMiB
 				}
 			}
 		}
@@ -223,6 +256,7 @@ func (m *capacityManager) prepare(ctx context.Context, r command, args []string,
 				return err
 			}
 			p.SnapshotID, p.SnapshotDigest, p.MemoryMiB = snapshot.ID, snapshot.Digest, snapshot.MemoryMiB
+			p.RootDiskMiB = snapshot.RootDiskMiB
 		}
 		status, err := capacityUsage(state, guests)
 		if err != nil {
@@ -236,11 +270,14 @@ func (m *capacityManager) prepare(ctx context.Context, r command, args []string,
 		if len(state.Permits) >= 10000 {
 			return errors.New("native reservation ledger requires reconciliation")
 		}
-		if state.Limits.Starts > 0 && len(state.Permits) >= int(state.Limits.Starts) {
+		if state.Limits.Starts > 0 && status.PendingStarts >= int(state.Limits.Starts) {
 			return errors.New("concurrent native start limit reached")
 		}
 		if state.Limits.MemoryMiB > 0 && (p.MemoryMiB == 0 || p.MemoryMiB > state.Limits.MemoryMiB || status.MemoryMiB > state.Limits.MemoryMiB-p.MemoryMiB) {
 			return errors.New("native memory limit reached")
+		}
+		if err := m.reserveDisk(ctx, state, guests, r, &p); err != nil {
+			return err
 		}
 		state.Permits[token] = p
 		return nil
@@ -261,13 +298,23 @@ func (m *capacityManager) dispatch(ctx context.Context, token string, args []str
 		if err != nil {
 			return err
 		}
+		captureSource := false
 		for _, guest := range guests {
-			if guest.Name == p.SourceName && (guest.ID != p.SourceID || guest.Status != "stopped") {
+			if guest.Name == p.SourceName && (guest.ID != p.SourceID || p.Operation != "snap create" && guest.Status != "stopped") {
 				return errors.New("native restore source changed")
+			}
+			if p.Operation == "snap create" && guest.ID == p.SourceID {
+				captureSource = true
+				if guest.MemoryMiB != p.MemoryMiB || guest.RootDiskMiB != p.RootDiskMiB || p.Full && guest.Status != "running" && guest.Status != "paused" {
+					return errors.New("native capture source changed")
+				}
 			}
 			if guest.Name == p.Name && (p.Operation != "start" || guest.ID != p.TargetID || guest.Status != "stopped") {
 				return errors.New("native target changed")
 			}
+		}
+		if p.Operation == "snap create" && !captureSource {
+			return errors.New("native capture source disappeared")
 		}
 		if p.SnapshotID != "" {
 			request, err := parse(args)
@@ -275,9 +322,12 @@ func (m *capacityManager) dispatch(ctx context.Context, token string, args []str
 				return err
 			}
 			snapshot, err := m.snapshot(ctx, request.selector)
-			if err != nil || snapshot.ID != p.SnapshotID || snapshot.Digest != p.SnapshotDigest || snapshot.MemoryMiB != p.MemoryMiB {
+			if err != nil || snapshot.ID != p.SnapshotID || snapshot.Digest != p.SnapshotDigest || snapshot.MemoryMiB != p.MemoryMiB || snapshot.RootDiskMiB != p.RootDiskMiB {
 				return errors.Join(errors.New("native checkpoint changed"), err)
 			}
+		}
+		if err := m.revalidateDisk(ctx, state, guests, p); err != nil {
+			return err
 		}
 		p.Dispatched = true
 		state.Permits[token] = p
@@ -295,6 +345,19 @@ func (m *capacityManager) finish(ctx context.Context, token string) error {
 		if err != nil {
 			return err
 		}
+		if diskBudgetEnabled(state.Limits) {
+			if _, err := m.diskStatus(ctx, state, guests); err != nil {
+				return err
+			}
+		}
+		if p.Operation == "snap create" {
+			snapshot, err := m.snapshot(ctx, p.Name)
+			if err != nil || snapshot.MemoryMiB != p.MemoryMiB || snapshot.RootDiskMiB != p.RootDiskMiB {
+				return errors.Join(errors.New("native capture completion could not be reconciled"), err)
+			}
+			delete(state.Permits, token)
+			return nil
+		}
 		for _, guest := range guests {
 			if guest.Name == p.Name && (p.TargetID == "" || guest.ID == p.TargetID) && guest.MemoryMiB > 0 {
 				delete(state.Permits, token)
@@ -306,7 +369,7 @@ func (m *capacityManager) finish(ctx context.Context, token string) error {
 }
 
 func capacityUsage(state *capacityState, guests []capacityGuest) (CapacityStatus, error) {
-	status := CapacityStatus{Limits: state.Limits, PendingStarts: len(state.Permits), Reservations: []string{}}
+	status := CapacityStatus{Limits: state.Limits, Reservations: []string{}}
 	counted := map[string]bool{}
 	add := func(memory uint64) error {
 		if memory == 0 && state.Limits.MemoryMiB > 0 || memory > ^uint64(0)-status.MemoryMiB {
@@ -328,6 +391,10 @@ func capacityUsage(state *capacityState, guests []capacityGuest) (CapacityStatus
 	}
 	for token, p := range state.Permits {
 		status.Reservations = append(status.Reservations, token)
+		if p.Operation == "snap create" {
+			continue
+		}
+		status.PendingStarts++
 		if !counted[p.TargetID] {
 			if err := add(p.MemoryMiB); err != nil {
 				return status, err
@@ -345,12 +412,18 @@ func (c *Client) Capacity(ctx context.Context) (CapacityStatus, error) {
 			return err
 		}
 		status, err = capacityUsage(state, guests)
+		if err == nil && diskBudgetEnabled(state.Limits) {
+			status.Disk, err = c.capacity.diskStatus(ctx, state, guests)
+		}
 		return err
 	})
 	return status, err
 }
 
 func (c *Client) SetCapacityLimits(ctx context.Context, limits CapacityLimits) error {
+	if limits.DiskMiB > maxDiskMiB || limits.MinFreeDiskMiB > maxDiskMiB {
+		return invalid("native disk limits overflow byte accounting")
+	}
 	return c.capacity.transaction(ctx, func(state *capacityState) error {
 		state.Limits = limits
 		return nil
@@ -396,7 +469,7 @@ func (m *capacityManager) transaction(ctx context.Context, fn func(*capacityStat
 	if err := readCapacityRecord(path, &state); err != nil && !errors.Is(err, os.ErrNotExist) {
 		return err
 	}
-	if state.Version != 1 || state.Permits == nil {
+	if state.Version != 1 || state.Permits == nil || state.Limits.DiskMiB > maxDiskMiB || state.Limits.MinFreeDiskMiB > maxDiskMiB {
 		return errors.New("native capacity ledger is invalid")
 	}
 	m.init.Do(func() {
@@ -406,7 +479,14 @@ func (m *capacityManager) transaction(ctx context.Context, fn func(*capacityStat
 		if state.Limits.Starts == 0 && m.limits.Starts != 0 {
 			state.Limits.Starts = m.limits.Starts
 		}
-		if m.limits.MemoryMiB != 0 && m.limits.MemoryMiB != state.Limits.MemoryMiB || m.limits.Starts != 0 && m.limits.Starts != state.Limits.Starts {
+		if state.Limits.DiskMiB == 0 && m.limits.DiskMiB != 0 {
+			state.Limits.DiskMiB = m.limits.DiskMiB
+		}
+		if state.Limits.MinFreeDiskMiB == 0 && m.limits.MinFreeDiskMiB != 0 {
+			state.Limits.MinFreeDiskMiB = m.limits.MinFreeDiskMiB
+		}
+		if m.limits.MemoryMiB != 0 && m.limits.MemoryMiB != state.Limits.MemoryMiB || m.limits.Starts != 0 && m.limits.Starts != state.Limits.Starts ||
+			m.limits.DiskMiB != 0 && m.limits.DiskMiB != state.Limits.DiskMiB || m.limits.MinFreeDiskMiB != 0 && m.limits.MinFreeDiskMiB != state.Limits.MinFreeDiskMiB {
 			m.initError = errors.New("native capacity configuration differs between helpers")
 			return
 		}
@@ -444,8 +524,8 @@ func snapshotMemoryPath(home, id string) string {
 	return filepath.Join(home, "floci-snapshot-memory", hex.EncodeToString(digest[:])+".json")
 }
 
-func recordSnapshotMemory(home, id, digest string, memory uint64) error {
-	return writeNetworkRecord(snapshotMemoryPath(home, id), capacitySnapshot{ID: id, Digest: digest, MemoryMiB: memory})
+func recordSnapshotMemory(home, id, digest string, memory, rootDisk uint64) error {
+	return writeNetworkRecord(snapshotMemoryPath(home, id), capacitySnapshot{ID: id, Digest: digest, MemoryMiB: memory, RootDiskMiB: rootDisk})
 }
 
 func capacityInventory(ctx context.Context) ([]capacityGuest, error) {
@@ -465,7 +545,7 @@ func capacityInventory(ctx context.Context) ([]capacityGuest, error) {
 			if err != nil {
 				return nil, err
 			}
-			guests = append(guests, capacityGuest{ID: handle.ID(), Name: handle.Name(), Status: string(handle.Status()), MemoryMiB: uint64(max(config.MemoryMiB, config.MaxMemoryMiB))})
+			guests = append(guests, capacityGuest{ID: handle.ID(), Name: handle.Name(), Status: string(handle.Status()), MemoryMiB: uint64(max(config.MemoryMiB, config.MaxMemoryMiB)), RootDiskMiB: rootDiskGeometry(*config)})
 		}
 		if page.NextCursor == nil || *page.NextCursor == "" {
 			return guests, nil

@@ -29,6 +29,8 @@ type Config struct {
 	GuestAgentPath    string
 	MemoryLimitMiB    uint64
 	StartLimit        uint32
+	DiskLimitMiB      uint64
+	MinFreeDiskMiB    uint64
 }
 
 type Result struct {

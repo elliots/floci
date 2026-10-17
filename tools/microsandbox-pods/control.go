@@ -293,6 +293,20 @@ func (p *provider) hibernate(ctx context.Context, e *podEntry) error {
 	if err := p.requireVMStatus(ctx, e, "Running"); err != nil {
 		return err
 	}
+	snapshot := fmt.Sprintf("sleep-%d", e.generation+1)
+	args := []string{"snap", "create", snapshot, "--sandbox", e.vm, "--full", "--integrity"}
+	permit, err := p.runner.prepareAdmission(ctx, args, "")
+	if err != nil {
+		return err
+	}
+	captureDispatched := false
+	defer func() {
+		if !captureDispatched {
+			cleanup, cancel := context.WithTimeout(context.WithoutCancel(ctx), 10*time.Second)
+			defer cancel()
+			_ = p.runner.runtime.CancelAdmission(cleanup, permit)
+		}
+	}()
 	e.generation++
 	e.state = "HIBERNATING"
 	e.applicationMissingSince = time.Time{}
@@ -306,9 +320,12 @@ func (p *provider) hibernate(ctx context.Context, e *podEntry) error {
 	if _, err := p.runner.vm(ctx, "pause", e.vm); err != nil {
 		return p.transitionFailed(e, err)
 	}
-	snapshot := fmt.Sprintf("sleep-%d", e.generation)
 	selector := e.vm + ":" + snapshot
-	if _, err := p.runner.vm(ctx, "snap", "create", snapshot, "--sandbox", e.vm, "--full", "--integrity"); err != nil {
+	captureDispatched = true
+	if _, err := p.runner.vm(context.WithValue(ctx, nativeAdmissionKey{}, permit), args...); err != nil {
+		if errors.Is(err, msbruntime.ErrCapacityUnavailable) {
+			captureDispatched = false
+		}
 		return p.rollbackPause(e, err)
 	}
 	e.snapshots = append(e.snapshots, selector)

@@ -143,5 +143,59 @@ be reconciled with the runtime before the ledger can safely be repaired.
 
 Tests cover two competing processes, symlink aliases, paused VM accounting,
 checkpoint/source protection, changed checkpoint identity, lowered limits and
-reservation retention after restart. Storage quotas are separate from this RAM
-and native-start admission mechanism.
+reservation retention after restart.
+
+### Disk admission
+
+`FLOCI_MICROSANDBOX_DISK_LIMIT_MIB` optionally limits conservative committed
+native storage. `FLOCI_MICROSANDBOX_MIN_FREE_DISK_MIB` optionally reserves a host
+filesystem free-space floor. Both default to zero and share the same private
+ledger across Pod controllers and the Aurora host helper. The host capacity API
+uses `diskMiB` and `minFreeDiskMiB`; its optional `disk` status reports observed,
+writable, reserved and committed bytes plus currently available filesystem bytes.
+With both limits disabled, operations do not query SDK storage or image inventory.
+
+Observed storage comes from the SDK's `StorageUsage`: images, snapshots, sandbox
+files, named volumes, branch memory and snapshot memory. Each category is charged
+the larger of its reported logical or allocated bytes. Unknown logical sizes
+refuse new work. Existing running/paused guests additionally reserve their full
+writable root, twice configured RAM for memory backing/materialization, and
+64 MiB of metadata headroom. Starts/restores reserve twice that allowance for
+new files and subsequent writes. New flat-root launches also reserve a complete
+shared flat base. Checkpoint capture reserves one additional allowance before
+the Pod freezes or Aurora pauses. Reflink and sparse-file savings are deliberately
+not credited; this is conservative admission accounting, not exclusive physical
+usage. Pending reservations serialize under the same filesystem lock.
+
+When enabled, launch requires a preloaded image with cached, converted layers,
+an immutable manifest digest and explicit managed/flat root geometry. The adapter
+does not pull an unmeasurable image inside the budget. Preload images before enabling
+the budget. Saved checkpoints must include the new root-geometry record; recreate
+older checkpoints before enabling disk admission. Named volumes already present
+are counted, but the adapter does not expose volume creation or growth. Any future
+volume mutation needs its own admission hook.
+
+The pinned SDK 0.7.8 leaves `Image.Inspect` layer EROFS size fields unset.
+Preflight therefore also stats its known `cache/layers/<DiffID-safe>.erofs` and
+`cache/fsmeta/<manifest-safe>.erofs` files using SDK-supplied SHA-256 identities.
+Digest validation and directory-relative opens reject malformed paths, symlinks,
+missing artifacts and non-regular files. This read-only fallback depends on the
+[pinned cache layout](https://github.com/superradcompany/microsandbox/blob/8352bb67d4ed51f5eb086dc80b16c3184a22b3a6/crates/image/lib/cache/store.rs)
+and must be requalified when upgrading the SDK. It does not download, convert or
+prune files. `FLOCI_NATIVE_TEST_MSB`, `FLOCI_NATIVE_TEST_HOME` and a cached
+`FLOCI_NATIVE_TEST_IMAGE` enable the read-only qualification:
+`go test -tags native -run '^TestNativeDiskInventory$' -count=1 -v .`.
+Against an empty, dedicated home with that image preloaded, the separate
+`TestNativeDiskAdmissionProtectsCaptureAndRestore` qualification exercises denied
+launch, denied capture before pause, denied restore with a retained checkpoint,
+successful full RAM capture/restore and an already-prepared restore after a limit
+reduction. It restores the previous limits and removes only its owned guest and
+checkpoint. Serialize it with other native qualifications.
+
+This is not a filesystem hard quota. Direct upstream CLI/SDK operations, writes
+outside the SDK home, host logs and unrelated host processes can bypass or consume
+the allowance. A prepared permit remains valid if limits are lowered, protecting
+a restore whose stopped source was already removed. New work checks fresh SDK
+usage and filesystem free space. No images, volumes or checkpoints are pruned
+automatically, and reducing a limit never deletes workloads. Use dedicated host
+filesystem quotas if a strict disk boundary is required.

@@ -661,6 +661,30 @@ return AccessDenied and do not mint credentials. This is shared by Docker and na
 Pods and uses the existing AWS credential response shape. Target-role chaining and
 downstream session-tag ABAC remain separate limitations described in the EKS docs.
 
+## Shared native disk admission
+
+Rebuild the host helper and Pod controller together to use optional disk admission.
+Set `FLOCI_MICROSANDBOX_DISK_LIMIT_MIB` and/or
+`FLOCI_MICROSANDBOX_MIN_FREE_DISK_MIB` consistently on helpers sharing the same
+native home. Zero leaves each limit disabled. The private capacity ledger persists
+these limits across restarts. The authenticated capacity API exposes `diskMiB`,
+`minFreeDiskMiB` and conservative byte accounting.
+
+Preload images before enabling disk admission. Uncached images, unconverted
+layers, unknown writable sizes and old checkpoints without recorded root geometry
+are rejected before starting or pausing a workload. Recreate old checkpoints with
+the rebuilt helpers before enabling limits. Kubernetes reserves a capture before
+freezing tasks; Aurora reserves before pausing. A refused capture leaves the
+running workload available, and a refused wake retains its saved checkpoint.
+
+Accounting includes SDK image, snapshot, sandbox, volume and memory storage,
+complete writable geometry and pending native operations. It does not credit
+sparse or reflink savings. This is an admission budget, not a hard filesystem
+quota. External CLI/SDK operations and unrelated host writes bypass it. No
+automatic pruning is performed, and lowering a limit never deletes workloads or
+revokes an already-prepared restore. Docker storage is unaffected. See the
+[shared adapter accounting details](../microsandbox-runtime/README.md#disk-admission).
+
 ## Shared microVM capacity admission
 
 Rebuild both the Go host helper and every native pod controller. Helpers using one

@@ -146,14 +146,19 @@ bearer token and environment network-policy check as `/v1/command`:
 
 | Method and path | Body or result |
 | --- | --- |
-| `GET /v1/capacity` | Limits, accounted guest RAM, pending start count and reservation tokens |
-| `POST /v1/capacity/limits` | `{"memoryMiB":16384,"starts":4}`; zero disables that limit |
+| `GET /v1/capacity` | Limits, accounted guest RAM, pending start count, reservation tokens and optional conservative disk accounting |
+| `POST /v1/capacity/limits` | `{"memoryMiB":16384,"starts":4,"diskMiB":131072,"minFreeDiskMiB":8192}`; zero disables that limit; omitted fields also become zero |
 | `POST /v1/capacity/prepare` | `{"arguments":["snap","restore","source:sleep","--name","target"],"sourceName":"source"}`; returns `{"token":"..."}` |
 | `POST /v1/capacity/cancel` | `{"token":"..."}`; only undispatched reservations can be cancelled |
 
 Pass a prepared token as `admission` alongside `arguments` in `/v1/command`.
-It must match the prepared command exactly. Ordinary launch/start/restore calls
-reserve automatically. Compound restores must prepare before consuming their source.
+It must match the prepared command exactly. Ordinary launch/start/restore/capture
+calls reserve automatically. Compound restores must prepare before consuming their
+source. Checkpoint callers prepare before pausing or freezing a guest, using
+`{"arguments":["snap","create","sleep","--sandbox","guest","--full","--integrity"]}`
+without `sourceName`. Capture reservations do not consume RAM or start slots.
+Cancel an undispatched capture reservation if preparation or pause fails. A
+dispatched capture retains its reservation until completion can be reconciled.
 Capacity refusal is HTTP 409 with `code: "CapacityUnavailable"` and the boolean
 `operationStarted: false`. Only this complete response proves non-dispatch. A lost
 response or any other runtime failure retains the usual uncertain-outcome semantics.
