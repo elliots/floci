@@ -5,6 +5,19 @@ ported from `feat/on-demand-runtime`, without importing that branch's unrelated
 service and network changes.
 Docker remains the default. No AWS request or response shapes change.
 
+## Reconciliation and capacity diagnostics
+
+The native pod controller now defaults to eight Kubernetes reconciliation workers
+instead of two. `--pod-workers` accepts 1 through 64; the setup helper's `run`
+command exposes the same option. This bounds concurrent cold-Pod cleanup without
+raising the separate VM-start or memory admission limits. Wait for the private
+Pod journals to disappear before removing a cluster; Kubernetes object deletion
+can finish first.
+
+`manage.py status` also reports shared native capacity and outstanding
+reservations, including disk accounting when enabled. Unknown inventory remains
+explicitly unavailable. No workload or AWS protocol changes are required.
+
 ## Checkout consolidation
 
 Use `feat/microsandbox` in the main Floci checkout. The host helper now builds

@@ -543,6 +543,14 @@ The shared controller uses a bounded Kubernetes API client, defaulting to
 set to publish readiness promptly. Lower them for a constrained control plane;
 registration and recovery then take longer.
 
+`--pod-workers` bounds concurrent Kubernetes reconciliations, including deletion
+of cold pods. It defaults to eight and accepts 1 through 64. Increase it only
+when cleanup is waiting on acknowledgements rather than control-plane capacity.
+The separate two-guest start limit and RAM/disk admission still govern VM
+activation. A Kubernetes Pod disappearing does not prove its owned runtime
+cleanup has finished; inspect remaining journal states before removing the
+controller or cluster.
+
 The default pod-count limit is a configuration ceiling, not a measured claim that
 500 applications fit or perform well. Cold registration avoids the cost of
 booting every application during deployment. Once an application has run,

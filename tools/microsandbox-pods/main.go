@@ -57,6 +57,7 @@ func run() error {
 	flag.StringVar(&cfg.tokenFile, "control-token-file", "", "File containing a bearer token of at least 32 bytes")
 	flag.StringVar(&cfg.clusterName, "cluster-name", "", "Cluster identity advertised by lifecycle discovery")
 	flag.IntVar(&cfg.maxPods, "max-pods", 512, "Maximum tracked pods including sleeping pods")
+	flag.IntVar(&cfg.podWorkers, "pod-workers", 8, "Concurrent Kubernetes pod reconciliations (1..64), independent of VM start admission")
 	flag.IntVar(&cfg.maxActiveMemoryMiB, "max-active-memory-mib", 4096, "Memory admission budget for active pod VMs only")
 	flag.StringVar(&cfg.schedulingCPU, "scheduling-cpu", "", "Virtual node CPU capacity for scheduling, as a Kubernetes quantity (default 4)")
 	flag.StringVar(&cfg.schedulingMemory, "scheduling-memory", "", "Virtual node memory capacity for scheduling, as a Kubernetes quantity (default active memory budget)")
@@ -145,7 +146,7 @@ func run() error {
 		return provider, provider, nil
 	}, nodeutil.WithNodeConfig(nodeutil.NodeConfig{
 		Client: client, NodeSpec: spec, InformerResyncPeriod: time.Minute,
-		HTTPListenAddr: cfg.listen, Handler: nodeutil.WithAuth(auth, mux), NumWorkers: 2,
+		HTTPListenAddr: cfg.listen, Handler: nodeutil.WithAuth(auth, mux), NumWorkers: cfg.podWorkers,
 		TLSConfig: &tls.Config{MinVersion: tls.VersionTLS12, Certificates: []tls.Certificate{cert},
 			ClientAuth: tls.RequireAndVerifyClientCert, ClientCAs: pool},
 	}), nodeutil.AttachProviderRoutes(mux))
@@ -163,6 +164,9 @@ func run() error {
 }
 
 func (c config) validate() error {
+	if c.podWorkers < 1 || c.podWorkers > 64 {
+		return errors.New("pod-workers must be 1..64")
+	}
 	if c.guestFSBinary != "" {
 		if _, err := readGuestFS(c.guestFSBinary); err != nil {
 			return err

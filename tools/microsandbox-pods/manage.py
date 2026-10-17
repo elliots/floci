@@ -287,7 +287,7 @@ def controller_arguments(record, args):
         "--client-ca", str(directory/"client-ca.crt"), "--control-listen", "127.0.0.1:"+str(record["controlPort"]),
         "--control-token-file", str(directory/"control-token"), "--cluster-name", record["peer"],
         "--max-active-memory-mib", str(args.memory_mib), "--scheduling-cpu", args.scheduling_cpu,
-        "--scheduling-memory", args.scheduling_memory]
+        "--scheduling-memory", args.scheduling_memory, "--pod-workers", str(args.pod_workers)]
 
 
 def status(args):
@@ -356,6 +356,7 @@ def main():
     running.add_argument("--memory-mib", type=int, default=4096)
     running.add_argument("--scheduling-cpu", default="500")
     running.add_argument("--scheduling-memory", default="384Gi")
+    running.add_argument("--pod-workers", type=int, default=8)
     for operation in ("status", "destroy"):
         commands.add_parser(operation).add_argument("--directory", required=True)
     args = parser.parse_args()

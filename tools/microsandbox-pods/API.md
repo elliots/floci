@@ -8,6 +8,7 @@ all owned Pods. Kubelet logs/exec use a separate mTLS/RBAC listener.
 | Request | Result |
 | --- | --- |
 | `GET /v1/health` | status, name, contract, clusterName, activeMemoryMiB, maxActiveMemoryMiB, maxPods |
+| `GET /v1/capacity` | Verified shared runtime RAM, pending starts, reservations, limits and enabled disk admission accounting; 503 if unverifiable |
 | `GET /v1/pods/{uid}` | Exact owned Pod view |
 | `POST /v1/pods/{uid}/hibernate` | Updated Pod view |
 | `POST /v1/pods/{uid}/resume` | Updated Pod view |

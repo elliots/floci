@@ -31,6 +31,7 @@ type config struct {
 	podCIDR, clusterCIDR, serviceCIDR, clusterDNS           string
 	clusterName                                             string
 	maxPods, maxActiveMemoryMiB                             int
+	podWorkers                                              int
 	schedulingCPU, schedulingMemory                         string
 	kubeAPIQPS                                              float64
 	kubeAPIBurst                                            int

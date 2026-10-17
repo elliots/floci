@@ -115,6 +115,11 @@ test_manage.py` checks these ownership and credential boundaries.
 
 For an existing development cluster, configure the controller directly:
 
+`run --pod-workers 8` controls concurrent Kubernetes reconciliation, including
+cold-Pod cleanup. The controller accepts 1 through 64 workers and defaults to
+eight. This does not increase the separate limit on simultaneous guest starts
+or bypass shared RAM and disk admission.
+
 Provide an owned Docker k3s worker labeled `io.floci.pod-probe=<owner>` with exactly
 one published UDP8472 binding. Reserve an unused /22 inside the cluster Pod CIDR.
 Keep cluster, peer, owner, node and persistent private state directory unchanged
