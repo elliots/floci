@@ -211,8 +211,15 @@ not sandbox hostile privileged containers or an administrator controlling the Do
 
 ## Native microVM boundary
 
-Set `FLOCI_NETWORK_CONFIG_FILE` for Floci, the native host helper and the pod controller.
-They must read identical file bytes. Add native destinations to that same file:
+This boundary currently supports the native host helper, including Aurora. The
+native Pod controller rejects environment-wide isolation configurations: its
+Kubernetes peer has its own forwarding and DNS paths outside the SDK firewall.
+Permitting the VM's tunnel does not constrain traffic after that peer decapsulates
+it. Kubernetes NetworkPolicy does not substitute for this environment boundary.
+Native Pod isolation requires protected peer integration before it can be enabled.
+
+Set `FLOCI_NETWORK_CONFIG_FILE` for Floci and the native host helper. They must
+read identical file bytes. Add native destinations to that same file:
 
 ```yaml
 network:
@@ -224,9 +231,6 @@ network:
       - destination: "172.24.0.0/16"
         protocol: tcp
         ports: "80-443"
-      - destination: host
-        protocol: udp
-        ports: "31000"
     ca-file: /absolute/host/path/floci-ca.crt
   routes:
     payments:
@@ -237,9 +241,8 @@ network:
 
 These addresses and ports are examples, not automatic discovery. Publish Floci's controlled
 DNS resolver on the chosen host port and use a locally reachable protected bridge subnet or
-explicit simulator port. The host UDP example permits a configured pod relay. Include the
-local AWS endpoint, credentials endpoint and required peer relay ports for the workloads you
-run. Allow only the required ports: an allowed local forward proxy could itself provide
+explicit simulator port. Include the local AWS endpoint and credentials endpoint
+for workloads that need them. Allow only the required ports: an allowed local forward proxy could itself provide
 internet access. Native isolation does not change the host's firewall.
 
 The native adapter intersects each workload's requested policy with this local allowlist.
@@ -263,7 +266,7 @@ Stop and delete remain available for cleanup. Changing even a comment changes th
 Use a dedicated runtime home and keep it together with Floci's journals across restarts.
 
 Native isolation also requires `FLOCI_MICROSANDBOX_GUEST_AGENT_PATH` on the native
-helper and pod controller. Build the static Linux `cmd/guestnet` binary from
+host helper. Build the static Linux `cmd/guestnet` binary from
 `tools/microsandbox-runtime` for the host architecture, as described in the
 [guest transport guide](../../tools/microsandbox-runtime/guestnet/README.md). The initial installer needs a shell and standard
 file utilities in the guest. It does not install packages or run a DNS daemon.

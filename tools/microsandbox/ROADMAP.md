@@ -74,8 +74,11 @@ compatibility remain priorities for ordinary Kubernetes application manifests.
   [local persistent-volume provisioner](../microsandbox-pods/STORAGE.md) adds
   node-bound Filesystem RWO disks, guarded single-Pod attachments and Delete/Retain
   reclaim. CSI drivers, expansion and broader access modes remain unsupported.
-- Networking: environment egress isolation and simulator routing are implemented.
-  Reconcile policy changes, then broaden
+- Networking: simulator routing and the native host helper's environment egress
+  isolation are implemented. Native Pods require protected peer integration:
+  the controller now rejects environment isolation because the peer's forwarding
+  and DNS paths are outside the SDK guest firewall. Protect the peer before
+  restoring that option. Reconcile policy changes, then broaden
   NetworkPolicy and networking compatibility. DNS overrides alone do not prevent
   direct-IP egress.
 

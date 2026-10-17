@@ -1034,3 +1034,21 @@ pre-dispatch admission refusal leaves the Pod cold or sleeping, releases local
 start/RAM permits, and retries at most once per 250 ms per Pod. Concurrent HTTP
 requests share that retry deadline. Unknown native outcomes and other failures
 remain errors and are never replayed by this wait path.
+
+## Native Pod environment isolation requires a protected peer
+
+The Pod controller now refuses startup when `FLOCI_NETWORK_CONFIG_FILE` enables
+environment isolation. Earlier versions checked only the SDK guest boundary's
+fingerprint. That does not prove protection of inner traffic decapsulated by the
+Kubernetes peer or DNS forwarded by that peer, so the previous guarantee was
+incomplete. Kubernetes NetworkPolicy is a separate control and cannot close this
+environment-wide gap by itself. Aurora isolation through the native host helper
+continues to use its existing SDK boundary.
+
+Stop previously running native Pods with the old controller before upgrading an
+isolated deployment. The new startup refusal does not stop already running VMs.
+Keep the old controller and runtime state available for owned cleanup; do not
+disable isolation merely to make the controller start. Use the existing protected
+Docker Kubernetes backend when this boundary is required until peer integration
+is implemented and qualified. Ordinary native Pods without environment isolation
+retain their existing runtime behavior.

@@ -1,6 +1,9 @@
 package main
 
-import "context"
+import (
+	"context"
+	"errors"
+)
 
 const reservedCAPath = "/etc/floci/certs/ca.crt"
 
@@ -12,7 +15,13 @@ type nativeBoundary interface {
 
 func (r commandRunner) verifyNetworkBoundary(ctx context.Context) error {
 	if runtime, ok := r.runtime.(nativeBoundary); ok {
-		return runtime.VerifyNetworkBoundary(ctx)
+		if err := runtime.VerifyNetworkBoundary(ctx); err != nil {
+			return err
+		}
+		if runtime.NetworkPolicyFingerprint() != "" {
+			return errors.New("native Pod environment isolation requires a protected Kubernetes network peer; " +
+				"the SDK guest firewall alone does not constrain tunneled traffic or peer DNS forwarding")
+		}
 	}
 	return nil
 }

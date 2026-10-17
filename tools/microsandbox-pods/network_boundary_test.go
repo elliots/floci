@@ -37,6 +37,24 @@ func TestRuntimeBoundaryVerificationAndPublishedIdentity(t *testing.T) {
 	}
 }
 
+func TestPodBoundaryRefusesIsolationWithoutProtectedPeer(t *testing.T) {
+	verified := false
+	runner := commandRunner{runtime: boundaryRuntime{fingerprint: "valid-sdk-policy", verify: func(ctx context.Context) error {
+		verified = true
+		return nil
+	}}}
+	if err := runner.verifyNetworkBoundary(t.Context()); err == nil || !strings.Contains(err.Error(), "protected Kubernetes network peer") {
+		t.Fatalf("SDK fingerprint advertised complete Pod isolation: %v", err)
+	}
+	if !verified {
+		t.Fatal("existing SDK boundary ownership was not checked")
+	}
+	runner.runtime = boundaryRuntime{verify: func(ctx context.Context) error { return nil }}
+	if err := runner.verifyNetworkBoundary(t.Context()); err != nil {
+		t.Fatalf("ordinary native networking was refused: %v", err)
+	}
+}
+
 func caPod() *corev1.Pod {
 	pod := validPod()
 	pod.Spec.Volumes = []corev1.Volume{{Name: "floci-network-ca", VolumeSource: corev1.VolumeSource{

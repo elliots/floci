@@ -19,8 +19,10 @@ control plane in each pod VM. The peer is infrastructure per configured network,
 not one sidecar per application.
 
 DNS and simulator routing belong to shared infrastructure. Environment isolation
-is enforced outside workloads: Docker network rules or the native host network
-policy. Guest DNS configuration is routing convenience, not the security boundary.
+is enforced by Docker network rules or, for the native host helper, the SDK's
+network policy. Native Pods currently reject environment isolation because their
+shared peer's tunnel forwarding and DNS paths need a protected boundary too.
+Guest DNS configuration is routing convenience, not the security boundary.
 Native DNS setup runs once at boot or restore, installs kernel routing to the
 configured shared resolvers, then exits and removes its temporary binary. There
 is no resident DNS server or DNS sidecar per VM.

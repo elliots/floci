@@ -640,16 +640,15 @@ real workloads.
 
 ## Shared environment network boundary
 
-Set the same `FLOCI_NETWORK_CONFIG_FILE` for Floci, its native helper and this
-controller. The controller verifies the SDK boundary before advertising node
-readiness and reports its immutable file fingerprint as `networkPolicy` in the
-authenticated lifecycle health response. Older active guests without the matching
-boundary make startup fail rather than reporting that isolation is enforced.
+The controller refuses `FLOCI_NETWORK_CONFIG_FILE` configurations that enable
+environment isolation. The SDK firewall covers direct guest traffic, but the
+shared Kubernetes peer also forwards decapsulated tunnel traffic and DNS. Its
+boundary must be integrated and verified before native Pods can safely promise
+environment-wide isolation. A matching SDK configuration fingerprint alone is
+insufficient. Kubernetes NetworkPolicy is a separate control.
 
-When the shared file configures a public native CA, the controller accepts only
-a `hostPath` of type `File` at `/etc/floci/certs/ca.crt`, mounted read-only at that
-exact path without subPath. This binds the public certificate already copied
-into the VM by the SDK. It does not access arbitrary host paths. The Floci
-admission webhook supplies this mount and `FLOCI_CA_BUNDLE` to regular and init
-containers. Without the configured native CA, this exception is rejected.
-Kubernetes NetworkPolicy enforcement remains a separate compatibility gap.
+Use the protected Docker Kubernetes backend when environment isolation is
+required. Aurora's native host helper retains its existing isolation support.
+See the [migration instructions](../../tools/microsandbox/MIGRATION.md#native-pod-environment-isolation-requires-a-protected-peer)
+before upgrading an isolated native Pod deployment. Ordinary native networking
+and simulator routing without environment isolation remain available.
