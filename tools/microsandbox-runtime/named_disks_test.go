@@ -80,6 +80,28 @@ func diskRequest() NamedDiskRequest {
 	return NamedDiskRequest{Name: "pvc-unique-uid", CapacityMiB: 256, Labels: map[string]string{"cluster": "cluster-uid", "pvc": "claim-uid"}}
 }
 
+func TestNamedDiskReleaseAfterUnattachedReclaimIsIdempotent(t *testing.T) {
+	client, _ := namedDiskClient(t, CapacityLimits{})
+	disk, err := client.CreateNamedDisk(t.Context(), diskRequest())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := client.RemoveNamedDisk(t.Context(), disk); err != nil {
+		t.Fatal(err)
+	}
+	attachment := NamedDiskAttachment{Owner: "cluster/node", PodUID: "pod-uid", VMName: "fvp-owned"}
+	if err := client.ReleaseNamedDisk(t.Context(), disk, attachment); err != nil {
+		t.Fatal("reclaimed unattached intent blocked Pod cleanup", err)
+	}
+	if err := client.AttachNamedDisk(t.Context(), disk, attachment); err == nil {
+		t.Fatal("reattached reclaimed disk")
+	}
+	disk.Inode++
+	if err := client.ReleaseNamedDisk(t.Context(), disk, attachment); err == nil {
+		t.Fatal("wrong identity accepted for deleted disk")
+	}
+}
+
 func TestNamedDiskCreationReservesBeforeDispatchAndCountsNoGuestRAM(t *testing.T) {
 	client, disks := namedDiskClient(t, CapacityLimits{MemoryMiB: 1, Starts: 1, DiskMiB: 512})
 	disks.onCreate = func(ctx context.Context) {

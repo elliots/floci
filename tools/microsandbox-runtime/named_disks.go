@@ -320,8 +320,16 @@ func (c *Client) namedDiskAttachment(ctx context.Context, expected NamedDiskIden
 	}
 	return c.capacity.transaction(ctx, func(state *capacityState) error {
 		record, err := c.readNamedDisk(expected.Name)
-		if err != nil || record.Phase != "ready" || record.Identity == nil || !record.Identity.Matches(expected) {
+		if err != nil || record.Identity == nil || !record.Identity.Matches(expected) {
 			return errors.Join(errors.New("named disk attachment identity differs"), err)
+		}
+		// A Pod can journal its intent immediately before another controller
+		// reclaims an unattached disk. Its later cleanup has no lease to release.
+		if release && record.Attachment == nil && (record.Phase == "deleting" || record.Phase == "deleted") {
+			return nil
+		}
+		if record.Phase != "ready" {
+			return errors.New("named disk attachment is not ready")
 		}
 		actual, err := c.disks.inspect(ctx, expected.Name)
 		if err != nil || !actual.Matches(expected) {
