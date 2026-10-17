@@ -89,6 +89,13 @@ It cannot create workloads, change Secrets, administer RBAC or change other node
 Use a dedicated development cluster: the controller still needs trusted access
 to application credentials and to the local Docker socket.
 
+`prepare --node-ip <host-IPv4>` selects the host address reachable from the
+cluster explicitly. No special hostname is required with this setting. Otherwise
+setup discovers Docker's host address, honoring `/etc/hosts` entries before DNS.
+Repeated setup retains the recorded address so existing routing and certificates
+keep the same identity. This is generic Docker networking, with no vendor-specific
+runtime mode.
+
 The directory must be private (0700); generated credential files are 0600.
 Keep it and the runtime home across restarts. `run` stays in the foreground and
 retains guests on exit. Stop it and rerun `prepare` before the 30-day certificates

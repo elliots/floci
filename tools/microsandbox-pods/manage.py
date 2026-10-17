@@ -169,6 +169,29 @@ def certificate(record, name, ca_name, common_name, usage, host=None):
         write_private(directory / (name+".crt"), (temporary/"certificate").read_text())
 
 
+def node_address(record, supplied=None):
+    host = supplied or record.get("hostIP")
+    if not host:
+        hosts = command("docker", "exec", record["peer"], "cat", "/etc/hosts")
+        for line in hosts.splitlines():
+            fields = line.split("#", 1)[0].split()
+            if len(fields) > 1 and "host.docker.internal" in fields[1:]:
+                host = fields[0]
+                break
+    if not host:
+        try:
+            host = command("docker", "exec", record["peer"], "getent", "hosts", "host.docker.internal").split()[0]
+        except (RuntimeError, IndexError):
+            host = command("docker", "exec", record["peer"], "sh", "-c",
+                "nslookup host.docker.internal | awk '/^Address: / {print $2}' | tail -n1")
+    address = ipaddress.IPv4Address(host)
+    if address.is_unspecified or address.is_multicast or address.is_loopback or host == "255.255.255.255":
+        raise ValueError("node-ip must be an explicit unicast host IPv4 address reachable from the cluster")
+    if record.get("hostIP") and host != record["hostIP"]:
+        raise RuntimeError("node-ip differs from the recorded cluster routing identity; reuse its original address")
+    return str(address)
+
+
 def prepare(args):
     directory = Path(args.directory).resolve()
     directory.mkdir(parents=True, exist_ok=True, mode=0o700)
@@ -204,7 +227,7 @@ def prepare(args):
     if peer is None:
         if (directory / "controller" / "owner").exists():
             raise RuntimeError("recorded network peer is missing; refusing to replace a cluster with workload state")
-        linux_host = ["--add-host", "host.docker.internal:host-gateway"] if platform.system() == "Linux" else []
+        linux_host = ["--add-host", "host.docker.internal:host-gateway"] if platform.system() == "Linux" and not args.node_ip else []
         command("docker", "run", "-d", "--name", record["peer"], "--hostname", record["peer"], *linux_host,
             "--label", LABEL+"="+record["owner"], "--privileged", "-p", "127.0.0.1::6443", "-p", "127.0.0.1::8472/udp",
             K3S_IMAGE, "server", "--disable=traefik", "--disable=servicelb", "--disable=metrics-server",
@@ -214,9 +237,7 @@ def prepare(args):
     wait("Kubernetes API ready", lambda: kubectl(record, "get", "--raw=/readyz") == "ok")
     peer = inspect_peer(record)
     api_port = peer["NetworkSettings"]["Ports"]["6443/tcp"][0]["HostPort"]
-    host = command("docker", "exec", record["peer"], "sh", "-c",
-        "nslookup host.docker.internal | awk '/^Address: / {print $2}' | tail -n1")
-    ipaddress.IPv4Address(host)
+    host = node_address(record, args.node_ip)
     record["hostIP"] = host
     admin = command("docker", "exec", record["peer"], "cat", "/etc/rancher/k3s/k3s.yaml")
     write_private(directory / "admin.kubeconfig", admin.replace("https://127.0.0.1:6443", "https://127.0.0.1:"+api_port)+"\n")
@@ -351,6 +372,7 @@ def main():
     preparing.add_argument("--binaries", required=True)
     preparing.add_argument("--msb", required=True)
     preparing.add_argument("--msb-home", required=True)
+    preparing.add_argument("--node-ip", help="host IPv4 address reachable from the owned cluster; bypasses automatic Docker host discovery")
     running = commands.add_parser("run", help="run in foreground, retaining guests and cluster on exit")
     running.add_argument("--directory", required=True)
     running.add_argument("--memory-mib", type=int, default=4096)

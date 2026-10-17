@@ -37,6 +37,23 @@ class ManagementTest(unittest.TestCase):
         with self.assertRaisesRegex(RuntimeError, "another directory"):
             manage.load(self.directory)
 
+    def test_explicit_or_recorded_node_ip_requires_no_special_hostname(self):
+        with patch.object(manage, "command") as command:
+            self.assertEqual("192.0.2.10", manage.node_address(self.record, "192.0.2.10"))
+            record = dict(self.record, hostIP="192.0.2.10")
+            self.assertEqual("192.0.2.10", manage.node_address(record))
+            with self.assertRaisesRegex(RuntimeError, "routing identity"):
+                manage.node_address(record, "192.0.2.11")
+            command.assert_not_called()
+        for address in ("0.0.0.0", "224.0.0.1", "127.0.0.1", "host.invalid", "::1", "255.255.255.255"):
+            with self.assertRaises(ValueError):
+                manage.node_address(self.record, address)
+
+    def test_node_discovery_honors_hosts_file_before_dns(self):
+        with patch.object(manage, "command", return_value="127.0.0.1 localhost\n192.0.2.10 host.docker.internal # supplied by Docker\n") as command:
+            self.assertEqual("192.0.2.10", manage.node_address(self.record))
+            command.assert_called_once_with("docker", "exec", self.record["peer"], "cat", "/etc/hosts")
+
     def test_setup_lock_excludes_concurrent_mutations(self):
         with manage.setup_lock(self.directory):
             with self.assertRaisesRegex(RuntimeError, "in progress"):
