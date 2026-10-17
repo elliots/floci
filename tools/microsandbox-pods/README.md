@@ -102,8 +102,12 @@ python3 tools/microsandbox-pods/manage.py prepare \
   --environment-network floci-protected \
   --isolation-helper floci-network-isolation \
   --environment-dns 172.30.0.2 --peer-udp-port 18472 \
-  --peer-images /path/to/k3s-airgap-images-arm64.tar.zst
+  --peer-images /path/to/k3s-airgap-images-arm64.tar.zst --node-ip 192.0.2.10
 ```
+
+Choose `--node-ip` as the actual host IPv4 address reachable from Docker; it is
+required for protected setup so host discovery never depends on an external DNS
+lookup. The documentation address above is a placeholder.
 
 Use the existing protected Docker bridge, its running Floci isolation helper and
 Floci's DNS address on that bridge. Setup verifies the helper's ownership metadata,

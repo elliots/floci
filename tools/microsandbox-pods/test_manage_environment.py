@@ -20,7 +20,7 @@ class EnvironmentTest(unittest.TestCase):
             "floci.network.table": "floci_iso_abcdef"}}, "State": {"Running": True}, "HostConfig": {"NetworkMode": "host"}}
         self.metadata = {"version": 1, "owner": "fixture/4566", "table": "floci_iso_abcdef", "fingerprint": "c" * 64,
             "bridges": [{"name": "protected", "networkId": "a" * 64, "bridge": "owned-bridge"}]}
-        self.args = argparse.Namespace(environment_network="protected", isolation_helper="helper", environment_dns="172.30.0.2", peer_udp_port=18472)
+        self.args = argparse.Namespace(environment_network="protected", isolation_helper="helper", environment_dns="172.30.0.2", peer_udp_port=18472, node_ip="192.0.2.10")
 
     def command(self, *args):
         if args[:3] == ("docker", "network", "inspect"):
@@ -41,6 +41,7 @@ class EnvironmentTest(unittest.TestCase):
         self.assertEqual("a" * 64, record["environment"]["networkID"])
         self.assertEqual("b" * 64, record["environment"]["helperID"])
         self.assertEqual("owned-bridge", record["environment"]["bridge"])
+        record["hostIP"] = "192.0.2.10"
         expected = copy.deepcopy(record)
         environment.resolve(record, argparse.Namespace(), self.command, True)
         self.assertEqual(expected, record)
@@ -56,6 +57,11 @@ class EnvironmentTest(unittest.TestCase):
                 environment.resolve({}, args, self.command, False)
         with self.assertRaisesRegex(RuntimeError, "existing unisolated"):
             environment.resolve({}, self.args, self.command, True)
+
+    def test_explicit_node_address_precedes_protected_peer_creation(self):
+        self.args.node_ip = None
+        with self.assertRaisesRegex(ValueError, "requires node-ip"):
+            self.resolved()
 
     def test_fixed_peer_port_is_required_and_cannot_change_after_prepare(self):
         for port in (None, 0, 65536):

@@ -64,6 +64,8 @@ def resolve(record, args, command, existing):
         if not previous:
             return
         values = [previous["networkID"], previous["helperID"], previous["dns"]]
+    if not getattr(args, "node_ip", None) and not record.get("hostIP"):
+        raise ValueError("protected setup requires node-ip reachable from the cluster without public DNS discovery")
     if not record.get("peerUDPPort"):
         raise ValueError("protected environments require an explicit peer-udp-port covered by the native UDP allowlist")
     observed = inspect(command, *values)
