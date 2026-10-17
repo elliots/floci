@@ -80,6 +80,29 @@ snapshot coverage also replaces `RdsContainerManagerPostgresTest` and the
 PostgreSQL case in `RdsAwsIntegrationTest`; the latter retains its SQL Server case.
 
 
+## Native Aurora JVM recovery
+
+After packaging Floci, `aurora-restart.py` checks recovery through full JVM
+shutdown and restart using AWS CLI management calls and PostgreSQL connections.
+It requires Python with `psycopg`, Java 25, AWS CLI, and an empty dedicated native
+helper home. It preserves diagnostic logs and writes an optional JSON report.
+
+```sh
+./mvnw package -DskipTests
+python3 tools/runtime-tests/aurora-restart.py --report /tmp/aurora-restart.json
+```
+
+Use the same `FLOCI_TEST_MICROSANDBOX_URL` and
+`FLOCI_TEST_MICROSANDBOX_TOKEN` variables as the matrix, and set `JAVA_HOME`.
+`--storage-mode hybrid` exercises hybrid storage instead of the default
+persistent storage. The check first verifies lazy cold recovery and stable
+endpoints, then waits the real AWS minimum of 300 idle seconds before verifying
+that ordinary shutdown preserves a RAM checkpoint. Metadata reads after restart
+must leave the database asleep; the first SQL connection must resume the same
+PostgreSQL process and read the previously committed row. This native lifecycle
+check supplements the shared database matrix.
+
+
 ## Remaining coverage boundaries
 
 This matrix is not a claim of complete feature parity. SQL Server still needs a
