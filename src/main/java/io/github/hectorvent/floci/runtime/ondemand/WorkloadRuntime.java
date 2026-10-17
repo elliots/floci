@@ -35,4 +35,11 @@ public interface WorkloadRuntime {
     default URI healthBackend() {
         return backend();
     }
+
+    /** An idle stop was declined before any mutation because newer application activity was observed. */
+    final class ActivityChangedException extends IllegalStateException {
+        public ActivityChangedException() {
+            super("Workload activity changed before hibernation");
+        }
+    }
 }

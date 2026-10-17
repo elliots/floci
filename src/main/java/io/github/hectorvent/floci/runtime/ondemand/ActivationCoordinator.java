@@ -251,6 +251,13 @@ public final class ActivationCoordinator implements AutoCloseable {
             }
             stopping.complete(null);
             LOG.debugv("Stopped idle on-demand workload {0}", entry.definition.id());
+        } catch (WorkloadRuntime.ActivityChangedException expected) {
+            synchronized (entry) {
+                entry.state = entry.stopFromFailure ? State.FAILED : State.READY;
+                entry.idleSince = nanoTime.getAsLong();
+            }
+            stopping.complete(null);
+            LOG.debugv("Deferred idle hibernation after newer activity for workload {0}", entry.definition.id());
         } catch (Exception e) {
             if (e instanceof InterruptedException) {
                 Thread.currentThread().interrupt();

@@ -119,6 +119,34 @@ class ActivationCoordinatorServiceTest {
     }
 
     @Test
+    void stopFailureAfterMutationRemainsFailedAndRejectsWaitingRequests() {
+        FakeRuntime uncertain = new FakeRuntime() {
+            @Override
+            public void stop(Duration timeout) {
+                super.stop(timeout);
+                throw new IllegalStateException("Stop completion was lost");
+            }
+        };
+        coordinator.register(OnDemandTestSupport.definition("orders", uncertain.backend, List.of()), uncertain);
+        RequestLease initial = coordinator.acquire("orders");
+        executor.runNext();
+        initial.close();
+        advance(120);
+        coordinator.tick("orders");
+        RequestLease waiting = coordinator.acquire("orders");
+
+        executor.runNext();
+
+        assertEquals(State.FAILED, coordinator.state("orders"));
+        assertThrows(CompletionException.class, () -> waiting.ready().join());
+        assertFalse(coordinator.canReportSleepingHealth("orders"));
+        assertTrue(coordinator.acquireHealth("orders").isEmpty());
+        assertEquals(1, uncertain.starts.get());
+        assertEquals(1, uncertain.stops.get());
+        waiting.close();
+    }
+
+    @Test
     void queueWorkActivatesAndUnknownQueueStatePreventsShutdown() {
         register(List.of("orders-incoming"));
         coordinator.reconcile("orders", true, true);

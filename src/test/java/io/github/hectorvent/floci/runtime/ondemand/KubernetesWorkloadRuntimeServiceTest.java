@@ -290,6 +290,33 @@ class KubernetesWorkloadRuntimeServiceTest {
     }
 
     @Test
+    void activityBetweenObservationAndStopDefersIdleWithoutFailingTheWorkload() {
+        AtomicLong time = new AtomicLong(1);
+        try (ActivationCoordinator coordinator = new ActivationCoordinator(Executors.newSingleThreadExecutor(),
+                (workload, endpoint, timeout) -> {}, 1, 2, 2, time::get)) {
+            coordinator.register(definition, runtime);
+            try (ActivationCoordinator.RequestLease request = coordinator.acquire("workers")) {
+                request.ready().join();
+            }
+            coordinator.reconcile("workers", false, true);
+            time.addAndGet(Duration.ofSeconds(1).toNanos());
+            controller.activityAfterObservation = true;
+            coordinator.tick("workers");
+            await().atMost(TIMEOUT).until(() -> coordinator.state("workers") == State.READY);
+            assertEquals(URI.create("http://127.0.0.1:31001"), coordinator.backend("workers"));
+            assertEquals(List.of("resume:pod-a:1"), controller.operations, "The deferred stop must mutate no pod");
+            coordinator.tick("workers");
+            time.addAndGet(Duration.ofMillis(999).toNanos());
+            coordinator.tick("workers");
+            assertEquals(State.READY, coordinator.state("workers"), "The activity deferral starts a new idle interval");
+            time.addAndGet(Duration.ofMillis(1).toNanos());
+            coordinator.tick("workers");
+            await().atMost(TIMEOUT).until(() -> coordinator.state("workers") == State.SLEEPING);
+            assertEquals(List.of("resume:pod-a:1", "hibernate:pod-a:2"), controller.operations);
+        }
+    }
+
+    @Test
     void refusesTwoIndependentIdleOwnersBeforeMutatingPods() {
         controller.pods.put("pod-a", new Pod("pod-a", "apps", "pod-a", "COLD", 1, true, "controller", 0));
         assertThrows(IllegalStateException.class, runtime::isRunning);
@@ -446,6 +473,7 @@ class KubernetesWorkloadRuntimeServiceTest {
         private boolean deferReadiness;
         private boolean readyOnSecondObservation;
         private boolean failObservation;
+        private boolean activityAfterObservation;
         private int observations;
 
         private FakeController() {
@@ -478,7 +506,14 @@ class KubernetesWorkloadRuntimeServiceTest {
             if (failObservation) {
                 throw new IllegalStateException("Controller observation is unavailable");
             }
-            return deployment(namespace, name, timeout);
+            Deployment observed = deployment(namespace, name, timeout);
+            if (activityAfterObservation) {
+                activityAfterObservation = false;
+                Pod current = pods.get("pod-a");
+                pods.put("pod-a", new Pod(current.uid(), current.namespace(), current.name(), current.state(),
+                        current.generation(), true, "external", 0, 0, 2));
+            }
+            return observed;
         }
 
         @Override

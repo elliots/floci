@@ -107,7 +107,7 @@ final class KubernetesWorkloadRuntime implements WorkloadRuntime {
         Deployment observed = stable(original, all, deadline);
         if (!activitySequences.isEmpty() && observed.pods().stream()
                 .anyMatch(pod -> activitySequences.getOrDefault(pod.uid(), -1L) != pod.activitySequence())) {
-            throw new IllegalStateException("Kubernetes workload activity changed before hibernation");
+            throw new ActivityChangedException();
         }
         for (Pod pod : observed.pods()) {
             if (!dormant(pod)) {
