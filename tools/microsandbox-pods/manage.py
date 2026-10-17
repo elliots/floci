@@ -8,6 +8,7 @@ import fcntl
 import ipaddress
 import json
 import manage_environment
+import manage_images
 import os
 from pathlib import Path
 import platform
@@ -330,6 +331,7 @@ def prepare(args):
             "peer": "floci-native-"+owner, "node": "native-pods", "user": "floci:microsandbox:"+owner,
             "accessName": "floci-native-"+owner, "kubeletPort": kubelet_port, "controlPort": control_port}
         record.update({option: str(Path(getattr(args, option)).resolve()) for option in ("binaries", "msb", "msb_home")})
+    manage_images.resolve(record, args, existing)
     manage_environment.resolve(record, args, command, existing)
     write_private(record_path, json.dumps(record, indent=2)+"\n")
     for name in ("microsandbox-pods", "network-relay", "guestfs"):
@@ -347,9 +349,11 @@ def prepare(args):
             *manage_environment.peer_options(record), "--label", LABEL+"="+record["owner"], "--privileged", "-p", "127.0.0.1::6443", "-p", "127.0.0.1:"+str(record.get("peerUDPPort", ""))+":8472/udp",
             K3S_IMAGE, "server", "--disable=traefik", "--disable=servicelb", "--disable=metrics-server",
             "--egress-selector-mode=disabled", timeout=600)
+        manage_images.stage(record, command)
         manage_environment.stage_resolver(record, command, write_private)
         command("docker", "start", record["peer"])
     elif not peer["State"]["Running"]:
+        manage_images.stage(record, command)
         manage_environment.stage_resolver(record, command, write_private)
         command("docker", "start", record["peer"])
     wait("Kubernetes API ready", lambda: kubectl(record, "get", "--raw=/readyz") == "ok")
@@ -525,6 +529,7 @@ def main():
     preparing.add_argument("--msb", required=True)
     preparing.add_argument("--msb-home", required=True)
     preparing.add_argument("--node-ip", help="host IPv4 address reachable from the owned cluster; bypasses automatic Docker host discovery")
+    preparing.add_argument("--peer-images", help="k3s airgap archive staged before peer startup; required for new protected clusters")
     preparing.add_argument("--peer-udp-port", type=int, help="fixed host UDP publication for the owned peer; required with environment-network")
     preparing.add_argument("--environment-network", help="existing protected Docker bridge; requires isolation-helper and environment-dns")
     preparing.add_argument("--isolation-helper", help="existing Floci isolation helper protecting that bridge")

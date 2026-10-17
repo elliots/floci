@@ -101,7 +101,8 @@ python3 tools/microsandbox-pods/manage.py prepare \
   --msb /path/to/msb --msb-home /path/to/private-runtime-home \
   --environment-network floci-protected \
   --isolation-helper floci-network-isolation \
-  --environment-dns 172.30.0.2 --peer-udp-port 18472
+  --environment-dns 172.30.0.2 --peer-udp-port 18472 \
+  --peer-images /path/to/k3s-airgap-images-arm64.tar.zst
 ```
 
 Use the existing protected Docker bridge, its running Floci isolation helper and
@@ -661,3 +662,14 @@ and permit exactly that host UDP port in `network.native.allowed-egress` in the
 shared immutable network file. Reuse the recorded port on later prepare runs.
 This avoids granting a broad host UDP range. Plain peers retain ephemeral ports
 unless this option is supplied explicitly.
+
+New protected peers also require `--peer-images` with the official architecture-
+matched airgap archive from the [pinned k3s release](https://github.com/k3s-io/k3s/releases/tag/v1.35.0%2Bk3s1).
+Download and verify it on the operator host before preparing the cluster, following
+[k3s airgap installation](https://docs.k3s.io/installation/airgap). Setup copies the
+archive privately, records its SHA-256 checksum and stages it in the stopped
+peer's `agent/images` directory. CoreDNS and the other system images can then
+start without public registry access. The saved copy is checked on every prepare
+and before every stopped-peer start. Ordinary peers may opt into the same option.
+Application images still need a reachable allowed registry, such as a protected
+registry exposed through Floci's HTTPS origin gateway.
