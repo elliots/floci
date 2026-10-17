@@ -18,14 +18,25 @@ pod routes, wake proxies and health checks. There is no kubelet or Kubernetes
 control plane in each pod VM. The peer is infrastructure per configured network,
 not one sidecar per application.
 
-DNS and simulator routing belong to shared infrastructure. Environment isolation
-is enforced by Docker network rules or, for the native host helper, the SDK's
-network policy. Native Pods currently reject environment isolation because their
-shared peer's tunnel forwarding and DNS paths need a protected boundary too.
+DNS and simulator routing belong to shared infrastructure. Aurora uses the SDK's
+environment boundary. Protected native Pod peers combine that direct guest
+boundary with inner egress filtering after Service DNAT and an outer Docker
+bridge firewall. Exact native transport grants connect the trusted peer to its
+owned host listeners. Startup and ongoing checks verify immutable identities and
+the actual rules. Destination exceptions remain explicit IPv4 TCP/UDP tuples;
+they do not authorize a changing public hostname. Kubernetes NetworkPolicy is an
+independent additional restriction, with node-wide safe capability admission.
 Guest DNS configuration is routing convenience, not the security boundary.
 Native DNS setup runs once at boot or restore, installs kernel routing to the
 configured shared resolvers, then exits and removes its temporary binary. There
-is no resident DNS server or DNS sidecar per VM.
+is no resident DNS server or DNS sidecar per VM. Pods use the cluster's existing
+CoreDNS and shared Floci resolver. A fresh protected managed record pins the peer
+UDP port and stages architecture-matched system images before k3s starts. See
+[managed setup](../microsandbox-pods/README.md#development-cluster-setup).
+
+The NetworkPolicy matrix passed 21 checks and the restricted installed smoke
+passed seven. Protected-environment end-to-end native qualification is still
+being run; its completion is tracked in [VALIDATION.md](VALIDATION.md).
 
 ## Workload state
 

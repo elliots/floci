@@ -1044,21 +1044,37 @@ remain errors and are never replayed by this wait path.
 
 ## Native Pod environment isolation requires a protected peer
 
-The Pod controller now refuses startup when `FLOCI_NETWORK_CONFIG_FILE` enables
-environment isolation. Earlier versions checked only the SDK guest boundary's
-fingerprint. That does not prove protection of inner traffic decapsulated by the
-Kubernetes peer or DNS forwarded by that peer, so the previous guarantee was
-incomplete. Kubernetes NetworkPolicy is a separate control and cannot close this
-environment-wide gap by itself. Aurora isolation through the native host helper
-continues to use its existing SDK boundary.
+Native Pod environment isolation now requires a protected managed peer. Earlier
+versions checked only the SDK guest boundary's fingerprint, which did not cover
+inner traffic decapsulated by the peer or its DNS forwarding. The implemented
+path combines the SDK boundary, peer filtering after Service DNAT and Floci's
+outer Docker firewall. The controller verifies live rules, exact transport grants
+and immutable environment identities. Kubernetes NetworkPolicy remains separate.
+Aurora continues to use its existing native SDK boundary.
 
-Stop previously running native Pods with the old controller before upgrading an
-isolated deployment. The new startup refusal does not stop already running VMs.
-Keep the old controller and runtime state available for owned cleanup; do not
-disable isolation merely to make the controller start. Use the existing protected
-Docker Kubernetes backend when this boundary is required until peer integration
-is implemented and qualified. Ordinary native Pods without environment isolation
-retain their existing runtime behavior.
+Stop and clean up previously running native Pods with their matching old
+controller before moving to a fresh protected managed cluster directory. Retain
+old disks for recovery and export/import application data into the replacement
+cluster; Retain does not authorize cross-cluster adoption. Do not copy Pod journals
+or RAM checkpoints into a different cluster identity. Keep the old controller and
+runtime state available until owned cleanup completes. An ordinary managed peer
+cannot be upgraded in place, and changing the network-file bytes, CA or recorded
+environment identities requires deliberate recreation. Do not disable isolation
+to bypass these checks.
+
+Use the [managed setup commands](../microsandbox-pods/README.md#development-cluster-setup)
+with the same exact network YAML read by Floci, a fixed permitted peer UDP port,
+the pinned architecture-matched k3s airgap archive and the environment's public CA
+when HTTPS origins or registries require it. Protected records use manager format
+2 and secure networking. Every native regular and init container must explicitly
+drop `NET_RAW` or `ALL`; policy-capable Pod journals use format 9. Older managers
+and controllers reject these records. Shared DNS remains infrastructure, with no
+DNS sidecar per Pod.
+
+This replaces the temporary blanket refusal of isolated native Pod startup.
+Protected-environment native qualification is still being run. The separate
+NetworkPolicy matrix passed 21 checks and its restricted installed smoke passed
+seven; see [VALIDATION.md](VALIDATION.md) for completed runs.
 
 ## Ordinary Pod termination
 
@@ -1095,6 +1111,13 @@ or `ALL`. This is separate from the environment's destination allowlist and
 simulator routing. Older managers reject the record; retain the matching tools
 when restarting or renewing credentials. The manager never deletes the shared
 Floci environment or isolation helper when destroying its owned empty cluster.
+
+Native registry pulls now use `network.native.ca-file` for each anonymous or
+authenticated pull through `ctr --local --tlscacert`. Rebuild the controller to
+use a registry served by the environment's HTTPS origin gateway. TLS hostname
+verification stays enabled; application trust stores and daemon-wide trust do
+not change. The public CA path is reserved, and a changed certificate requires
+deliberate guest recreation. See [workload networking](../../docs/configuration/workload-network.md#native-microvm-boundary).
 
 ## Explicit environment egress and protected-peer metadata
 

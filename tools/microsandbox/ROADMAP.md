@@ -74,13 +74,22 @@ compatibility remain priorities for ordinary Kubernetes application manifests.
   [local persistent-volume provisioner](../microsandbox-pods/STORAGE.md) adds
   node-bound Filesystem RWO disks, guarded single-Pod attachments and Delete/Retain
   reclaim. CSI drivers, expansion and broader access modes remain unsupported.
-- Networking: simulator routing and the native host helper's environment egress
-  isolation are implemented. Native Pods require protected peer integration:
-  the controller now rejects environment isolation because the peer's forwarding
-  and DNS paths are outside the SDK guest firewall. Protect the peer before
-  restoring that option. Reconcile policy changes, then broaden
-  NetworkPolicy and networking compatibility. DNS overrides alone do not prevent
-  direct-IP egress.
+- Networking: live IPv4 TCP/UDP NetworkPolicy, selectors, IP blocks and supported
+  named ports are implemented in explicit node-wide secure mode. The shared
+  Docker/native matrix passed 21 checks; the restricted installed smoke passed
+  seven. Every native regular and init container in that mode must drop `NET_RAW`
+  or `ALL`. Raw-socket workloads, IPv6 policies, SCTP and arbitrary CNI plugins
+  remain outside this qualification. See [NetworkPolicy](../microsandbox-pods/NETWORK_POLICY.md).
+- Protected environment networking is implemented with the SDK guest boundary,
+  peer filtering after Service DNAT and Floci's outer Docker firewall. Exact
+  IPv4 TCP/UDP global allowances supplement native-local transport rules;
+  simulator routing and shared DNS remain independent of Pod policy. Fresh
+  managed records pin environment identities and the peer UDP port, preload k3s
+  system images, and use the configured CA for registry pulls. The full native
+  isolation/simulator-routing fixture is still being run. After it passes,
+  broaden topology and failure-recovery qualification, then address application
+  network namespaces for raw-socket compatibility. DNS overrides alone are not
+  an egress boundary.
 
 ## Aurora and other AWS workloads
 

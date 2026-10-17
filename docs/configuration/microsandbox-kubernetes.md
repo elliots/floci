@@ -644,15 +644,23 @@ real workloads.
 
 ## Shared environment network boundary
 
-The controller refuses `FLOCI_NETWORK_CONFIG_FILE` configurations that enable
-environment isolation. The SDK firewall covers direct guest traffic, but the
-shared Kubernetes peer also forwards decapsulated tunnel traffic and DNS. Its
-boundary must be integrated and verified before native Pods can safely promise
-environment-wide isolation. A matching SDK configuration fingerprint alone is
-insufficient. Kubernetes NetworkPolicy is a separate control.
+Native Pods can use an existing isolated Floci environment through a protected
+managed peer. The SDK filters direct guest traffic; the peer filters inner traffic
+after Service destination translation, and the outer Docker firewall constrains
+traffic leaving its bridge. The controller verifies actual rules and exact owned
+transport allowances, not just the network-file fingerprint. Kubernetes
+NetworkPolicy adds Pod-level restrictions independently.
 
-Use the protected Docker Kubernetes backend when environment isolation is
-required. Aurora's native host helper retains its existing isolation support.
-See the [migration instructions](../../tools/microsandbox/MIGRATION.md#native-pod-environment-isolation-requires-a-protected-peer)
-before upgrading an isolated native Pod deployment. Ordinary native networking
-and simulator routing without environment isolation remain available.
+Use a fresh managed cluster record, the same exact network YAML as Floci, a fixed
+peer UDP port allowed by `network.native.allowed-egress`, and preloaded k3s system
+images. Protected setup enables secure networking, requiring every native regular
+and init container to drop `NET_RAW` or `ALL`. Shared CoreDNS and Floci DNS remain
+infrastructure services; no per-Pod DNS sidecar is added. Global explicit IPv4
+TCP/UDP allowances, HTTPS simulator routes and the configured registry CA are
+described in [workload networking](workload-network.md#native-microvm-boundary).
+
+See the [managed setup commands](../../tools/microsandbox-pods/README.md#development-cluster-setup)
+and [migration instructions](../../tools/microsandbox/MIGRATION.md#native-pod-environment-isolation-requires-a-protected-peer).
+Protected-environment native qualification is still being run. The separate
+NetworkPolicy matrix has passed 21 checks, and its restricted installed smoke
+passed seven; those results do not substitute for the environment-boundary run.

@@ -254,15 +254,21 @@ not sandbox hostile privileged containers or an administrator controlling the Do
 
 ## Native microVM boundary
 
-This boundary currently supports the native host helper, including Aurora. The
-native Pod controller rejects environment-wide isolation configurations: its
-Kubernetes peer has its own forwarding and DNS paths outside the SDK firewall.
-Permitting the VM's tunnel does not constrain traffic after that peer decapsulates
-it. Kubernetes NetworkPolicy does not substitute for this environment boundary.
-Native Pod isolation requires protected peer integration before it can be enabled.
+Aurora uses the native SDK boundary. Native Kubernetes Pods additionally use an
+owned peer on an existing Floci-protected Docker bridge. The peer filters inner
+traffic after Service destination translation and before source masquerading;
+Floci's outer Docker firewall filters traffic leaving that bridge. The SDK still
+filters direct guest traffic. These layers prevent an allowed VXLAN tunnel from
+becoming unrestricted external access. Kubernetes NetworkPolicy remains a separate,
+additional restriction.
 
-Set `FLOCI_NETWORK_CONFIG_FILE` for Floci and the native host helper. They must
-read identical file bytes. Add native destinations to that same file:
+Protected peer integration is implemented. Its end-to-end native isolation and
+simulator-routing qualification is still being run; see the
+[validation record](../../tools/microsandbox/VALIDATION.md) for completed evidence.
+
+Set `FLOCI_NETWORK_CONFIG_FILE` for Floci and each native host helper or Pod
+controller using the environment. They must read identical file bytes. Add native
+destinations to that same file:
 
 ```yaml
 network:
@@ -286,20 +292,48 @@ These addresses and ports are examples, not automatic discovery. Publish Floci's
 DNS resolver on the chosen host port and use a locally reachable protected bridge subnet or
 explicit simulator port. Include the local AWS endpoint and credentials endpoint
 for workloads that need them. Allow only the required ports: an allowed local forward proxy could itself provide
-internet access. Native isolation does not change the host's firewall.
+internet access. The native SDK does not modify the microVM host's OS firewall;
+Floci's Docker helper owns a separate table on the Linux Docker daemon host.
 
-The native adapter intersects each workload's requested policy with this local allowlist.
-It cannot grant public destinations, and a workload security group cannot reopen them.
-IPv6 egress is denied. TCP and UDP exceptions require private IPv4 CIDRs or `host`, plus an
-explicit port or range. DNS goes only to the configured local IP:port resolvers; those
-resolvers must also have public forwarding disabled. No native DNS configuration means
-startup fails while isolation is enabled.
+The native adapter intersects each workload's requested policy with the union of
+`network.allowed-egress` and `network.native.allowed-egress`. The global field accepts
+the explicit public or private IPv4 address/port permissions described above; the
+native field retains private IPv4 CIDRs or `host` for local transport. A workload
+cannot expand that environment allowlist. IPv6 egress remains denied. Controlled
+local DNS is the default, with public forwarding disabled; startup requires its
+explicit configuration. An explicitly allowed DNS-server address and port uses the
+same global rule syntax as any other service. The pinned SDK's independent DNS-port
+interception still applies to direct guest traffic.
+
+Prepare a fresh protected managed cluster using the
+[managed setup commands](../../tools/microsandbox-pods/README.md#development-cluster-setup).
+Supply the existing environment network, isolation helper and Floci DNS address,
+a fixed unused peer UDP port, and the pinned architecture-matched k3s airgap image
+archive. Permit that exact `host` UDP port in the shared native allowlist before
+launch. Setup stages the shared resolver and system images before k3s starts and
+records the immutable peer, network, helper and policy identities. The controller
+verifies the actual outer firewall, its own peer rules and exact transport grants
+at startup and during operation. Missing or changed protection blocks activation
+and withdraws readiness.
+
+Protected peers require node-wide secure networking. Every native regular and init
+container must explicitly drop `NET_RAW` or `ALL`, and the controller rejects the
+administrative capabilities listed in the
+[NetworkPolicy guide](../../tools/microsandbox-pods/NETWORK_POLICY.md).
+Existing ordinary peers cannot be converted in place; follow the
+[migration steps](../../tools/microsandbox/MIGRATION.md#native-pod-environment-isolation-requires-a-protected-peer).
 
 `ca-file` is optional and names a public PEM certificate bundle on the native host, not a
 private signing key. It is copied into guests before boot at `/etc/floci/certs/ca.crt`, with
 `FLOCI_CA_BUNDLE` pointing to it. Clients still need to opt into trusting the CA as described
 above. Mount the same network file into Floci; its host-side certificate path is interpreted
 by the native helper, not resolved inside the Floci container.
+
+Native application image pulls also use this CA for the individual registry
+request, including authenticated pulls. TLS hostname verification stays enabled
+and daemon-wide trust is unchanged. A registry on the protected bridge can be
+exposed through an HTTPS simulator origin. Application TLS clients still need to
+select the CA explicitly.
 
 The helper checks existing active guests before advertising readiness. Guests and full RAM
 checkpoints are tied to a SHA-256 fingerprint of the entire configuration file. A helper
@@ -315,7 +349,8 @@ host helper. Build the static Linux `cmd/guestnet` binary from
 file utilities in the guest. It does not install packages or run a DNS daemon.
 
 One-time guest setup routes DNS directly to the configured shared resolvers using
-kernel nftables rules. There is no resident DNS process per VM. Configure one to
+kernel nftables rules. Pods use the cluster's existing CoreDNS and shared Floci
+resolver; there is no additional DNS process or DNS sidecar per Pod VM. Configure one to
 three local IPv4 resolver endpoints. Use a direct resolver port such as 5300. Ports 53, 137, 853, 5353 and 5355 are
 intercepted or blocked by the pinned SDK and cannot be used for these endpoints.
 The guest setup supports UDP and TCP; the shared resolver must provide whichever
