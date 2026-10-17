@@ -119,6 +119,9 @@ func (p *provider) acquireHTTP(ctx context.Context, e *podEntry, backendPort int
 }
 
 func (p *provider) acquireProxyActivity(ctx context.Context, e *podEntry, backendPort int, request bool) (string, func(), error) {
+	if request {
+		ctx = context.WithValue(ctx, httpWakeKey{}, true)
+	}
 	e.op.Lock()
 	if err := ctx.Err(); err != nil {
 		e.op.Unlock()

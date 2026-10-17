@@ -65,11 +65,24 @@ func (r commandRunner) run(ctx context.Context, binary string, args ...string) (
 
 func (r commandRunner) vm(ctx context.Context, args ...string) (string, error) {
 	if nativeMutation(args) {
-		// Once accepted, mutations finish under the caller's lifecycle lock. A
-		// disconnected HTTP request must not abandon a delegated runtime action.
-		ctx = context.WithoutCancel(ctx)
-		nativeMutations.Lock()
+		// Accepted HTTP wakes already have a bounded Pod lifetime context.
+		// Other lifecycle callers retain their existing mutation fence behavior.
+		if accepted, _ := ctx.Value(acceptedHTTPWakeKey{}).(bool); !accepted {
+			ctx = context.WithoutCancel(ctx)
+			nativeMutations.Lock()
+		} else {
+			for !nativeMutations.TryLock() {
+				select {
+				case <-ctx.Done():
+					return "", ctx.Err()
+				case <-time.After(25 * time.Millisecond):
+				}
+			}
+		}
 		defer nativeMutations.Unlock()
+		if err := ctx.Err(); err != nil {
+			return "", err
+		}
 		if err := r.checkPending(); err != nil {
 			return "", err
 		}

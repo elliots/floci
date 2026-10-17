@@ -58,6 +58,7 @@ func (r scriptNativeRuntime) ExecuteStream(ctx context.Context, args []string, s
 
 type stubNativeRuntime struct {
 	prepare func(context.Context, msbruntime.AdmissionRequest) (string, error)
+	cancel  func(context.Context, string) error
 	execute func(context.Context, []string, []byte) (msbruntime.Result, error)
 	stream  func(context.Context, []string, io.Reader, io.Writer, io.Writer) (int, error)
 }
@@ -68,7 +69,12 @@ func (r stubNativeRuntime) PrepareAdmission(ctx context.Context, request msbrunt
 	}
 	return "test-permit", nil
 }
-func (r stubNativeRuntime) CancelAdmission(context.Context, string) error { return nil }
+func (r stubNativeRuntime) CancelAdmission(ctx context.Context, token string) error {
+	if r.cancel != nil {
+		return r.cancel(ctx, token)
+	}
+	return nil
+}
 func (r stubNativeRuntime) ExecuteAdmitted(ctx context.Context, args []string, input []byte, _ string) (msbruntime.Result, error) {
 	return r.Execute(ctx, args, input)
 }

@@ -437,7 +437,7 @@ func (p *provider) resumeFor(ctx context.Context, e *podEntry, terminating bool)
 			return err
 		}
 		if err := p.startAdmitted(ctx, e); err != nil {
-			if errors.Is(err, msbruntime.ErrCapacityUnavailable) || errors.Is(err, errPersistentVolumePending) {
+			if errors.Is(err, msbruntime.ErrCapacityUnavailable) || errors.Is(err, errPersistentVolumePending) || errors.Is(err, errColdWakeNotDispatched) {
 				p.releaseMemory(e)
 				e.state = "COLD"
 				if errors.Is(err, errPersistentVolumePending) {
@@ -506,8 +506,15 @@ func (p *provider) resumeFor(ctx context.Context, e *podEntry, terminating bool)
 	defer func() {
 		if !sourceRemovalStarted {
 			_ = p.runner.runtime.CancelAdmission(context.WithoutCancel(ctx), permit)
+			p.releaseMemory(e)
 		}
 	}()
+	accepted, cancel, err := acceptHTTPWake(ctx, e)
+	if err != nil {
+		return err
+	}
+	defer cancel()
+	ctx = accepted
 	e.generation++
 	e.state = "RESUMING"
 	if err := p.journal(e); err != nil {

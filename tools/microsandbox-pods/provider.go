@@ -363,7 +363,13 @@ func (p *provider) CreatePod(ctx context.Context, pod *corev1.Pod) error {
 	return nil
 }
 
-func (p *provider) startAdmitted(ctx context.Context, e *podEntry) error {
+func (p *provider) startAdmitted(ctx context.Context, e *podEntry) (err error) {
+	dispatched := false
+	defer func() {
+		if !dispatched && isHTTPWake(ctx) && (errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded)) {
+			err = errors.Join(errColdWakeNotDispatched, err)
+		}
+	}()
 	if err := p.preparePersistentVolumes(ctx, e); err != nil {
 		return err
 	}
@@ -401,7 +407,32 @@ func (p *provider) startAdmitted(ctx context.Context, e *podEntry) error {
 		bootstrap = "(" + bootstrap + ") &\n" + guesttask.SupervisorScript()
 	}
 	args = append(args, guestImage, "--", "-ec", bootstrap)
-	if _, err := p.runner.vm(ctx, args...); err != nil {
+	permit := ""
+	if isHTTPWake(ctx) {
+		permit, err = p.runner.prepareAdmission(ctx, args, "")
+		if err != nil {
+			return err
+		}
+		defer func() {
+			cleanup, cancel := context.WithTimeout(context.WithoutCancel(ctx), 10*time.Second)
+			defer cancel()
+			// The SDK refuses cancellation of dispatched reservations. This
+			// releases an unused permit even if Pod cancellation beat dispatch.
+			_ = p.runner.runtime.CancelAdmission(cleanup, permit)
+		}()
+		accepted, cancel, err := acceptHTTPWake(ctx, e)
+		if err != nil {
+			return err
+		}
+		defer cancel()
+		ctx = accepted
+	}
+	runContext := ctx
+	if permit != "" {
+		runContext = context.WithValue(ctx, nativeAdmissionKey{}, permit)
+	}
+	dispatched = true
+	if _, err := p.runner.vm(runContext, args...); err != nil {
 		return fmt.Errorf("create native pod VM: %w", err)
 	}
 	e.created = true

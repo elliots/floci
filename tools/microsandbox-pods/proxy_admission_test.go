@@ -16,13 +16,13 @@ func TestProxyWaitsForSharedAdmissionWithoutRetainingLocalPermits(t *testing.T) 
 	attempts := 0
 	p := &provider{starts: make(chan struct{}, 1), runner: commandRunner{
 		cfg: config{state: t.TempDir(), peerOwner: "owner", maxActiveMemoryMiB: 768},
-		runtime: stubNativeRuntime{execute: func(_ context.Context, args []string, _ []byte) (msbruntime.Result, error) {
+		runtime: stubNativeRuntime{prepare: func(context.Context, msbruntime.AdmissionRequest) (string, error) {
+			attempts++
+			return "", msbruntime.ErrCapacityUnavailable
+		}, execute: func(_ context.Context, args []string, _ []byte) (msbruntime.Result, error) {
 			switch args[0] {
 			case "ls":
 				return msbruntime.Result{Stdout: "[]"}, nil
-			case "run":
-				attempts++
-				return msbruntime.Result{}, msbruntime.ErrCapacityUnavailable
 			default:
 				t.Fatalf("unexpected operation while native admission refuses: %v", args)
 				return msbruntime.Result{}, nil

@@ -588,3 +588,18 @@ PostgreSQL's original process start time survived the sleep/recovery cycles.
 VMs, snapshots, volumes, workloads and the owned cluster were removed after the
 run. This is a representative PostgreSQL/SQS graph; Linux/KVM and a larger
 multi-service graph require their own qualification.
+
+The smaller `qualify_http_cancellation.py` fixture uses one 768 MiB native Pod.
+It disconnects an HTTP client after observing the durable cold-start or restore
+mutation intent, then verifies subsequent HTTP, preserved RAM state, automatic
+idle sleep, released request activity and absence of an uncertain SDK fence:
+
+```sh
+FLOCI_MICROSANDBOX_MEMORY_LIMIT_MIB=768 \
+python3 tools/microsandbox-pods/qualify_http_cancellation.py \
+  --binaries /private/native-tools --msb /path/to/msb \
+  --msb-home /private/cancellation-runtime --report /tmp/cancellation-report.json
+```
+
+Use a dedicated empty runtime home. The fixture removes only its owned workloads,
+VMs, checkpoints and managed cluster after successful qualification.

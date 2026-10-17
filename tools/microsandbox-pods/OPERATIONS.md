@@ -47,6 +47,23 @@ is false; proxy availability can keep it Ready when the wake path is healthy.
 This distinction prevents virtual-kubelet from treating a sleeping application as
 already terminated and bypassing graceful deletion.
 
+## HTTP disconnects during wake
+
+An HTTP client can cancel a request while a cold or sleeping Pod waits for RAM,
+start admission or preflight checks. That cancellation leaves the workload cold
+or sleeping and releases its unused reservations. Once native admission succeeds,
+the accepted cold start or restore finishes under a four-minute Pod lifetime
+context even if that client disconnects. Pod deletion and controller shutdown
+still cancel the transition. An uncertain native SDK result retains the durable
+operation fence and is never automatically replayed.
+
+The disconnected request releases its activity when the transition returns, so
+the usual idle policy can hibernate the Pod again. A later HTTP request can use
+the completed start; applications do not need retry-specific deployment changes.
+`qualify_http_cancellation.py` verifies both accepted cold start and RAM restore
+against an installed managed controller, including subsequent HTTP, unchanged
+RAM state, automatic idle sleep and owned cleanup.
+
 ## Downward API
 
 Both standalone `downwardAPI` volumes and combined projected volumes accept

@@ -37,6 +37,13 @@ can finish first.
 reservations, including disk accounting when enabled. Unknown inventory remains
 explicitly unavailable. No workload or AWS protocol changes are required.
 
+HTTP wake now survives the requesting client's disconnect after native admission
+has succeeded. Capacity and preflight waits still cancel with the request; an
+accepted VM transition has a separate four-minute deadline and remains bound to
+Pod deletion and controller shutdown. Rebuild the Pod controller to pick up this
+fix. No annotations or application changes are required. Existing unknown native
+operation fences still require reconciliation before another lifecycle mutation.
+
 ## Native local persistent volumes
 
 Existing storage classes keep their meaning. To place persistent data in native
