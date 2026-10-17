@@ -84,6 +84,8 @@ func (p *provider) serveControl(address, tokenFile string) (*http.Server, error)
 	}
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /v1/capacity", p.capacityStatus)
+	mux.HandleFunc("GET /v1/storage", p.storageStatus)
+	mux.HandleFunc("POST /v1/storage/prune", p.storageStatus)
 	mux.HandleFunc("GET /v1/health", func(w http.ResponseWriter, r *http.Request) {
 		p.budgetMu.Lock()
 		allocated := p.activeMemoryMiB

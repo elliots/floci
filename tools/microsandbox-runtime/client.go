@@ -52,6 +52,7 @@ type Client struct {
 	bootNetwork func(context.Context, command) error
 	capacity    *capacityManager
 	disks       namedDiskBackend
+	storage     storageBackend
 }
 
 // New validates configuration without loading the SDK or running a subprocess.
@@ -97,6 +98,7 @@ func New(config Config) (*Client, error) {
 	}
 	c := &Client{config: config, core: &sdkBackend{config: config}, boundary: boundary}
 	c.disks = sdkNamedDisks{home: config.Home}
+	c.storage = sdkStorage{config: config}
 	c.capacity, err = newCapacityManager(config)
 	if err != nil {
 		return nil, err

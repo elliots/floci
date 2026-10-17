@@ -41,6 +41,8 @@ func newHandler(config hostConfig, runtime executor) http.Handler {
 	mux.HandleFunc("GET /health", h.health)
 	mux.HandleFunc("POST /v1/command", h.command)
 	mux.HandleFunc("GET /v1/capacity", h.capacity)
+	mux.HandleFunc("GET /v1/storage", h.storage)
+	mux.HandleFunc("POST /v1/storage/prune", h.storage)
 	mux.HandleFunc("POST /v1/capacity/prepare", h.capacity)
 	mux.HandleFunc("POST /v1/capacity/cancel", h.capacity)
 	mux.HandleFunc("POST /v1/capacity/limits", h.capacity)

@@ -9,13 +9,15 @@ all owned Pods. Kubelet logs/exec use a separate mTLS/RBAC listener.
 | --- | --- |
 | `GET /v1/health` | status, name, contract, clusterName, activeMemoryMiB, maxActiveMemoryMiB, maxPods |
 | `GET /v1/capacity` | Verified shared runtime RAM, pending starts, reservations, limits and enabled disk admission accounting; 503 if unverifiable |
+| `GET /v1/storage` | Detailed runtime storage inventory and Pod-to-VM/checkpoint identity mapping |
+| `POST /v1/storage/prune` | Preview-first age-qualified unused runtime backing and opt-in image cleanup; see the [maintenance contract](../microsandbox-runtime/STORAGE.md) |
 | `GET /v1/pods/{uid}` | Exact owned Pod view |
 | `POST /v1/pods/{uid}/hibernate` | Updated Pod view |
 | `POST /v1/pods/{uid}/resume` | Updated Pod view |
 | `GET /v1/deployments` | Batch `{deployments:[view or {namespace,name,error}]}` |
 | `GET /v1/deployments/{namespace}/{name}` | Actual Deployment identity and owned Pod views |
 
-POST requires `{"expectedGeneration":4}`. Stale generations conflict: refresh and
+Pod lifecycle POST requires `{"expectedGeneration":4}`. Stale generations conflict: refresh and
 reconcile before retrying. Requests may finish after client disconnect. Resume
 boots COLD or restores SLEEPING. Hibernate leaves COLD untouched. Hibernate also
 accepts `expectedActivitySequence` from the last observed Pod view. A mismatch

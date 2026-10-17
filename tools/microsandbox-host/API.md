@@ -141,6 +141,10 @@ Linux/KVM workload qualification remains separate from Apple Silicon testing.
 
 ## Native capacity admission
 
+Native storage diagnostics and preview-first cleanup are described in the
+[storage maintenance guide](../microsandbox-runtime/STORAGE.md). They use the same
+authentication as capacity operations and retain durable workload state.
+
 The following endpoints are private host-helper operations, protected by the same
 bearer token and environment network-policy check as `/v1/command`:
 
