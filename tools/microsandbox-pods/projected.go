@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"maps"
+	"math/big"
 	"path"
 	"reflect"
 	"slices"
@@ -11,11 +12,12 @@ import (
 	"strings"
 
 	corev1 "k8s.io/api/core/v1"
+	"k8s.io/apimachinery/pkg/api/resource"
 	"k8s.io/apimachinery/pkg/util/validation"
 )
 
 func projectedData(volume corev1.Volume) bool {
-	return volume.ConfigMap != nil || volume.Secret != nil || volume.Projected != nil
+	return volume.ConfigMap != nil || volume.Secret != nil || volume.Projected != nil || volume.DownwardAPI != nil
 }
 
 func projectedToken(volume corev1.Volume) bool {
@@ -53,6 +55,7 @@ func projectionSource(volume corev1.Volume, source corev1.VolumeProjection) core
 }
 
 func validateCombinedProjection(volume corev1.Volume) error {
+	volume = normalizeDownwardVolume(volume)
 	source := volume.Projected
 	if projectedMode(source) < 0 || projectedMode(source) > 0o777 || source.DefaultUser != nil {
 		return fmt.Errorf("projected defaultMode must be between 0000 and 0777; ownership overrides are not qualified")
@@ -90,13 +93,17 @@ func validateCombinedProjection(volume corev1.Volume) error {
 				if err := validateProjectionPath(file.Path); err != nil {
 					return err
 				}
-				if file.User != nil || file.ResourceFieldRef != nil || file.FieldRef == nil {
-					return fmt.Errorf("DownwardAPI projections require metadata fieldRef without ownership overrides")
+				if file.User != nil || (file.ResourceFieldRef == nil) == (file.FieldRef == nil) {
+					return fmt.Errorf("DownwardAPI projections require exactly one fieldRef or resourceFieldRef without ownership overrides")
 				}
 				if file.Mode != nil && (*file.Mode < 0 || *file.Mode > 0o777) {
 					return fmt.Errorf("DownwardAPI item mode must be between 0000 and 0777")
 				}
-				if _, err := downwardMetadata(&corev1.Pod{}, file.FieldRef); err != nil {
+				if file.FieldRef != nil {
+					if _, err := downwardMetadata(&corev1.Pod{}, file.FieldRef); err != nil {
+						return err
+					}
+				} else if err := validateDownwardResource(file.ResourceFieldRef); err != nil {
 					return err
 				}
 			}
@@ -154,6 +161,7 @@ func downwardMetadata(pod *corev1.Pod, selector *corev1.ObjectFieldSelector) (st
 }
 
 func (p *provider) resolvePodProjection(ctx context.Context, e *podEntry, volume corev1.Volume) (map[string]volumeFile, error) {
+	volume = normalizeDownwardVolume(volume)
 	if volume.Projected == nil {
 		return resolveProjectedVolume(ctx, p.client, e.pod.Namespace, volume)
 	}
@@ -175,7 +183,17 @@ func (p *provider) resolvePodProjection(ctx context.Context, e *podEntry, volume
 		}
 		if source.DownwardAPI != nil {
 			for _, item := range source.DownwardAPI.Items {
-				value, err := downwardMetadata(pod, item.FieldRef)
+				var value string
+				var err error
+				if item.FieldRef != nil {
+					value, err = downwardMetadata(pod, item.FieldRef)
+				} else {
+					var capacity corev1.ResourceList
+					capacity, err = p.runner.cfg.nodeCapacity()
+					if err == nil {
+						value, err = downwardResource(pod, item.ResourceFieldRef, capacity)
+					}
+				}
 				if err != nil {
 					return nil, err
 				}
@@ -226,4 +244,69 @@ func (p *provider) refreshRecoveredTokens(ctx context.Context, e *podEntry) erro
 		}
 	}
 	return nil
+}
+
+func normalizeDownwardVolume(volume corev1.Volume) corev1.Volume {
+	if source := volume.DownwardAPI; source != nil {
+		volume.Projected = &corev1.ProjectedVolumeSource{DefaultMode: source.DefaultMode,
+			Sources: []corev1.VolumeProjection{{DownwardAPI: &corev1.DownwardAPIProjection{Items: source.Items}}}}
+		volume.DownwardAPI = nil
+	}
+	return volume
+}
+
+func validateDownwardResource(selector *corev1.ResourceFieldSelector) error {
+	if selector.ContainerName == "" {
+		return fmt.Errorf("DownwardAPI volume resourceFieldRef requires containerName")
+	}
+	switch selector.Resource {
+	case "limits.cpu", "requests.cpu", "limits.memory", "requests.memory", "limits.ephemeral-storage", "requests.ephemeral-storage":
+	default:
+		return fmt.Errorf("unsupported DownwardAPI resource %q", selector.Resource)
+	}
+	if selector.Divisor.Sign() < 0 {
+		return fmt.Errorf("DownwardAPI divisor must be positive")
+	}
+	return nil
+}
+
+func downwardResource(pod *corev1.Pod, selector *corev1.ResourceFieldSelector, capacity corev1.ResourceList) (string, error) {
+	if err := validateDownwardResource(selector); err != nil {
+		return "", err
+	}
+	var selected *corev1.Container
+	for container := range podContainers(pod) {
+		if container.Name == selector.ContainerName {
+			selected = &container
+			break
+		}
+	}
+	if selected == nil {
+		return "", fmt.Errorf("DownwardAPI container %q does not exist", selector.ContainerName)
+	}
+	kind, name, _ := strings.Cut(selector.Resource, ".")
+	resourceName := corev1.ResourceName(name)
+	quantity := selected.Resources.Requests[resourceName]
+	if kind == "limits" {
+		quantity = selected.Resources.Limits[resourceName]
+		if quantity.IsZero() && (resourceName == corev1.ResourceCPU || resourceName == corev1.ResourceMemory) {
+			quantity = capacity[resourceName]
+		}
+	}
+	divisor := selector.Divisor
+	if divisor.IsZero() {
+		divisor = resource.MustParse("1")
+	}
+	value, unit := quantity.Value(), divisor.Value()
+	if resourceName == corev1.ResourceCPU {
+		value, unit = quantity.MilliValue(), divisor.MilliValue()
+	}
+	if unit <= 0 {
+		return "", fmt.Errorf("invalid resource divisor")
+	}
+	whole, remainder := new(big.Int).QuoRem(big.NewInt(value), big.NewInt(unit), new(big.Int))
+	if remainder.Sign() > 0 {
+		whole.Add(whole, big.NewInt(1))
+	}
+	return whole.String(), nil
 }

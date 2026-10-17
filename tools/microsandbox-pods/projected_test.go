@@ -13,6 +13,7 @@ import (
 
 	msbruntime "github.com/floci-io/floci/tools/microsandbox-runtime"
 	corev1 "k8s.io/api/core/v1"
+	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 )
 
@@ -228,5 +229,28 @@ func TestRecoveredIdentityRequiresFreshProjectionOnlyForAwakePods(t *testing.T) 
 				t.Fatal("recovery admitted stale awake identity or issued tokens for a sleeping Pod")
 			}
 		})
+	}
+}
+
+func TestDownwardResourceProjectionRoundsUpAndUsesNodeFallback(t *testing.T) {
+	pod := validPod()
+	pod.Spec.Containers[0].Resources = corev1.ResourceRequirements{Requests: corev1.ResourceList{corev1.ResourceCPU: resource.MustParse("125m"), corev1.ResourceMemory: resource.MustParse("10Mi")}}
+	capacity := corev1.ResourceList{corev1.ResourceCPU: resource.MustParse("64"), corev1.ResourceMemory: resource.MustParse("128Gi")}
+	for _, test := range []struct{ resource, divisor, want string }{{"requests.cpu", "1", "1"}, {"requests.cpu", "1m", "125"}, {"requests.memory", "3Mi", "4"}, {"limits.cpu", "1", "64"}, {"limits.memory", "1Gi", "128"}, {"requests.ephemeral-storage", "1", "0"}} {
+		got, err := downwardResource(pod, &corev1.ResourceFieldSelector{ContainerName: "app", Resource: test.resource, Divisor: resource.MustParse(test.divisor)}, capacity)
+		if err != nil || got != test.want {
+			t.Fatalf("%s / %s = %s %v", test.resource, test.divisor, got, err)
+		}
+	}
+	volume := corev1.Volume{Name: "resources", VolumeSource: corev1.VolumeSource{DownwardAPI: &corev1.DownwardAPIVolumeSource{Items: []corev1.DownwardAPIVolumeFile{{Path: "cpu", ResourceFieldRef: &corev1.ResourceFieldSelector{ContainerName: "app", Resource: "requests.cpu", Divisor: resource.MustParse("1m")}}}}}}
+	if err := validateVolume(volume, 768); err != nil {
+		t.Fatal(err)
+	}
+	p, e := probeFixture(t)
+	e.pod = pod
+	p.runner.cfg.maxActiveMemoryMiB = 4096
+	files, err := p.resolvePodProjection(t.Context(), e, volume)
+	if err != nil || string(files["cpu"].Data) != "125" {
+		t.Fatal("standalone DownwardAPI not resolved", err)
 	}
 }

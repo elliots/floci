@@ -259,7 +259,7 @@ func volumeSetupWithOwnership(pod *corev1.Pod, volume corev1.Volume, memoryMiB i
 		return script + "if ! test -d " + root + "; then mkdir " + root + "; chmod 0777 " + root + "; " + volumeOwnership(pod, guestVolumePath(volume.Name), false, false) + "fi"
 	}
 	script += "mkdir -p " + root + "; "
-	if volume.Secret != nil || volume.Projected != nil || volume.EmptyDir != nil {
+	if volume.Secret != nil || volume.Projected != nil || volume.DownwardAPI != nil || volume.EmptyDir != nil {
 		limit, mode := int64(memoryMiB)*bytesPerMiB, "0755"
 		if volume.EmptyDir != nil {
 			mode = "0777"
