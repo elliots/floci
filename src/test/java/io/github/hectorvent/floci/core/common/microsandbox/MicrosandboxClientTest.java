@@ -68,6 +68,12 @@ class MicrosandboxClientTest {
             authorization = exchange.getRequestHeaders().getFirst("Authorization");
             respond(exchange, mapper.createObjectNode().put("port", port));
         });
+        server.createContext("/v1/capacity", exchange -> {
+            authorization = exchange.getRequestHeaders().getFirst("Authorization");
+            policyHeader = exchange.getRequestHeaders().getFirst("X-Floci-Network-Policy");
+            request = mapper.readTree(exchange.getRequestBody());
+            respond(exchange, responseStatus, responseBody != null ? responseBody : "{\"token\":\"permit\"}");
+        });
         server.createContext("/v1/command", exchange -> {
             authorization = exchange.getRequestHeaders().getFirst("Authorization");
             policyHeader = exchange.getRequestHeaders().getFirst("X-Floci-Network-Policy");
@@ -112,6 +118,46 @@ class MicrosandboxClientTest {
         });
         server.start();
         client = new MicrosandboxClient("http://127.0.0.1:" + server.getAddress().getPort() + "/", "private-token", mapper);
+    }
+
+    @Test
+    void captureAdmissionIsAuthenticatedAndCanBeCancelledBeforeMutation() {
+        MicrosandboxOperationJournal journal = journal();
+        client = client(journal);
+        client.requireNetworkPolicy("policy-digest");
+        List<String> arguments = List.of("snap", "create", "sleep", "--sandbox", "guest", "--full", "--integrity");
+        assertEquals("permit", client.prepareAdmission(TIMEOUT, arguments));
+        assertEquals("Bearer private-token", authorization);
+        assertEquals("policy-digest", policyHeader);
+        assertEquals(mapper.valueToTree(arguments), request.path("arguments"));
+        assertFalse(request.has("sourceName"));
+        assertDoesNotThrow(journal::beforeReset);
+        client.cancelAdmission(TIMEOUT, "permit");
+        assertEquals(mapper.createObjectNode().put("token", "permit"), request);
+        assertDoesNotThrow(journal::beforeReset);
+        assertEquals("permit", client.prepareAdmission(TIMEOUT, arguments));
+        client.commandAdmitted(TIMEOUT, "permit", arguments);
+        assertEquals("permit", request.path("admission").asText());
+        assertEquals(mapper.valueToTree(arguments), request.path("arguments"));
+        assertDoesNotThrow(journal::beforeReset);
+    }
+
+    @Test
+    void captureCapacityRefusalAndMalformedPermitNeverFenceGuestMutations() {
+        MicrosandboxOperationJournal journal = journal();
+        client = client(journal);
+        List<String> arguments = List.of("snap", "create", "sleep", "--sandbox", "guest", "--full");
+        responseStatus = 409;
+        responseBody = "{\"code\":\"CapacityUnavailable\",\"error\":\"full\",\"operationStarted\":false}";
+        assertThrows(MicrosandboxCapacity.CapacityUnavailableException.class,
+                () -> client.prepareAdmission(TIMEOUT, arguments));
+        responseStatus = 200;
+        for (String body : List.of("{}", "{\"token\":42}", "{\"token\":\" \"}")) {
+            responseBody = body;
+            assertThrows(IllegalStateException.class, () -> client.prepareAdmission(TIMEOUT, arguments));
+        }
+        assertDoesNotThrow(journal::beforeReset);
+        assertDoesNotThrow(() -> client.awaitQuiescence(Duration.ZERO));
     }
 
     @Test

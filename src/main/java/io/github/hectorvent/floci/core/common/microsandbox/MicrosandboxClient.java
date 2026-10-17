@@ -109,15 +109,23 @@ public class MicrosandboxClient {
         return execute(timeout, List.of(arguments), "");
     }
 
+    /** Reserve shared native capacity before freezing a guest for capture. */
+    public String prepareAdmission(Duration timeout, List<String> arguments) {
+        return prepareAdmission(timeout, arguments, null);
+    }
+
     /** Reserve shared native capacity before removing a stopped restore source. */
     public String prepareAdmission(Duration timeout, List<String> arguments, String sourceName) {
-        ObjectNode body = mapper.createObjectNode().put("sourceName", sourceName);
+        ObjectNode body = mapper.createObjectNode();
+        if (sourceName != null && !sourceName.isBlank()) {
+            body.put("sourceName", sourceName);
+        }
         body.set("arguments", mapper.valueToTree(arguments));
-        String permit = post("capacity/prepare", body, timeout).path("token").asText();
-        if (permit.isBlank()) {
+        JsonNode response = post("capacity/prepare", body, timeout);
+        if (!response.path("token").isTextual() || response.path("token").asText().isBlank()) {
             throw new IllegalStateException("Native admission permit is missing");
         }
-        return permit;
+        return response.path("token").asText();
     }
 
     public void cancelAdmission(Duration timeout, String permit) {

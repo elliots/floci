@@ -66,6 +66,22 @@ class MicrosandboxSidecarClientTest {
     }
 
     @Test
+    void reservesAndCancelsCaptureWithoutEmbeddingThePermitInRuntimeArguments() {
+        List<String> capture = List.of("snap", "create", "sleep", "--sandbox", "db", "--full", "--integrity");
+        response.set("{\"token\":\"capture-permit\"}");
+        assertEquals("capture-permit", client.prepareAdmission(capture));
+        assertEquals(mapper.valueToTree(capture), request.get().path("arguments"));
+        assertFalse(request.get().has("sourceName"));
+        response.set("{}");
+        client.cancelAdmission("capture-permit");
+        assertEquals("capture-permit", request.get().path("token").asText());
+        response.set("{\"exitCode\":0,\"stdout\":\"captured\"}");
+        assertEquals("captured", client.commandAdmitted("capture-permit", capture));
+        assertEquals("capture-permit", request.get().path("admission").asText());
+        assertEquals(mapper.valueToTree(capture), request.get().path("arguments"));
+    }
+
+    @Test
     void guestErrorsDoNotExposeCredentials() {
         response.set("{\"exitCode\":1,\"stderr\":\"password=secret\"}");
         IllegalStateException error = assertThrows(IllegalStateException.class,

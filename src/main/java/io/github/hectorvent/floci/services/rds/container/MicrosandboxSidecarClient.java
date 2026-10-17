@@ -47,6 +47,18 @@ public class MicrosandboxSidecarClient {
         return transport().command(TIMEOUT, arguments);
     }
 
+    String prepareAdmission(List<String> arguments) {
+        return transport().prepareAdmission(TIMEOUT, arguments);
+    }
+
+    void cancelAdmission(String permit) {
+        transport().cancelAdmission(TIMEOUT, permit);
+    }
+
+    String commandAdmitted(String permit, List<String> arguments) {
+        return transport().commandAdmitted(TIMEOUT, permit, arguments);
+    }
+
     String commandWithVerifiedCompletion(BooleanSupplier completed, String... arguments) {
         return transport().commandWithVerifiedCompletion(TIMEOUT, completed, arguments);
     }
