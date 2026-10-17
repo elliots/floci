@@ -29,7 +29,7 @@ def free_udp_port():
 
 def unused_public_canary_subnet(networks):
     allocated = [ipaddress.ip_network(config["Subnet"], strict=False)
-        for network in networks for config in network.get("IPAM", {}).get("Config", [])
+        for network in networks for config in (network.get("IPAM", {}).get("Config") or [])
         if config.get("Subnet")]
     for candidate in ("203.0.113.0/24", "198.51.100.0/24", "192.0.2.0/24"):
         subnet = ipaddress.ip_network(candidate)

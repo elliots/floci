@@ -14,6 +14,7 @@ class IsolationQualificationTest(unittest.TestCase):
     def test_public_canary_subnet_avoids_existing_supernets_and_subnets(self):
         networks = [{"IPAM": {"Config": [{"Subnet": subnet}]}}
             for subnet in ("203.0.0.0/16", "198.51.100.128/25", "fd00::/64")]
+        networks.append({"IPAM": {"Config": None}})
         self.assertEqual("192.0.2.0/24", unused_public_canary_subnet(networks))
 
     def test_public_canary_subnet_refuses_when_all_candidates_overlap(self):
