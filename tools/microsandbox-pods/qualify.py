@@ -22,6 +22,7 @@ from qualification_aws_identity import qualify_aws_identity
 from qualification_applications import qualify_applications
 from qualification_operations import qualify_operations
 from qualification_compat_operations import qualify_compat_operations
+from qualification_network_policy import qualify_network_policy
 from qualification_sidecars import qualify_sidecars
 from qualification_identity import qualify_identity
 from qualification_groups import qualify_groups
@@ -180,6 +181,8 @@ def qualify(args):
                 "--client-ca", str(temporary/"client-ca.crt"), "--control-listen", f"127.0.0.1:{control_port}", "--control-token-file", str(token_path), "--cleanup-on-exit", "--cluster-name", "qualification"]
             if args.activation_only:
                 controller_args.extend(["--max-active-memory-mib", "768"])
+            if args.network_policy_only:
+                controller_args.append("--network-policy=true")
             if args.network_relay_binary:
                 controller_args.extend(["--network-relay-binary",args.network_relay_binary])
             if args.guest_fs_binary:
@@ -223,6 +226,14 @@ def qualify(args):
                     "tolerations":[{"key":"microsandbox.dev/runtime","operator":"Equal","value":"native","effect":"NoSchedule"}],
                     "automountServiceAccountToken":False, "restartPolicy":"Never",
                     "containers":[{"name":"app","image":"public.ecr.aws/docker/library/busybox:1.37.0","command":["sh","-ec",script]}]}}
+            if args.network_policy_only:
+                if not args.policy_probe_binary or not args.network_relay_binary:
+                    raise RuntimeError("network policy qualification requires probe and relay binaries")
+                qualify_network_policy(args=args, peer=peer, pod=pod, apply=apply, resource=resource,
+                    kubectl=kubectl, ready=ready, lifecycle=lifecycle, control_get=control_get,
+                    crash_and_restart=crash_and_restart, wait=wait, report=report,
+                    command=command, environment=environment)
+                raise QualificationComplete()
             if args.compat_operations_only:
                 if not args.guest_fs_binary or not args.network_relay_binary:
                     raise RuntimeError("compatibility operations qualification requires guestfs and network relay binaries")
@@ -1087,6 +1098,8 @@ if __name__ == "__main__":
     parser.add_argument("--proxy-pods",type=int,default=0)
     parser.add_argument("--applications-only", action="store_true", help="qualify multiple regular containers using the shared owned fixture")
     parser.add_argument("--compat-operations-only", action="store_true", help="shared lifecycle hooks, resource projections and logs, including native hibernation")
+    parser.add_argument("--network-policy-only", action="store_true", help="shared live Kubernetes NetworkPolicy and native resume/egress isolation")
+    parser.add_argument("--policy-probe-binary", help="Linux test workload used to verify socket mark and raw packet restrictions")
     parser.add_argument("--operations-only", action="store_true", help="qualify TTY, port forwarding and gRPC probes using the shared owned fixture")
     parser.add_argument("--sidecars-only", action="store_true", help="qualify restartable init sidecars and ordered Job completion using the shared owned fixture")
     parser.add_argument("--identity-only", action="store_true", help="qualify real Pod-bound service-account projection, TLS/RBAC and RAM wake")
