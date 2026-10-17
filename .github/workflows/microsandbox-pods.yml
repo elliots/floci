@@ -33,7 +33,12 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        module: [microsandbox-runtime, microsandbox-host, microsandbox-pods]
+        module:
+          - microsandbox-runtime
+          - microsandbox-host
+          - microsandbox-pods
+          - microsandbox-pods/qualification/awsidentity
+          - microsandbox-pods/qualification/applicationgraph
     defaults:
       run:
         working-directory: tools/${{ matrix.module }}
@@ -47,9 +52,15 @@ jobs:
             tools/microsandbox-pods/go.sum
             tools/microsandbox-host/go.sum
             tools/microsandbox-runtime/go.sum
+            tools/microsandbox-pods/qualification/awsidentity/go.sum
+            tools/microsandbox-pods/qualification/applicationgraph/go.sum
 
       - name: Run unit tests with the race detector
         run: go test -race ./...
 
       - name: Run Go vet
         run: go vet ./...
+
+      - name: Check managed setup and qualification ownership
+        if: matrix.module == 'microsandbox-pods'
+        run: python3 -m unittest discover -p 'test_*.py'
