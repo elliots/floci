@@ -99,3 +99,8 @@ while asleep, controller recovery without wake, no hook replay on RAM restore,
 and graceful deletion starting from a checkpoint. Supply the rebuilt controller,
 network relay and guestfs binaries. The fixture owns its Kubernetes peer and
 cleans only its own resources.
+
+The 2026-10-17 macOS/Apple Silicon run passed all twelve shared/native checks and
+cleanup using journal version 8. The log helper used 3,184 KiB RSS for the fixture
+container. Controller recovery took 2.038 seconds; retained sleeping logs stayed
+identical and no startup hook replayed. Linux/KVM requires separate qualification.

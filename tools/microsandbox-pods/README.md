@@ -555,3 +555,36 @@ Other representative graphs can import `ManagedQualification` and call
 lifecycle, control and supervised-restart helpers. Clean any additional JVMs,
 Aurora databases or broker resources within the callback before returning, since
 the outer harness requires an empty native runtime before deleting its cluster.
+
+`qualify_application_graph.py` uses that installed path for a connected Aurora
+and SQS graph. It runs the same Go AWS SDK worker and PostgreSQL application on
+Docker and native Kubernetes workers. The native phase deploys both applications
+proxy-Ready while cold, wakes Aurora through an HTTP application's SQL request,
+and wakes the worker from SQS enqueue. It checks committed SQL rows, coordinator
+idle sleep, shared Pod/Aurora RAM accounting and process markers across a
+controller crash. While that budget is full, it requires a third VM admission
+to be rejected before dispatch, without changing VM inventory or reservations.
+At most one 768 MiB Pod and one 768 MiB Aurora VM run together:
+
+```sh
+python3 tools/microsandbox-pods/qualify_application_graph.py \
+  --binaries /private/native-tools --msb /path/to/msb \
+  --msb-home /private/graph-runtime --report /tmp/application-graph-report.json \
+  --floci-checkout /path/to/floci --java-home /path/to/jdk25
+```
+
+Use a dedicated empty SDK home and reserve the checkout's Maven test process.
+The fixture owns its temporary binary download server, host helper, AWS services
+and Kubernetes peer. Both runtime clients share the same canonical SDK home and
+1,536 MiB active RAM limit. The ordinary Docker worker uses the same Aurora
+database as the native worker, so the application contract stays identical.
+The test advances Aurora's idle check directly through its existing test fixture,
+avoiding the AWS minimum five-minute auto-pause wait; Pod idle behavior uses the
+real coordinator and queue activity notifications.
+
+The 2026-10-17 macOS/Apple Silicon qualification passed all ten graph checks and
+the Java SDK fixture's final SQL assertions. Both application RAM markers and
+PostgreSQL's original process start time survived the sleep/recovery cycles.
+VMs, snapshots, volumes, workloads and the owned cluster were removed after the
+run. This is a representative PostgreSQL/SQS graph; Linux/KVM and a larger
+multi-service graph require their own qualification.
