@@ -312,3 +312,36 @@ func TestDiskConfigurationRejectsOverflowAndDifferentHelperLimits(t *testing.T) 
 		t.Fatal("conflicting helpers accepted")
 	}
 }
+
+func TestRestoredDiskGeometryRequiresMatchingImmutableSnapshotRecord(t *testing.T) {
+	home := t.TempDir()
+	config := msb.SandboxConfig{MemoryMiB: 384}
+	raw := `{"snapshot_parent":"saved-id"}`
+	if got := retainedRootGeometry(home, raw, config); got != 0 {
+		t.Fatal("missing geometry guessed", got)
+	}
+	for _, change := range []string{"", "id", "digest", "memory", "root"} {
+		record := capacitySnapshot{ID: "saved-id", Digest: "saved-digest", MemoryMiB: 384, RootDiskMiB: 1024}
+		switch change {
+		case "id":
+			record.ID = "different-id"
+		case "digest":
+			record.Digest = ""
+		case "memory":
+			record.MemoryMiB = 512
+		case "root":
+			record.RootDiskMiB = 0
+		}
+		if err := writeNetworkRecord(snapshotMemoryPath(home, "saved-id"), record); err != nil {
+			t.Fatal(err)
+		}
+		got := retainedRootGeometry(home, raw, config)
+		if change == "" && got != 1024 || change != "" && got != 0 {
+			t.Fatalf("%s geometry: %d", change, got)
+		}
+	}
+	config.RootDisk = new(msb.RootDisk.Managed(2048))
+	if got := retainedRootGeometry(home, raw, config); got != 2048 {
+		t.Fatal("current explicit disk geometry ignored", got)
+	}
+}

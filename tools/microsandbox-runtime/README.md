@@ -175,6 +175,12 @@ older checkpoints before enabling disk admission. Named volumes already present
 are counted, but the adapter does not expose volume creation or growth. Any future
 volume mutation needs its own admission hook.
 
+SDK full restores can omit root geometry from their sandbox configuration. The
+adapter joins the restored sandbox's immutable `snapshot_parent` with its private
+captured geometry record, requiring the captured memory allocation to match.
+Subsequent captures retain that root size. Missing or inconsistent lineage remains
+unknown and refuses disk admission; no default disk size is substituted.
+
 The pinned SDK 0.7.8 leaves `Image.Inspect` layer EROFS size fields unset.
 Preflight therefore also stats its known `cache/layers/<DiffID-safe>.erofs` and
 `cache/fsmeta/<manifest-safe>.erofs` files using SDK-supplied SHA-256 identities.

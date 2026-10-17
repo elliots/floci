@@ -125,7 +125,7 @@ func newCapacityManager(config Config) (*capacityManager, error) {
 		if err := initializeSDK(config); err != nil {
 			return nil, err
 		}
-		return capacityInventory(ctx)
+		return capacityInventory(ctx, config.Home)
 	}
 	m.snapshot = func(ctx context.Context, selector string) (capacitySnapshot, error) {
 		if err := initializeSDK(config); err != nil {
@@ -528,7 +528,7 @@ func recordSnapshotMemory(home, id, digest string, memory, rootDisk uint64) erro
 	return writeNetworkRecord(snapshotMemoryPath(home, id), capacitySnapshot{ID: id, Digest: digest, MemoryMiB: memory, RootDiskMiB: rootDisk})
 }
 
-func capacityInventory(ctx context.Context) ([]capacityGuest, error) {
+func capacityInventory(ctx context.Context, home string) ([]capacityGuest, error) {
 	var guests []capacityGuest
 	cursor, seen := "", map[string]bool{}
 	for {
@@ -545,7 +545,7 @@ func capacityInventory(ctx context.Context) ([]capacityGuest, error) {
 			if err != nil {
 				return nil, err
 			}
-			guests = append(guests, capacityGuest{ID: handle.ID(), Name: handle.Name(), Status: string(handle.Status()), MemoryMiB: uint64(max(config.MemoryMiB, config.MaxMemoryMiB)), RootDiskMiB: rootDiskGeometry(*config)})
+			guests = append(guests, capacityGuest{ID: handle.ID(), Name: handle.Name(), Status: string(handle.Status()), MemoryMiB: uint64(max(config.MemoryMiB, config.MaxMemoryMiB)), RootDiskMiB: retainedRootGeometry(home, handle.ConfigJSON(), *config)})
 		}
 		if page.NextCursor == nil || *page.NextCursor == "" {
 			return guests, nil
@@ -556,4 +556,25 @@ func capacityInventory(ctx context.Context) ([]capacityGuest, error) {
 		}
 		seen[cursor] = true
 	}
+}
+
+// Full restore can omit root_disk from the SDK's persisted sandbox config.
+// Its immutable snapshot parent joins the geometry captured before hibernation.
+// Missing, mismatched or legacy records remain unknown rather than guessed.
+func retainedRootGeometry(home, rawConfig string, config msb.SandboxConfig) uint64 {
+	if root := rootDiskGeometry(config); root != 0 {
+		return root
+	}
+	parent, err := snapshotParent(rawConfig)
+	if err != nil || parent == "" {
+		return 0
+	}
+	var record capacitySnapshot
+	if err := readCapacityRecord(snapshotMemoryPath(home, parent), &record); err != nil {
+		return 0
+	}
+	if record.ID != parent || record.Digest == "" || record.MemoryMiB != uint64(max(config.MemoryMiB, config.MaxMemoryMiB)) {
+		return 0
+	}
+	return record.RootDiskMiB
 }

@@ -148,7 +148,7 @@ func (b *sdkBackend) execute(ctx context.Context, r command, stdin io.Reader, st
 		if _, err = h.Refresh(ctx); err != nil {
 			return 0, err
 		}
-		if err := recordSnapshotMemory(b.config.Home, artifact.ID(), artifact.Digest(), uint64(max(geometry.MemoryMiB, geometry.MaxMemoryMiB)), rootDiskGeometry(*geometry)); err != nil {
+		if err := recordSnapshotMemory(b.config.Home, artifact.ID(), artifact.Digest(), uint64(max(geometry.MemoryMiB, geometry.MaxMemoryMiB)), retainedRootGeometry(b.config.Home, h.ConfigJSON(), *geometry)); err != nil {
 			return 0, err
 		}
 		if r.boundary != nil {
