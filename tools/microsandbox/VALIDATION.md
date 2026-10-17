@@ -247,3 +247,23 @@ the complete Pod-controller and shared-runtime Go race suites and vet passed.
 The host-helper race suite and vet also passed, along with Java test compilation,
 Checkstyle and 11 managed-setup Python tests. Platform-gated native tests remain
 opt-in; these checks do not imply a run of every repository test.
+
+## Native storage maintenance and resource metrics: 17 October 2026
+
+The storage fixture passed on Apple Silicon with SDK/runtime 0.7.8. A 384 MiB
+guest stored a marker in RAM and hibernated to a full checkpoint. Both preview
+and applied cleanup preserved its stopped VM, checkpoint and image dependencies.
+Restore returned the same marker. After exact owned VM/checkpoint cleanup, the
+fixture's now-unused image was removed and no RAM reservation remained. The
+fixture completed in 2.35 seconds; this is one small synthetic workload, not an
+application latency guarantee. The dedicated VM inventory was empty afterward.
+
+The complete shared-runtime and host-helper race suites and vet passed. The
+Pod-controller race suite passed in 41.908 seconds, and vet passed. Focused
+resource tests cover cgroup counter decoding, working-set calculation, incomplete
+scrapes and no activity or guest execution for cold/sleeping Pods. Native metric
+endpoint behavior is covered separately by the installed-path qualification.
+
+The current Docker host exposes no KVM device. These new native VM results are
+Apple Silicon results; native Linux/KVM qualification still requires a suitable
+Linux host. Linux unit tests and cross-builds do not replace that qualification.

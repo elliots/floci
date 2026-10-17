@@ -970,3 +970,20 @@ disk; recovering a checkpoint never derives a different size from current
 annotations. New allocation records missing disk geometry are rejected.
 Kubernetes `ephemeral-storage` requests/limits and disk `emptyDir.sizeLimit`
 remain unsupported.
+
+## Container metrics and native storage maintenance
+
+The kubelet TLS endpoint now supports container CPU and working-set memory
+through `/metrics/resource` and `/stats/summary`. No configuration change is
+required. Cold and sleeping containers remain absent from current samples;
+metrics never wake them or renew activity. Whole-host node metrics are not
+fabricated from guest allocations. See the [metrics contract](../microsandbox-pods/METRICS.md).
+
+The authenticated Pod and host helpers add `/v1/storage` inventory and
+`/v1/storage/prune` maintenance. Cleanup defaults to a preview and a 24-hour age
+limit. It retains durable snapshots, guest disks and PVCs. Image removal is
+separately opt-in, never forced, and blocked by outstanding native admissions.
+The Pod helper always retains the base image needed by cold Pods. Operators using
+the host helper should retain other preloaded images needed by never-started
+workloads. See [storage maintenance](../microsandbox-runtime/STORAGE.md) for exact
+accounting and cleanup limits. AWS endpoint shapes and Docker execution are unchanged.
