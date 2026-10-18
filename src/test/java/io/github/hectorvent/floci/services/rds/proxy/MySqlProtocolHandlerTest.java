@@ -25,9 +25,11 @@ import java.nio.charset.StandardCharsets;
 import java.nio.file.Path;
 import java.security.MessageDigest;
 import java.security.cert.X509Certificate;
+import java.time.Clock;
 import java.time.Instant;
 import java.util.Arrays;
 import java.util.HexFormat;
+import java.util.List;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicReference;
 
@@ -128,6 +130,83 @@ class MySqlProtocolHandlerTest {
 
         assertEquals((byte) 1, backendResponseSeq.get(), "sequence must be unchanged when no TLS upgrade occurs");
         assertEquals("admin", extractUsername(backendResponsePayload.get()));
+    }
+
+    @ParameterizedTest
+    @ValueSource(booleans = {false, true})
+    void auroraDiscoveryIsRewrittenOnlyOnTheClusterBinding(boolean aurora) throws Exception {
+        byte[] nonce = fixedNonce();
+        AtomicReference<Throwable> failure = new AtomicReference<>();
+        AtomicReference<String> observed = new AtomicReference<>();
+        AtomicReference<String> observedPair = new AtomicReference<>();
+        AtomicReference<String> ordinary = new AtomicReference<>();
+        try (ServerSocket backendServer = new ServerSocket(0);
+             ServerSocket clientServer = new ServerSocket(0)) {
+            Thread backendThread = Thread.ofVirtual().start(() -> {
+                try (Socket socket = backendServer.accept()) {
+                    socket.setSoTimeout(5000);
+                    InputStream input = socket.getInputStream();
+                    OutputStream output = socket.getOutputStream();
+                    output.write(buildHandshakeV10(nonce));
+                    output.flush();
+                    readMysqlPacketRaw(input);
+                    writeMysqlPacket(output, 2, OK_PAYLOAD);
+                    byte[] query = readMysqlPacketRaw(input);
+                    observed.set(new String(query, 5, query.length - 5, StandardCharsets.US_ASCII));
+                    writeMysqlPacket(output, 1, OK_PAYLOAD);
+                    byte[] pair = readMysqlPacketRaw(input);
+                    observedPair.set(new String(pair, 5, pair.length - 5, StandardCharsets.US_ASCII));
+                    writeMysqlPacket(output, 1, OK_PAYLOAD);
+                    byte[] next = readMysqlPacketRaw(input);
+                    ordinary.set(new String(next, 5, next.length - 5, StandardCharsets.US_ASCII));
+                    writeMysqlPacket(output, 1, OK_PAYLOAD);
+                } catch (Throwable error) {
+                    failure.set(error);
+                }
+            });
+            try (Socket client = new Socket("localhost", clientServer.getLocalPort());
+                 Socket proxyClient = clientServer.accept();
+                 Socket backend = new Socket("localhost", backendServer.getLocalPort())) {
+                client.setSoTimeout(5000);
+                RdsProxyBinding binding = aurora ? testBinding().withAuroraMySql(() ->
+                        new AuroraMySqlEmulation.Server("writer", "3.04.6")) : testBinding();
+                Thread proxy = Thread.ofVirtual().start(() -> {
+                    try {
+                        MySqlProtocolHandler.handleAuth(proxyClient, backend, NO_RECONNECT, "admin", "secret",
+                                false, testSigV4Validator(), testTlsCertificates(),
+                                (user, pass) -> PasswordValidator.AuthResult.MASTER_EQUIVALENT,
+                                5000, username -> true, binding);
+                    } catch (Throwable error) {
+                        failure.set(error);
+                    }
+                });
+                InputStream input = client.getInputStream();
+                OutputStream output = client.getOutputStream();
+                readMysqlPacketRaw(input);
+                output.write(buildHandshakeResponse41("admin", scrambleNativePassword("secret", nonce), (byte) 1));
+                output.flush();
+                readMysqlPacketRaw(input);
+                writeMysqlPacket(output, 0, "\003SELECT @@aurora_server_id".getBytes(StandardCharsets.US_ASCII));
+                assertNotNull(readMysqlPacketRaw(input));
+                writeMysqlPacket(output, 0, "\003SELECT @@aurora_server_id, @@aurora_server_id"
+                        .getBytes(StandardCharsets.US_ASCII));
+                assertNotNull(readMysqlPacketRaw(input));
+                writeMysqlPacket(output, 0, "\003SELECT 'information_schema.replica_host_status'"
+                        .getBytes(StandardCharsets.US_ASCII));
+                assertNotNull(readMysqlPacketRaw(input));
+                client.close();
+                proxyClient.close();
+                proxy.join(5000);
+                backendThread.join(5000);
+                assertFalse(proxy.isAlive());
+                assertFalse(backendThread.isAlive());
+            }
+        }
+        assertNull(failure.get());
+        assertEquals(aurora ? "SELECT 'writer' AS `@@aurora_server_id`" : "SELECT @@aurora_server_id", observed.get());
+        assertEquals(aurora ? "SELECT 'writer' AS `@@aurora_server_id`, 'writer' AS `@@aurora_server_id`"
+                : "SELECT @@aurora_server_id, @@aurora_server_id", observedPair.get());
+        assertEquals("SELECT 'information_schema.replica_host_status'", ordinary.get());
     }
 
     @Test
@@ -695,7 +774,7 @@ class MySqlProtocolHandlerTest {
 
     private RdsProxyTlsCertificates testTlsCertificates() {
         return new RdsProxyTlsCertificates(FlociCertificateAuthority.loadOrCreate(tempDir.resolve("tls")),
-                new CertificateGenerator());
+                new CertificateGenerator(), List.of(), Clock.systemUTC());
     }
 
     private static RdsSigV4Validator testSigV4Validator() {

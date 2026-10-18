@@ -2,11 +2,13 @@ package io.github.hectorvent.floci.services.rds.proxy;
 
 import com.fasterxml.jackson.databind.ObjectMapper;
 import io.github.hectorvent.floci.config.CertificateMetadata;
+import io.github.hectorvent.floci.config.EmulatorConfig;
 import io.github.hectorvent.floci.config.FlociCertificateAuthority;
 import io.github.hectorvent.floci.config.FlociVersion;
 import io.github.hectorvent.floci.core.common.Pem;
 import io.github.hectorvent.floci.services.acm.CertificateGenerator;
 import io.github.hectorvent.floci.services.acm.model.KeyAlgorithm;
+import io.quarkus.runtime.Startup;
 import jakarta.enterprise.context.ApplicationScoped;
 import jakarta.inject.Inject;
 import org.jboss.logging.Logger;
@@ -25,11 +27,15 @@ import java.util.ArrayList;
 import java.util.Date;
 import java.util.LinkedHashSet;
 import java.util.List;
+import java.util.Locale;
 import java.util.Set;
+import java.util.regex.Pattern;
 
 /**
  * Owns the RDS auth proxy's in-memory server certificate signed by Floci's shared root CA.
- * The server certificate's SANs cover every advertised Postgres/MySQL host.
+ * The server certificate's SANs cover every advertised Postgres/MySQL host and the names
+ * configured in {@code services.rds.tls-hostnames}. The bean is created at startup, so a
+ * malformed configured name stops Floci from starting.
  *
  * <p>The shared CA persists at {@code {persistent-path}/tls/floci-root-ca.{crt,key}}. The
  * {@code rds-ca.crt} compatibility copy preserves existing client paths, and
@@ -38,6 +44,7 @@ import java.util.Set;
  * database and every restart, including when advertised hosts change.
  */
 @ApplicationScoped
+@Startup
 public class RdsProxyTlsCertificates {
 
     private static final Logger LOG = Logger.getLogger(RdsProxyTlsCertificates.class);
@@ -45,9 +52,11 @@ public class RdsProxyTlsCertificates {
     private static final List<String> DEFAULT_SANS = List.of("localhost", "127.0.0.1");
     private static final String METADATA_NAME = "rds-ca.metadata.json";
     private static final ObjectMapper OBJECT_MAPPER = new ObjectMapper();
+    private static final Pattern DNS_NAME = Pattern.compile("[a-z0-9](?:[a-z0-9.-]*[a-z0-9])?");
 
     private final FlociCertificateAuthority certificateAuthority;
     private final CertificateGenerator certificateGenerator;
+    private final Set<String> configuredSans;
     private final Clock clock;
     private final Object lock = new Object();
 
@@ -57,14 +66,17 @@ public class RdsProxyTlsCertificates {
     }
 
     @Inject
-    public RdsProxyTlsCertificates(FlociCertificateAuthority certificateAuthority, CertificateGenerator certificateGenerator) {
-        this(certificateAuthority, certificateGenerator, Clock.systemUTC());
+    public RdsProxyTlsCertificates(FlociCertificateAuthority certificateAuthority, CertificateGenerator certificateGenerator,
+                                   EmulatorConfig config) {
+        this(certificateAuthority, certificateGenerator, config.services().rds().tlsHostnames().orElse(List.of()),
+                Clock.systemUTC());
     }
 
     RdsProxyTlsCertificates(FlociCertificateAuthority certificateAuthority, CertificateGenerator certificateGenerator,
-                            Clock clock) {
+                            List<String> configuredHostnames, Clock clock) {
         this.certificateAuthority = certificateAuthority;
         this.certificateGenerator = certificateGenerator;
+        this.configuredSans = configuredSans(configuredHostnames);
         this.clock = clock;
     }
 
@@ -122,10 +134,25 @@ public class RdsProxyTlsCertificates {
                             metadataFile);
                 }
             }
+            sans.addAll(configuredSans);
             refreshLegacyCaFiles();
             regenerate(sans);
             logTrustHint(certificateAuthority.certificatePath());
         }
+    }
+
+    /** The configured names, validated before anything is written. */
+    private static Set<String> configuredSans(List<String> configuredHostnames) {
+        Set<String> names = new LinkedHashSet<>();
+        for (String configured : configuredHostnames) {
+            String name = configured.trim().toLowerCase(Locale.ROOT);
+            if (name.length() > 253 || !DNS_NAME.matcher(name).matches() || name.contains("..")) {
+                throw new IllegalArgumentException("Invalid RDS TLS hostname '" + configured
+                        + "': use a DNS name without a scheme or port");
+            }
+            names.add(name);
+        }
+        return names;
     }
 
     private void refreshLegacyCaFiles() {

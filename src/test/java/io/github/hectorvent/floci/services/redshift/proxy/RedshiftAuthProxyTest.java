@@ -1,5 +1,6 @@
 package io.github.hectorvent.floci.services.redshift.proxy;
 
+import io.github.hectorvent.floci.config.EmulatorConfig;
 import io.github.hectorvent.floci.config.FlociCertificateAuthority;
 import io.github.hectorvent.floci.services.acm.CertificateGenerator;
 import io.github.hectorvent.floci.services.iam.IamService;
@@ -31,6 +32,7 @@ import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 import static org.mockito.Mockito.mock;
+import static org.mockito.Mockito.when;
 
 class RedshiftAuthProxyTest {
 
@@ -217,8 +219,13 @@ class RedshiftAuthProxyTest {
     }
 
     private RdsProxyTlsCertificates realTls() {
+        EmulatorConfig config = mock(EmulatorConfig.class);
+        EmulatorConfig.ServicesConfig services = mock(EmulatorConfig.ServicesConfig.class);
+        EmulatorConfig.RdsServiceConfig rds = mock(EmulatorConfig.RdsServiceConfig.class);
+        when(config.services()).thenReturn(services);
+        when(services.rds()).thenReturn(rds);
         return new RdsProxyTlsCertificates(FlociCertificateAuthority.loadOrCreate(tempDir.resolve("tls")),
-                new CertificateGenerator());
+                new CertificateGenerator(), config);
     }
 
     private static boolean portAccepts(int port) {

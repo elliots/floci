@@ -973,8 +973,12 @@ public class RdsQueryHandler {
                .elem("Engine", option.get("engine"))
                .elem("EngineVersion", option.get("engineVersion"))
                .elem("DBInstanceClass", option.get("dbInstanceClass"))
-               .elem("LicenseModel", licenseModel(option.get("engine")))
-               .start("AvailabilityZones")
+               .elem("LicenseModel", licenseModel(option.get("engine")));
+            if (option.get("storageType") != null) {
+                // the AWS provider filters aws_rds_orderable_db_instance on storage_type client-side
+                xml.elem("StorageType", option.get("storageType"));
+            }
+            xml.start("AvailabilityZones")
                  .start("AvailabilityZone")
                    .elem("Name", config.defaultAvailabilityZone())
                  .end("AvailabilityZone")
@@ -1264,6 +1268,7 @@ public class RdsQueryHandler {
                 // A global cluster's members take its Aurora engine; any other create names its own.
                 RdsService.requireDataApiEngine(engine);
             }
+            String kmsKeyId = params.getFirst("KmsKeyId");
             Double serverlessV2Min = parseDoubleParam(params, "ServerlessV2ScalingConfiguration.MinCapacity");
             Double serverlessV2Max = parseDoubleParam(params, "ServerlessV2ScalingConfiguration.MaxCapacity");
             Integer serverlessV2SecondsUntilAutoPause = parseIntegerParam(
@@ -1272,31 +1277,19 @@ public class RdsQueryHandler {
             String globalClusterIdentifier = params.getFirst("GlobalClusterIdentifier");
             DbCluster cluster;
             if (globalClusterIdentifier != null && !globalClusterIdentifier.isBlank()) {
-                cluster = requestedPort == null
-                    ? service.createDbClusterInGlobalCluster(globalClusterIdentifier, id, engine,
-                            params.getFirst("EngineVersion"), masterUsername, masterPassword, databaseName,
-                            iamEnabled, paramGroupName, dbSubnetGroupName, availabilityZone, multiAz, region,
-                            serverlessV2Min, serverlessV2Max, serverlessV2SecondsUntilAutoPause,
-                            manageMasterUserPassword, masterUserSecretKmsKeyId, engineMode, storageEncrypted)
-                    : service.createDbClusterInGlobalCluster(globalClusterIdentifier, id, engine,
-                            params.getFirst("EngineVersion"), masterUsername, masterPassword, databaseName,
-                            iamEnabled, paramGroupName, dbSubnetGroupName, availabilityZone, multiAz, region,
-                            serverlessV2Min, serverlessV2Max, serverlessV2SecondsUntilAutoPause,
-                            manageMasterUserPassword, masterUserSecretKmsKeyId, engineMode, storageEncrypted,
-                            requestedPort);
+                cluster = service.createDbClusterInGlobalCluster(globalClusterIdentifier, id, engine,
+                        params.getFirst("EngineVersion"), masterUsername, masterPassword, databaseName,
+                        iamEnabled, paramGroupName, dbSubnetGroupName, availabilityZone, multiAz, region,
+                        serverlessV2Min, serverlessV2Max, serverlessV2SecondsUntilAutoPause,
+                        manageMasterUserPassword, masterUserSecretKmsKeyId, engineMode, storageEncrypted,
+                        requestedPort, kmsKeyId);
             } else {
-                cluster = requestedPort == null
-                    ? service.createDbCluster(id, engine, engineVersion, masterUsername,
-                            masterPassword, databaseName, iamEnabled, paramGroupName,
-                            dbSubnetGroupName, availabilityZone, multiAz, region,
-                            serverlessV2Min, serverlessV2Max, serverlessV2SecondsUntilAutoPause,
-                            manageMasterUserPassword, masterUserSecretKmsKeyId, engineMode, storageEncrypted)
-                    : service.createDbCluster(id, engine, engineVersion, masterUsername,
-                            masterPassword, databaseName, iamEnabled, paramGroupName,
-                            dbSubnetGroupName, availabilityZone, multiAz, region,
-                            serverlessV2Min, serverlessV2Max, serverlessV2SecondsUntilAutoPause,
-                            manageMasterUserPassword, masterUserSecretKmsKeyId, engineMode, storageEncrypted,
-                            requestedPort);
+                cluster = service.createDbCluster(id, engine, engineVersion, masterUsername,
+                        masterPassword, databaseName, iamEnabled, paramGroupName,
+                        dbSubnetGroupName, availabilityZone, multiAz, region,
+                        serverlessV2Min, serverlessV2Max, serverlessV2SecondsUntilAutoPause,
+                        manageMasterUserPassword, masterUserSecretKmsKeyId, engineMode, storageEncrypted,
+                        requestedPort, kmsKeyId);
             }
             if (!associatedRoles.isEmpty()) {
                 try {
@@ -2740,7 +2733,8 @@ public class RdsQueryHandler {
             return missing;
         }
         boolean copyTags = Boolean.TRUE.equals(parseOptionalBoolean(params, "CopyTags"));
-        DbClusterSnapshot copy = service.copyDbClusterSnapshot(sourceId, targetId, copyTags, parseTags(params), region);
+        DbClusterSnapshot copy = service.copyDbClusterSnapshot(sourceId, targetId, copyTags, parseTags(params),
+                params.getFirst("KmsKeyId"), region);
         return Response.ok(AwsQueryResponse.envelope("CopyDBClusterSnapshot", AwsNamespaces.RDS,
                 dbClusterSnapshotXml(copy))).build();
     }
@@ -2794,7 +2788,7 @@ public class RdsQueryHandler {
                     optionalInt(params.getFirst("Port")), params.getFirst("DBSubnetGroupName"),
                     params.getFirst("DBClusterParameterGroupName"),
                     parseOptionalBoolean(params, "EnableIAMDatabaseAuthentication"),
-                    params.getFirst("EngineMode"), parseTags(params), region);
+                    params.getFirst("EngineMode"), parseTags(params), params.getFirst("KmsKeyId"), region);
             return Response.ok(AwsQueryResponse.envelope("RestoreDBClusterToPointInTime", AwsNamespaces.RDS,
                     dbClusterXml(cluster))).build();
         } catch (AwsException e) {
@@ -2819,7 +2813,7 @@ public class RdsQueryHandler {
                 params.getFirst("DBClusterParameterGroupName"),
                 params.getFirst("AvailabilityZones.member.1"),
                 parseOptionalBoolean(params, "EnableIAMDatabaseAuthentication"),
-                params.getFirst("EngineMode"), parseTags(params), region);
+                params.getFirst("EngineMode"), parseTags(params), params.getFirst("KmsKeyId"), region);
         return Response.ok(AwsQueryResponse.envelope("RestoreDBClusterFromSnapshot", AwsNamespaces.RDS,
                 dbClusterXml(cluster))).build();
     }
@@ -3218,6 +3212,11 @@ public class RdsQueryHandler {
         }
         xml.elem("DbClusterResourceId", c.getDbClusterResourceId())
            .elem("DBClusterArn", c.getDbClusterArn());
+        // AWS returns the key an encrypted cluster was created with; a client that reads it back
+        // (Terraform's aws_rds_cluster) compares it with what it asked for.
+        if (c.getKmsKeyId() != null && !c.getKmsKeyId().isBlank()) {
+            xml.elem("KmsKeyId", c.getKmsKeyId());
+        }
         if (c.getMasterUserSecretArn() != null && !c.getMasterUserSecretArn().isBlank()) {
             xml.start("MasterUserSecret")
                     .elem("SecretArn", c.getMasterUserSecretArn())
@@ -3247,10 +3246,10 @@ public class RdsQueryHandler {
         if (c.getDbClusterMembers() != null) {
             String writer = c.resolveWriterIdentifier();
             for (String memberId : c.getDbClusterMembers()) {
-                xml.start("member")
+                xml.start("DBClusterMember")
                    .elem("DBInstanceIdentifier", memberId)
                    .elem("IsClusterWriter", memberId.equals(writer))
-                   .end("member");
+                   .end("DBClusterMember");
             }
         }
         xml.end("DBClusterMembers");

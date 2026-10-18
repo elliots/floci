@@ -1781,6 +1781,10 @@ public interface EmulatorConfig {
         /** Hostname advertised for RDS endpoints. Uses published Docker ports when configured. */
         Optional<String> endpointHost();
 
+        /** Additional DNS names covered by the RDS proxy's server certificate, besides the
+         *  advertised endpoint hosts. Env: FLOCI_SERVICES_RDS_TLS_HOSTNAMES */
+        Optional<List<String>> tlsHostnames();
+
         /** Whether a PostgreSQL IAM auth token must have been generated for the endpoint the
          *  instance publishes (hostname, port and region), as on RDS. On by default; turn it off
          *  when clients generate tokens for a container name or DNS alias the endpoint does not

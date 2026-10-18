@@ -36,6 +36,7 @@ import java.security.KeyStore;
 import java.security.cert.CertificateFactory;
 import java.security.cert.X509Certificate;
 import java.text.MessageFormat;
+import java.time.Clock;
 import java.time.Instant;
 import java.util.ArrayList;
 import java.util.HashMap;
@@ -2140,7 +2141,7 @@ class PostgresProtocolHandlerTest {
 
     private RdsProxyTlsCertificates testTlsCertificates() {
         return new RdsProxyTlsCertificates(FlociCertificateAuthority.loadOrCreate(tempDir.resolve("tls")),
-                new CertificateGenerator());
+                new CertificateGenerator(), List.of(), Clock.systemUTC());
     }
 
     /**
