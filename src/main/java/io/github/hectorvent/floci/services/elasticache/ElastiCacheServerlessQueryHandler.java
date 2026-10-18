@@ -60,10 +60,6 @@ public class ElastiCacheServerlessQueryHandler {
         }
     }
 
-    public Map<String, String> getTags(String name) {
-        return service.getServerlessCache(name).getTags();
-    }
-
     private static String cacheXml(ServerlessCache cache) {
         return new XmlBuilder().start("ServerlessCache").raw(cacheFields(cache)).end("ServerlessCache").build();
     }

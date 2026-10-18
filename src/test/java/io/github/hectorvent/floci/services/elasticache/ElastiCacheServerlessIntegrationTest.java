@@ -78,6 +78,12 @@ class ElastiCacheServerlessIntegrationTest {
             assertEquals("03:00", created.dailySnapshotTime());
             assertEquals("test", client.listTagsForResource(request -> request.resourceName(created.arn()))
                     .tagList().getFirst().value());
+            client.addTagsToResource(request -> request.resourceName(created.arn())
+                    .tags(tag -> tag.key("added").value("yes")));
+            assertEquals(2, client.listTagsForResource(request -> request.resourceName(created.arn())).tagList().size());
+            client.removeTagsFromResource(request -> request.resourceName(created.arn()).tagKeys("added"));
+            assertEquals("team", client.listTagsForResource(request -> request.resourceName(created.arn()))
+                    .tagList().getFirst().key());
             ServerlessCache updated = client.modifyServerlessCache(request -> request.serverlessCacheName("sdk-serverless")
                     .description("second").securityGroupIds(updatedGroup)).serverlessCache();
             assertEquals(created.endpoint(), updated.endpoint());
