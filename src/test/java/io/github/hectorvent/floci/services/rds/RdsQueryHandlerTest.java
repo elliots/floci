@@ -36,6 +36,7 @@ import org.junit.jupiter.params.provider.ValueSource;
 import org.mockito.ArgumentCaptor;
 
 import java.time.Instant;
+import java.util.ArrayList;
 import java.util.List;
 import java.util.Map;
 
@@ -632,6 +633,39 @@ class RdsQueryHandlerTest {
     }
 
     @Test
+    void describeDbClusters_reportsTheClusterParameterGroupOrTheEngineDefault() {
+        DbCluster postgres = makeCluster("aurora-pg");
+        postgres.setEngineIdentifier("aurora-postgresql");
+        postgres.setEngineVersion("16.3");
+        DbCluster mysql = makeCluster("aurora-my");
+        mysql.setEngine(DatabaseEngine.MYSQL);
+        mysql.setEngineIdentifier("aurora-mysql");
+        mysql.setEngineVersion(null);
+        DbCluster custom = makeCluster("custom");
+        custom.setParameterGroupName("custom-cluster-params");
+        when(service.listDbClusters(null, null)).thenReturn(List.of(postgres, mysql, custom));
+
+        String body = (String) handler.handle("DescribeDBClusters", params()).getEntity();
+
+        assertTrue(body.contains("<DBClusterParameterGroup>default.aurora-postgresql16</DBClusterParameterGroup>"),
+                body);
+        assertTrue(body.contains("<DBClusterParameterGroup>default.aurora-mysql8.0</DBClusterParameterGroup>"), body);
+        assertTrue(body.contains("<DBClusterParameterGroup>custom-cluster-params</DBClusterParameterGroup>"), body);
+    }
+
+    @Test
+    void describeDbClusters_namesEachMemberDbClusterMember() {
+        DbCluster cluster = makeCluster("members");
+        cluster.setDbClusterMembers(new ArrayList<>(List.of("w")));
+        when(service.listDbClusters(null, null)).thenReturn(List.of(cluster));
+
+        String body = (String) handler.handle("DescribeDBClusters", params()).getEntity();
+
+        assertTrue(body.contains("<DBClusterMembers><DBClusterMember><DBInstanceIdentifier>w</DBInstanceIdentifier>"
+                + "<IsClusterWriter>true</IsClusterWriter></DBClusterMember></DBClusterMembers>"), body);
+    }
+
+    @Test
     void describeDbInstances_unknownFilterFallsBackToUnfilteredList() {
         when(service.listDbInstances(null, null)).thenReturn(List.of());
 
@@ -696,7 +730,7 @@ class RdsQueryHandlerTest {
         when(service.createDbCluster(eq("mycluster"), eq("aurora-postgresql"), any(),
                 eq("omni_admin"), isNull(), eq("omni"), eq(false), isNull(),
                 isNull(), isNull(), eq(false), any(),
-                isNull(), isNull(), isNull(), eq(true), eq("kms-key-1"), isNull(), eq(false)))
+                isNull(), isNull(), isNull(), eq(true), eq("kms-key-1"), isNull(), eq(false), isNull(), isNull()))
                 .thenReturn(cluster);
 
         MultivaluedMap<String, String> p = params();
@@ -716,7 +750,7 @@ class RdsQueryHandlerTest {
         verify(service).createDbCluster(eq("mycluster"), eq("aurora-postgresql"), any(),
                 eq("omni_admin"), isNull(), eq("omni"), eq(false), isNull(),
                 isNull(), isNull(), eq(false), any(),
-                isNull(), isNull(), isNull(), eq(true), eq("kms-key-1"), isNull(), eq(false));
+                isNull(), isNull(), isNull(), eq(true), eq("kms-key-1"), isNull(), eq(false), isNull(), isNull());
     }
 
     @Test
@@ -724,7 +758,7 @@ class RdsQueryHandlerTest {
         DbCluster cluster = makeCluster("mycluster");
         when(service.createDbCluster(any(), any(), any(), any(), any(), any(), anyBoolean(), any(),
                 any(), any(), anyBoolean(), any(), any(), any(), any(), eq(false), isNull(),
-                any(), anyBoolean()))
+                any(), anyBoolean(), isNull(), isNull()))
                 .thenReturn(cluster);
 
         MultivaluedMap<String, String> p = params();
@@ -742,7 +776,7 @@ class RdsQueryHandlerTest {
         DbCluster cluster = makeCluster("mycluster");
         when(service.createDbCluster(any(), any(), any(), any(), any(), any(), anyBoolean(), any(),
                 any(), any(), anyBoolean(), any(), any(), any(), any(), anyBoolean(), any(),
-                any(), anyBoolean()))
+                any(), anyBoolean(), isNull(), isNull()))
                 .thenReturn(cluster);
         // Another request associated the role between the create and the roles being added.
         when(service.addRolesToNewDbCluster(any(), eq("mycluster"), anyList()))
@@ -2385,7 +2419,7 @@ class RdsQueryHandlerTest {
     void copyClusterSnapshotRejectsMalformedCopyTagsBeforeServiceCall(String value) {
         DbClusterSnapshot snapshot = new DbClusterSnapshot();
         snapshot.setDbClusterSnapshotIdentifier("target");
-        when(service.copyDbClusterSnapshot(anyString(), anyString(), anyBoolean(), anyMap(), isNull()))
+        when(service.copyDbClusterSnapshot(anyString(), anyString(), anyBoolean(), anyMap(), isNull(), isNull()))
                 .thenReturn(snapshot);
         MultivaluedMap<String, String> p = params();
         p.putSingle("SourceDBClusterSnapshotIdentifier", "source");
@@ -2408,7 +2442,7 @@ class RdsQueryHandlerTest {
         snapshot.setDbClusterSnapshotIdentifier("target");
         boolean copyTags = Boolean.parseBoolean(value);
         when(service.copyDbClusterSnapshot(eq("source"), eq("target"), eq(copyTags),
-                eq(Map.of("owner", "team")), isNull())).thenReturn(snapshot);
+                eq(Map.of("owner", "team")), isNull(), isNull())).thenReturn(snapshot);
         MultivaluedMap<String, String> p = params();
         p.putSingle("SourceDBClusterSnapshotIdentifier", "source");
         p.putSingle("TargetDBClusterSnapshotIdentifier", "target");
@@ -2422,7 +2456,7 @@ class RdsQueryHandlerTest {
 
         assertEquals(200, response.getStatus());
         assertTrue(((String) response.getEntity()).contains("<DBClusterSnapshotIdentifier>target"));
-        verify(service).copyDbClusterSnapshot("source", "target", copyTags, Map.of("owner", "team"), null);
+        verify(service).copyDbClusterSnapshot("source", "target", copyTags, Map.of("owner", "team"), null, null);
     }
 
     @Test
@@ -2524,9 +2558,9 @@ class RdsQueryHandlerTest {
         when(service.restoreDbInstanceFromDbSnapshot(any(), any(), any(), any(), anyBoolean(),
                 any(), any(), any(), any(), any(), any())).thenReturn(makeInstance("restored"));
         when(service.restoreDbClusterFromSnapshot(any(), any(), any(), any(), any(), any(),
-                any(), any(), any(), any(), any(), any(), any())).thenReturn(makeCluster("restored"));
+                any(), any(), any(), any(), any(), any(), isNull(), any())).thenReturn(makeCluster("restored"));
         when(service.restoreDbClusterToPointInTime(any(), any(), any(), any(), any(), any(),
-                any(), any(), any(), any(), any(), any(), any())).thenReturn(makeCluster("restored"));
+                any(), any(), any(), any(), any(), any(), isNull(), any())).thenReturn(makeCluster("restored"));
         for (String invalid : List.of("yes", "", "not-a-boolean")) {
             MultivaluedMap<String, String> p = params();
             p.putSingle("DBInstanceIdentifier", "restored");
@@ -2603,10 +2637,10 @@ class RdsQueryHandlerTest {
         Boolean enabled = value == null ? null : Boolean.parseBoolean(value);
         when(service.restoreDbClusterFromSnapshot(eq("restored"), eq("snapshot"), eq("aurora-postgresql"),
                 isNull(), isNull(), isNull(), isNull(), isNull(), isNull(), eq(enabled), isNull(),
-                eq(Map.of()), isNull())).thenReturn(makeCluster("restored"));
+                eq(Map.of()), isNull(), isNull())).thenReturn(makeCluster("restored"));
         when(service.restoreDbClusterToPointInTime(eq("restored"), eq("source"), isNull(), isNull(),
                 isNull(), eq(true), isNull(), isNull(), isNull(), eq(enabled), isNull(),
-                eq(Map.of()), isNull())).thenReturn(makeCluster("restored"));
+                eq(Map.of()), isNull(), isNull())).thenReturn(makeCluster("restored"));
         MultivaluedMap<String, String> p = params();
         p.putSingle("DBClusterIdentifier", "restored");
         p.putSingle("SnapshotIdentifier", "snapshot");
@@ -2617,12 +2651,12 @@ class RdsQueryHandlerTest {
 
         assertEquals(200, handler.handle("RestoreDBClusterFromSnapshot", p).getStatus());
         verify(service).restoreDbClusterFromSnapshot("restored", "snapshot", "aurora-postgresql",
-                null, null, null, null, null, null, enabled, null, Map.of(), null);
+                null, null, null, null, null, null, enabled, null, Map.of(), null, null);
         p.putSingle("SourceDBClusterIdentifier", "source");
         p.putSingle("UseLatestRestorableTime", "true");
         assertEquals(200, handler.handle("RestoreDBClusterToPointInTime", p).getStatus());
         verify(service).restoreDbClusterToPointInTime("restored", "source", null, null, null, true,
-                null, null, null, enabled, null, Map.of(), null);
+                null, null, null, enabled, null, Map.of(), null, null);
     }
 
     @Test

@@ -51,12 +51,13 @@ public class RdsCfnProvisioner implements CfnResourceProvisioner {
     private static final ObjectMapper MAPPER = new ObjectMapper();
 
     /**
-     * The createOnlyProperties of {@code AWS::RDS::DBCluster} that nothing on the cluster on file
-     * records. {@code DBClusterIdentifier} is the physical id, {@code EngineMode},
-     * {@code StorageEncrypted} and {@code DatabaseName} are fields of the cluster, but Floci does not
-     * emulate a KMS key, public access, a subnet group placement chosen by the template or a
-     * restore source on a cluster, so a change to one of these can only be seen against what the
-     * template said last time. The values the last successful provision resolved are kept on the
+     * The createOnlyProperties of {@code AWS::RDS::DBCluster} that cannot be checked against the
+     * cluster on file. {@code DBClusterIdentifier} is the physical id, {@code EngineMode},
+     * {@code StorageEncrypted} and {@code DatabaseName} are fields of the cluster. The cluster keeps its
+     * KMS key as an ARN while a template may name the key by id or alias, and Floci does not emulate
+     * public access, a subnet group placement chosen by the template or a restore source on a
+     * cluster, so a change to one of these can only be seen against what the template said last
+     * time. The values the last successful provision resolved are kept on the
      * resource under {@link #DB_CLUSTER_CREATE_ONLY_ATTR}, which is how CloudFormation decides too:
      * on the template's change, not on the live entity.
      */
@@ -472,7 +473,7 @@ public class RdsCfnProvisioner implements CfnResourceProvisioner {
             cluster = rdsService.createDbCluster(id, engineName, engineVersion, masterUsername,
                     masterPassword, databaseName, iamEnabled, parameterGroup, null, null, false, region,
                     serverlessV2MinCapacity, serverlessV2MaxCapacity, serverlessV2SecondsUntilAutoPause,
-                    false, null, engineMode, storageEncrypted);
+                    false, null, engineMode, storageEncrypted, null, resolveOptional(props, "KmsKeyId", engine));
         }
         cluster = reconcileClusterRoles(r, cluster, roles, created, ctx.isUpdate(), region);
         // EnableHttpEndpoint updates with no interruption; a template that leaves it out wants it off.

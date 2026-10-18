@@ -88,6 +88,65 @@ class CloudFormationRdsIntegrationTest {
     }
 
     @Test
+    void aDbClusterWhoseKmsKeyDoesNotExistFailsBeforeTheClusterIsCreated() {
+        // Refused before a container is started, so this stays Docker-free too.
+        String suffix = Long.toString(System.nanoTime(), 36);
+        String clusterId = "cfn-kms-cluster-" + suffix;
+        String stackName = "cfn-kms-stack-" + suffix;
+        String template = """
+                {
+                  "Resources": {
+                    "Cluster": {
+                      "Type": "AWS::RDS::DBCluster",
+                      "Properties": {
+                        "DBClusterIdentifier": "%s",
+                        "Engine": "aurora-postgresql",
+                        "MasterUsername": "admin",
+                        "MasterUserPassword": "test-password-123",
+                        "StorageEncrypted": true,
+                        "KmsKeyId": "alias/cfn-missing-%s"
+                      }
+                    }
+                  }
+                }
+                """.formatted(clusterId, suffix);
+
+        given()
+            .contentType("application/x-www-form-urlencoded")
+            .header("Authorization", CFN_AUTH)
+            .formParam("Action", "CreateStack")
+            .formParam("StackName", stackName)
+            .formParam("TemplateBody", template)
+        .when()
+            .post("/")
+        .then()
+            .statusCode(200);
+
+        CfnStackWaits.StackState state = CfnStackWaits.awaitTerminal(stackName, CFN_AUTH);
+        assertEquals("ROLLBACK_COMPLETE", state.status(), state.reason());
+        given()
+            .contentType("application/x-www-form-urlencoded")
+            .header("Authorization", CFN_AUTH)
+            .formParam("Action", "DescribeStackEvents")
+            .formParam("StackName", stackName)
+        .when()
+            .post("/")
+        .then()
+            .statusCode(200)
+            .body(containsString("does not exist, is not enabled or you do not have permissions to access it"));
+        given()
+            .contentType("application/x-www-form-urlencoded")
+            .header("Authorization", RDS_AUTH)
+            .formParam("Action", "DescribeDBClusters")
+            .formParam("DBClusterIdentifier", clusterId)
+        .when()
+            .post("/")
+        .then()
+            .statusCode(404)
+            .body(containsString("DBClusterNotFoundFault"));
+    }
+
+    @Test
     void updateStackReconcilesExistingDbSubnetGroupInsteadOfFailing() {
         // Regression for lex00/floci#16: provision() re-runs on every UpdateStack for every resource
         // regardless of whether its properties changed, so a fixed-name DBSubnetGroup left unchanged
