@@ -2,6 +2,10 @@ package io.github.hectorvent.floci.services.elasticache.proxy;
 
 import org.jboss.logging.Logger;
 
+import javax.net.ssl.SSLContext;
+import javax.net.ssl.SSLSocket;
+
+import java.io.ByteArrayInputStream;
 import java.io.IOException;
 import java.io.InputStream;
 import java.io.OutputStream;
@@ -27,6 +31,8 @@ import java.util.concurrent.CountDownLatch;
 public abstract class AbstractRedisAuthProxy {
     private static final int HANDSHAKE_TIMEOUT_MILLIS = 10_000;
     private static final long RELAY_JOIN_TIMEOUT_MILLIS = 1_000;
+    /** The first byte of a TLS handshake record; a Redis command starts with '*'. */
+    private static final int TLS_HANDSHAKE_RECORD = 0x16;
 
     private static final byte[] OK_RESPONSE = "+OK\r\n".getBytes(StandardCharsets.UTF_8);
     private static final byte[] NOAUTH_RESPONSE =
@@ -64,6 +70,7 @@ public abstract class AbstractRedisAuthProxy {
     private final Set<Socket> handshakingClients = ConcurrentHashMap.newKeySet();
 
     private volatile boolean running;
+    private volatile SSLContext tls;
     private ServerSocket serverSocket;
 
     protected AbstractRedisAuthProxy(Logger log, String serviceName, String threadPrefix,
@@ -136,10 +143,37 @@ public abstract class AbstractRedisAuthProxy {
         }
     }
 
-    private void handleConnection(Socket client) {
+    /**
+     * Serves TLS as well as plain text on the proxy's port: a client whose first byte is a TLS handshake record
+     * is handshaken with {@code context}, any other is served the plain Redis protocol. Call before {@link #start}.
+     */
+    public void serveTls(SSLContext context) {
+        this.tls = context;
+    }
+
+    private void handleConnection(Socket raw) {
+        Socket client = raw;
         try {
-            client.setTcpNoDelay(true);
-            client.setSoTimeout(handshakeTimeoutMillis);
+            raw.setTcpNoDelay(true);
+            raw.setSoTimeout(handshakeTimeoutMillis);
+            if (tls != null) {
+                int first = raw.getInputStream().read();
+                if (first < 0) {
+                    closeQuietly(raw);
+                    return;
+                }
+                if (first == TLS_HANDSHAKE_RECORD) {
+                    SSLSocket secure = (SSLSocket) tls.getSocketFactory()
+                            .createSocket(raw, new ByteArrayInputStream(new byte[] {(byte) first}), true);
+                    secure.setUseClientMode(false);
+                    secure.startHandshake();
+                    client = secure;
+                } else {
+                    client = new PrefixedSocket(raw, (byte) first);
+                }
+                handshakingClients.remove(raw);
+                handshakingClients.add(client);
+            }
             RespReader reader = new RespReader(client.getInputStream());
             while (true) {
                 String[] cmd = reader.readCommand();
@@ -177,6 +211,7 @@ public abstract class AbstractRedisAuthProxy {
             closeQuietly(client);
         } finally {
             handshakingClients.remove(client);
+            handshakingClients.remove(raw);
         }
     }
 

@@ -496,6 +496,7 @@ floci:
       proxy-max-port: 6399
       default-image: "valkey/valkey:8"
       default-memcached-image: "memcached:1.6"
+      tls-suffixes: ${FLOCI_SERVICES_ELASTICACHE_TLS_SUFFIXES:auto}
     memorydb:
       enabled: true
       mock: false

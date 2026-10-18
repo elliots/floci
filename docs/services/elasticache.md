@@ -72,7 +72,9 @@ users, user groups, replication groups, member clusters, standalone clusters, se
 caches, subnet groups, and parameter groups. Replication-group tag changes propagate to
 member clusters. User-group listing supports `MaxRecords` and `Marker`.
 
-Local serverless caches have fixed capacity and plaintext TCP endpoints. Usage limits, subnet and
+Local serverless caches have fixed capacity. Valkey and Redis serverless endpoints accept both
+plaintext and TLS connections (see [Local TLS connections](#local-tls-connections)), and Memcached
+endpoints accept plaintext only. Usage limits, subnet and
 security-group placement, KMS encryption and snapshot schedules are metadata; they do not enable
 autoscaling, VPC networking, encryption or snapshot storage. Snapshot restore and final snapshots
 are rejected explicitly. Engine/version transitions are rejected; supported major versions are
@@ -271,6 +273,7 @@ provisioning its container is refused too.
 | `FLOCI_SERVICES_ELASTICACHE_PROXY_BASE_PORT` | `6379` | First host port in the ElastiCache proxy range |
 | `FLOCI_SERVICES_ELASTICACHE_PROXY_MAX_PORT` | `6399` | Last host port in the ElastiCache proxy range |
 | `FLOCI_SERVICES_ELASTICACHE_DEFAULT_IMAGE` | `valkey/valkey:8` | Docker image for Redis/Valkey containers |
+| `FLOCI_SERVICES_ELASTICACHE_TLS_SUFFIXES` | `auto` | Comma-separated domains whose names the Redis and Valkey proxies issue TLS certificates for; see [Local TLS connections](#local-tls-connections) |
 
 ### Docker Compose
 
@@ -334,3 +337,19 @@ aws elasticache create-user \
   --no-no-password-required \
   --endpoint-url $AWS_ENDPOINT_URL
 ```
+
+## Local TLS connections
+
+Redis and Valkey proxies accept both plaintext Redis and TLS connections on their published
+ports. Certificates are signed by Floci's local CA. Trust that CA in your client before
+using `rediss://` with hostname verification.
+
+`FLOCI_SERVICES_ELASTICACHE_TLS_SUFFIXES` is a comma-separated list of domains for which
+the proxy can issue certificates using SNI. Its default, `auto`, derives cache domains
+from the AWS partition catalogue. Explicit domain lists replace this automatic list.
+
+For clients that do not send SNI, set the replication group tag `floci:tls-hostnames`
+to a comma-separated list of endpoint names, on `CreateReplicationGroup` or later with
+`AddTagsToResource`. The certificate that the group's proxies, including every node of a
+cluster-mode group, give such clients then also covers those names. Tag changes apply to
+subsequent handshakes, and persisted tags are restored when Floci restarts.
