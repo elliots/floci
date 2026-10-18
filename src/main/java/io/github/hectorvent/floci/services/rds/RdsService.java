@@ -930,6 +930,12 @@ public class RdsService implements Resettable, ResourceProvider {
                     } catch (RuntimeException rollbackFailure) {
                         e.addSuppressed(rollbackFailure);
                     }
+                    releaseProxyPort(proxyPort);
+                    if (publicationCluster == null) {
+                        // A member uses its cluster's container; a standalone instance's was started here.
+                        discardStartedBackend(buildHandle(instance), resolvedInstanceStorageResourceId(instance),
+                                resolvedInstanceDockerVolumeName(instance), e);
+                    }
                     throw e;
                 }
             }
@@ -4355,7 +4361,7 @@ public class RdsService implements Resettable, ResourceProvider {
         }
     }
 
-    private void stopStartedBackend(RdsContainerHandle started, RuntimeException proxyFailure) {
+    private void stopStartedBackend(RdsContainerHandle started, Throwable proxyFailure) {
         if (started == null) {
             return;
         }
@@ -4365,6 +4371,22 @@ public class RdsService implements Resettable, ResourceProvider {
             proxyFailure.addSuppressed(stopFailure);
             LOG.warnv(stopFailure, "Failed to stop container {0} after its auth proxy did not start",
                     started.getContainerId());
+        }
+    }
+
+    /**
+     * Removes the container and storage that a create started for a resource it does not keep,
+     * because the resource's auth proxy did not start, so that a retry does not leak them.
+     */
+    private void discardStartedBackend(RdsContainerHandle started, String storageResourceId,
+                                       String dockerVolumeName, Throwable proxyFailure) {
+        stopStartedBackend(started, proxyFailure);
+        try {
+            containerManager.removeVolume(started.getRuntimeId(), storageResourceId, dockerVolumeName);
+        } catch (RuntimeException | Error removeFailure) {
+            proxyFailure.addSuppressed(removeFailure);
+            LOG.warnv(removeFailure, "Failed to remove the storage of {0} after its auth proxy did not start",
+                    started.getRuntimeId());
         }
     }
 
@@ -4706,16 +4728,22 @@ public class RdsService implements Resettable, ResourceProvider {
                 String effectiveMasterUser = masterUsername != null ? masterUsername : "root";
                 final String accountId = accountIdFromArn(cluster.getDbClusterArn());
                 final String clusterRegion = regionFromArn(cluster.getDbClusterArn());
-                proxyManager.startProxy(rdsResourceRelayKey(cluster.getDbClusterArn(), id),
-                    cluster.getDbClusterArn(),
-                        engine, iamEnabled, proxyPort,
-                        cluster.getContainerHost(), cluster.getContainerPort(),
-                        cluster.getEndpoint().address(),
-                        effectiveMasterUser, masterPassword, databaseName,
-                        (user, pw) -> validateDbClusterPasswordForScope(
-                                accountId, clusterRegion, id, user, pw),
-                        clusterProxyBinding(cluster, cluster.getEndpoint().address(), cluster.getEndpoint().port(),
-                                clusterRegion, accountId));
+                try {
+                    proxyManager.startProxy(rdsResourceRelayKey(cluster.getDbClusterArn(), id),
+                            cluster.getDbClusterArn(), engine, iamEnabled, proxyPort,
+                            cluster.getContainerHost(), cluster.getContainerPort(),
+                            cluster.getEndpoint().address(),
+                            effectiveMasterUser, masterPassword, databaseName,
+                            (user, pw) -> validateDbClusterPasswordForScope(
+                                    accountId, clusterRegion, id, user, pw),
+                            clusterProxyBinding(cluster, cluster.getEndpoint().address(),
+                                    cluster.getEndpoint().port(), clusterRegion, accountId));
+                } catch (RuntimeException e) {
+                    releaseProxyPort(proxyPort);
+                    discardStartedBackend(buildClusterHandle(cluster), resolvedClusterStorageResourceId(cluster),
+                            resolvedClusterDockerVolumeName(cluster), e);
+                    throw e;
+                }
             }
 
             cluster.setServerlessV2MinCapacity(serverlessV2MinCapacity);
