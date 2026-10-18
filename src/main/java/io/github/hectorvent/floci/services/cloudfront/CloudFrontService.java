@@ -7,6 +7,8 @@ import io.github.hectorvent.floci.core.common.AwsException;
 import io.github.hectorvent.floci.core.common.CloudFrontEdgeDomain;
 import io.github.hectorvent.floci.core.common.RegionResolver;
 import io.github.hectorvent.floci.core.common.dns.EmbeddedDnsServer;
+import io.github.hectorvent.floci.core.storage.AccountAwareStorageBackend;
+import io.github.hectorvent.floci.core.storage.AccountAwareStorageBackend.AccountEntry;
 import io.github.hectorvent.floci.core.storage.StorageBackend;
 import io.github.hectorvent.floci.core.storage.StorageFactory;
 import io.github.hectorvent.floci.services.cloudfront.model.CacheBehavior;
@@ -416,11 +418,33 @@ public class CloudFrontService implements ServerCertificateReferenceProvider {
      * case-insensitive. Returns {@code null} when nothing matches.
      */
     public Distribution findByHost(String host) {
+        AccountEntry<Distribution> entry = findEntryByHost(host);
+        return entry == null ? null : entry.value();
+    }
+
+    /**
+     * {@link #findByHost} over every account, with the account that owns the match. A request to a
+     * distribution's host carries no credential, so it names no account of its own.
+     */
+    public AccountEntry<Distribution> findEntryByHost(String host) {
+        List<AccountEntry<Distribution>> entries = allAccountDistributions();
+        Distribution found = matchHost(host, entries.stream().map(AccountEntry::value).toList());
+        return entries.stream().filter(e -> e.value() == found).findFirst().orElse(null);
+    }
+
+    private List<AccountEntry<Distribution>> allAccountDistributions() {
+        if (distStore instanceof AccountAwareStorageBackend<Distribution> aware) {
+            return aware.scanAllAccountEntries(k -> true);
+        }
+        return distStore.scan(k -> true).stream()
+                .map(d -> new AccountEntry<>(accountId, d.getId(), d)).toList();
+    }
+
+    private Distribution matchHost(String host, List<Distribution> distributions) {
         if (host == null || host.isBlank()) {
             return null;
         }
         String hostname = stripPort(host);
-        List<Distribution> distributions = distStore.scan(k -> true);
         for (Distribution dist : distributions) {
             if (hostname.equalsIgnoreCase(dist.getDomainName())) {
                 return dist;
@@ -498,7 +522,9 @@ public class CloudFrontService implements ServerCertificateReferenceProvider {
             if (requested == null || requested.isBlank()) {
                 continue;
             }
-            for (Distribution existing : distStore.scan(k -> true)) {
+            // An alternate domain name is unique across every account, as in AWS.
+            for (AccountEntry<Distribution> entry : allAccountDistributions()) {
+                Distribution existing = entry.value();
                 if (existing.getId().equals(currentDistributionId) || existing.getConfig() == null
                         || existing.getConfig().getAliases() == null) {
                     continue;
