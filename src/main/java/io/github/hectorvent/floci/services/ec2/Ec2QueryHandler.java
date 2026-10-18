@@ -177,6 +177,7 @@ public class Ec2QueryHandler {
                 case "AssociateVpcCidrBlock" -> handleAssociateVpcCidrBlock(params, region);
                 case "DisassociateVpcCidrBlock" -> handleDisassociateVpcCidrBlock(params, region);
                 // Subnets
+                case "CreateDefaultSubnet" -> handleCreateDefaultSubnet(params, region);
                 case "CreateSubnet" -> handleCreateSubnet(params, region);
                 case "DescribeSubnets" -> handleDescribeSubnets(params, region);
                 case "DeleteSubnet" -> handleDeleteSubnet(params, region);
@@ -3160,6 +3161,20 @@ public class Ec2QueryHandler {
     }
 
     // ─── Subnet handlers ──────────────────────────────────────────────────────
+
+    private Response handleCreateDefaultSubnet(MultivaluedMap<String, String> p, String region) {
+        checkDryRun(p);
+        if (Boolean.parseBoolean(p.getFirst("Ipv6Native"))) {
+            throw new AwsException("UnsupportedOperation", "IPv6-only default subnets are not supported.", 400);
+        }
+        Subnet subnet = service.createDefaultSubnet(region, p.getFirst("AvailabilityZone"),
+                p.getFirst("AvailabilityZoneId"));
+        XmlBuilder xml = new XmlBuilder().start("CreateDefaultSubnetResponse", AwsNamespaces.EC2)
+                .elem("requestId", UUID.randomUUID().toString())
+                .start("subnet").raw(subnetXml(subnet)).end("subnet")
+                .end("CreateDefaultSubnetResponse");
+        return xmlResponse(xml.build());
+    }
 
     private Response handleCreateSubnet(MultivaluedMap<String, String> p, String region) {
         String vpcId = p.getFirst("VpcId");
