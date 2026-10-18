@@ -934,7 +934,8 @@ class ElastiCacheServiceTest {
 
         verify(clusterFormation).form(eq("grp"), any(), eq(2));
         verify(containerManager, times(4)).start(anyString(), anyString(), any(), any());
-        verify(proxyManager, times(4)).startProxy(anyString(), any(), anyInt(), anyString(), anyInt(), any());
+        verify(proxyManager, times(4)).startNodeProxy(anyString(), eq("grp"), any(), anyInt(), anyString(), anyInt(),
+                any());
     }
 
     @Test
@@ -981,7 +982,8 @@ class ElastiCacheServiceTest {
                 () -> service.createReplicationGroup(clusterRequest("grp", 2, 1)));
 
         verify(containerManager, times(4)).stop(any());
-        verify(proxyManager, never()).startProxy(anyString(), any(), anyInt(), anyString(), anyInt(), any());
+        verify(proxyManager, never()).startNodeProxy(anyString(), anyString(), any(), anyInt(), anyString(), anyInt(),
+                any());
 
         ReplicationGroup recovered =
                 service.createReplicationGroup("grp2", "test", AuthMode.PASSWORD, null, "us-east-1");
@@ -1446,6 +1448,67 @@ class ElastiCacheServiceTest {
     }
 
     @Test
+    void restorePublishesTheTlsHostnamesTagOfEachGroup() {
+        StorageFactory storageFactory = sharedStorageFactory();
+        ElastiCacheContainerManager beforeRestart = mock(ElastiCacheContainerManager.class);
+        stubSingleNodeContainer(beforeRestart);
+        serviceWith(storageFactory, beforeRestart, mock(ElastiCacheProxyManager.class),
+                mock(ValkeyClusterFormation.class))
+                .createReplicationGroup("grp", "test", AuthMode.NO_AUTH, null, "us-east-1",
+                        ReplicationGroupSettings.defaults(),
+                        Map.of(ElastiCacheService.TLS_HOSTNAMES_TAG, "master.app.example"));
+
+        ElastiCacheContainerManager restartedContainers = mock(ElastiCacheContainerManager.class);
+        stubSingleNodeContainer(restartedContainers);
+        ElastiCacheProxyManager restartedProxies = mock(ElastiCacheProxyManager.class);
+        serviceWith(storageFactory, restartedContainers, restartedProxies, mock(ValkeyClusterFormation.class))
+                .restorePersistedRuntime().join();
+
+        verify(restartedProxies).setTlsHostnames("grp", Set.of("master.app.example"));
+    }
+
+    @Test
+    void tlsHostnamesTagIsReadAsCommaOrWhitespaceSeparatedDnsNames() {
+        assertEquals(Set.of("master.app.example", "replica.app.example", "reader.app.example"),
+                ElastiCacheService.tlsHostnames(Map.of(ElastiCacheService.TLS_HOSTNAMES_TAG,
+                        " Master.App.Example,replica.app.example \treader.app.example,,https://bad.example:6379 -bad")));
+        assertTrue(ElastiCacheService.tlsHostnames(Map.of("Name", "grp")).isEmpty());
+        assertTrue(ElastiCacheService.tlsHostnames(null).isEmpty());
+    }
+
+    @Test
+    void tlsHostnamesTagIsPublishedOnCreateAndTagChangesAndClearedOnDelete() {
+        ReplicationGroup group = service.createReplicationGroup("grp", "test", AuthMode.NO_AUTH, null,
+                "us-east-1", ReplicationGroupSettings.defaults(),
+                Map.of(ElastiCacheService.TLS_HOSTNAMES_TAG, "master.app.example"));
+        verify(proxyManager).setTlsHostnames("grp", Set.of("master.app.example"));
+
+        service.addTagsToResource(group.getArn(), Map.of(ElastiCacheService.TLS_HOSTNAMES_TAG,
+                "master.app.example replica.app.example"), "us-east-1");
+        verify(proxyManager).setTlsHostnames("grp", Set.of("master.app.example", "replica.app.example"));
+        service.removeTagsFromResource(group.getArn(), List.of(ElastiCacheService.TLS_HOSTNAMES_TAG), "us-east-1");
+        verify(proxyManager).setTlsHostnames("grp", Set.of());
+
+        service.deleteReplicationGroup("grp");
+        verify(proxyManager, times(2)).setTlsHostnames("grp", Set.of());
+    }
+
+    @Test
+    void clusterModeGroupPublishesItsTlsHostnamesTagForItsNodeProxies() {
+        stubPerNodeContainers();
+
+        service.createReplicationGroup(new ElastiCacheService.CreateReplicationGroupRequest("grp", "test",
+                AuthMode.NO_AUTH, null, "us-east-1", "valkey", "8.2", "cache.t4g.micro",
+                "default.valkey8.cluster.on", null, null, 1, 1, null, true, null, null,
+                ReplicationGroupSettings.defaults(),
+                Map.of(ElastiCacheService.TLS_HOSTNAMES_TAG, "clustercfg.app.example"), null, null));
+
+        verify(proxyManager).setTlsHostnames("grp", Set.of("clustercfg.app.example"));
+        verify(proxyManager, times(2)).startNodeProxy(anyString(), eq("grp"), any(), anyInt(), anyString(),
+                anyInt(), any());
+    }
+
+    @Test
     void restorePersistedRuntimeSkipsGroupsBeingDeleted() {
         StorageFactory storageFactory = storageWithSingleNodeGroup("grp");
         ElastiCacheContainerManager beforeRestart = mock(ElastiCacheContainerManager.class);
@@ -1486,7 +1549,8 @@ class ElastiCacheServiceTest {
 
         verify(restartedContainers, times(4)).start(anyString(), anyString(), any(), any());
         verify(restartedFormation).form(eq("grp"), any(), eq(2));
-        verify(restartedProxies, times(4)).startProxy(anyString(), any(), anyInt(), anyString(), anyInt(), any());
+        verify(restartedProxies, times(4)).startNodeProxy(anyString(), eq("grp"), any(), anyInt(), anyString(),
+                anyInt(), any());
         ReplicationGroup restored = restarted.getReplicationGroup("grp");
         assertEquals(ReplicationGroupStatus.AVAILABLE, restored.getStatus());
         assertEquals(16379, restored.getConfigurationEndpoint().port());
@@ -1522,7 +1586,8 @@ class ElastiCacheServiceTest {
         assertEquals(ReplicationGroupStatus.CREATE_FAILED, failed.getStatus());
         assertNull(failed.getConfigurationEndpoint(),
                 "A group whose data plane is gone must not advertise an endpoint");
-        verify(restartedProxies, never()).startProxy(anyString(), any(), anyInt(), anyString(), anyInt(), any());
+        verify(restartedProxies, never()).startNodeProxy(anyString(), anyString(), any(), anyInt(), anyString(),
+                anyInt(), any());
 
         ReplicationGroup next =
                 restarted.createReplicationGroup("grp2", "test", AuthMode.NO_AUTH, null, "us-east-1");

@@ -69,7 +69,14 @@ import java.util.regex.Pattern;
 @ApplicationScoped
 public class ElastiCacheService implements ResourceProvider {
 
+    /**
+     * The tag that names the hostnames a replication group's proxy answers to, besides the one Floci reports
+     * (comma-separated): the addresses a client takes from its own configuration, such as a real endpoint's name.
+     */
+    public static final String TLS_HOSTNAMES_TAG = "floci:tls-hostnames";
+
     private static final Logger LOG = Logger.getLogger(ElastiCacheService.class);
+    private static final Pattern HOSTNAME = Pattern.compile("[a-z0-9](?:[a-z0-9.-]*[a-z0-9])?");
 
     private final AccountAwareStorageBackend<ReplicationGroup> groups;
     private final AccountAwareStorageBackend<CacheCluster> cacheClusters;
@@ -387,6 +394,7 @@ public class ElastiCacheService implements ResourceProvider {
                 }
                 // Under the same monitor as the put, for the reason given on recordsHoldingTheirPort.
                 recordsHoldingTheirPort.add(recordKey(groups.accountId(), groupId));
+                proxyManager.setTlsHostnames(groupId, tlsHostnames(group.getTags()));
             }
 
             LOG.infov("Replication group {0} created, endpoint={1}:{2}", groupId, endpointHost, String.valueOf(proxyPort));
@@ -455,7 +463,7 @@ public class ElastiCacheService implements ResourceProvider {
             for (int i = 0; i < nodes.size(); i++) {
                 ClusterNode node = nodes.get(i);
                 ElastiCacheContainerHandle handle = handles.get(i);
-                proxyManager.startProxy(node.getMemberClusterId(), authMode, node.getProxyPort(),
+                proxyManager.startNodeProxy(node.getMemberClusterId(), groupId, authMode, node.getProxyPort(),
                         handle.getHost(), handle.getPort(),
                         groupAuthenticator(groups.accountId(), groupId));
                 startedProxyKeys.add(node.getMemberClusterId());
@@ -477,6 +485,7 @@ public class ElastiCacheService implements ResourceProvider {
             applyCommonAttributes(group, request, resolvedSettings);
 
             groups.put(groupId, group);
+            proxyManager.setTlsHostnames(groupId, tlsHostnames(group.getTags()));
             LOG.infov("Cluster-mode replication group {0} created, configuration endpoint={1}:{2}",
                     groupId, endpointHost, String.valueOf(configurationEndpoint.port()));
             return group;
@@ -682,6 +691,7 @@ public class ElastiCacheService implements ResourceProvider {
             if (group.getStatus() == ReplicationGroupStatus.DELETING) {
                 continue;
             }
+            proxyManager.setTlsHostnames(group.getReplicationGroupId(), tlsHostnames(group.getTags()));
             if (group.isClusterEnabled() && !group.getClusterNodes().isEmpty()) {
                 reserveClusterModeGroup(entry, clusterModeToRestore);
             } else {
@@ -1102,8 +1112,8 @@ public class ElastiCacheService implements ResourceProvider {
                 for (int i = 0; i < nodes.size(); i++) {
                     ClusterNode node = nodes.get(i);
                     ElastiCacheContainerHandle handle = handles.get(i);
-                    proxyManager.startProxy(node.getMemberClusterId(), group.getAuthMode(), node.getProxyPort(),
-                            handle.getHost(), handle.getPort(),
+                    proxyManager.startNodeProxy(node.getMemberClusterId(), groupId, group.getAuthMode(),
+                            node.getProxyPort(), handle.getHost(), handle.getPort(),
                             groupAuthenticator(accountId, groupId));
                     startedProxyKeys.add(node.getMemberClusterId());
                 }
@@ -1236,6 +1246,7 @@ public class ElastiCacheService implements ResourceProvider {
                 }
             }
             groups.delete(groupId);
+            proxyManager.setTlsHostnames(groupId, Set.of());
             LOG.infov("Replication group {0} deleted", groupId);
         }
     }
@@ -1859,6 +1870,20 @@ public class ElastiCacheService implements ResourceProvider {
                 "KMS key does not exist with key id: " + kmsKeyId, 400);
     }
 
+    static Set<String> tlsHostnames(Map<String, String> tags) {
+        Set<String> names = new LinkedHashSet<>();
+        if (tags == null) {
+            return names;
+        }
+        for (String name : tags.getOrDefault(TLS_HOSTNAMES_TAG, "").split("[,\\s]+")) {
+            String n = name.toLowerCase(Locale.ROOT);
+            if (HOSTNAME.matcher(n).matches()) {
+                names.add(n);
+            }
+        }
+        return names;
+    }
+
     public ElastiCacheUser createUser(String userId, String userName, AuthMode authMode,
                                       List<String> passwords, String accessString, String engine) {
         return createUser(userId, userName, authMode, passwords, accessString, engine, Map.of());
@@ -1962,6 +1987,7 @@ public class ElastiCacheService implements ResourceProvider {
             requireResourceArn(group.getArn(), ref.resourceArn(), "ReplicationGroupNotFoundFault", ref.id());
             group.getTags().putAll(tags);
             groups.put(ref.id(), group);
+            proxyManager.setTlsHostnames(ref.id(), tlsHostnames(group.getTags()));
             return new LinkedHashMap<>(group.getTags());
         }
     }
@@ -1972,6 +1998,7 @@ public class ElastiCacheService implements ResourceProvider {
             requireResourceArn(group.getArn(), ref.resourceArn(), "ReplicationGroupNotFoundFault", ref.id());
             tagKeys.forEach(group.getTags()::remove);
             groups.put(ref.id(), group);
+            proxyManager.setTlsHostnames(ref.id(), tlsHostnames(group.getTags()));
             return new LinkedHashMap<>(group.getTags());
         }
     }
