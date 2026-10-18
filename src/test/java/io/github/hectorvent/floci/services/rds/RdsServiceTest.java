@@ -1094,7 +1094,7 @@ class RdsServiceTest {
 
     @Test
     void createDbInstanceRemovesVisibleRecordWhenProxyStartupFails() {
-        doThrow(new IllegalStateException("proxy down"))
+        doThrow(new IllegalStateException("proxy down")).doNothing()
                 .when(proxyManager).startProxy(any(), any(), anyBoolean(), anyInt(), any(), anyInt(),
                         any(), any(), any(), any(), any(), any());
 
@@ -1103,6 +1103,30 @@ class RdsServiceTest {
                 "admin", "secret123", null, "db.t3.micro",
                 20, false, null, null, null, null, false));
         assertThrows(AwsException.class, () -> rdsService.getDbInstance("mypostgres"));
+
+        // The container started for it is removed with its storage, and the port is free again.
+        verify(containerManager).stop(any());
+        verify(containerManager).removeVolume(eq("arn:aws:rds:us-east-1:123456789012:db:mypostgres"), any(), any());
+        assertEquals(7000, rdsService.createDbInstance("retried", "postgres", "13",
+                "admin", "secret123", null, "db.t3.micro",
+                20, false, null, null, null, null, false).getProxyPort());
+    }
+
+    @Test
+    void createDbClusterReleasesItsPortAndContainerWhenProxyStartupFails() {
+        doThrow(new IllegalStateException("proxy down")).doNothing()
+                .when(proxyManager).startProxy(any(), any(), anyBoolean(), anyInt(), any(), anyInt(),
+                        any(), any(), any(), any(), any(), any());
+
+        assertThrows(IllegalStateException.class, () -> rdsService.createDbCluster("failed-cluster",
+                "aurora-postgresql", "16.3", "admin", "password", "appdb", false, null));
+        assertThrows(AwsException.class, () -> rdsService.getDbCluster("failed-cluster"));
+
+        verify(containerManager).stop(any());
+        verify(containerManager).removeVolume(
+                eq("arn:aws:rds:us-east-1:123456789012:cluster:failed-cluster"), any(), any());
+        assertEquals(7000, rdsService.createDbCluster("retried-cluster", "aurora-postgresql", "16.3",
+                "admin", "password", "appdb", false, null).getProxyPort());
     }
 
     @Test
