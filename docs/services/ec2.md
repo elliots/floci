@@ -260,9 +260,16 @@ private gateway lifecycles are not modelled.
 | Action | Description |
 |--------|-------------|
 | CreateSubnet | Creates a subnet in a VPC. |
+| CreateDefaultSubnet | Creates an available /20 subnet in the default VPC for an AZ name or ID, with public IP mapping and `DefaultForAz=true`. |
 | DescribeSubnets | Lists or returns stored subnets. |
 | DeleteSubnet | Deletes a subnet from the local EC2 store. Fails with `DependencyViolation` while the subnet still has a transit gateway attachment, an Elastic Load Balancing v2 load balancer, or anything holding a network interface in it: an instance that is not terminated, a NAT gateway that is not deleted or failed, a standalone network interface, or an interface endpoint. |
 | ModifySubnetAttribute | Updates supported subnet attributes. |
+
+`CreateDefaultSubnet` rejects an existing default subnet with
+`DefaultSubnetAlreadyExistsInAvailabilityZone`, and a deleted default VPC with
+`DefaultVpcNotFound`. It supports `DryRun`. IPv6-only default subnets are not implemented.
+The existing `CreateDefaultVpc` operation remains available; it returns an existing default
+VPC when present, and its replacement path does not recreate all AWS default VPC components.
 
 ### Security Groups
 

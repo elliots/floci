@@ -18,7 +18,6 @@ import io.github.hectorvent.floci.services.ec2.model.Image;
 import io.github.hectorvent.floci.services.ec2.model.Instance;
 import io.github.hectorvent.floci.services.ec2.model.InstanceState;
 import io.github.hectorvent.floci.services.ec2.model.IpPermission;
-import io.github.hectorvent.floci.services.ec2.model.IpPermission;
 import io.github.hectorvent.floci.services.ec2.model.IpRange;
 import io.github.hectorvent.floci.services.ec2.model.Ipv6Range;
 import io.github.hectorvent.floci.services.ec2.model.KeyPair;
@@ -37,7 +36,6 @@ import io.github.hectorvent.floci.services.ec2.model.PrefixListEntry;
 import io.github.hectorvent.floci.services.ec2.model.PrefixListId;
 import io.github.hectorvent.floci.services.ec2.model.Reservation;
 import io.github.hectorvent.floci.services.ec2.model.SecurityGroup;
-import io.github.hectorvent.floci.services.ec2.model.SecurityGroupRule;
 import io.github.hectorvent.floci.services.ec2.model.SecurityGroupRule;
 import io.github.hectorvent.floci.services.ec2.model.Snapshot;
 import io.github.hectorvent.floci.services.ec2.model.Subnet;
@@ -228,6 +226,43 @@ class Ec2ServiceTest {
         assertEquals(List.of(created.getVpcId()), found.stream().map(Vpc::getVpcId).toList());
         assertTrue(service.describeVpcs("eu-central-1", List.of(), Map.of()).stream().anyMatch(Vpc::isDefault));
         verifyNoInteractions(docker);
+    }
+
+    @Test
+    void createDefaultSubnetUsesFreeSpaceAndRejectsDuplicates() {
+        Ec2Service service = mockModeService();
+        String region = "us-east-1";
+        Subnet prior = service.describeSubnets(region, List.of(), Map.of()).stream()
+                .filter(subnet -> "us-east-1a".equals(subnet.getAvailabilityZone())).findFirst().orElseThrow();
+        service.deleteSubnet(region, prior.getSubnetId());
+        service.createSubnet(region, prior.getVpcId(), "172.31.0.0/24", "us-east-1a");
+        Subnet created = service.createDefaultSubnet(region, "us-east-1a", null);
+        assertTrue(created.isDefaultForAz());
+        assertTrue(created.isMapPublicIpOnLaunch());
+        assertEquals(4091, created.getAvailableIpAddressCount());
+        assertEquals("172.31.48.0/20", created.getCidrBlock());
+        assertEquals(prior.getVpcId(), created.getVpcId());
+        assertEquals("DefaultSubnetAlreadyExistsInAvailabilityZone", assertThrows(AwsException.class,
+                () -> service.createDefaultSubnet(region, null, created.getAvailabilityZoneId())).getErrorCode());
+        assertEquals("InvalidParameterValue", assertThrows(AwsException.class,
+                () -> service.createDefaultSubnet(region, "eu-west-1a", null)).getErrorCode());
+    }
+
+    @Test
+    void createDefaultSubnetDoesNotRecreateDeletedDefaultVpc() {
+        Ec2Service service = mockModeService();
+        String region = "us-east-1";
+        Vpc vpc = service.createDefaultVpc(region);
+        for (Subnet subnet : service.describeSubnets(region, List.of(), Map.of())) {
+            service.deleteSubnet(region, subnet.getSubnetId());
+        }
+        service.describeInternetGateways(region, List.of(), Map.of()).forEach(gateway -> {
+            service.detachInternetGateway(region, gateway.getInternetGatewayId(), vpc.getVpcId());
+            service.deleteInternetGateway(region, gateway.getInternetGatewayId());
+        });
+        service.deleteVpc(region, vpc.getVpcId());
+        assertEquals("DefaultVpcNotFound", assertThrows(AwsException.class,
+                () -> service.createDefaultSubnet(region, "us-east-1a", null)).getErrorCode());
     }
 
     @Test
