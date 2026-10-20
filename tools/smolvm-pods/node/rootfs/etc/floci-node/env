@@ -1,0 +1,44 @@
+# Environment of k3s, and through containerd of the smolvm-pods shim.
+PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin:/opt/k3s/bin:/opt/k3s/bin/aux
+# smolvm keeps VM data under SMOLVM_DATA_DIR, a disk volume. floci-node copies
+# the agent rootfs and libkrun there at boot and puts the disk templates in
+# $SMOLVM_DATA_DIR/.smolvm, so that VM data and templates share one mount.
+SMOLVM_DATA_DIR=/var/lib/smolvm
+SMOLVM_AGENT_ROOTFS=/var/lib/smolvm/runtime/agent-rootfs
+SMOLVM_LIB_DIR=/var/lib/smolvm/runtime/lib
+RUST_LOG=info
+# The memory, in GiB, and the CPUs that kubelet reports for the node. They
+# bound the sum of all pods' requests, awake and asleep, so they are set far
+# above the node's own. Only the wake admission caps below protect the node's
+# real memory. 0, or a value below the node's own, reports the node's own. See
+# node/README.md, "Capacity". floci-node reads them each time it starts k3s.
+FLOCI_NODE_MEMORY_GIB=256
+FLOCI_NODE_CPUS=128
+# The node service's API over TCP, for Floci, as ADDR:PORT; empty for none.
+# Every request needs the bearer token in /etc/floci-node/api-token, which
+# floci-node creates at boot if it is missing. See node/README.md, "The node
+# service's API over TCP". floci-node reads it each time it starts the node
+# service.
+FLOCI_NODE_API_LISTEN=0.0.0.0:7070
+# When an idle VM pod sleeps: after FLOCI_NODE_IDLE_TIMEOUT with no traffic on
+# connections to it, unless its VM used more than FLOCI_NODE_CPU_THRESHOLD
+# vCPUs on average over FLOCI_NODE_CPU_WINDOW. FLOCI_NODE_CPU_THRESHOLD=off
+# (or 0) lets busy pods sleep too. Durations are Go durations such as 30s or
+# 5m. A pod's annotations smolvm-pods.floci.io/idle-timeout, cpu-threshold and
+# cpu-window override them. See node/README.md, "Idle sleep". floci-node reads
+# them each time it starts the node service; empty leaves the node service's
+# own default.
+FLOCI_NODE_IDLE_TIMEOUT=5m
+FLOCI_NODE_CPU_THRESHOLD=0.5
+FLOCI_NODE_CPU_WINDOW=60s
+# Wake admission: a wake is admitted only while fewer than
+# FLOCI_NODE_MAX_AWAKE_PODS pods are creating, awake, pausing or waking, and
+# while their guest RAM with the waking pod's, 1024 MiB for each pod VM, stays
+# within FLOCI_NODE_MAX_AWAKE_MEMORY MiB. A wake that does not fit waits up to
+# FLOCI_NODE_ADMISSION_WAIT, then is refused. An empty or 0 cap is no cap, and
+# with no cap nothing keeps awake pods within the node's real memory. See
+# node/README.md, "Wake admission". floci-node reads them each time it starts
+# the node service; empty leaves the node service's own default.
+FLOCI_NODE_MAX_AWAKE_PODS=
+FLOCI_NODE_MAX_AWAKE_MEMORY=
+FLOCI_NODE_ADMISSION_WAIT=

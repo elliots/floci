@@ -1,0 +1,7 @@
+# The node imports every image it runs and pulls none. Every registry goes
+# to an endpoint that refuses connections, and config.yaml turns off the
+# fallback to the registry itself, so a missing image fails at once.
+mirrors:
+  "*":
+    endpoint:
+      - "http://127.0.0.1:1"

@@ -1,0 +1,24 @@
+# k3s server settings for the smolvm-pods node. Files in config.yaml.d/ are
+# read after this one and can override it.
+write-kubeconfig-mode: "0644"
+tls-san:
+  - localhost
+  - 127.0.0.1
+disable:
+  - traefik
+  - servicelb
+  - metrics-server
+  - local-storage
+kube-proxy-arg:
+  # Leave nf_conntrack_max at the kernel's value.
+  - conntrack-max-per-core=0
+# Room for 500 pods: 600 on the node, and a /22 of pod IPs (1,021), which
+# takes effect only when the node first registers. Never set a memory
+# eviction threshold, or a CPU or memory manager: floci-node refuses them
+# (node/README.md, "Capacity").
+kubelet-arg:
+  - max-pods=600
+kube-controller-manager-arg:
+  - node-cidr-mask-size=22
+# With the mirror in registries.yaml, no image is pulled from a registry.
+disable-default-registry-endpoint: true

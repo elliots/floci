@@ -1,0 +1,8 @@
+{{ template "base" . }}
+
+[plugins.'io.containerd.cri.v1.runtime'.containerd.runtimes.'smolvm-pods']
+  runtime_type = "io.containerd.smolvm-pods.v2"
+  runtime_path = "/usr/local/bin/containerd-shim-smolvm-pods-v2"
+  sandboxer = "podsandbox"
+  pod_annotations = ["smolvm.io/*", "smolvm-pods.floci.io/*"]
+  container_annotations = ["smolvm.io/*", "smolvm-pods.floci.io/*"]
