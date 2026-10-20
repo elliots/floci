@@ -1,0 +1,11 @@
+[package]
+name = "smolvm-pods-e2e"
+version = "0.1.0"
+edition = "2021"
+description = "End-to-end tests of smolvm-pods, run from the Mac against a node VM"
+license = "Apache-2.0"
+publish = false
+
+# The tests run on the Mac with the host toolchain and need nothing from the
+# shim's Linux dependency graph, so this package is a workspace of its own.
+[workspace]
