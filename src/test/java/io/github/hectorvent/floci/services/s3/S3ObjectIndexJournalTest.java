@@ -278,6 +278,7 @@ class S3ObjectIndexJournalTest {
         when(config.effectiveBaseUrl()).thenReturn("http://localhost:4566");
         when(config.services().s3().enforceAuth()).thenReturn(false);
         when(config.services().s3().globalBucketNamespace()).thenReturn(false);
+        when(config.services().s3().defaultObjectOwnership()).thenReturn("BucketOwnerEnforced");
         return new S3Service(factory, config, null, null, null, null, null,
                 new RegionResolver(REGION, ACCOUNT), new ObjectMapper(), null);
     }

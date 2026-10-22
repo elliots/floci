@@ -405,6 +405,7 @@ floci:
       enabled: true
       enforce-auth: false
       default-presign-expiry-seconds: 3600
+      default-object-ownership: BucketOwnerEnforced   # FLOCI_SERVICES_S3_DEFAULT_OBJECT_OWNERSHIP - ownership of a bucket whose CreateBucket names none: BucketOwnerEnforced, BucketOwnerPreferred or ObjectWriter
       global-bucket-namespace: false
       lifecycle-sweep-enabled: true          # FLOCI_SERVICES_S3_LIFECYCLE_SWEEP_ENABLED - apply lifecycle expiration rules in the background
       lifecycle-sweep-interval-seconds: 60   # FLOCI_SERVICES_S3_LIFECYCLE_SWEEP_INTERVAL_SECONDS

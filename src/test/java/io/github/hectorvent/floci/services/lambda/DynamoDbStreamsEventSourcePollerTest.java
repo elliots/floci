@@ -936,6 +936,7 @@ class DynamoDbStreamsEventSourcePollerTest {
         when(config.storage()).thenReturn(storageConfig);
         EmulatorConfig.S3ServiceConfig s3Config = mock(EmulatorConfig.S3ServiceConfig.class);
         when(s3Config.globalBucketNamespace()).thenReturn(globalBucketNamespace);
+        when(s3Config.defaultObjectOwnership()).thenReturn("BucketOwnerEnforced");
         when(config.services().s3()).thenReturn(s3Config);
         EmulatorConfig.IamServiceConfig iamConfig = mock(EmulatorConfig.IamServiceConfig.class);
         when(iamConfig.enforcementEnabled()).thenReturn(false);

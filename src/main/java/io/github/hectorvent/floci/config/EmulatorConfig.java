@@ -1416,6 +1416,16 @@ public interface EmulatorConfig {
         @WithDefault("true")
         boolean enabled();
 
+        /**
+         * The object ownership a new bucket gets when CreateBucket names none: {@code BucketOwnerEnforced}
+         * (S3's default since April 2023, which rejects ACL writes), or {@code BucketOwnerPreferred} or
+         * {@code ObjectWriter} (the default of buckets created before it, which accept them). A bucket whose
+         * infrastructure code sets an ACL without ownership controls, as one made before 2023 may, needs one of the
+         * latter. Env: FLOCI_SERVICES_S3_DEFAULT_OBJECT_OWNERSHIP
+         */
+        @WithDefault("BucketOwnerEnforced")
+        String defaultObjectOwnership();
+
         @WithDefault("false")
         boolean enforceAuth();
 
