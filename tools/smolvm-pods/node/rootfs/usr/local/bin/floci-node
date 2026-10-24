@@ -1,0 +1,1036 @@
+#!/bin/bash
+# The workload of the smolvm-pods node VM.
+#
+#   floci-node run           Prepare the node, then run k3s until SIGTERM.
+#   floci-node exec CMD...   Run CMD with the node's environment.
+#   floci-node _k3s          Run k3s server with the capacity view (internal).
+#
+# smolvm runs "floci-node run" on every boot and sends it SIGTERM on stop. The
+# disk volumes start empty and hide what the image has at their paths, so it
+# copies the smolvm runtime and the k3s files onto them before starting k3s.
+# A node with a seed directory mounted at /etc/floci-node/seed first waits for
+# the seed and installs its files (node/README.md, "The seed").
+# It runs the node service, k3s and dockerd, and restarts each when it exits. k3s runs
+# in a mount namespace of its own, in which kubelet sees the memory and CPUs
+# that the node's settings configure (node/README.md, "Capacity").
+set -euo pipefail
+
+# The node service's stdout and stderr.
+service_log=/var/log/smolvm-pods/node-service.log
+# The front shim's log.
+front_log=/var/log/smolvm-pods/front-shim.log
+# The size above which rotate_logs rotates the two logs, and how often it
+# looks, in seconds.
+log_rotate_bytes=$((64 * 1024 * 1024))
+log_check_secs=60
+# A fault point for the next node service to start (tests/e2e/README.md).
+fault_file=/run/smolvm-pods/fault
+# Words added to the node service's arguments at each start, while the file
+# exists (tests/e2e/README.md).
+args_file=/run/smolvm-pods/node-service.args
+# The bearer token of the node service's API over TCP.
+api_token_file=/etc/floci-node/api-token
+# The open files the node service may have: a packet socket for each pod that
+# sleeps, besides what each pod VM needs.
+service_open_files=65536
+# What khugepaged sleeps between scans on a Mac node, in ms: a day.
+khugepaged_sleep_ms=86400000
+# dockerd: k3s's containerd, which it runs on, its data on the storage disk,
+# its socket and its log.
+containerd_socket=/run/k3s/containerd/containerd.sock
+docker_data=/var/lib/smolvm/docker
+docker_socket=/run/docker.sock
+docker_log=/var/log/dockerd.log
+# The cgroup of the node service and the pod VMs, beside kubelet's kubepods.
+runtime_cgroup=/sys/fs/cgroup/smolvm-pods
+# The files of the capacity view that k3s's namespace binds over the real ones.
+view_dir=/run/floci-node/capacity
+# Why floci-node stopped the node, when kubelet runs with settings it refuses.
+refused_file=/run/floci-node/refused
+# The seed directory that Floci writes on the Mac, mounted read-only.
+seed_dir=/etc/floci-node/seed
+# The paths of the files that the last seed installed, one per line, and under
+# $seed_state/image the image's own files that seed files replaced.
+seed_state=/var/lib/floci-node/seed
+# Each file of the seed that floci-node installs, the path it installs it at,
+# and its mode. root owns each one.
+seed_files=(
+    "k3s.yaml /etc/rancher/k3s/config.yaml.d/50-floci.yaml 0644"
+    "token-webhook.yaml /etc/rancher/k3s/floci/token-webhook.yaml 0644"
+    "tokens.csv /etc/rancher/k3s/floci/tokens.csv 0600"
+    "sa-signing-key.pem /etc/rancher/k3s/floci/sa-signing-key.pem 0600"
+    "sa-public-key.pem /etc/rancher/k3s/floci/sa-public-key.pem 0600"
+    "registries.yaml /etc/rancher/k3s/registries.yaml 0644"
+    "manifests/floci-admission.yaml /var/lib/rancher/k3s/server/manifests/floci-admission.yaml 0644"
+    "api-token $api_token_file 0600"
+)
+# The comments around the seed's host names in /etc/hosts.
+hosts_begin='# floci-node seed: begin'
+hosts_end='# floci-node seed: end'
+# How often the env watcher reads the seed's env, in seconds.
+seed_env_poll=5
+# The node address, where pods and node processes ask DNS (node/README.md,
+# "Network"), and the files of the resolvers.
+node_address=${FLOCI_NODE_NETWORK_ADDRESS:-169.254.53.1}
+upstream_resolv=/etc/floci-node/upstream-resolv.conf
+pod_resolv=/etc/floci-node/pod-resolv.conf
+network_dropin=/etc/rancher/k3s/config.yaml.d/40-floci-network.yaml
+
+log() {
+    printf 'floci-node: %s\n' "$*" >&2
+}
+
+die() {
+    log "error: $*"
+    exit 1
+}
+
+# Log to floci-node's log and to the node service's.
+service_note() {
+    log "$*"
+    printf '%s INFO floci-node: %s\n' "$(date -u +%Y-%m-%dT%H:%M:%S.%3NZ)" "$*" >>"$service_log"
+}
+
+# Copy $1 to $2 unless $2 already has the same content.
+install_file() {
+    cmp -s "$1" "$2" || install -D -m 0644 "$1" "$2"
+}
+
+# A pause hard-links the disk templates that a VM's disks are layered on, so
+# the templates must be on the same mount as the VM data.
+install_smolvm_runtime() {
+    local runtime=$SMOLVM_DATA_DIR/runtime templates=$SMOLVM_DATA_DIR/.smolvm t
+    if ! cmp -s /opt/smolvm/BUILD "$runtime/BUILD"; then
+        log "installing the smolvm runtime in $runtime"
+        rm -rf "$runtime.new"
+        mkdir -p "$runtime.new"
+        cp -a /opt/smolvm/agent-rootfs /opt/smolvm/lib /opt/smolvm/BUILD "$runtime.new/"
+        rm -rf "$runtime"
+        mv "$runtime.new" "$runtime"
+    fi
+    # Existing VM disks use a template as their backing file, so it is never replaced.
+    mkdir -p "$templates"
+    for t in storage overlay; do
+        if [ ! -e "$templates/$t-template.ext4" ] && [ ! -e "$templates/$t-template.ext4.zst" ]; then
+            cp "/opt/smolvm/$t-template.ext4.zst" "$templates/"
+        fi
+    done
+}
+
+# No pod VM survives a node restart, and containerd, whose state is in /run,
+# never deletes the pods of the last boot, so their pod shares are removed
+# here. Dot files, such as the shim's locks, stay. A Docker container's
+# volumes and binds are bound into its pod share, so any mount still there is
+# detached first: rm would otherwise delete what the volume holds.
+remove_old_pod_shares() {
+    local root=/var/lib/containerd-shim-smolvm-pods mount
+    if [ -d "$root" ]; then
+        awk -v root="$root/" 'index($5, root) == 1 { print $5 }' /proc/self/mountinfo |
+            sort -r | while read -r mount; do
+            umount -l "$mount" || log "could not detach $mount"
+        done
+        if awk -v root="$root/" 'index($5, root) == 1 { found = 1 } END { exit !found }' \
+            /proc/self/mountinfo; then
+            log "mounts stay under $root, so the old pod shares stay"
+            return
+        fi
+        find "$root" -mindepth 1 -maxdepth 1 ! -name '.*' -exec rm -rf {} +
+    fi
+}
+
+install_k3s_files() {
+    local image
+    install_file /etc/floci-node/containerd/config-v3.toml.tmpl \
+        /var/lib/rancher/k3s/agent/etc/containerd/config-v3.toml.tmpl
+    install_file /etc/floci-node/manifests/smolvm-pods-runtimeclass.yaml \
+        /var/lib/rancher/k3s/server/manifests/smolvm-pods-runtimeclass.yaml
+    for image in /opt/floci-node/images/*.tar; do
+        install_file "$image" "/var/lib/rancher/k3s/agent/images/${image##*/}"
+    done
+}
+
+# The value of KEY in k3s's config file and its drop-ins, the last one
+# found, without quotes; or $2.
+k3s_config_value() {
+    local key=$1 default=$2 f found='' value
+    for f in /etc/rancher/k3s/config.yaml /etc/rancher/k3s/config.yaml.d/*.yaml; do
+        if [ ! -f "$f" ] || [ "$f" = "$network_dropin" ]; then
+            continue
+        fi
+        value=$(awk -v key="$key" '
+            { sub(/(^|[ \t])#.*/, "") }
+            index($0, key ":") == 1 { v = substr($0, length(key) + 2); gsub(/["\047 \t]/, "", v); found = v }
+            END { print found }' "$f")
+        if [ -n "$value" ]; then
+            found=$value
+        fi
+    done
+    printf '%s' "${found:-$default}"
+}
+
+# The tenth address of an IPv4 CIDR, where k3s puts the cluster DNS.
+tenth_address() {
+    local a b c d
+    IFS=. read -r a b c d <<<"${1%/*}"
+    printf '%s.%s.%s.%s' "$a" "$b" "$c" "$((d + 10))"
+}
+
+# Point pods and node processes at the node address for DNS, pass the
+# cluster's CIDRs to the node service, and load the table that holds until
+# Floci publishes a network profile (node/README.md, "Network"). The node's
+# first resolver is kept in $upstream_resolv for the node service's DNS
+# forwarder.
+setup_node_network() {
+    local cluster service dns
+    cluster=$(k3s_config_value cluster-cidr 10.42.0.0/16)
+    service=$(k3s_config_value service-cidr 10.43.0.0/16)
+    dns=$(k3s_config_value cluster-dns "$(tenth_address "$service")")
+    export FLOCI_NODE_CLUSTER_CIDRS="${cluster%%,*},${service%%,*}"
+    export FLOCI_NODE_CLUSTER_DNS="$dns"
+    if ! grep -qx "nameserver $node_address" /etc/resolv.conf 2>/dev/null; then
+        cat /etc/resolv.conf >"$upstream_resolv.new" 2>/dev/null || : >"$upstream_resolv.new"
+        mv -f "$upstream_resolv.new" "$upstream_resolv"
+    fi
+    printf 'nameserver %s\n' "$node_address" >"$pod_resolv"
+    mkdir -p "${network_dropin%/*}"
+    printf 'resolv-conf: %s\n' "$pod_resolv" >"$network_dropin"
+    rm -f /etc/resolv.conf
+    printf 'nameserver %s\n' "$node_address" >/etc/resolv.conf
+    if ! smolvm-pods _network-boot; then
+        log "warning: the node address and its table are not set up; pods have no DNS" \
+            "until the node service starts its network"
+    fi
+    log "node address $node_address; cluster $FLOCI_NODE_CLUSTER_CIDRS, cluster DNS $dns," \
+        "isolation ${FLOCI_NODE_ISOLATION:-0}"
+}
+
+# The IPv4 gateway of the node's default route, or nothing.
+default_gateway() {
+    ip -4 route show default | awk '$1 == "default" && $2 == "via" { print $3; exit }'
+}
+
+# Print why the seed cannot be applied yet, or nothing. Floci writes the
+# seed's version last, so the seed is complete once version reads 1.
+seed_not_ready() {
+    local version
+    if [ ! -f "$seed_dir/version" ]; then
+        echo "it has no version file yet"
+        return
+    fi
+    version=$(tr -d '[:space:]' <"$seed_dir/version") || version=unreadable
+    if [ "$version" != 1 ]; then
+        echo "its version is \"$version\", not 1"
+    elif [ -f "$seed_dir/hosts" ] && [ -z "$(default_gateway)" ]; then
+        echo "the node has no default route, and the seed's host names go to its gateway"
+    fi
+}
+
+# Install $1 at $2 with mode $3, owned by root.
+install_seed_file() {
+    if ! cmp -s "$1" "$2"; then
+        { mkdir -p "$(dirname "$2")" && install -o root -g root -m "$3" "$1" "$2.new" &&
+            mv -f "$2.new" "$2"; } || die "could not install $1 at $2"
+    fi
+    { chown root:root "$2" && chmod "$3" "$2"; } || die "could not set the owner and mode of $2"
+}
+
+# Install each file of the seed, and remove each one that the last seed
+# installed and this one lacks. Before a seed file replaces one of the
+# image's, a copy of the image's goes to $seed_state/image, and it comes back
+# when the seed file goes. The list of installed paths names every path that
+# may hold a seed file, and each copy stays until the list no longer names its
+# path, so that a boot that ends at any point leaves the next one what it
+# needs.
+install_seed_files() {
+    local entry src dst mode kept before=() installed=()
+    mkdir -p "$seed_state/image"
+    if [ -f "$seed_state/installed" ]; then
+        mapfile -t before <"$seed_state/installed"
+    fi
+    for entry in "${seed_files[@]}"; do
+        read -r src dst mode <<<"$entry"
+        kept=$seed_state/image$dst
+        if [ -f "$seed_dir/$src" ]; then
+            installed+=("$dst")
+            # A path that the list does not name holds the image's file, or none.
+            if ! listed "$dst" "${before[@]}"; then
+                if [ -e "$dst" ]; then
+                    copy_file "$dst" "$kept" || die "could not keep the image's $dst"
+                else
+                    rm -f "$kept" || die "could not remove $kept"
+                fi
+            fi
+        fi
+    done
+    write_lines "$seed_state/installed" "${before[@]}" "${installed[@]}"
+    for entry in "${seed_files[@]}"; do
+        read -r src dst mode <<<"$entry"
+        kept=$seed_state/image$dst
+        if [ -f "$seed_dir/$src" ]; then
+            install_seed_file "$seed_dir/$src" "$dst" "$mode"
+        elif listed "$dst" "${before[@]}"; then
+            if [ -e "$kept" ]; then
+                copy_file "$kept" "$dst" || die "could not put back the image's $dst"
+                log "the seed has no $src: put back the image's $dst"
+            else
+                rm -f "$dst" || die "could not remove $dst"
+                log "the seed has no $src: removed $dst"
+            fi
+        fi
+    done
+    write_lines "$seed_state/installed" "${installed[@]}"
+    for entry in "${seed_files[@]}"; do
+        read -r src dst mode <<<"$entry"
+        if ! listed "$dst" "${installed[@]}"; then
+            rm -f "$seed_state/image$dst" || die "could not remove $seed_state/image$dst"
+        fi
+    done
+}
+
+# Copy $1 to $2 with its owner and mode, through a temporary file, so that $2
+# is never partial.
+copy_file() {
+    mkdir -p "$(dirname "$2")" && cp -a "$1" "$2.new" && mv -f "$2.new" "$2"
+}
+
+# Whether $1 is one of the other arguments.
+listed() {
+    local item=$1 arg
+    shift
+    for arg; do
+        if [ "$arg" = "$item" ]; then
+            return 0
+        fi
+    done
+    return 1
+}
+
+# Replace file $1 with the other arguments, one per line.
+write_lines() {
+    local file=$1
+    shift
+    { { if [ $# -gt 0 ]; then printf '%s\n' "$@"; fi; } >"$file.new" && mv -f "$file.new" "$file"; } ||
+        die "could not write $file"
+}
+
+# Write the host names of the seed's hosts file, one per line, in /etc/hosts at
+# the gateway of the node's default route, between the marker comments. Node
+# processes such as k3s and containerd reach the Mac's loopback there. Without
+# a hosts file, the marked lines go. The rest of /etc/hosts stays.
+write_seed_hosts() {
+    local gateway='' line name names=() new=/etc/hosts.floci-node
+    if [ -f "$seed_dir/hosts" ]; then
+        gateway=$(default_gateway)
+        # read trims the blanks around each line.
+        while read -r line || [ -n "$line" ]; do
+            case $line in
+                '' | '#'*) continue ;;
+            esac
+            if [[ $line =~ ^[A-Za-z0-9]([A-Za-z0-9.-]*[A-Za-z0-9])?$ ]]; then
+                names+=("$line")
+            else
+                log "warning: ignoring \"$line\" in the seed's hosts: not a host name"
+            fi
+        done <"$seed_dir/hosts"
+    fi
+    (
+        awk -v begin="$hosts_begin" -v end="$hosts_end" '
+            $0 == begin { marked = 1 }
+            !marked { print }
+            $0 == end { marked = 0 }' /etc/hosts || exit
+        if [ ${#names[@]} -gt 0 ]; then
+            echo "$hosts_begin"
+            for name in "${names[@]}"; do
+                printf '%s\t%s\n' "$gateway" "$name"
+            done
+            echo "$hosts_end"
+        fi
+    ) >"$new" || die "could not write $new"
+    if ! cmp -s "$new" /etc/hosts; then
+        cat "$new" >/etc/hosts || die "could not write /etc/hosts"
+    fi
+    rm -f "$new"
+    if [ ${#names[@]} -gt 0 ]; then
+        log "/etc/hosts maps ${names[*]} to the gateway $gateway"
+    fi
+}
+
+# Wait until the seed is complete, then install its files and write its host
+# names. Nothing that uses them, k3s or the node service, starts before. It
+# checks the seed at once and again after 2 s, then waits twice as long before
+# each later check, up to 30 s.
+apply_seed() {
+    local delay=2 why
+    trap 'log "stopped while waiting for the seed"; exit 143' TERM INT
+    until why=$(seed_not_ready) && [ -z "$why" ]; do
+        log "waiting for the seed in $seed_dir: ${why:-it cannot be read}; checking again in $delay s"
+        sleep "$delay" &
+        wait $! || true
+        delay=$((delay * 2 > 30 ? 30 : delay * 2))
+    done
+    trap - TERM INT
+    install_seed_files
+    write_seed_hosts
+    seed_settings warn >/dev/null
+    log "applied the seed in $seed_dir"
+}
+
+# The SHA-256 of the seed's env, or "none" when it has none.
+seed_env_sum() {
+    if [ -f "$seed_dir/env" ]; then
+        sha256sum <"$seed_dir/env" | cut -d ' ' -f 1
+    else
+        echo none
+    fi
+}
+
+# Every $seed_env_poll seconds, compare the SHA-256 of the seed's env with the
+# last one, $2 at first. On a change, have the node service's supervisor, $1,
+# stop the node service, which it starts again with the new settings. k3s and
+# the pods keep running.
+watch_seed_env() {
+    local supervisor=$1 last=$2 sum
+    while kill -0 "$supervisor" 2>/dev/null; do
+        sleep "$seed_env_poll"
+        sum=$(seed_env_sum) || continue
+        if [ "$sum" != "$last" ]; then
+            last=$sum
+            service_note "the seed's env changed: restarting the node service"
+            seed_settings warn >/dev/null
+            kill -HUP "$supervisor" 2>/dev/null || true
+        fi
+    done
+}
+
+# Whether the node is a VM on a Mac. Hypervisor.framework gives every vCPU an
+# Apple MIDR_EL1 (0x610f0000: implementer 0x61, part 0). A VM under KVM, or a
+# Linux host, reports the vendor of the host's CPU. Linux on Apple silicon
+# hardware (Asahi) also reports Apple and counts as a Mac.
+mac_node() {
+    grep -Eq '^CPU implementer[[:space:]]*:[[:space:]]*0x61$' /proc/cpuinfo
+}
+
+# MADV_COLLAPSE crashed the nested node twice in Hypervisor.framework, and
+# khugepaged runs the same collapse code, so on a Mac node khugepaged sleeps
+# a day between scans. Elsewhere it keeps the kernel's settings. Run before
+# k3s, so that no pod VM runs yet.
+slow_khugepaged() {
+    local dir=/sys/kernel/mm/transparent_hugepage/khugepaged f
+    if ! mac_node; then
+        log "not a Mac node: khugepaged keeps the kernel's settings"
+        return
+    fi
+    for f in scan_sleep_millisecs alloc_sleep_millisecs; do
+        echo "$khugepaged_sleep_ms" >"$dir/$f" || log "warning: could not set khugepaged/$f"
+    done
+    log "Mac node: khugepaged sleeps $khugepaged_sleep_ms ms between scans"
+}
+
+# Kernel limits for 500 pods. Each container shim holds an inotify instance,
+# and the default of 128 let only about 105 pods start. Each pod that talks
+# needs a neighbour entry on cni0.
+raise_kernel_limits() {
+    sysctl -q -w fs.inotify.max_user_instances=8192 fs.inotify.max_user_watches=1048576 \
+        net.ipv4.neigh.default.gc_thresh1=1024 net.ipv4.neigh.default.gc_thresh2=4096 \
+        net.ipv4.neigh.default.gc_thresh3=8192 ||
+        die "could not raise the kernel limits for 500 pods"
+}
+
+# Expedite RCU grace periods. Closing a packet socket waits for one, 11 to
+# 50 ms at the nested node's normal pace, and the kernel closes the sockets
+# of a node service killed with SIGKILL one after another: one for each
+# sleeping pod, up to 25 s for 500.
+expedite_rcu() {
+    if echo 1 >/sys/kernel/rcu_expedited; then
+        log "RCU grace periods are expedited"
+    else
+        log "warning: could not expedite RCU grace periods: a node service killed with SIGKILL takes up to 50 ms to exit for each sleeping pod"
+    fi
+}
+
+# Count the packets and bytes of each connection in conntrack, which idle
+# detection reads to tell whether a connection moved. It applies to
+# connections that start after it, so it runs before k3s.
+count_conntrack_traffic() {
+    if sysctl -q -w net.netfilter.nf_conntrack_acct=1; then
+        log "conntrack counts the packets and bytes of each connection"
+    else
+        log "warning: could not turn on conntrack accounting: idle detection reads only TCP states and timeouts"
+    fi
+}
+
+# Create the bearer token of the node service's API if there is none, 32
+# random bytes in hex, and make it readable by root only. The node service
+# reads it when it starts (node/README.md, "The node service's API over TCP").
+ensure_api_token() {
+    if [ ! -s "$api_token_file" ]; then
+        { (umask 077 && od -An -tx1 -N32 /dev/urandom | tr -d ' \n' >"$api_token_file.new") &&
+            mv -f "$api_token_file.new" "$api_token_file"; } ||
+            die "could not create $api_token_file"
+        log "created the API token in $api_token_file"
+    fi
+    { chown root:root "$api_token_file" && chmod 0600 "$api_token_file"; } ||
+        die "could not make $api_token_file readable by root only"
+}
+
+# Let this shell, and the node service it starts, open $service_open_files
+# files.
+raise_open_files() {
+    local hard
+    hard=$(ulimit -Hn)
+    if [ "$hard" != unlimited ] && [ "$hard" -lt "$service_open_files" ]; then
+        ulimit -Hn "$service_open_files" || hard=''
+    fi
+    if [ -z "$hard" ] || ! ulimit -Sn "$service_open_files"; then
+        log "warning: the node service may open only $(ulimit -Sn) files, not $service_open_files"
+    fi
+}
+
+# Whether a seed directory is mounted.
+seeded() {
+    mountpoint -q "$seed_dir"
+}
+
+# Print, on a node with a seed, the settings of the seed's env that have a
+# value, as NAME=VALUE lines. The file holds NAME=VALUE lines, taken as they
+# are, with no quotes or expansion, and # comments. It may set RUST_LOG and the
+# FLOCI_NODE_* settings, but not FLOCI_NODE_ISOLATION, which comes only from
+# the machine's environment. With "warn", log each line it leaves out.
+seed_settings() {
+    local warn=${1:-} line name why
+    if ! seeded || [ ! -f "$seed_dir/env" ]; then
+        return 0
+    fi
+    while IFS= read -r line || [ -n "$line" ]; do
+        case $line in
+            '' | '#'*) continue ;;
+        esac
+        name=${line%%=*}
+        why=''
+        if [[ $line != *=* || ! $name =~ ^(FLOCI_NODE_[A-Z0-9_]+|RUST_LOG)$ ]]; then
+            why='not a node setting'
+        elif [ "$name" = FLOCI_NODE_ISOLATION ]; then
+            why="the machine's environment sets FLOCI_NODE_ISOLATION"
+        fi
+        if [ -n "$why" ]; then
+            if [ -n "$warn" ]; then
+                log "warning: ignoring \"$line\" in the seed's env: $why"
+            fi
+        elif [ -n "${line#*=}" ]; then
+            printf '%s\n' "$line"
+        fi
+    done <"$seed_dir/env"
+}
+
+# Export the node's settings: /etc/floci-node/env, then on a node with a seed
+# each setting of the seed's env that has a value. An empty value in the seed
+# keeps the value of /etc/floci-node/env.
+load_env() {
+    local setting
+    set -a
+    # shellcheck source=/dev/null
+    . /etc/floci-node/env
+    set +a
+    while IFS= read -r setting; do
+        export "${setting?}"
+    done < <(seed_settings)
+}
+
+# Print the current value of the node's setting $1, read as load_env reads it.
+env_value() {
+    (
+        load_env
+        printf '%s' "${!1:-}"
+    )
+}
+
+# Print the words of the arguments file, one per line, if it exists.
+extra_service_args() {
+    local words=()
+    if [ -e "$args_file" ]; then
+        read -r -d '' -a words <"$args_file" || true
+    fi
+    if [ ${#words[@]} -gt 0 ]; then
+        printf '%s\n' "${words[@]}"
+    fi
+}
+
+check_capacity_settings() {
+    local name
+    for name in FLOCI_NODE_MEMORY_GIB FLOCI_NODE_CPUS; do
+        [[ ${!name:-0} =~ ^[0-9]+$ ]] || die "$name must be a whole number, not \"${!name}\""
+    done
+}
+
+# The node's memory in KiB.
+real_memory_kib() {
+    awk '$1 == "MemTotal:" { print $2 }' /proc/meminfo
+}
+
+# The node's CPUs as cAdvisor counts them: every cpuN directory, online or not.
+real_cpus() {
+    local d n=0
+    for d in /sys/devices/system/cpu/cpu[0-9]*; do
+        n=$((n + 1))
+    done
+    echo "$n"
+}
+
+# The memory in KiB and the CPUs that kubelet sees: the configured values, or
+# the node's own where they are larger or the setting is 0.
+reported_memory_kib() {
+    local real configured=$((${FLOCI_NODE_MEMORY_GIB:-0} * 1048576))
+    real=$(real_memory_kib)
+    echo $((configured > real ? configured : real))
+}
+
+reported_cpus() {
+    local real configured=${FLOCI_NODE_CPUS:-0}
+    real=$(real_cpus)
+    echo $((configured > real ? configured : real))
+}
+
+# The cpu.weight that kubelet gives kubepods for $1 CPUs: 1024 shares a CPU,
+# converted to a weight as runc does.
+kubepods_cpu_weight() {
+    local weight=$((1 + ($1 * 1024 - 2) * 9999 / 262142))
+    echo $((weight > 10000 ? 10000 : weight))
+}
+
+# The node service, the pod VMs, and the boot's template expansion and TSO
+# canary run in a cgroup of their own beside kubepods, with the weight that
+# kubelet gives kubepods for the CPUs it reports. Under contention the pod VMs
+# together then get as much CPU as the runc pods together. In the root cgroup
+# each VM thread would weigh 100, against 5000 for kubepods with 128 CPUs.
+setup_runtime_cgroup() {
+    { echo '+cpu +memory +pids' >/sys/fs/cgroup/cgroup.subtree_control &&
+        mkdir -p "$runtime_cgroup"; } ||
+        die "could not set up the cgroup $runtime_cgroup"
+    set_runtime_cpu_weight "$(reported_cpus)"
+}
+
+# Give the runtime's cgroup kubepods' weight for $1 CPUs.
+set_runtime_cpu_weight() {
+    local weight
+    weight=$(kubepods_cpu_weight "$1")
+    echo "$weight" >"$runtime_cgroup/cpu.weight" ||
+        die "could not set the cpu.weight of $runtime_cgroup"
+    log "the node service and the pod VMs run in $runtime_cgroup with cpu.weight $weight"
+}
+
+# Move this shell, and with it everything it starts, into the runtime's cgroup.
+join_runtime_cgroup() {
+    echo "$BASHPID" >"$runtime_cgroup/cgroup.procs" ||
+        die "could not move process $BASHPID into $runtime_cgroup"
+}
+
+# Print /proc/meminfo with MemTotal set to $1 KiB, and MemFree and
+# MemAvailable raised by as much as MemTotal, so that the memory in use stays
+# the real figure. $2 is the real MemTotal.
+fake_meminfo() {
+    awk -v total="$1" -v real="$2" '
+        $1 == "MemTotal:" { printf "%-16s%8d kB\n", $1, total; next }
+        $1 == "MemFree:" || $1 == "MemAvailable:" { printf "%-16s%8d kB\n", $1, $2 + total - real; next }
+        { print }' /proc/meminfo
+}
+
+# Make in $1 a CPU tree in which cAdvisor counts $2 CPUs: the node's online,
+# possible, present, offline and kernel_max files and its CPUs' topology, and
+# empty cpuN directories for the rest. With the real online file, kubelet
+# still gives kubepods the real CPUs as its cpuset: writing a cpuset with CPUs
+# that the node does not have fails.
+fake_cpu_tree() {
+    local dir=$1 cpus=$2 real=/sys/devices/system/cpu d f i
+    mkdir -p "$dir"
+    for f in online possible present offline kernel_max; do
+        cat "$real/$f" >"$dir/$f"
+    done
+    for d in "$real"/cpu[0-9]*; do
+        mkdir -p "$dir/${d##*/}"
+        if [ -d "$d/topology" ]; then
+            mkdir -p "$dir/${d##*/}/topology"
+            for f in "$d"/topology/*; do
+                cat "$f" >"$dir/${d##*/}/topology/${f##*/}"
+            done
+        fi
+    done
+    for ((i = 0; i < cpus; i++)); do
+        mkdir -p "$dir/cpu$i"
+    done
+}
+
+# Run k3s server in the mount namespace that "floci-node run" made for it,
+# with a meminfo and a CPU tree that report the configured capacity. kubelet
+# reads both once, when it starts. /proc and /sys become slaves here, so the
+# binds stay in this namespace; every other mount is shared both ways, so
+# kubelet's volumes and containerd's rootfs and netns mounts reach the node
+# service.
+k3s_server() {
+    local memory real_memory cpus real_cpus online tree
+    [ "$(readlink /proc/self/ns/mnt)" != "$(readlink /proc/$PPID/ns/mnt)" ] ||
+        die "_k3s must run in a mount namespace of its own"
+    check_capacity_settings
+    real_memory=$(real_memory_kib)
+    memory=$(reported_memory_kib)
+    real_cpus=$(real_cpus)
+    cpus=$(reported_cpus)
+    online=$(cat /sys/devices/system/cpu/online)
+    set_runtime_cpu_weight "$cpus"
+    mount --make-rslave /proc
+    mount --make-rslave /sys
+    mkdir -p "$view_dir"
+    if [ "$memory" -gt "$real_memory" ]; then
+        # A k3s that ended may have left processes in its namespace, which
+        # keep the file they bound. Each start writes a new one.
+        fake_meminfo "$memory" "$real_memory" >"$view_dir/meminfo.new"
+        mv -f "$view_dir/meminfo.new" "$view_dir/meminfo"
+        mount --bind "$view_dir/meminfo" /proc/meminfo
+    fi
+    if [ "$cpus" -gt "$real_cpus" ]; then
+        tree=$view_dir/cpu-$cpus
+        if [ ! -d "$tree" ]; then
+            rm -rf "$tree.new"
+            fake_cpu_tree "$tree.new" "$cpus"
+            mv "$tree.new" "$tree"
+        fi
+        mount --bind "$tree" /sys/devices/system/cpu
+    fi
+    log "k3s sees $memory KiB of memory and $cpus CPUs; the node has $real_memory KiB" \
+        "and $real_cpus CPUs, $online online"
+    exec k3s server --log /var/log/k3s.log
+}
+
+# Print what in k3s's configuration would make kubelet evict on memory or run
+# a CPU or memory manager, one line for each, and fail if there is any: the
+# kubelet-arg flags of k3s's config files, and the files in kubelet's drop-in
+# directory. verify_kubelet checks kubelet's running configuration, which
+# also has kubelet config files that a flag names.
+kubelet_config_problems() {
+    local files=() f
+    for f in /etc/rancher/k3s/config.yaml /etc/rancher/k3s/config.yaml.d/*.yaml \
+        /var/lib/rancher/k3s/agent/etc/kubelet.conf.d/*.conf; do
+        if [ -f "$f" ]; then
+            files+=("$f")
+        fi
+    done
+    awk '
+        function bad(what) { printf "%s: %s\n", FILENAME, what; found = 1 }
+        function value(s) { gsub(/["\047 \t]/, "", s); return s }
+        FNR == 1 { section = "" }
+        { sub(/(^|[ \t])#.*/, "") }
+        FILENAME ~ /\.conf$/ {
+            if (/^[^ \t]/) { section = $0; sub(/:.*/, "", section) }
+            if ((section == "evictionHard" || section == "evictionSoft") && /[Mm]emory\.available/) {
+                bad(section " has a memory threshold")
+            }
+            if (/^cpuManagerPolicy:/ && value(substr($0, 18)) != "none") {
+                bad("cpuManagerPolicy " value(substr($0, 18)))
+            }
+            if (/^memoryManagerPolicy:/ && value(substr($0, 21)) != "None") {
+                bad("memoryManagerPolicy " value(substr($0, 21)))
+            }
+            next
+        }
+        match($0, /eviction-(hard|soft)=[^]"\047 ]*[Mm]emory\.available/) {
+            bad(substr($0, RSTART, RLENGTH))
+        }
+        match($0, /cpu-manager-policy=[^]"\047 ,]*/) && substr($0, RSTART + 19, RLENGTH - 19) != "none" {
+            bad(substr($0, RSTART, RLENGTH))
+        }
+        match($0, /memory-manager-policy=[^]"\047 ,]*/) && substr($0, RSTART + 22, RLENGTH - 22) != "None" {
+            bad(substr($0, RSTART, RLENGTH))
+        }
+        END { exit found }' "${files[@]}"
+}
+
+# The problems in kubelet's running configuration (configz), in one line.
+configz_problems='.kubeletconfig
+    | [((.evictionHard // {}) | keys[] | select(test("memory\\.available$"; "i")) | "evictionHard " + .),
+       ((.evictionSoft // {}) | keys[] | select(test("memory\\.available$"; "i")) | "evictionSoft " + .),
+       (.cpuManagerPolicy // "none" | select(. != "none") | "cpuManagerPolicy " + .),
+       (.memoryManagerPolicy // "None" | select(. != "None") | "memoryManagerPolicy " + .)]
+    | join(", ")'
+
+# Record why the node stops, which "floci-node run" logs when it exits:
+# kubelet must not run with these settings. The capacity view leaves kubelet
+# no real memory figure to evict on, and a CPU or memory manager would assign
+# CPUs and memory that the node does not have.
+refuse() {
+    printf '%s\n' "$*" >"$refused_file"
+}
+
+# Once kubelet answers, check its running configuration, and log the
+# capacity that the node reports. Stop the node if kubelet evicts on memory
+# or runs a CPU or memory manager. $1 is the k3s process.
+verify_kubelet() {
+    local k3s=$1 node config problems eviction capacity
+    export KUBECONFIG=/etc/rancher/k3s/k3s.yaml
+    until node=$(kubectl get nodes -o 'jsonpath={.items[0].metadata.name}' 2>/dev/null) &&
+        [ -n "$node" ] &&
+        config=$(kubectl get --raw "/api/v1/nodes/$node/proxy/configz" 2>/dev/null); do
+        kill -0 "$k3s" 2>/dev/null || return 0
+        sleep 2
+    done
+    problems=$(jq -r "$configz_problems" <<<"$config")
+    if [ -n "$problems" ]; then
+        refuse "kubelet runs with $problems, which the capacity view does not allow" \
+            "(node/README.md, \"Capacity\"); stopping the node"
+        kill -TERM $$
+        return 0
+    fi
+    eviction=$(jq -r '.kubeletconfig.evictionHard // {} | to_entries
+        | map(.key + "<" + .value) | join(",")' <<<"$config")
+    capacity=$(kubectl get node "$node" -o 'jsonpath=cpu {.status.capacity.cpu}, memory {.status.capacity.memory}, pods {.status.capacity.pods}')
+    log "kubelet reports $capacity; eviction $eviction, CPU manager none, memory manager None"
+}
+
+# Print the first line of the fault file and remove the file, if it exists.
+take_fault() {
+    local taken=$fault_file.taken line=''
+    mv -f "$fault_file" "$taken" 2>/dev/null || return 0
+    read -r line <"$taken" || true
+    rm -f "$taken"
+    printf '%s' "$line"
+}
+
+# Keep the node service's and the front shim's logs small: every
+# $log_check_secs seconds, a log larger than $log_rotate_bytes is copied to
+# FILE.1, over the older copy, and emptied. Its writers append with
+# O_APPEND, the node service and the pod VM processes that inherit its
+# stderr, and the front shim, so they go on at the new end; lines written
+# between the copy and the truncate are lost.
+rotate_logs() {
+    local file size
+    while :; do
+        for file in "$service_log" "$front_log"; do
+            size=$(stat -c %s "$file" 2>/dev/null) || continue
+            if [ "$size" -gt "$log_rotate_bytes" ]; then
+                if cp -f "$file" "$file.1" && truncate -s 0 "$file"; then
+                    log "rotated $file at $size bytes to $file.1"
+                else
+                    log "warning: could not rotate $file"
+                fi
+            fi
+        done
+        sleep "$log_check_secs"
+    done
+}
+
+# Run the node service until SIGTERM, and start it again 1 second after it
+# exits. Each start passes FLOCI_NODE_API_LISTEN, FLOCI_NODE_IDLE_TIMEOUT,
+# FLOCI_NODE_CPU_THRESHOLD, FLOCI_NODE_CPU_WINDOW, FLOCI_NODE_MAX_AWAKE_PODS,
+# FLOCI_NODE_MAX_AWAKE_MEMORY and FLOCI_NODE_ADMISSION_WAIT, read again with
+# env_value, as their flags, adds the words of the arguments file, which
+# stays, and takes the fault file and passes its first line as
+# SMOLVM_PODS_FAULT. SIGHUP stops the node service, which then starts again
+# with the settings read after the signal: a SIGHUP that comes while it reads
+# them stops the node service as soon as it starts. k3s neither waits for the
+# node service nor stops it: the front shim waits for it, and pod VMs outlive
+# it.
+supervise_node_service() {
+    local pid='' stopping=0 reload=0 status fault listen args extra flag name value
+    trap 'stopping=1; if [ -n "$pid" ]; then kill -TERM "$pid" 2>/dev/null || true; fi' TERM
+    trap 'reload=1; if [ -n "$pid" ]; then kill -TERM "$pid" 2>/dev/null || true; fi' HUP
+    join_runtime_cgroup
+    raise_open_files
+    while [ "$stopping" = 0 ]; do
+        reload=0
+        fault=$(take_fault)
+        args=(node-service)
+        listen=$(env_value FLOCI_NODE_API_LISTEN)
+        if [ -n "$listen" ]; then
+            args+=(--api-listen "$listen")
+        fi
+        for flag in idle-timeout cpu-threshold cpu-window max-awake-pods max-awake-memory admission-wait; do
+            name=${flag//-/_}
+            value=$(env_value "FLOCI_NODE_${name^^}")
+            if [ -n "$value" ]; then
+                args+=("--$flag" "$value")
+            fi
+        done
+        mapfile -t extra < <(extra_service_args)
+        if [ ${#extra[@]} -gt 0 ]; then
+            service_note "starting the node service with the arguments of $args_file: ${extra[*]}"
+            args+=("${extra[@]}")
+        fi
+        if [ -n "$fault" ]; then
+            service_note "starting the node service with SMOLVM_PODS_FAULT=$fault"
+            SMOLVM_PODS_FAULT=$fault smolvm-pods "${args[@]}" >>"$service_log" 2>&1 &
+        else
+            smolvm-pods "${args[@]}" >>"$service_log" 2>&1 &
+        fi
+        pid=$!
+        if [ "$stopping" = 1 ] || [ "$reload" = 1 ]; then
+            kill -TERM "$pid"
+        fi
+        while :; do
+            if wait "$pid"; then status=0; else status=$?; fi
+            # A signal also ends wait, while the node service may still be running.
+            kill -0 "$pid" 2>/dev/null || break
+        done
+        pid=''
+        if [ "$stopping" = 1 ]; then
+            break
+        fi
+        service_note "the node service exited with status $status, restarting it in 1 second"
+        sleep 1 &
+        wait $! || true
+    done
+}
+
+# Run dockerd on k3s's containerd until SIGTERM, and start it again 5 seconds
+# after it exits. It waits for containerd's socket, which k3s makes, and keeps
+# its data on the storage disk. Its default runtime is runc; a container runs
+# in a pod VM only when it names the runtime io.containerd.smolvm-pods.v2
+# (node/README.md, "Docker").
+supervise_dockerd() {
+    local pid='' stopping=0 status
+    trap 'stopping=1; if [ -n "$pid" ]; then kill -TERM "$pid" 2>/dev/null || true; fi' TERM
+    while [ "$stopping" = 0 ]; do
+        until [ -S "$containerd_socket" ] || [ "$stopping" = 1 ]; do
+            sleep 1 &
+            wait $! || true
+        done
+        if [ "$stopping" = 1 ]; then
+            break
+        fi
+        log "starting dockerd on $containerd_socket, logging to $docker_log"
+        dockerd --containerd="$containerd_socket" --data-root "$docker_data" \
+            --host "unix://$docker_socket" >>"$docker_log" 2>&1 &
+        pid=$!
+        while :; do
+            if wait "$pid"; then status=0; else status=$?; fi
+            # A signal also ends wait, while dockerd may still be running.
+            kill -0 "$pid" 2>/dev/null || break
+        done
+        pid=''
+        if [ "$stopping" = 1 ]; then
+            break
+        fi
+        log "dockerd exited with status $status, restarting it in 5 seconds"
+        sleep 5 &
+        wait $! || true
+    done
+}
+
+run() {
+    local pid='' stopping=0 status service watcher='' rotator env_sum problems self docker
+    self=$(realpath "$0")
+    check_capacity_settings
+    # kubelet needs a writable /sys.
+    mount -o remount,rw /sys || log "warning: could not remount /sys read-write"
+    raise_kernel_limits
+    expedite_rcu
+    count_conntrack_traffic
+    slow_khugepaged
+    install_smolvm_runtime
+    if seeded; then
+        apply_seed
+        env_sum=$(seed_env_sum)
+        load_env
+        check_capacity_settings
+    fi
+    install_k3s_files
+    setup_node_network
+    remove_old_pod_shares
+    setup_runtime_cgroup
+    # The node's mounts are private. k3s's mount namespace starts as a copy
+    # of this one, so make them shared first, or the mounts that kubelet and
+    # containerd make there would not reach the node service.
+    mount --make-rshared /
+    mkdir -p "${refused_file%/*}"
+    rm -f "$refused_file"
+    # The node service owns the pod VMs, and the shim that containerd starts
+    # forwards to it, so it starts before k3s.
+    ensure_api_token
+    mkdir -p "${service_log%/*}"
+    supervise_node_service &
+    service=$!
+    rotate_logs &
+    rotator=$!
+    if seeded; then
+        watch_seed_env "$service" "$env_sum" &
+        watcher=$!
+    fi
+    # Expand the disk templates while k3s starts, then check TSO for Rosetta
+    # pods. The node service takes the same locks before it creates a VM, so
+    # a pod that comes earlier waits for them.
+    { join_runtime_cgroup; smolvm-pods _expand-templates || true; smolvm-pods _tso-canary; } &
+    supervise_dockerd &
+    docker=$!
+
+    trap 'stopping=1; kill -TERM "$service" "$docker" 2>/dev/null || true
+        if [ -n "$pid" ]; then kill -TERM "$pid" 2>/dev/null || true; fi' TERM INT
+    while [ "$stopping" = 0 ]; do
+        if ! problems=$(kubelet_config_problems); then
+            refuse "k3s's configuration makes kubelet evict on memory or run a CPU or memory" \
+                "manager, which the capacity view does not allow (node/README.md, \"Capacity\"):" \
+                "${problems//$'\n'/; }; not starting k3s"
+            stopping=1
+            kill -TERM "$service" "$docker" 2>/dev/null || true
+            break
+        fi
+        # k3s rotates its own log: 50 MB a file, three old files.
+        log "starting k3s, logging to /var/log/k3s.log"
+        unshare --mount --propagation unchanged -- "$self" _k3s &
+        pid=$!
+        verify_kubelet "$pid" &
+        if [ "$stopping" = 1 ]; then
+            kill -TERM "$pid"
+        fi
+        while :; do
+            if wait "$pid"; then status=0; else status=$?; fi
+            # A signal also ends wait, while k3s may still be running.
+            kill -0 "$pid" 2>/dev/null || break
+        done
+        pid=''
+        if [ "$stopping" = 1 ]; then
+            break
+        fi
+        log "k3s exited with status $status, restarting it in 5 seconds"
+        sleep 5 &
+        wait $! || true
+    done
+    while kill -0 "$service" 2>/dev/null; do
+        wait "$service" || true
+    done
+    while kill -0 "$docker" 2>/dev/null; do
+        wait "$docker" || true
+    done
+    if [ -n "$watcher" ]; then
+        kill "$watcher" 2>/dev/null || true
+    fi
+    kill "$rotator" 2>/dev/null || true
+    if [ -e "$refused_file" ]; then
+        die "$(cat "$refused_file")"
+    fi
+    log "stopped"
+}
+
+load_env
+
+case ${1:-run} in
+    run)
+        run
+        ;;
+    _k3s)
+        k3s_server
+        ;;
+    exec)
+        shift
+        if [ $# -eq 0 ]; then
+            echo "usage: floci-node exec COMMAND [ARG...]" >&2
+            exit 2
+        fi
+        export KUBECONFIG=/etc/rancher/k3s/k3s.yaml
+        export CRI_CONFIG_FILE=/var/lib/rancher/k3s/agent/etc/crictl.yaml
+        export CONTAINERD_ADDRESS=/run/k3s/containerd/containerd.sock
+        export CONTAINERD_NAMESPACE=k8s.io
+        export DOCKER_HOST=unix://$docker_socket
+        exec "$@"
+        ;;
+    *)
+        echo "usage: floci-node [run | exec COMMAND [ARG...] | _k3s]" >&2
+        exit 2
+        ;;
+esac
