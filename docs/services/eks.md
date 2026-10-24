@@ -13,6 +13,7 @@ EKS uses a standard REST API with JSON bodies: not the JSON 1.1 (`X-Amz-Target`)
 | `DescribeCluster` | Describe a cluster by name |
 | `ListClusters` | List all cluster names |
 | `DeleteCluster` | Delete a cluster |
+| `UpdateClusterConfig` | Change a cluster's control plane logging ([Logging configuration](#logging-configuration)) |
 | `CreateAccessEntry` | Create STANDARD or EC2_LINUX access-entry metadata |
 | `DescribeAccessEntry` | Describe an access entry by IAM principal ARN |
 | `ListAccessEntries` | List principal ARNs with pagination |
@@ -26,7 +27,7 @@ EKS uses a standard REST API with JSON bodies: not the JSON 1.1 (`X-Amz-Target`)
 | `DescribeAddon` | Describe an addon by cluster and addon name |
 | `ListAddons` | List addon names installed in a cluster with pagination |
 | `UpdateAddon` | Update addon configuration, version, or service account role |
-| `DescribeUpdate` | Describe an update for an addon |
+| `DescribeUpdate` | Describe an update of an addon or of a cluster's logging |
 | `DeleteAddon` | Delete an addon from a cluster |
 | `DescribeAddonVersions` | Describe supported addon versions by Kubernetes version or addon name |
 | `CreateNodegroup` | Create node group metadata for a cluster |
@@ -93,7 +94,7 @@ Floci supports the EKS Pod Identity association management plane. You can map a 
 
 ### Credential injection at admission
 
-Floci registers a `MutatingWebhookConfiguration` in every real-mode cluster, scoped to pod `CREATE`. When a pod is created, Floci looks up an association matching the pod's namespace and its `spec.serviceAccountName`. A pod that matches nothing is admitted unchanged.
+Floci registers a `MutatingWebhookConfiguration` in every real-mode cluster, scoped to pod `CREATE`. When a pod is created, Floci looks up an association matching the pod's namespace and its `spec.serviceAccountName`. A pod that matches nothing gets IRSA when its service account names a role ([IRSA injection at admission](#irsa-injection-at-admission)), and is admitted unchanged otherwise.
 
 Injection happens only when the `eks-pod-identity-agent` addon is installed on the cluster, which is what real EKS requires too. Install it with `CreateAddon` before expecting pods to be mutated.
 
@@ -117,7 +118,8 @@ The credentials endpoint performs the following validations:
 3. Validates the token signature against the cluster OIDC public key, confirming the token is unexpired and carries audience `pods.eks.amazonaws.com`.
 4. Extracts the subject claim (`system:serviceaccount:<namespace>:<serviceAccount>`) and looks up the pod identity association for the cluster, namespace, and service account.
 5. Confirms the associated IAM role still exists under the ARN the association names. A role that was deleted, or recreated under another path, gets `400 AccessDeniedException` and no credentials.
-6. Issues temporary session credentials (`ASIA...`) for the associated IAM role and returns them in standard AWS container credentials format (`AccessKeyId`, `SecretAccessKey`, `Token`, `AccountId`, `Expiration`).
+6. Evaluates the role's trust policy for the service principal `pods.eks.amazonaws.com`, as AWS does: it must allow `sts:AssumeRole`, and `sts:TagSession` unless the association disables session tags. Conditions see `aws:SourceAccount`, `aws:SourceArn` (the cluster's ARN) and, with session tags, the request tags `eks-cluster-name`, `eks-cluster-arn`, `kubernetes-namespace`, `kubernetes-service-account`, `kubernetes-pod-name` and `kubernetes-pod-uid`, the last two from the pod claims of the projected token. A trust policy that does not allow the pod gets `400 AccessDeniedException` and no credentials.
+7. Issues temporary session credentials (`ASIA...`) for the associated IAM role and returns them in standard AWS container credentials format (`AccessKeyId`, `SecretAccessKey`, `Token`, `AccountId`, `Expiration`).
 
 #### TLS is required
 
@@ -129,13 +131,15 @@ The webhook carries `failurePolicy: Ignore`, and Floci admits the pod unchanged 
 
 The manifest is written into the cluster's k3s server manifests directory (`/var/lib/rancher/k3s/server/manifests`) before the container starts, so k3s applies it as the API server comes up.
 
+On a [smolvm-pods node](#smolvm-pods-nodes) the manifest is the seed's `manifests/floci-admission.yaml`, which the node installs in the same directory at every boot. The webhook URL then names the host of `FLOCI_RUNTIME_NODE_FLOCI_ENDPOINT`, `host.docker.internal` by default, which must be a name in Floci's certificate for the API server to accept the call.
+
 ## Addon management
 
 Floci supports the EKS cluster addon management plane for AWS SDKs and Terraform (`aws_eks_addon` resource).
 
 ### Supported operations
 
-- **Creation**: `CreateAddon` creates an addon on an ACTIVE cluster. Supported addons include `vpc-cni`, `coredns`, `kube-proxy`, and `eks-pod-identity-agent`. If `addonVersion` is omitted, the default version compatible with the cluster Kubernetes version is resolved automatically. Referenced `serviceAccountRoleArn` must exist in IAM. Idempotency is supported via `clientRequestToken`.
+- **Creation**: `CreateAddon` creates an addon on an ACTIVE cluster. Supported addons include `vpc-cni`, `coredns`, `kube-proxy`, `eks-pod-identity-agent`, `aws-ebs-csi-driver` and `amazon-cloudwatch-observability`. If `addonVersion` is omitted, the default version compatible with the cluster Kubernetes version is resolved automatically. Referenced `serviceAccountRoleArn` must exist in IAM. Idempotency is supported via `clientRequestToken`.
 - **Retrieval**: `DescribeAddon` returns the complete addon resource shape, including ARN, cluster name, version, status (`ACTIVE`), health issues, tags, service account role ARN, configuration values, pod identity associations, owner, and publisher.
 - **Listing**: `ListAddons` lists installed addon names with pagination (`maxResults` and `nextToken`).
 - **Updating**: `UpdateAddon` updates the addon version, configuration values, service account role ARN, or resolve-conflicts strategy. It returns an `Update` tracking object and updates the addon metadata.
@@ -146,6 +150,23 @@ Floci supports the EKS cluster addon management plane for AWS SDKs and Terraform
 ### Metadata recording only
 
 Addons in Floci are recorded metadata only. Creating or updating an addon does not install or reconcile Kubernetes DaemonSets, Deployments, or custom resources inside the cluster container.
+
+### Container Insights
+
+On a [smolvm-pods node](#smolvm-pods-nodes), the `amazon-cloudwatch-observability` add-on turns on
+Container Insights application logs, which Floci ships itself instead of running the add-on's
+CloudWatch agent and Fluent Bit. While the add-on is on the cluster, each running container's log
+goes to `/aws/containerinsights/<cluster-name>/application`, in the stream that the add-on's Fluent
+Bit names, `<node-name>-application.var.log.containers.<pod>_<namespace>_<container>-<container-id>.log`.
+Each line is a JSON event with `log`, its `time`, and `kubernetes` with `pod_name`,
+`namespace_name`, `pod_id`, `host`, `container_name`, `docker_id` and `container_image`; Fluent
+Bit's `stream` is not known. The logs come from the Kubernetes API's pod logs, which the kubelet
+reads from the node's files, so they do not wake a sleeping pod. Floci looks for new containers
+every 10 seconds. The containers running when the add-on is created, or when Floci starts, ship
+from then on, and a later one ships its whole log, as Fluent Bit reads a new file from its start.
+A follow that ends while its container runs follows again from then on. Deleting the add-on
+stops it. Floci sends no Container Insights metrics, and a cluster in a k3s container ships no
+application logs.
 
 ## Cluster security group
 
@@ -238,6 +259,16 @@ The following flags are refused outright because they conflict with the k3s embe
 - `etcd-servers`
 - `authorization-mode`
 
+When `FLOCI_SERVICES_EKS_PROVIDER` is `smolvm-pods`, `CreateCluster` also refuses, with
+`InvalidParameterException` (HTTP 400):
+- in any component, the flags that the node takes from Floci or from its image: `token-auth-file`,
+  `node-name`, `hostname-override`, `service-cidr`, `service-cluster-ip-range`, `cluster-cidr` and
+  `resolv-conf`;
+- a kubelet `eviction-hard` or `eviction-soft` with a `memory.available` threshold, a kubelet
+  `cpu-manager-policy` other than `none` and a `memory-manager-policy` other than `None`. The node
+  reports a larger capacity than it has, which they do not allow
+  (`tools/smolvm-pods/node/README.md`, "Capacity").
+
 ### Error handling and tag stripping
 
 - **Malformed arguments**: If an argument tag is blank, contains control characters, or cannot be parsed, Floci logs a warning and proceeds with cluster creation.
@@ -297,6 +328,24 @@ EKS clusters support configuring KMS envelope encryption for secrets and control
   - When both `api` and `audit` are enabled, both streams are created and populated under `/aws/eks/<cluster-name>/cluster`. When neither is enabled, no log group or streams are created.
 - **Component streams deviation**: AWS EKS provisions separate log streams for each component (`kube-apiserver-*`, `kube-apiserver-audit-*`, `kube-controller-manager-*`, `kube-scheduler-*`, `authenticator-*`). Because Floci runs clusters on k3s, which embeds the Kubernetes API server, controller manager, and scheduler within a single process, control plane container logs are delivered to the single `kube-apiserver-<hash>` stream when `api` is enabled, and API server audit logs are delivered to `kube-apiserver-audit-<hash>` when `audit` is enabled. Other control plane log types (`authenticator`, `controllerManager`, `scheduler`) do not provision separate streams.
 - **Authenticator logs**: Authenticator webhook authentication events are logged directly by Floci.
+- **Changing it**: `UpdateClusterConfig` with `logging` turns the types it names on or off and keeps
+  the others, on an `ACTIVE` cluster. It returns an `Update` of type `LoggingUpdate`, already
+  `Successful`, whose `ClusterLogging` parameter is the new configuration, and which
+  `DescribeUpdate` finds. The streams change at once, for the lines written from then on. A
+  request that changes nothing is `InvalidParameterException`, as on AWS, and so is one with any
+  member but `logging` and `clientRequestToken`, which Floci does not change. A k3s container's API
+  server writes an audit log only when `audit` was on at `CreateCluster`, so turning it on later
+  ships nothing until the cluster is created again; on a smolvm-pods node it always writes one.
+- **On a smolvm-pods node**: `api` ships the node's k3s log, `/var/log/k3s.log`, and `audit` the API
+  server's audit log, through the node API's log follows (`GET /v1/logs/{log}`,
+  `tools/smolvm-pods/docs/configuration.md`), to `/aws/eks/<cluster-name>/cluster`, streams
+  `kube-apiserver-<id>` and `kube-apiserver-audit-<id>`, where `<id>` is 32 hex digits of the
+  SHA-256 of the node's id. They ship the lines written from the time the cluster becomes `ACTIVE`,
+  or from a change of its logging, on. The node's API server always writes its audit log, with the
+  Amazon EKS policy from the node's seed, to `/var/log/kube-apiserver-audit.log`, keeping three
+  files of 50 MB, so turning `audit` on needs no restart. A follow that the node drops follows again
+  after 1 s, and up to 30 s; the lines written in between are not shipped. The lines do not go to the
+  Floci console.
 
 ## Node group inputs
 
@@ -576,6 +625,7 @@ When an instance joins a cluster, Floci registers a Kubernetes `Node` matching A
 |---|---|---|
 | `FLOCI_SERVICES_EKS_ENABLED` | `true` | Enable the EKS service |
 | `FLOCI_SERVICES_EKS_MOCK` | `false` | Metadata-only mode (no Docker) |
+| `FLOCI_SERVICES_EKS_PROVIDER` | `k3s` | What new clusters run on: `k3s`, a k3s container each, or `smolvm-pods`, the k3s of Floci's smolvm-pods node, which holds one cluster ([smolvm-pods nodes](#smolvm-pods-nodes)) |
 | `FLOCI_SERVICES_EKS_MAX_MEMORY_MIB` | `0` | Optional k3s container memory ceiling in MiB |
 | `FLOCI_SERVICES_EKS_MAX_VCPUS` | `0` | Optional k3s container vCPU ceiling |
 | `FLOCI_SERVICES_EKS_DEFAULT_IMAGE` | `rancher/k3s:latest` | k3s Docker image fallback |
@@ -595,6 +645,218 @@ When an instance joins a cluster, Floci registers a Kubernetes `Node` matching A
 | `FLOCI_SERVICES_EKS_IMDS` | `false` | Enable link-local IMDS (`169.254.169.254`) proxy in cluster containers |
 | `FLOCI_SERVICES_EKS_EMBEDDED_DNS` | `true` | Inject Floci's embedded DNS server into cluster containers for Route 53 private hosted zones and internal name resolution |
 | `FLOCI_SERVICES_EKS_VPC_ROUTE_PROGRAMMING` | `true` | Program emulated VPC route table entries into k3s cluster containers |
+
+### smolvm-pods nodes
+
+The `smolvm-pods` provider runs the cluster on the smolvm-pods node (`tools/smolvm-pods`) that
+Floci shares between RDS and EKS ([The Floci node](../configuration/smolvm-runtime.md#the-floci-node)):
+the cluster is the node's k3s. Floci runs one cluster this way. The node is either the runtime
+file's or one that Floci creates with `node-vm.sh`, which needs Floci running natively on an Apple
+silicon Mac, as a JVM or the native binary, not in a container. With the provider, EKS enabled and
+not in mock mode, and no node in the runtime file, Floci refuses to start unless it runs there,
+`node-vm.sh`, the smolvm checkout and the node image exist, the image's SHA-256 is
+`FLOCI_RUNTIME_NODE_IMAGE_SHA256`, and every node setting is valid. The message names each problem
+with its variable. A cluster needs a node that Floci created, since Floci configures its k3s:
+`CreateCluster` fails with `InvalidRequestException` when the runtime file lists a node.
+
+#### Getting started
+
+The node VM needs an Apple silicon Mac of M3 or later, which runs nested virtual machines, and
+Rosetta 2 for amd64 pods. Build the node image as `tools/smolvm-pods/docs/getting-started.md`
+describes, from "What you need" to "The node image", ending with `scripts/node-vm.sh build`. Then
+start Floci, here from the repository's root with the smolvm checkout beside it:
+
+```sh
+export FLOCI_SERVICES_EKS_PROVIDER=smolvm-pods
+export FLOCI_RUNTIME_NODE_NODE_VM_SCRIPT=$PWD/tools/smolvm-pods/scripts/node-vm.sh
+export FLOCI_RUNTIME_NODE_SMOLVM_SRC=$(cd .. && pwd)/smolvm
+export FLOCI_RUNTIME_NODE_IMAGE=$PWD/tools/smolvm-pods/target/node/node-image.tar
+export FLOCI_RUNTIME_NODE_IMAGE_SHA256=$(shasum -a 256 "$FLOCI_RUNTIME_NODE_IMAGE" | cut -d' ' -f1)
+export FLOCI_STORAGE_MODE=persistent
+export FLOCI_TLS_ENABLED=true
+export FLOCI_SERVICES_ECR_URI_STYLE=path
+./mvnw quarkus:dev
+```
+
+Persistent storage keeps the cluster, and with it the node and its pods, across Floci restarts
+([When Floci stops and starts](#when-floci-stops-and-starts)). TLS turns on
+[IRSA injection](#irsa-injection-at-admission), and with the path style it lets Docker push images
+to Floci's ECR ([Pods, Floci and images](#pods-floci-and-images)). Create a cluster and point
+kubectl at it:
+
+```sh
+aws --endpoint-url http://localhost:4566 eks create-cluster --name dev \
+    --role-arn arn:aws:iam::000000000000:role/eks --resources-vpc-config '{}'
+aws --endpoint-url http://localhost:4566 eks wait cluster-active --name dev
+aws --endpoint-url http://localhost:4566 eks update-kubeconfig --name dev
+kubectl get nodes
+```
+
+kubectl signs in with a token from `aws eks get-token`, which Floci checks against IAM, so run it
+with the access key of an IAM user of the cluster's account, from `aws iam create-access-key`:
+`test`/`test` gets no access. [Using the Floci node day to day](../configuration/smolvm-node.md#kubectl-k9s-and-lens)
+has a recipe for such a profile, the admin kubeconfig that needs none, k9s, Lens and `kubectl top`.
+
+#### Settings
+
+The node's settings, its size, ports, paths and node service settings, are the
+`FLOCI_RUNTIME_NODE_*` variables of [The Floci node](../configuration/smolvm-runtime.md#the-floci-node).
+Two settings belong to the cluster:
+
+| Variable | Default | Description |
+|---|---|---|
+| `FLOCI_SERVICES_EKS_SMOLVM_KUBERNETES_VERSION` | `1.35` | The version a cluster reports when `CreateCluster` names none: the minor of the node image's k3s |
+| `FLOCI_SERVICES_EKS_SMOLVM_RUNTIME_NAMESPACES` | _(empty)_ | Comma-separated namespaces whose pods the [admission webhook](#credential-injection-at-admission) gives the `smolvm-pods` RuntimeClass when they name none, so that pods made by an operator that cannot set it run in VMs and sleep. `*` is every namespace except those that start with `kube-`. A pod with host network, or a container with `stdin` or `tty`, is left in runc. Needs `FLOCI_TLS_ENABLED=true`, as the webhook does |
+
+#### Creating and deleting a cluster
+
+`CreateCluster` claims the node and answers at once with status `CREATING`. A second
+`CreateCluster`, in any account or region, fails while a cluster holds the node:
+
+```
+ResourceLimitExceededException: Floci runs one EKS cluster per smolvm-pods node, and cluster dev
+(account 000000000000, region us-east-1) runs on it. Delete that cluster first, or set
+FLOCI_SERVICES_EKS_PROVIDER=k3s to run each cluster in a k3s container instead.
+```
+
+A FAILED cluster holds the node too, until it is deleted.
+
+When Floci has no node yet, the cluster has Floci create one, which gets the cluster's Service
+range, pod range and k3s arguments. When the node exists, for example because an RDS database
+created it, the cluster adopts the node and its k3s as they are: it reports the node's Service and
+pod ranges, and Floci logs a warning when the cluster asked for other ranges or for k3s arguments.
+Floci's record of the node names the seed its k3s booted with. A node created while
+`FLOCI_SERVICES_EKS_PROVIDER` was not `smolvm-pods` booted without the token webhook, the service
+account key and the ECR mirror, so `CreateCluster` on it fails with `InvalidRequestException`:
+stop the node with `node-vm.sh stop --name NODE` and restart Floci, which starts it with them, or
+reset Floci.
+Either way the cluster's OIDC issuer is the node's, so IRSA tokens that the node's k3s signs verify
+in STS, and its endpoint is the node's Kubernetes API, `https://localhost:PORT`. The node's name in
+Kubernetes is an EC2 private DNS name in the region of the node's first use, and the cluster's EC2
+node instance has its instance id. The issuer, `oidc.eks.REGION.amazonaws.com/id/ID`, names that
+region too, also for a cluster in another region or account. A cluster in another partition than
+the node's, such as `cn-north-1` on a node created in `us-east-1`, fails with
+`InvalidParameterException`, which names both partitions; a reset deletes the node, and the next
+use creates one in its own partition.
+
+A cluster created without a version reports `FLOCI_SERVICES_EKS_SMOLVM_KUBERNETES_VERSION`. A
+cluster created with a version reports that version, and its node still runs the node image's k3s:
+`version` 1.30 gives a 1.35 node with the default image, and Floci logs a warning that names both.
+The cluster becomes `ACTIVE` once the node is ready, which is once all of these hold:
+
+1. the Kubernetes API answers `GET /readyz`;
+2. the node's `Ready` condition is `True`, reported by kubelet since the node VM last started: the
+   node's `status.nodeInfo.bootID` is the VM's boot id. After a stop and a start, the node keeps
+   the `Ready` status of its previous boot until kubelet reports again;
+3. RuntimeClass `smolvm-pods` exists;
+4. the node service answers its API;
+5. the node applied the network profile that Floci publishes to it
+   ([smolvm Runtime](../configuration/smolvm-runtime.md#network)).
+
+`certificateAuthority` then holds the cluster CA, from which `aws eks update-kubeconfig --name NAME`
+writes a kubeconfig. A cluster on a node that exists and is ready is `ACTIVE` within seconds. When
+the node fails, the cluster becomes `FAILED`, and `DeleteCluster` removes it; the next
+`CreateCluster` has Floci create the node again.
+
+The node gets the labels and taints of the cluster's first active node group, and Floci keeps them
+in step every 10 seconds. A node group's instance type does not resize the node: the node has the
+size of `FLOCI_RUNTIME_NODE_CPUS` and `FLOCI_RUNTIME_NODE_MEMORY_MIB`.
+
+`DeleteCluster` removes what the cluster put in Kubernetes and keeps the node:
+
+- every namespace but `default`, `kube-system`, `kube-public` and `kube-node-lease`;
+- in `default`, the Deployments, StatefulSets, DaemonSets, ReplicaSets, Jobs, CronJobs, pods,
+  Services but `kubernetes`, claims, secrets, config maps, service accounts, Roles, RoleBindings,
+  Ingresses, NetworkPolicies, HorizontalPodAutoscalers, PodDisruptionBudgets, ResourceQuotas and
+  LimitRanges;
+- the cluster-scoped objects: mutating and validating webhook configurations, validating admission
+  policies and their bindings, CRDs with their resources, ClusterRoles, ClusterRoleBindings,
+  StorageClasses, PriorityClasses, and PersistentVolumes but those of a claim in `kube-system`,
+  `kube-public` or `kube-node-lease`;
+- the labels and taints that Floci gave the node for the cluster's node groups.
+
+What k3s, Kubernetes and Floci's own manifests made stays: objects named `system:*` or
+`system-*`, Kubernetes's default RBAC (label `kubernetes.io/bootstrapping`), what k3s's deploy
+controller applied (labels or annotations `objectset.rio.cattle.io/*`, which also mark the seed's
+manifests, such as the `floci-eks-pod-identity` webhook), and k3s's `*.cattle.io` CRDs. What the
+cluster put in `kube-system`, `kube-public` and `kube-node-lease`, and cluster-scoped kinds not in
+the list, such as APIServices, stay too. The node, its k3s, and RDS's databases on it keep running,
+so the next cluster starts in seconds. Kubernetes deletes the namespaces in the background. A node
+that does not answer then keeps the objects, which Floci logs.
+
+Floci's other features find the node as `cluster:ACCOUNT/REGION/NAME` while the cluster holds it
+([smolvm Runtime](../configuration/smolvm-runtime.md#workloads)).
+
+#### Pods, Floci and images
+
+A pod runs in a VM of its own, and sleeps while it is idle, when it names the RuntimeClass
+`smolvm-pods`. Its annotations, such as `smolvm-pods.floci.io/idle-timeout`, are in
+`tools/smolvm-pods/docs/configuration.md`, "Pod annotations". Other pods run in runc on the same
+node and never sleep.
+
+- **Pods to Floci.** Floci answers the pods' DNS for its own names, so `localhost.floci.io` and
+  `host.docker.internal` resolve in a pod to the node address `169.254.53.1`, which leads to
+  Floci's ports on the Mac. Give pods `http://localhost.floci.io:4566` as `AWS_ENDPOINT_URL`, and
+  start Floci with `FLOCI_HOSTNAME=localhost.floci.io` and
+  `FLOCI_BASE_URL=http://localhost.floci.io:4566` when pods follow the URLs that Floci returns,
+  such as an SQS `QueueUrl`. The Mac resolves the same name to `127.0.0.1` through public DNS.
+- **IRSA.** A pod whose ServiceAccount names a role gets the role's credentials through STS
+  `AssumeRoleWithWebIdentity` at that endpoint ([IRSA injection at admission](#irsa-injection-at-admission)).
+- **Pod Identity.** Once the node applied its network profile, `169.254.170.23:80` in a pod leads
+  to Floci, and a pod whose service account has a Pod Identity association gets its credentials
+  there ([Credential injection at admission](#credential-injection-at-admission)). Until then,
+  admission gives such a pod IRSA when its service account names a role, and Floci logs it once
+  per cluster.
+- **The node to Floci.** k3s and containerd call Floci at `FLOCI_RUNTIME_NODE_FLOCI_ENDPOINT`,
+  by default `host.docker.internal:<FLOCI_PORT>`, which the node's `/etc/hosts` puts at its gateway.
+  The node's token webhook and admission webhook are routes of the node,
+  `/_floci/eks/smolvm-node/token-webhook` and `/_floci/eks/smolvm-node/pod-identity-webhook`, which
+  answer for the cluster that holds the node, and authenticate no token and change no pod without one.
+- **Images.** The node pulls only from Floci's ECR: its containerd mirrors every registry to that
+  endpoint, where Floci serves the ECR repositories of every account and region by the registry
+  that containerd names, and answers `404` for any other registry. So a cluster in any account,
+  whichever account created the node, pulls its own account's images. Push the image to a Floci
+  ECR repository and name it in the pod by the repository's `repositoryUri`. Docker speaks HTTPS to `localhost` without checking the
+  certificate, so with `FLOCI_TLS_ENABLED=true` and `FLOCI_SERVICES_ECR_URI_STYLE=path`, whose URIs
+  are `localhost:4566/ACCOUNT/REGION/NAME`, it pushes to Floci without trusting Floci's CA. A
+  daemon with the containerd image store, the default from Docker Engine 29, may not push to
+  Floci's plain HTTP.
+- **amd64 images.** From a multi-platform image the node takes the arm64 variant. To run the amd64
+  one under Rosetta, push it alone, pulled by its platform's digest:
+  `docker pull --platform linux/amd64 IMAGE@sha256:DIGEST`, then `docker tag` and `docker push`.
+- **The Mac to pods.** A NodePort Service with a `nodePort` in the node's range answers on the same
+  Mac port: `http://localhost:32080` for `nodePort: 32080`.
+
+```sh
+aws --endpoint-url http://localhost:4566 ecr create-repository --repository-name orders
+docker tag orders:dev localhost:4566/000000000000/us-east-1/orders:dev
+docker push localhost:4566/000000000000/us-east-1/orders:dev
+```
+
+#### When Floci stops and starts
+
+What Floci's stop does to the node is the node's ([The Floci node](../configuration/smolvm-runtime.md#the-floci-node)):
+with `memory` storage Floci deletes it, and otherwise leaves it running, or stops it when
+`FLOCI_RUNTIME_NODE_KEEP_RUNNING_ON_SHUTDOWN` is `false`. When Floci starts, the persisted cluster
+is `CREATING` until the node is ready again: Floci adopts a running node, starts a stopped one, and
+creates a missing one again with the same ports. A node created again has a new cluster CA and
+none of its workloads, so run `aws eks update-kubeconfig` again.
+
+An emulator reset, `POST /_floci/state/reset`, deletes the cluster and the node with its seed, and
+frees its ports.
+
+#### What a smolvm-pods node does not do
+
+Floci skips these on a smolvm-pods cluster, and logs each once per cluster:
+
+- launch template user data of a node group;
+- EC2 instances joining the cluster: `CreateNodegroup` works, but an instance launched with EKS
+  bootstrap user data does not become a node;
+- resizing the node for a node group's instance type.
+
+The IMDS endpoint (`FLOCI_SERVICES_EKS_IMDS`), the embedded DNS (`FLOCI_SERVICES_EKS_EMBEDDED_DNS`),
+VPC route programming, `FLOCI_SERVICES_EKS_DISABLE_CNI` and `FLOCI_SERVICES_EKS_DEFAULT_STORAGE_CLASS`
+apply only to k3s containers.
 
 ### Kubernetes versions and network configuration
 
@@ -691,6 +953,9 @@ Requirements and limits:
   docker cp registries.yaml floci-eks-<cluster>:/etc/rancher/k3s/registries.yaml
   docker restart floci-eks-<cluster>
   ```
+
+A smolvm-pods node gets the same mirrors through its seed, and refuses every other registry
+([Pods, Floci and images](#pods-floci-and-images)).
 
 ### DNS resolution and Route 53 private hosted zones
 
@@ -849,6 +1114,8 @@ spec:
 
 Tokens projected with audience `sts.amazonaws.com` are signed by k3s using the cluster key and advertise the cluster issuer URL. When the AWS SDK inside the container calls `sts:AssumeRoleWithWebIdentity`, Floci verifies the signature against the cluster public key and checks the trust policy conditions. In-cluster components that do not specify an audience receive tokens with both the in-cluster audience and STS audience, allowing normal Kubernetes operation without disruption.
 
+A smolvm-pods node gets the same keys and API server arguments through its seed.
+
 #### 2. Minting a service-account token via HTTP (mock mode & out-of-cluster testing)
 
 For local development harnesses running outside Kubernetes or when using mock mode (`FLOCI_SERVICES_EKS_MOCK=true`), tokens can be requested directly from Floci via HTTP. Signing happens server-side, so the private key never leaves Floci:
@@ -869,6 +1136,29 @@ curl -sX POST http://localhost:4566/_floci/eks/clusters/my-cluster/oidc-token \
 ```
 
 `audience` (default `sts.amazonaws.com`) and `expirySeconds` (default 24h, max 7d) are optional. This is Floci plumbing under `_floci/…`, not an AWS API.
+
+### IRSA injection at admission
+
+The admission webhook that Floci registers for [Pod Identity](#credential-injection-at-admission)
+also injects IRSA, as the EKS pod identity webhook does. When a pod has no Pod Identity
+association, Floci reads its ServiceAccount from the cluster at admission. When the ServiceAccount
+has the annotation `eks.amazonaws.com/role-arn`, every init container and container that does not
+set them gets `AWS_ROLE_ARN`,
+`AWS_WEB_IDENTITY_TOKEN_FILE=/var/run/secrets/eks.amazonaws.com/serviceaccount/token`, `AWS_REGION`
+and `AWS_DEFAULT_REGION` with the cluster's region, and a read-only mount of the projected token
+volume `aws-iam-token`, so a pod needs none of them in its manifest.
+
+| Annotation | On | Effect |
+|---|---|---|
+| `eks.amazonaws.com/role-arn` | ServiceAccount | The role; without it the pod is admitted unchanged |
+| `eks.amazonaws.com/audience` | ServiceAccount | The token's audience, `sts.amazonaws.com` by default |
+| `eks.amazonaws.com/sts-regional-endpoints` | ServiceAccount | `"true"` adds `AWS_STS_REGIONAL_ENDPOINTS=regional` |
+| `eks.amazonaws.com/token-expiration` | ServiceAccount or pod | The token's lifetime in seconds, 86400 by default and at least 600; the pod's wins |
+| `eks.amazonaws.com/skip-containers` | Pod | Comma-separated containers that get nothing |
+
+Like Pod Identity injection, this needs `FLOCI_TLS_ENABLED=true`. A ServiceAccount that cannot be
+read leaves the pod unchanged. Floci gives the read 2 seconds, inside the 3 that the API server gives
+the webhook, and logs a warning when the read fails or runs out of time.
 
 ### Trust policy
 

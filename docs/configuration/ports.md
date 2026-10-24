@@ -10,13 +10,15 @@
 | `5672–5699` | AMQP | Amazon MQ (RabbitMQ) AMQP listener, bound directly by each broker container | **No** |
 | `6379–6399` | TCP | ElastiCache Redis proxy (inside Floci) | Yes |
 | `6400–6419` | TCP | MemoryDB proxy (inside Floci) | Yes |
-| `6500–6599` | HTTPS | EKS k3s API server — bound directly by each k3s container | **No** |
+| `6500–6599` | HTTPS | EKS Kubernetes API server, bound directly by each k3s container or by the smolvm-pods node VM | **No** |
+| `6600–6699` | HTTP | The smolvm-pods node service API, bound by the node VM on the Mac's loopback | **No** |
 | `7001–7099` | TCP | RDS proxy (inside Floci) | Yes |
 | `8182–8282` | TCP | Neptune Gremlin proxy (inside Floci) | Yes |
 | `8700–8799` | HTTP | MWAA Airflow webserver proxy (inside Floci) | Yes |
 | `9400–9499` | HTTP | OpenSearch data-plane — bound directly by each OpenSearch container | **No** |
 | `12000–12499` | HTTP | Lambda Runtime API (internal, Docker-network only) | **No** |
 | `15672–15699` | HTTP | Amazon MQ (RabbitMQ) management console, bound directly by each broker container | **No** |
+| `32080–32099` | TCP | NodePorts of the smolvm-pods node, on the same Mac ports | **No** |
 
 ## Why some ports don't need docker-compose mapping
 
@@ -90,6 +92,22 @@ aws eks create-cluster \
 
 !!! note
     Configure the range with `FLOCI_SERVICES_EKS_API_SERVER_BASE_PORT` and `FLOCI_SERVICES_EKS_API_SERVER_MAX_PORT`.
+
+## Ports 6500–6699 and 32080–32099: the smolvm-pods node
+
+When RDS or EKS runs on the smolvm-pods node and the runtime file lists none, Floci runs natively
+on a Mac and creates the node VM ([The Floci node](./smolvm-runtime.md#the-floci-node)). The node
+publishes its ports on the Mac's loopback only, `127.0.0.1` and `[::1]`:
+
+| Ports | What | Setting |
+|---|---|---|
+| One of `6500–6599` | The node's Kubernetes API, the `endpoint` that `DescribeCluster` returns for the EKS cluster on the node, `https://localhost:PORT` | `FLOCI_RUNTIME_NODE_API_SERVER_BASE_PORT`, `_MAX_PORT` |
+| One of `6600–6699` | The node service's API, which Floci calls with the node's token | `FLOCI_RUNTIME_NODE_NODE_SERVICE_BASE_PORT`, `_MAX_PORT` |
+| `32080–32099` | The node's NodePorts, each on the same Mac port, so a Service with `nodePort: 32080` answers on `http://localhost:32080` | `FLOCI_RUNTIME_NODE_NODE_PORTS` |
+
+A port that another process holds is skipped, and the node gets no NodePorts when another process
+holds one of them. Floci keeps the node's ports across its own restarts, and creates a missing
+node again on the same ports when they are free.
 
 ## Ports 7001–7099 — RDS
 

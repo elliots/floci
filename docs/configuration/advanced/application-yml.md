@@ -116,6 +116,27 @@ floci:
   protocols:
     max-request-size: 2048                   # FLOCI_PROTOCOLS_MAX_REQUEST_SIZE — max HTTP request body size in MB (legacy: floci.max-request-size / FLOCI_MAX_REQUEST_SIZE)
 
+  runtime:
+    config-file: ""                          # FLOCI_RUNTIME_CONFIG_FILE: the smolvm runtime file (see smolvm-runtime.md)
+    dns-listen: ""                           # FLOCI_RUNTIME_DNS_LISTEN: HOST:PORT of the smolvm-pods nodes' DNS; empty is 127.0.0.1:15353, or 0.0.0.0:15353 in a container
+    node:                                    # the one smolvm-pods node of RDS and EKS (smolvm-runtime.md, "The Floci node")
+      name: ""                               # the runtime file's node, by its key; empty takes the only one
+      node-vm-script: ""                     # absolute path of tools/smolvm-pods/scripts/node-vm.sh, to create one
+      smolvm-src: ""                         # the smolvm checkout that node-vm.sh runs
+      image: ""                              # the node image tar of node-vm.sh build
+      image-sha256: ""                       # its SHA-256
+      data-path: ./data/runtime-node         # the node's seed
+      cpus: 4
+      memory-mib: 8192                       # room for a few databases and an EKS cluster's pods
+      storage-gib: 64
+      api-server-base-port: 6500
+      api-server-max-port: 6599
+      node-service-base-port: 6600
+      node-service-max-port: 6699
+      node-ports: 32080-32099                # FIRST-LAST, PORT or none
+      keep-running-on-shutdown: true         # with persistent storage, the node outlives Floci
+      idle-timeout: ""                       # and the node's other settings; empty keeps the node's own
+
   docker:
     log-max-size: "10m"                      # Max size per container log file before rotation
     log-max-file: "3"                        # Number of rotated log files to retain
@@ -325,6 +346,16 @@ floci:
       keep-running-on-shutdown: true
       uri-style: hostname                     # hostname | path
       prefer-local-images: true
+
+    eks:
+      enabled: true
+      provider: k3s                           # k3s | smolvm-pods: one cluster, the k3s of the smolvm-pods node (runtime.node)
+      api-server-base-port: 6500
+      api-server-max-port: 6599
+      data-path: ./data/eks
+      smolvm:                                 # provider smolvm-pods (services/eks.md, "smolvm-pods nodes")
+        kubernetes-version: "1.35"            # the version a cluster reports when CreateCluster names none
+        runtime-namespaces: ""                # namespaces whose pods get RuntimeClass smolvm-pods
 ```
 
 ### Initialization hooks

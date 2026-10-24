@@ -90,6 +90,8 @@ nav:
     - Storage Modes: configuration/storage.md
     - TLS / HTTPS: configuration/tls.md
     - Initialization Hooks: configuration/initialization-hooks.md
+    - smolvm Runtime: configuration/smolvm-runtime.md
+    - Using the Floci Node: configuration/smolvm-node.md
     - Advanced:
       - application.yml Reference: configuration/advanced/application-yml.md
   - Services:
