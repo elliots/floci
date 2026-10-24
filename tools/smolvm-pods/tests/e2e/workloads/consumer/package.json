@@ -1,0 +1,13 @@
+{
+  "name": "smolvm-pods-e2e-consumer",
+  "version": "1.0.0",
+  "description": "The SQS and AMQP consumers of the smolvm-pods messages test",
+  "private": true,
+  "license": "Apache-2.0",
+  "type": "module",
+  "main": "consumer.mjs",
+  "dependencies": {
+    "@aws-sdk/client-sqs": "3.1147.0",
+    "amqplib": "2.2.0"
+  }
+}
