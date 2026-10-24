@@ -246,6 +246,14 @@ public class AssumeRolePolicyEvaluator {
      */
     public boolean allowsService(String trustPolicyDocument, String servicePrincipal,
                                  String sourceArn, String sourceAccount) {
+        Map<String, List<String>> context = IamConditionContextResolver.serviceCallContext(
+                servicePrincipal, null, null, sourceArn, sourceAccount);
+        return allowsServiceAction(trustPolicyDocument, servicePrincipal, ASSUME_ROLE_ACTION, context);
+    }
+
+    /** Evaluates one STS action for a service, including its authenticated request and session-tag context. */
+    public boolean allowsServiceAction(String trustPolicyDocument, String servicePrincipal, String action,
+                                       Map<String, List<String>> context) {
         if (trustPolicyDocument == null || trustPolicyDocument.isBlank()) {
             return false;
         }
@@ -261,19 +269,17 @@ public class AssumeRolePolicyEvaluator {
             return false;
         }
         String version = root.path("Version").asText(null);
-        Map<String, List<String>> context = IamConditionContextResolver.serviceCallContext(
-                servicePrincipal, null, null, sourceArn, sourceAccount);
         boolean allow = false;
         if (statements.isArray()) {
             for (JsonNode statement : statements) {
-                switch (evaluateServiceStatement(statement, servicePrincipal, context, version)) {
+                switch (evaluateServiceStatement(statement, servicePrincipal, action, context, version)) {
                     case DENY -> { return false; }
                     case ALLOW -> allow = true;
                     case NO_MATCH -> { }
                 }
             }
         } else if (statements.isObject()) {
-            return evaluateServiceStatement(statements, servicePrincipal, context, version) == Match.ALLOW;
+            return evaluateServiceStatement(statements, servicePrincipal, action, context, version) == Match.ALLOW;
         }
         return allow;
     }
@@ -351,9 +357,9 @@ public class AssumeRolePolicyEvaluator {
         return effectOf(stmt);
     }
 
-    private Match evaluateServiceStatement(JsonNode stmt, String servicePrincipal,
+    private Match evaluateServiceStatement(JsonNode stmt, String servicePrincipal, String action,
                                            Map<String, List<String>> context, String policyVersion) {
-        if (!actionApplies(stmt) || !matchesServicePrincipal(stmt.get("Principal"), servicePrincipal)) {
+        if (!actionApplies(stmt, action) || !matchesServicePrincipal(stmt.get("Principal"), servicePrincipal)) {
             return Match.NO_MATCH;
         }
         if (!policyEvaluator.conditionMatches(stmt.get("Condition"), context, policyVersion)) {
@@ -414,27 +420,31 @@ public class AssumeRolePolicyEvaluator {
      * A statement with neither key expresses no action constraint and does not apply.
      */
     private boolean actionApplies(JsonNode stmt) {
+        return actionApplies(stmt, ASSUME_ROLE_ACTION);
+    }
+
+    private boolean actionApplies(JsonNode stmt, String requestedAction) {
         JsonNode action = stmt.get("Action");
         if (action != null) {
-            return matchesAssumeRoleAction(action);
+            return matchesAction(action, requestedAction);
         }
         JsonNode notAction = stmt.get("NotAction");
         if (notAction != null) {
-            return !matchesAssumeRoleAction(notAction);
+            return !matchesAction(notAction, requestedAction);
         }
         return false;
     }
 
-    private boolean matchesAssumeRoleAction(JsonNode actionNode) {
+    private boolean matchesAction(JsonNode actionNode, String requestedAction) {
         if (actionNode == null) {
             return false;
         }
         if (actionNode.isTextual()) {
-            return IamPolicyEvaluator.globMatches(actionNode.asText(), ASSUME_ROLE_ACTION);
+            return IamPolicyEvaluator.globMatches(actionNode.asText(), requestedAction);
         }
         if (actionNode.isArray()) {
             for (JsonNode a : actionNode) {
-                if (a.isTextual() && IamPolicyEvaluator.globMatches(a.asText(), ASSUME_ROLE_ACTION)) {
+                if (a.isTextual() && IamPolicyEvaluator.globMatches(a.asText(), requestedAction)) {
                     return true;
                 }
             }

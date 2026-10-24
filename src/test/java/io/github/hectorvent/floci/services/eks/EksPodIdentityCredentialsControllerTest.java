@@ -7,6 +7,8 @@ import io.github.hectorvent.floci.services.eks.model.Cluster;
 import io.github.hectorvent.floci.services.eks.model.ClusterStatus;
 import io.github.hectorvent.floci.services.eks.model.EksPodIdentityCredentialsResponse;
 import io.github.hectorvent.floci.services.eks.model.PodIdentityAssociation;
+import io.github.hectorvent.floci.services.iam.AssumeRolePolicyEvaluator;
+import io.github.hectorvent.floci.services.iam.IamPolicyEvaluator;
 import io.github.hectorvent.floci.services.iam.IamService;
 import io.github.hectorvent.floci.services.iam.model.IamRole;
 import jakarta.ws.rs.core.Response;
@@ -37,6 +39,10 @@ import static org.mockito.Mockito.when;
 
 class EksPodIdentityCredentialsControllerTest {
 
+    private static final String TRUST = """
+            {"Version":"2012-10-17","Statement":[{"Effect":"Allow",
+              "Principal":{"Service":"pods.eks.amazonaws.com"},"Action":["sts:AssumeRole","sts:TagSession"]}]}
+            """;
     private static final String ISSUER =
             "https://oidc.eks.us-east-1.amazonaws.com/id/A1B2C3D4E5F6A1B2C3D4E5F6A1B2C3D4";
     private static final String CLUSTER_NAME = "demo-cluster";
@@ -65,7 +71,8 @@ class EksPodIdentityCredentialsControllerTest {
         tokenVerifier = new WebIdentityTokenVerifier(new ObjectMapper());
 
         controller = new EksPodIdentityCredentialsController(
-                eksService, oidcService, associationService, iamService, tokenVerifier
+                eksService, oidcService, associationService, iamService, tokenVerifier,
+                new AssumeRolePolicyEvaluator(new ObjectMapper(), new IamPolicyEvaluator(new ObjectMapper()))
         );
 
         cluster = new Cluster();
@@ -95,7 +102,7 @@ class EksPodIdentityCredentialsControllerTest {
         when(associationService.findAssociation(cluster, NAMESPACE, SERVICE_ACCOUNT))
                 .thenReturn(Optional.of(association));
         when(iamService.findRole(ACCOUNT_ID, "app-role"))
-                .thenReturn(Optional.of(new IamRole("AROA-app", "app-role", "/", ROLE_ARN, "{}")));
+                .thenReturn(Optional.of(new IamRole("AROA-app", "app-role", "/", ROLE_ARN, TRUST)));
     }
 
     private static KeyPair newKeyPair() throws GeneralSecurityException {
@@ -123,6 +130,97 @@ class EksPodIdentityCredentialsControllerTest {
     private String validToken() throws GeneralSecurityException {
         return buildToken(keyPair.getPrivate(), ISSUER, "pods.eks.amazonaws.com",
                 "system:serviceaccount:" + NAMESPACE + ":" + SERVICE_ACCOUNT, 3600);
+    }
+
+    @Test
+    void missingWrongOrExplicitlyDeniedTrustNeverMintsCredentials() throws Exception {
+        for (String trust : new String[]{"{}", "{\"Statement\":[]}",
+                TRUST.replace("pods.eks.amazonaws.com", "ec2.amazonaws.com"),
+                TRUST.replace("\"Allow\"", "\"Deny\""),
+                TRUST.replace(",\"sts:TagSession\"", ""),
+                "{\"Statement\":[{\"Effect\":\"Allow\",\"Principal\":{\"Service\":\"pods.eks.amazonaws.com\"},"
+                        + "\"Action\":\"sts:*\"},{\"Effect\":\"Deny\",\"Principal\":{\"Service\":\"pods.eks.amazonaws.com\"},"
+                        + "\"Action\":\"sts:TagSession\"}]}"}) {
+            when(iamService.findRole(ACCOUNT_ID, "app-role"))
+                    .thenReturn(Optional.of(new IamRole("AROA-app", "app-role", "/", ROLE_ARN, trust)));
+
+            Response response = controller.getCredentials(validToken());
+
+            assertEquals(400, response.getStatus(), trust);
+            assertTrue(response.getEntity().toString().startsWith("AccessDeniedException"));
+        }
+        verify(iamService, never()).registerSession(any(), any(), any(), any(), any(), any(), any(), any(), any());
+    }
+
+    @Test
+    void namespaceServiceAccountAndSourceAccountConditionsUseVerifiedIdentity() throws Exception {
+        String conditional = """
+                {"Version":"2012-10-17","Statement":[{"Effect":"Allow",
+                  "Principal":{"Service":"pods.eks.amazonaws.com"},"Action":["sts:AssumeRole","sts:TagSession"],
+                  "Condition":{"StringEquals":{"aws:RequestTag/kubernetes-namespace":"workloads",
+                    "aws:RequestTag/kubernetes-service-account":"app-sa","aws:SourceAccount":"123456789012"}}}]}
+                """;
+        when(iamService.findRole(ACCOUNT_ID, "app-role"))
+                .thenReturn(Optional.of(new IamRole("AROA-app", "app-role", "/", ROLE_ARN, conditional)));
+        assertEquals(200, controller.getCredentials(validToken()).getStatus());
+        Mockito.clearInvocations(iamService);
+
+        for (String denied : new String[]{conditional.replace("workloads", "another-namespace"),
+                conditional.replace("app-sa", "another-service-account"),
+                conditional.replace(ACCOUNT_ID, "999999999999")}) {
+            when(iamService.findRole(ACCOUNT_ID, "app-role"))
+                    .thenReturn(Optional.of(new IamRole("AROA-app", "app-role", "/", ROLE_ARN, denied)));
+            assertEquals(400, controller.getCredentials(validToken()).getStatus());
+        }
+        verify(iamService, never()).registerSession(any(), any(), any(), any(), any(), any(), any(), any(), any());
+    }
+
+    @Test
+    void podNameAndUidFromTheTokenAreRequestTags() throws Exception {
+        long now = Instant.now().getEpochSecond();
+        String podToken = signRs256(keyPair.getPrivate(), String.format(
+                "{\"iss\":\"%s\",\"aud\":[\"pods.eks.amazonaws.com\"],\"sub\":\"system:serviceaccount:%s:%s\","
+                        + "\"iat\":%d,\"exp\":%d,\"kubernetes.io\":{\"namespace\":\"%s\",\"pod\":{\"name\":"
+                        + "\"app-7d4f\",\"uid\":\"0b7c1f9e-2a3d-4c5b-8e6f-7a8b9c0d1e2f\"},\"serviceaccount\":"
+                        + "{\"name\":\"%s\"}}}", ISSUER, NAMESPACE, SERVICE_ACCOUNT, now - 10, now + 3600, NAMESPACE,
+                SERVICE_ACCOUNT));
+        String conditional = """
+                {"Version":"2012-10-17","Statement":[{"Effect":"Allow",
+                  "Principal":{"Service":"pods.eks.amazonaws.com"},"Action":["sts:AssumeRole","sts:TagSession"],
+                  "Condition":{"StringEquals":{"aws:RequestTag/kubernetes-pod-name":"app-7d4f",
+                    "aws:RequestTag/kubernetes-pod-uid":"0b7c1f9e-2a3d-4c5b-8e6f-7a8b9c0d1e2f"},
+                    "ForAllValues:StringEquals":{"aws:TagKeys":["eks-cluster-name","eks-cluster-arn",
+                      "kubernetes-namespace","kubernetes-service-account","kubernetes-pod-name",
+                      "kubernetes-pod-uid"]}}}]}
+                """;
+        when(iamService.findRole(ACCOUNT_ID, "app-role"))
+                .thenReturn(Optional.of(new IamRole("AROA-app", "app-role", "/", ROLE_ARN, conditional)));
+
+        assertEquals(200, controller.getCredentials(podToken).getStatus());
+        assertEquals(400, controller.getCredentials(validToken()).getStatus(), "a token without the pod claims");
+
+        when(iamService.findRole(ACCOUNT_ID, "app-role")).thenReturn(Optional.of(new IamRole("AROA-app", "app-role",
+                "/", ROLE_ARN, conditional.replace("\"app-7d4f\"", "\"another-pod\""))));
+        assertEquals(400, controller.getCredentials(podToken).getStatus());
+    }
+
+    @Test
+    void disabledSessionTagsDoNotRequireTagSessionOrSatisfyRequestTagConditions() throws Exception {
+        when(associationService.findAssociation(cluster, NAMESPACE, SERVICE_ACCOUNT)).thenReturn(Optional.of(
+                new PodIdentityAssociation(CLUSTER_NAME, NAMESPACE, SERVICE_ACCOUNT, ROLE_ARN,
+                        "association-arn", "association-id", null, 1, 1, null, null, true, null, null)));
+        String untaggedTrust = TRUST.replace(",\"sts:TagSession\"", "");
+        when(iamService.findRole(ACCOUNT_ID, "app-role"))
+                .thenReturn(Optional.of(new IamRole("AROA-app", "app-role", "/", ROLE_ARN, untaggedTrust)));
+        assertEquals(200, controller.getCredentials(validToken()).getStatus());
+        Mockito.clearInvocations(iamService);
+
+        String requiresTags = untaggedTrust.replace("\"Effect\":\"Allow\",",
+                "\"Effect\":\"Allow\",\"Condition\":{\"StringEquals\":{\"aws:RequestTag/kubernetes-namespace\":\"workloads\"}},");
+        when(iamService.findRole(ACCOUNT_ID, "app-role"))
+                .thenReturn(Optional.of(new IamRole("AROA-app", "app-role", "/", ROLE_ARN, requiresTags)));
+        assertEquals(400, controller.getCredentials(validToken()).getStatus());
+        verify(iamService, never()).registerSession(any(), any(), any(), any(), any(), any(), any(), any(), any());
     }
 
     @Test
@@ -157,7 +255,7 @@ class EksPodIdentityCredentialsControllerTest {
         when(associationService.findAssociation(cluster, NAMESPACE, SERVICE_ACCOUNT))
                 .thenReturn(Optional.of(association));
         when(iamService.findRole(ACCOUNT_ID, "app-role"))
-                .thenReturn(Optional.of(new IamRole("AROA-app", "app-role", "/", ROLE_ARN, "{}")));
+                .thenReturn(Optional.of(new IamRole("AROA-app", "app-role", "/", ROLE_ARN, TRUST)));
 
         Response response = controller.getCredentials("Bearer " + validToken());
 

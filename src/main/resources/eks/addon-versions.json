@@ -348,6 +348,47 @@
           "requiresIamPermissions": true
         }
       ]
+    },
+    {
+      "addonName": "amazon-cloudwatch-observability",
+      "type": "observability",
+      "owner": "aws",
+      "publisher": "eks",
+      "addonVersions": [
+        {
+          "addonVersion": "v4.1.0-eksbuild.1",
+          "architecture": ["amd64", "arm64"],
+          "compatibilities": [
+            {
+              "clusterVersion": "1.32",
+              "platformVersions": ["*"],
+              "defaultVersion": true
+            },
+            {
+              "clusterVersion": "1.31",
+              "platformVersions": ["*"],
+              "defaultVersion": true
+            },
+            {
+              "clusterVersion": "1.30",
+              "platformVersions": ["*"],
+              "defaultVersion": true
+            },
+            {
+              "clusterVersion": "1.29",
+              "platformVersions": ["*"],
+              "defaultVersion": true
+            },
+            {
+              "clusterVersion": "1.28",
+              "platformVersions": ["*"],
+              "defaultVersion": true
+            }
+          ],
+          "requiresConfiguration": false,
+          "requiresIamPermissions": true
+        }
+      ]
     }
   ]
 }

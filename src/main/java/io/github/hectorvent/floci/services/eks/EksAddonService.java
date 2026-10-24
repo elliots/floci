@@ -342,6 +342,16 @@ public class EksAddonService {
         }
     }
 
+    /** Whether the add-on {@code addonName} is on the cluster. */
+    public boolean isInstalled(Cluster cluster, String addonName) {
+        return storage.get(prefix(cluster) + addonName.toLowerCase(Locale.ROOT)).isPresent();
+    }
+
+    /** Keeps an update of the cluster itself, such as UpdateClusterConfig's, for {@link #describeUpdate}. */
+    public void recordClusterUpdate(Cluster cluster, Update update) {
+        updatesStorage.put(prefix(cluster) + update.id(), new StoredUpdate(update, null));
+    }
+
     public Update describeUpdate(Cluster cluster, String updateId, String addonName) {
         StoredUpdate stored = storedUpdate(cluster, updateId);
         if (addonName != null && !addonName.isBlank()

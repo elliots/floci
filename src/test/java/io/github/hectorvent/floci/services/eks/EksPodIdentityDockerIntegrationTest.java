@@ -52,6 +52,10 @@ class EksPodIdentityDockerIntegrationTest {
     }
 
     private static final Logger LOG = Logger.getLogger(EksPodIdentityDockerIntegrationTest.class);
+    private static final String POD_IDENTITY_TRUST = """
+            {"Version":"2012-10-17","Statement":[{"Effect":"Allow",
+              "Principal":{"Service":"pods.eks.amazonaws.com"},"Action":["sts:AssumeRole","sts:TagSession"]}]}
+            """;
     private static final String TEST_IMAGE = "alpine:3.21";
 
     @Inject
@@ -127,7 +131,7 @@ class EksPodIdentityDockerIntegrationTest {
         clusterName = "pi-it-" + UUID.randomUUID().toString().substring(0, 8);
         roleName = "pi-it-role-" + UUID.randomUUID().toString().substring(0, 8);
         String roleArn = "arn:aws:iam::000000000000:role/" + roleName;
-        iamService.createRole(roleName, "/", "{\"Version\":\"2012-10-17\",\"Statement\":[]}", null, 3600, null);
+        iamService.createRole(roleName, "/", POD_IDENTITY_TRUST, null, 3600, null);
 
         cluster = new Cluster();
         cluster.setName(clusterName);

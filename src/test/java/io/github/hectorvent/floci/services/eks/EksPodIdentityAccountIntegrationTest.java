@@ -21,12 +21,17 @@ import static io.restassured.RestAssured.given;
 import static org.hamcrest.Matchers.equalTo;
 import static org.hamcrest.Matchers.notNullValue;
 import static org.hamcrest.Matchers.nullValue;
+import static org.hamcrest.Matchers.startsWith;
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
 @QuarkusTest
 class EksPodIdentityAccountIntegrationTest {
 
+    private static final String POD_IDENTITY_TRUST = """
+            {"Version":"2012-10-17","Statement":[{"Effect":"Allow",
+              "Principal":{"Service":"pods.eks.amazonaws.com"},"Action":["sts:AssumeRole","sts:TagSession"]}]}
+            """;
     private static final String DEFAULT_ACCOUNT = "000000000000";
     private static final String OTHER_ACCOUNT = "123456789012";
     private static final String NAMESPACE = "payments";
@@ -74,6 +79,44 @@ class EksPodIdentityAccountIntegrationTest {
         }
     }
 
+    @Test
+    void theRoleTrustPolicyDecidesWhetherAPodGetsCredentials() {
+        String name = "pi-trust-" + UUID.randomUUID().toString().substring(0, 8);
+        String roleName = "role-" + name;
+        try {
+            Cluster cluster = createCluster(DEFAULT_ACCOUNT, name);
+            String clusterArn = cluster.getArn();
+            String trusted = """
+                    {"Version":"2012-10-17","Statement":[{"Effect":"Allow",
+                      "Principal":{"Service":"pods.eks.amazonaws.com"},"Action":["sts:AssumeRole","sts:TagSession"],
+                      "Condition":{"StringEquals":{"aws:SourceAccount":"%s","aws:SourceArn":"%s",
+                        "aws:RequestTag/kubernetes-namespace":"%s"}}}]}
+                    """.formatted(DEFAULT_ACCOUNT, clusterArn, NAMESPACE);
+            String roleArn = RequestScopes.callAs(DEFAULT_ACCOUNT,
+                    () -> iamService.createRole(roleName, "/", trusted, null, 3600, null).getArn());
+            createPodIdentityResourcesForRole(DEFAULT_ACCOUNT, cluster, roleArn);
+            String token = mintToken(DEFAULT_ACCOUNT, cluster);
+
+            String accessKeyId = given().header("Authorization", token).get("/v1/credentials")
+                    .then().statusCode(200).body("AccessKeyId", startsWith("ASIA"))
+                    .extract().path("AccessKeyId");
+            iamService.unregisterSession(DEFAULT_ACCOUNT, accessKeyId);
+
+            for (String refused : List.of(
+                    trusted.replace("pods.eks.amazonaws.com", "ec2.amazonaws.com"),
+                    trusted.replace(",\"sts:TagSession\"", ""),
+                    trusted.replace(clusterArn, clusterArn + "-other"),
+                    trusted.replace("\"" + NAMESPACE + "\"", "\"another-namespace\""))) {
+                RequestScopes.runAs(DEFAULT_ACCOUNT, () -> iamService.updateAssumeRolePolicy(roleName, refused));
+
+                given().header("Authorization", token).get("/v1/credentials")
+                        .then().statusCode(400).body(startsWith("AccessDeniedException"));
+            }
+        } finally {
+            cleanUp(DEFAULT_ACCOUNT, name, roleName);
+        }
+    }
+
     private Cluster createCluster(String account, String name) {
         Cluster cluster = new Cluster();
         cluster.setName(name);
@@ -93,7 +136,7 @@ class EksPodIdentityAccountIntegrationTest {
 
     private void createPodIdentityResources(String account, Cluster cluster, String roleName) {
         String roleArn = RequestScopes.callAs(account,
-                () -> iamService.createRole(roleName, "/", "{}", null, 3600, null).getArn());
+                () -> iamService.createRole(roleName, "/", POD_IDENTITY_TRUST, null, 3600, null).getArn());
         createPodIdentityResourcesForRole(account, cluster, roleArn);
     }
 

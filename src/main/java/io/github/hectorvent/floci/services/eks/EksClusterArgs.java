@@ -93,6 +93,24 @@ public final class EksClusterArgs {
             "authorizationmode"
     );
 
+    /**
+     * Flags that a smolvm-pods node takes from its seed or its image, in any component: the node's
+     * name, its Service and pod ranges and the static token file, which Floci sets, and the
+     * {@code resolv-conf} of the node image. Normalized without hyphens.
+     */
+    static final Set<String> SMOLVM_NODE_FLAGS = Set.of(
+            "tokenauthfile",
+            "nodename",
+            "hostnameoverride",
+            "servicecidr",
+            "serviceclusteriprange",
+            "clustercidr",
+            "resolvconf"
+    );
+
+    private static final String SMOLVM_CPU_MANAGER_POLICY = "none";
+    private static final String SMOLVM_MEMORY_MANAGER_POLICY = "None";
+
     private static final TypeReference<List<String>> STRING_LIST_TYPE = new TypeReference<>() {};
 
     private EksClusterArgs() {
@@ -178,6 +196,56 @@ public final class EksClusterArgs {
                     break;
                 }
             }
+        }
+    }
+
+    /**
+     * Refuses the arguments that clusters of {@code provider} cannot take. A {@code smolvm-pods}
+     * node refuses {@link #SMOLVM_NODE_FLAGS}, a {@code memory.available} threshold in
+     * {@code eviction-hard} or {@code eviction-soft}, and a CPU or memory manager policy other than
+     * {@code none} and {@code None}, which its capacity view does not allow. A k3s container takes
+     * every argument that {@link #validateClusterArgs} accepts.
+     *
+     * @throws CollisionException naming the first refused argument
+     */
+    public static void validateProviderArgs(String provider, List<String> serverArgs) {
+        if (!EksSmolvmSettings.PROVIDER_SMOLVM_PODS.equals(provider) || serverArgs == null) {
+            return;
+        }
+        for (String arg : serverArgs) {
+            if (arg == null || arg.isBlank()) {
+                continue;
+            }
+            for (Component component : Component.values()) {
+                if (arg.startsWith(component.flagPrefix())) {
+                    validateSmolvmArg(component, arg.substring(component.flagPrefix().length()));
+                    break;
+                }
+            }
+        }
+    }
+
+    private static void validateSmolvmArg(Component component, String flag) {
+        String rawName = extractFlagName(flag);
+        String flagName = rawName.replace("-", "").toLowerCase(Locale.ROOT);
+        int eqIndex = flag.indexOf('=');
+        String value = eqIndex >= 0 ? flag.substring(eqIndex + 1).trim() : null;
+        if (SMOLVM_NODE_FLAGS.contains(flagName)) {
+            throw new CollisionException("Cluster argument '" + rawName
+                    + "' is set by the smolvm-pods node and cannot be overridden on a smolvm-pods cluster.");
+        }
+        if (component != Component.KUBELET) {
+            return;
+        }
+        boolean memoryEviction = ("evictionhard".equals(flagName) || "evictionsoft".equals(flagName))
+                && value != null && value.toLowerCase(Locale.ROOT).contains("memory.available");
+        boolean cpuManager = "cpumanagerpolicy".equals(flagName) && !SMOLVM_CPU_MANAGER_POLICY.equals(value);
+        boolean memoryManager = "memorymanagerpolicy".equals(flagName)
+                && !SMOLVM_MEMORY_MANAGER_POLICY.equals(value);
+        if (memoryEviction || cpuManager || memoryManager) {
+            throw new CollisionException("Cluster argument '" + flag.trim()
+                    + "' is refused on a smolvm-pods cluster: the node reports a larger capacity than it has, "
+                    + "so it allows no memory.available eviction threshold, and no CPU or memory manager.");
         }
     }
 

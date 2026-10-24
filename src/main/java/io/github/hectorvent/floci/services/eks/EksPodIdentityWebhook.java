@@ -25,8 +25,11 @@ import java.util.Optional;
  * variables the AWS SDKs read, so the SDK credential chain reaches the container credentials
  * provider instead of falling through. Floci reproduces exactly that mutation.
  *
- * <p>Nothing answers {@link #CREDENTIALS_FULL_URI} yet: this class injects the plumbing only, so an
- * injected pod still cannot obtain credentials.
+ * <p>Pods without a Pod Identity association may instead use IRSA annotations on their service
+ * account. Pod Identity takes precedence, as it does in the upstream EKS admission webhook, except
+ * in a cluster whose pods do not reach the Pod Identity endpoint
+ * ({@link EksClusterManager#supportsPodIdentity}), such as one on a smolvm-pods node: there a pod
+ * gets IRSA.
  *
  * <p>Every path here admits the pod. A cluster that is gone, an addon that is not installed, a
  * malformed review and an internal error all return {@code allowed: true} with no patch, which is
@@ -53,19 +56,26 @@ public class EksPodIdentityWebhook {
     static final String ENV_AUTHORIZATION_TOKEN_FILE = "AWS_CONTAINER_AUTHORIZATION_TOKEN_FILE";
     static final String CREDENTIALS_FULL_URI = "http://169.254.170.23/v1/credentials";
 
+    static final String SMOLVM_RUNTIME_CLASS = "smolvm-pods";
+
     private static final String DEFAULT_API_VERSION = "admission.k8s.io/v1";
     private static final String DEFAULT_SERVICE_ACCOUNT = "default";
 
     private final EksService eks;
     private final EksAddonService addons;
     private final EksPodIdentityAssociationService associations;
+    private final EksIrsaWebhook irsa;
+    private final EksClusterManager clusters;
 
     @Inject
     public EksPodIdentityWebhook(EksService eks, EksAddonService addons,
-                                 EksPodIdentityAssociationService associations) {
+                                 EksPodIdentityAssociationService associations, EksIrsaWebhook irsa,
+                                 EksClusterManager clusters) {
         this.eks = eks;
         this.addons = addons;
         this.associations = associations;
+        this.irsa = irsa;
+        this.clusters = clusters;
     }
 
     /**
@@ -105,12 +115,43 @@ public class EksPodIdentityWebhook {
             return List.of();
         }
         return RequestScopes.callAs(accountId, () -> {
-            if (!podIdentityAgentInstalled(cluster.get())
-                    || !hasAssociation(cluster.get(), namespace, serviceAccountOf(pod))) {
-                return List.of();
-            }
-            return buildPatch(pod);
+            List<Map<String, Object>> patch = new ArrayList<>(credentialsPatch(cluster.get(), namespace, pod));
+            patch.addAll(runtimePatch(cluster.get(), namespace, pod));
+            return patch;
         });
+    }
+
+    private List<Map<String, Object>> credentialsPatch(Cluster cluster, String namespace, Map<String, Object> pod) {
+        if (podIdentityAgentInstalled(cluster)
+                && hasAssociation(cluster, namespace, serviceAccountOf(pod))
+                && clusters.supportsPodIdentity(cluster)) {
+            return buildPatch(pod);
+        }
+        return irsa.patch(cluster, namespace, serviceAccountOf(pod), pod);
+    }
+
+    /**
+     * Gives a pod of a configured namespace the {@code smolvm-pods} RuntimeClass, so that pods made by
+     * an operator that cannot set one run in VMs and sleep. A pod that names a RuntimeClass keeps it,
+     * and one that a VM pod refuses (host network, an attached stdin or tty) is left in runc.
+     */
+    private List<Map<String, Object>> runtimePatch(Cluster cluster, String namespace, Map<String, Object> pod) {
+        Map<String, Object> spec = asMap(pod.get("spec"));
+        if (spec == null || spec.get("runtimeClassName") != null || Boolean.TRUE.equals(spec.get("hostNetwork"))
+                || !clusters.wantsSmolvmRuntime(cluster, namespace)) {
+            return List.of();
+        }
+        for (String field : List.of("initContainers", "containers")) {
+            List<Object> containers = asList(spec.get(field));
+            for (Object entry : containers == null ? List.of() : containers) {
+                Map<String, Object> container = asMap(entry);
+                if (container != null && (Boolean.TRUE.equals(container.get("stdin"))
+                        || Boolean.TRUE.equals(container.get("tty")))) {
+                    return List.of();
+                }
+            }
+        }
+        return List.of(operation("/spec/runtimeClassName", SMOLVM_RUNTIME_CLASS));
     }
 
     private boolean podIdentityAgentInstalled(Cluster cluster) {

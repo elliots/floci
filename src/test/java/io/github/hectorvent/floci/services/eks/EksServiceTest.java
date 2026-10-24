@@ -1,6 +1,7 @@
 package io.github.hectorvent.floci.services.eks;
 
 import com.fasterxml.jackson.core.type.TypeReference;
+import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import com.fasterxml.jackson.datatype.jsr310.JavaTimeModule;
 import io.github.hectorvent.floci.config.EmulatorConfig;
@@ -54,6 +55,7 @@ import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Optional;
+import java.util.Set;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
@@ -61,6 +63,7 @@ import java.util.concurrent.Future;
 import java.util.concurrent.TimeUnit;
 import java.util.stream.Collectors;
 
+import static org.awaitility.Awaitility.await;
 import static org.junit.jupiter.api.Assertions.*;
 import static org.mockito.ArgumentMatchers.any;
 import static org.mockito.ArgumentMatchers.anyString;
@@ -114,12 +117,17 @@ class EksServiceTest {
     }
 
     private EmulatorConfig testConfig(boolean mock, boolean keepRunningOnShutdown) {
+        return testConfig(mock, keepRunningOnShutdown, "k3s");
+    }
+
+    private EmulatorConfig testConfig(boolean mock, boolean keepRunningOnShutdown, String provider) {
         EmulatorConfig.EksServiceConfig eksConfig = proxy(EmulatorConfig.EksServiceConfig.class,
                 (proxy, method, args) -> switch (method.getName()) {
                     case "enabled" -> true;
                     case "mock" -> mock;
                     case "keepRunningOnShutdown" -> keepRunningOnShutdown;
                     case "apiServerBasePort" -> 6500;
+                    case "provider" -> provider;
                     default -> defaultValue(method);
                 });
         EmulatorConfig.ServicesConfig servicesConfig = proxy(EmulatorConfig.ServicesConfig.class,
@@ -528,29 +536,38 @@ class EksServiceTest {
         }
     }
 
-    @SuppressWarnings("unchecked")
     @Test
-    void shutdownLeavesClusterContainersRunningWhenRetentionIsEnabled() {
-        Cluster cluster = activeCluster();
-        EksClusterManager clusterManager = mock(EksClusterManager.class);
-        EksService service = serviceWithCluster(cluster, clusterManager, true);
+    void shutdownHandsEveryClusterToTheManager() {
+        for (boolean keepRunning : List.of(true, false)) {
+            Cluster cluster = activeCluster();
+            EksClusterManager clusterManager = mock(EksClusterManager.class);
+            EksService service = serviceWithCluster(cluster, clusterManager, keepRunning);
 
-        service.shutdown();
+            service.shutdown();
 
-        verify(clusterManager).detachCluster(cluster);
-        verify(clusterManager, never()).stopCluster(any(Cluster.class));
+            verify(clusterManager).shutdownCluster(cluster);
+            verify(clusterManager, never()).stopCluster(any(Cluster.class));
+            verify(clusterManager, never()).detachCluster(any(Cluster.class));
+        }
     }
 
     @Test
-    void shutdownStopsClusterContainersWhenRetentionIsDisabled() {
+    void aFailedNodeCreationMakesTheClusterFailed() {
         Cluster cluster = activeCluster();
+        cluster.setStatus(ClusterStatus.CREATING);
         EksClusterManager clusterManager = mock(EksClusterManager.class);
+        when(clusterManager.creationFailure(cluster)).thenReturn(Optional.of("node-vm.sh create failed"));
         EksService service = serviceWithCluster(cluster, clusterManager, false);
+        try {
+            service.init();
 
-        service.shutdown();
-
-        verify(clusterManager).stopCluster(cluster);
-        verify(clusterManager, never()).detachCluster(any(Cluster.class));
+            await().atMost(10, TimeUnit.SECONDS)
+                    .until(() -> service.describeCluster("running-cluster").getStatus() == ClusterStatus.FAILED);
+            verify(clusterManager, never()).isReady(cluster);
+            verify(clusterManager, never()).finalizeCluster(cluster);
+        } finally {
+            service.shutdown();
+        }
     }
 
     @Test
@@ -2705,6 +2722,46 @@ class EksServiceTest {
         assertEquals("InvalidParameterException", ex.getErrorCode());
         assertEquals(400, ex.getHttpStatus());
         assertTrue(ex.getMessage().contains("collides with Floci-managed kubelet argument"));
+    }
+
+    @Test
+    void smolvmPodsProviderRefusesArgsThatItsNodeSets() {
+        EksService smolvmService = new EksService(storageFactory, testConfig(true, false, "smolvm-pods"),
+                regionResolver, null, realEc2Service(), new EksOidcService(storageFactory, new ObjectMapper()),
+                mock(EksAccessEntryService.class), mock(EksPodIdentityAssociationService.class));
+        CreateClusterRequest req = createTestClusterRequest("smolvm-resolv-conf");
+        req.setTags(Map.of("floci:kubelet-arg:resolv-conf", "/etc/other-resolv.conf"));
+
+        AwsException ex = assertThrows(AwsException.class, () -> smolvmService.createCluster(req));
+        assertEquals("InvalidParameterException", ex.getErrorCode());
+        assertEquals(400, ex.getHttpStatus());
+        assertEquals("Cluster argument 'resolv-conf' is set by the smolvm-pods node and cannot be overridden on a "
+                + "smolvm-pods cluster.", ex.getMessage());
+
+        CreateClusterRequest k3sReq = createTestClusterRequest("k3s-resolv-conf");
+        k3sReq.setTags(Map.of("floci:kubelet-arg:resolv-conf", "/etc/other-resolv.conf"));
+        assertEquals(List.of("--kubelet-arg=resolv-conf=/etc/other-resolv.conf"),
+                eksService.createCluster(k3sReq).getClusterArgs());
+    }
+
+    @Test
+    void smolvmNodeIsPersistedButNeverInTheClusterResponse() throws Exception {
+        Cluster cluster = eksService.createCluster(createTestClusterRequest("smolvm-wire"));
+        cluster.setProvider("smolvm-pods");
+        cluster.setSmolvmNodeId("floci-node-0123456789abcdef");
+        ObjectMapper mapper = new ObjectMapper().findAndRegisterModules();
+
+        Cluster reloaded = mapper.readValue(mapper.writeValueAsString(cluster), Cluster.class);
+        assertEquals("smolvm-pods", reloaded.getProvider());
+        assertEquals(cluster.getSmolvmNodeId(), reloaded.getSmolvmNodeId());
+        assertEquals(cluster.getSmolvmNodeId(), cluster.copy().getSmolvmNodeId());
+
+        JsonNode wire = mapper.readTree(mapper.writeValueAsString(EksController.toClusterResponse(cluster)));
+        assertFalse(wire.has("provider"));
+        assertFalse(wire.has("smolvmNodeId"));
+        assertEquals("smolvm-wire", wire.path("name").asText());
+        assertEquals("smolvm-pods", cluster.getProvider());
+        assertNotNull(cluster.getSmolvmNodeId());
     }
 
     @Test
