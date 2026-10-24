@@ -1,0 +1,456 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>smolvm-pods node</title>
+<style>
+:root {
+  --bg: #fafaf9; --panel: #ffffff; --text: #1c1917; --muted: #78716c; --line: #e7e5e4;
+  --awake: #16a34a; --asleep: #6366f1; --pausing: #d97706; --waking: #0891b2;
+  --creating: #a3a3a3; --failed: #dc2626; --deleting: #525252;
+  --wake-edge: #9333ea; --traffic-edge: #0284c7;
+}
+@media (prefers-color-scheme: dark) {
+  :root {
+    --bg: #1c1917; --panel: #292524; --text: #f5f5f4; --muted: #a8a29e; --line: #44403c;
+    --awake: #4ade80; --asleep: #a5b4fc; --pausing: #fbbf24; --waking: #22d3ee;
+    --creating: #a3a3a3; --failed: #f87171; --deleting: #a3a3a3;
+    --wake-edge: #c084fc; --traffic-edge: #38bdf8;
+  }
+}
+* { box-sizing: border-box; }
+body { margin: 0; background: var(--bg); color: var(--text);
+  font: 14px/1.4 system-ui, -apple-system, "Segoe UI", sans-serif; }
+header { display: flex; gap: 16px; align-items: baseline; padding: 12px 16px;
+  border-bottom: 1px solid var(--line); flex-wrap: wrap; }
+header h1 { font-size: 16px; margin: 0; }
+#status { color: var(--muted); }
+main { display: grid; grid-template-columns: minmax(0, 3fr) minmax(0, 2fr); gap: 16px; padding: 16px; }
+@media (max-width: 900px) { main { grid-template-columns: 1fr; } }
+section { background: var(--panel); border: 1px solid var(--line); border-radius: 8px; padding: 12px;
+  min-width: 0; }
+section h2 { font-size: 13px; text-transform: uppercase; letter-spacing: .04em; color: var(--muted);
+  margin: 0 0 8px; }
+.wide { grid-column: 1 / -1; }
+#cards { display: flex; flex-wrap: wrap; gap: 8px; }
+.card { border: 1px solid var(--line); border-radius: 6px; padding: 6px 10px; min-width: 110px; }
+.card b { display: block; font-size: 18px; font-variant-numeric: tabular-nums; }
+.card span { color: var(--muted); font-size: 12px; }
+table { width: 100%; border-collapse: collapse; font-variant-numeric: tabular-nums; }
+th, td { text-align: left; padding: 4px 6px; border-bottom: 1px solid var(--line); white-space: nowrap; }
+th { color: var(--muted); font-weight: 500; font-size: 12px; }
+tbody tr { cursor: pointer; }
+tbody tr:hover, tbody tr.selected { background: color-mix(in srgb, var(--asleep) 12%, transparent); }
+.scroll { overflow: auto; max-height: 420px; }
+.dot { display: inline-block; width: 9px; height: 9px; border-radius: 50%; margin-right: 6px; }
+svg text { fill: var(--text); font-size: 11px; }
+#graph { width: 100%; height: 420px; display: block; }
+.legend { color: var(--muted); font-size: 12px; display: flex; gap: 12px; flex-wrap: wrap; margin-top: 6px; }
+#states { display: contents; }
+.legend i { display: inline-block; width: 18px; height: 0; border-top: 2px solid; vertical-align: middle;
+  margin-right: 4px; }
+#timeline-strip { width: 100%; height: 26px; display: block; margin-bottom: 8px; }
+.err { color: var(--failed); }
+.wait { color: var(--pausing); }
+form#login { display: none; gap: 8px; align-items: center; }
+form#login input { font: inherit; padding: 4px 6px; width: 320px; max-width: 60vw;
+  background: var(--bg); color: var(--text); border: 1px solid var(--line); border-radius: 4px; }
+button { font: inherit; padding: 4px 10px; border-radius: 4px; border: 1px solid var(--line);
+  background: var(--panel); color: var(--text); cursor: pointer; }
+pre { margin: 0; font-size: 12px; white-space: pre-wrap; max-height: 300px; overflow: auto; }
+details summary { cursor: pointer; color: var(--muted); margin-top: 8px; }
+</style>
+</head>
+<body>
+<header>
+  <h1>smolvm-pods node</h1>
+  <span id="status">connecting</span>
+  <form id="login">
+    <label for="token">API token</label>
+    <input id="token" type="password" autocomplete="off" placeholder="the node service's --api-token-file">
+    <button type="submit">Use</button>
+  </form>
+</header>
+<main>
+  <section class="wide"><h2>Node</h2><div id="cards"></div>
+    <details><summary>All metrics</summary><pre id="metrics"></pre></details></section>
+  <section><h2>Pods and who woke whom</h2>
+    <svg id="graph" role="img" aria-label="Pods by state, with edges from wakes and traffic"></svg>
+    <div class="legend"><span><i style="border-color: var(--wake-edge); border-top-style: dashed"></i>woke</span>
+      <span><i style="border-color: var(--traffic-edge)"></i>traffic, by bytes</span>
+      <span id="states"></span></div></section>
+  <section><h2>Pods</h2><div class="scroll"><table>
+    <thead><tr><th>Pod</th><th>State</th><th>Since</th><th>Wake</th><th>Pause</th><th>Checkpoint</th></tr></thead>
+    <tbody id="pods"></tbody></table></div></section>
+  <section class="wide"><h2 id="timeline-title">Timeline: select a pod</h2>
+    <svg id="timeline-strip"></svg>
+    <div class="scroll"><table>
+      <thead><tr><th>Time (UTC)</th><th>Change</th><th>Reason</th><th>Took</th><th>Detail</th></tr></thead>
+      <tbody id="timeline"></tbody></table></div></section>
+</main>
+<script>
+"use strict";
+const STATES = ["creating", "awake", "pausing", "asleep", "waking", "failed", "deleting"];
+const KEEP_PER_POD = 300;
+const STRIP_MS = 60 * 60 * 1000;
+const state = {
+  token: "",
+  pods: new Map(),        // sandbox id -> pod
+  events: new Map(),      // sandbox id -> events, oldest first
+  wakes: new Map(),       // "from\u0000to" -> {from, to, count, last}
+  flows: [],
+  selected: null,
+};
+try { state.token = sessionStorage.getItem("smolvm-pods-token") || ""; } catch (e) { /* no storage */ }
+
+const $ = (id) => document.getElementById(id);
+function make(node, attrs, text) {
+  for (const [k, v] of Object.entries(attrs)) { node.setAttribute(k, v); }
+  if (text !== undefined) { node.textContent = text; }
+  return node;
+}
+const el = (tag, attrs, text) => make(document.createElement(tag), attrs, text);
+const svg = (tag, attrs, text) => make(document.createElementNS("http://www.w3.org/2000/svg", tag), attrs, text);
+const color = (s) => `var(--${STATES.includes(s) ? s : "creating"})`;
+const podName = (p) => `${p.namespace}/${p.name}`;
+const ms = (v) => v == null ? "" : v < 1000 ? `${Math.round(v)} ms` : `${(v / 1000).toFixed(1)} s`;
+const mib = (b) => b == null ? "" : `${(b / 1048576).toFixed(0)} MiB`;
+const ago = (t) => {
+  const s = Math.max(0, (Date.now() - Date.parse(t)) / 1000);
+  return s < 60 ? `${Math.round(s)}s` : s < 3600 ? `${Math.round(s / 60)}m` : `${(s / 3600).toFixed(1)}h`;
+};
+
+class Unauthorized extends Error {}
+
+async function api(path, init) {
+  const headers = state.token ? { Authorization: `Bearer ${state.token}` } : {};
+  const response = await fetch(path, Object.assign({ headers, cache: "no-store" }, init || {}));
+  if (response.status === 401) { throw new Unauthorized(); }
+  if (!response.ok) { throw new Error(`${path}: HTTP ${response.status}`); }
+  return response;
+}
+
+function needToken() {
+  $("login").style.display = "flex";
+  $("status").textContent = "the API needs its bearer token";
+}
+
+$("login").addEventListener("submit", (e) => {
+  e.preventDefault();
+  state.token = $("token").value.trim();
+  $("token").value = "";
+  try { sessionStorage.setItem("smolvm-pods-token", state.token); } catch (err) { /* no storage */ }
+  $("login").style.display = "none";
+  start();
+});
+
+async function loadPods() {
+  const body = await (await api("/v1/pods")).json();
+  state.pods = new Map(body.pods.map((p) => [p.sandbox_id, p]));
+  render();
+}
+
+async function loadTraffic() {
+  state.flows = (await (await api("/v1/traffic")).json()).flows;
+  renderGraph();
+}
+
+// A wake's source as a node of the graph: a pod's sandbox id when the
+// reason names a known pod, else a label of its own.
+function wakeSource(e) {
+  const detail = e.reason_detail || {};
+  if (e.reason === "traffic" && detail.from) {
+    for (const p of state.pods.values()) {
+      if (podName(p) === detail.from || p.ip === detail.from) { return p.sandbox_id; }
+    }
+    return `ext:${detail.from}`;
+  }
+  if (e.reason === "aws" && detail.queue) { return `ext:queue ${detail.queue.split("/").pop()}`; }
+  if (e.source) { return `ext:${e.source}`; }
+  return null;
+}
+
+function addEvent(e) {
+  const list = state.events.get(e.pod) || [];
+  list.push(e);
+  if (list.length > KEEP_PER_POD) { list.splice(0, list.length - KEEP_PER_POD); }
+  state.events.set(e.pod, list);
+  if (e.to === "awake" && (e.from === "waking" || (e.from === "pausing" && e.cancelled))) {
+    const from = wakeSource(e);
+    if (from) {
+      const key = `${from}\u0000${e.pod}`;
+      const edge = state.wakes.get(key) || { from, to: e.pod, count: 0, last: "" };
+      edge.count += 1;
+      edge.last = e.time;
+      state.wakes.set(key, edge);
+    }
+  }
+}
+
+let refresh = null;
+function soon() {
+  if (refresh) { return; }
+  refresh = setTimeout(() => { refresh = null; loadPods().catch(fail); }, 300);
+}
+
+// Follows /v1/events from the start of the log, one JSON object a line.
+async function follow() {
+  let cursor = 0;
+  for (;;) {
+    try {
+      const response = await api(`/v1/events?follow=true&cursor=${cursor}`);
+      $("status").textContent = "live";
+      const reader = response.body.getReader();
+      const decoder = new TextDecoder();
+      let buffer = "";
+      for (;;) {
+        const { value, done } = await reader.read();
+        if (done) { break; }
+        buffer += decoder.decode(value, { stream: true });
+        let end;
+        while ((end = buffer.indexOf("\n")) >= 0) {
+          const line = buffer.slice(0, end).trim();
+          buffer = buffer.slice(end + 1);
+          if (!line) { continue; }
+          const e = JSON.parse(line);
+          cursor = Math.max(cursor, e.seq);
+          addEvent(e);
+          if (e.pod === state.selected) { renderTimeline(); }
+          soon();
+        }
+      }
+    } catch (err) {
+      if (err instanceof Unauthorized) { needToken(); return; }
+      $("status").textContent = `reconnecting: ${err.message}`;
+    }
+    await new Promise((r) => setTimeout(r, 2000));
+  }
+}
+
+function parseMetrics(text) {
+  const samples = [];
+  for (const line of text.split("\n")) {
+    if (!line || line.startsWith("#")) { continue; }
+    const m = line.match(/^([a-zA-Z_:][\w:]*)(\{(.*)\})? (\S+)$/);
+    if (!m) { continue; }
+    const labels = {};
+    for (const l of (m[3] || "").matchAll(/(\w+)="((?:[^"\\]|\\.)*)"/g)) { labels[l[1]] = l[2]; }
+    samples.push({ name: m[1], labels, value: Number(m[4]) });
+  }
+  return samples;
+}
+
+const sum = (samples, name, test) => samples
+  .filter((s) => s.name === name && (!test || test(s.labels)))
+  .reduce((a, s) => a + s.value, 0);
+
+// A quantile of a histogram summed over its other labels, from its buckets.
+function quantile(samples, name, q) {
+  const buckets = new Map();
+  for (const s of samples) {
+    if (s.name !== `${name}_bucket`) { continue; }
+    const le = s.labels.le === "+Inf" ? Infinity : Number(s.labels.le);
+    buckets.set(le, (buckets.get(le) || 0) + s.value);
+  }
+  const sorted = [...buckets.entries()].sort((a, b) => a[0] - b[0]);
+  const total = sorted.length ? sorted[sorted.length - 1][1] : 0;
+  if (!total) { return null; }
+  let [prevLe, prevCount] = [0, 0];
+  for (const [le, count] of sorted) {
+    if (count >= q * total) {
+      if (le === Infinity) { return prevLe; }
+      return prevLe + (le - prevLe) * ((q * total - prevCount) / Math.max(1, count - prevCount));
+    }
+    [prevLe, prevCount] = [le, count];
+  }
+  return null;
+}
+
+async function loadMetrics() {
+  const text = await (await api("/metrics")).text();
+  $("metrics").textContent = text;
+  const s = parseMetrics(text);
+  const seconds = (v) => v == null ? "none" : ms(v * 1000);
+  const cards = [
+    ...STATES.map((st) => [st, sum(s, "smolvm_pods_pods", (l) => l.state === st)]),
+    ["wakes", sum(s, "smolvm_pods_wakes_total", (l) => l.outcome === "awake")],
+    ["wake p50", seconds(quantile(s, "smolvm_pods_wake_duration_seconds", 0.5))],
+    ["wake p95", seconds(quantile(s, "smolvm_pods_wake_duration_seconds", 0.95))],
+    ["sleeps", sum(s, "smolvm_pods_sleeps_total", (l) => l.outcome === "asleep")],
+    ["refused wakes", sum(s, "smolvm_pods_wakes_total", (l) => l.outcome === "refused")],
+    ["admission waits", sum(s, "smolvm_pods_admission_waits_total")],
+    ["waiting now", sum(s, "smolvm_pods_admission_waiting")],
+    ["checkpoints", mib(sum(s, "smolvm_pods_checkpoint_bytes"))],
+    ["blocked", sum(s, "smolvm_pods_network_attempts_total", (l) => l.kind === "blocked")],
+    ["k8s events", sum(s, "smolvm_pods_kubernetes_events_total", (l) => l.result === "sent")],
+    ["node service RSS", mib(sum(s, "process_resident_memory_bytes"))],
+  ];
+  const root = $("cards");
+  root.replaceChildren(...cards.map(([label, value]) => {
+    const card = el("div", { class: "card" });
+    card.append(el("b", {}, String(value)), el("span", {}, label));
+    return card;
+  }));
+}
+
+function render() {
+  renderTable();
+  renderGraph();
+  renderTimeline();
+}
+
+function renderTable() {
+  const pods = [...state.pods.values()].sort((a, b) => podName(a).localeCompare(podName(b)));
+  $("pods").replaceChildren(...pods.map((p) => {
+    const row = el("tr", { class: p.sandbox_id === state.selected ? "selected" : "" });
+    const name = el("td", {});
+    name.append(el("span", { class: "dot", style: `background: ${color(p.state)}` }), podName(p));
+    row.append(name, el("td", {}, p.phase ? `${p.state} (${p.phase})` : p.state), el("td", {}, ago(p.state_since)),
+      el("td", {}, ms(p.last_wake_ms)), el("td", {}, ms(p.last_pause_ms)), el("td", {}, mib(p.checkpoint_bytes)));
+    row.addEventListener("click", () => select(p.sandbox_id));
+    return row;
+  }));
+  $("states").replaceChildren(...STATES.map((st) => {
+    const span = el("span", {});
+    span.append(el("span", { class: "dot", style: `background: ${color(st)}` }), st);
+    return span;
+  }));
+}
+
+function renderGraph() {
+  const graph = $("graph");
+  const width = graph.clientWidth || 600;
+  const height = graph.clientHeight || 420;
+  const pods = [...state.pods.values()].sort((a, b) => podName(a).localeCompare(podName(b)));
+  const externals = [...new Set([...state.wakes.values()].map((w) => w.from).filter((f) => f.startsWith("ext:")))];
+  const pos = new Map();
+  const cx = width / 2, cy = height / 2, r = Math.max(40, Math.min(width, height) / 2 - 60);
+  pods.forEach((p, i) => {
+    const a = (2 * Math.PI * i) / Math.max(1, pods.length) - Math.PI / 2;
+    pos.set(p.sandbox_id, [cx + r * Math.cos(a), cy + r * Math.sin(a)]);
+  });
+  externals.forEach((x, i) => pos.set(x, [16, 24 + i * 22]));
+  const children = [];
+  const defs = svg("defs", {});
+  for (const [id, c] of [["wake", "--wake-edge"], ["traffic", "--traffic-edge"]]) {
+    const marker = svg("marker", { id: `arrow-${id}`, viewBox: "0 0 10 10", refX: "20", refY: "5",
+      markerUnits: "userSpaceOnUse", markerWidth: "9", markerHeight: "9", orient: "auto-start-reverse" });
+    marker.append(svg("path", { d: "M 0 0 L 10 5 L 0 10 z", style: `fill: var(${c})` }));
+    defs.append(marker);
+  }
+  children.push(defs);
+  const maxBytes = Math.max(1, ...state.flows.map((f) => f.bytes));
+  for (const f of state.flows) {
+    const [a, b] = [pos.get(f.from), pos.get(f.to)];
+    if (!a || !b) { continue; }
+    const line = svg("line", { x1: a[0], y1: a[1], x2: b[0], y2: b[1], "marker-end": "url(#arrow-traffic)",
+      style: `stroke: var(--traffic-edge); stroke-width: ${1 + 4 * Math.sqrt(f.bytes / maxBytes)}; opacity: .7` });
+    line.append(svg("title", {}, `${f.packets} packets, ${mib(f.bytes)}, last ${ago(f.last)} ago`));
+    children.push(line);
+  }
+  for (const w of state.wakes.values()) {
+    const [a, b] = [pos.get(w.from), pos.get(w.to)];
+    if (!a || !b) { continue; }
+    const mx = (a[0] + b[0]) / 2 + (b[1] - a[1]) * 0.15, my = (a[1] + b[1]) / 2 - (b[0] - a[0]) * 0.15;
+    const path = svg("path", { d: `M ${a[0]} ${a[1]} Q ${mx} ${my} ${b[0]} ${b[1]}`, fill: "none",
+      "marker-end": "url(#arrow-wake)", style: "stroke: var(--wake-edge); stroke-width: 1.5; stroke-dasharray: 4 3" });
+    path.append(svg("title", {}, `${w.count} wakes, last ${ago(w.last)} ago`));
+    children.push(path);
+  }
+  const labels = pods.length <= 80;
+  for (const p of pods) {
+    const [x, y] = pos.get(p.sandbox_id);
+    const g = svg("g", { style: "cursor: pointer" });
+    g.append(svg("circle", { cx: x, cy: y, r: p.sandbox_id === state.selected ? 9 : 7,
+      style: `fill: ${color(p.state)}; stroke: var(--panel); stroke-width: 2` }));
+    g.append(svg("title", {}, `${podName(p)}: ${p.state}`));
+    if (labels) {
+      const right = x >= cx;
+      g.append(svg("text", { x: x + (right ? 11 : -11), y: y + 4, "text-anchor": right ? "start" : "end" }, p.name));
+    }
+    g.addEventListener("click", () => select(p.sandbox_id));
+    children.push(g);
+  }
+  for (const x of externals) {
+    const [px, py] = pos.get(x);
+    children.push(svg("rect", { x: px - 5, y: py - 5, width: 10, height: 10, style: "fill: var(--muted)" }));
+    children.push(svg("text", { x: px + 9, y: py + 4 }, x.slice(4)));
+  }
+  graph.replaceChildren(...children);
+}
+
+function select(id) {
+  state.selected = id;
+  history.replaceState(null, "", `#pod=${encodeURIComponent(id)}`);
+  render();
+}
+
+function renderTimeline() {
+  const pod = state.pods.get(state.selected);
+  const events = state.events.get(state.selected) || [];
+  $("timeline-title").textContent = pod ? `Timeline: ${podName(pod)}` : "Timeline: select a pod";
+  const strip = $("timeline-strip");
+  const width = strip.clientWidth || 600;
+  const now = Date.now();
+  const start = now - STRIP_MS;
+  const rects = [];
+  let current = null;
+  let since = start;
+  for (const e of events) {
+    const t = Date.parse(e.time);
+    if (t > start && current) {
+      rects.push([since, t, current]);
+    }
+    since = Math.max(start, t);
+    current = e.to;
+  }
+  if (current) { rects.push([since, now, current]); }
+  const x = (t) => ((t - start) / STRIP_MS) * width;
+  strip.replaceChildren(...rects.filter(([a, b]) => b > a).map(([a, b, st]) => {
+    const rect = svg("rect", { x: x(a), y: 4, width: Math.max(1, x(b) - x(a)), height: 18, style: `fill: ${color(st)}` });
+    rect.append(svg("title", {}, `${st} for ${ms(b - a)}`));
+    return rect;
+  }), svg("text", { x: 2, y: 25, style: "font-size: 9px; fill: var(--muted)" }, "1 h ago"));
+  $("timeline").replaceChildren(...events.slice().reverse().map((e) => {
+    const row = el("tr", {});
+    const detail = e.waiting ? ["wait", `waits for admission: ${e.waiting}`] : e.error ? ["err", e.error]
+      : e.reason_detail ? ["", e.reason_detail.from ? `from ${e.reason_detail.from}:${e.reason_detail.port}` : e.reason_detail.queue || ""]
+      : ["", e.warning || ""];
+    row.append(el("td", {}, e.time.replace("T", " ").replace("Z", "")), el("td", {}, `${e.from} → ${e.to}`),
+      el("td", {}, e.source ? `${e.reason} (${e.source})` : e.reason), el("td", {}, ms(e.duration_ms)),
+      el("td", { class: detail[0] }, detail[1]));
+    return row;
+  }));
+}
+
+function fail(err) {
+  if (err instanceof Unauthorized) { needToken(); return; }
+  $("status").textContent = err.message;
+}
+
+let timers = [];
+async function start() {
+  timers.forEach(clearInterval);
+  timers = [];
+  try {
+    await loadPods();
+  } catch (err) {
+    fail(err);
+    return;
+  }
+  follow();
+  loadTraffic().catch(fail);
+  loadMetrics().catch(fail);
+  timers.push(setInterval(() => loadTraffic().catch(fail), 15000));
+  timers.push(setInterval(() => loadMetrics().catch(fail), 10000));
+  timers.push(setInterval(() => { renderTable(); renderTimeline(); }, 5000));
+}
+
+const linked = location.hash.match(/^#pod=(.+)$/);
+if (linked) { state.selected = decodeURIComponent(linked[1]); }
+window.addEventListener("resize", render);
+start();
+</script>
+</body>
+</html>
