@@ -72,6 +72,14 @@ public class WebIdentityTokenVerifier {
     }
 
     /**
+     * Reads every claim without verifying the signature, such as the {@code kubernetes.io} claims of
+     * a token that {@link #verify} accepted. Returns empty when {@code token} is not a parseable JWT.
+     */
+    public Optional<JsonNode> peekClaims(String token) {
+        return parseClaims(token);
+    }
+
+    /**
      * Fully verifies {@code token}: RS256 signature against {@code publicKey}, {@code iss} equal to
      * {@code expectedIssuer}, {@code aud} containing {@code requiredAudience}, and {@code exp}/
      * {@code nbf} within {@link #CLOCK_SKEW_SECONDS}.

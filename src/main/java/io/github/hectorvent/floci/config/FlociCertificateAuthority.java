@@ -4,16 +4,31 @@ import io.github.hectorvent.floci.core.common.Digests;
 import io.github.hectorvent.floci.core.common.Pem;
 import io.github.hectorvent.floci.services.acm.CertificateGenerator;
 import io.github.hectorvent.floci.services.acm.model.KeyAlgorithm;
+import org.bouncycastle.asn1.ASN1BitString;
 import org.bouncycastle.asn1.ASN1ObjectIdentifier;
 import org.bouncycastle.asn1.pkcs.PKCSObjectIdentifiers;
+import org.bouncycastle.asn1.pkcs.PrivateKeyInfo;
 import org.bouncycastle.asn1.pkcs.RSAPublicKey;
+import org.bouncycastle.asn1.sec.ECPrivateKey;
 import org.bouncycastle.asn1.sec.SECObjectIdentifiers;
 import org.bouncycastle.asn1.x500.X500Name;
+import org.bouncycastle.asn1.x500.X500NameBuilder;
+import org.bouncycastle.asn1.x500.style.BCStyle;
+import org.bouncycastle.asn1.x509.BasicConstraints;
 import org.bouncycastle.asn1.x509.Extension;
+import org.bouncycastle.asn1.x509.GeneralName;
+import org.bouncycastle.asn1.x509.GeneralSubtree;
+import org.bouncycastle.asn1.x509.KeyUsage;
+import org.bouncycastle.asn1.x509.NameConstraints;
+import org.bouncycastle.asn1.x509.SubjectKeyIdentifier;
 import org.bouncycastle.asn1.x509.SubjectPublicKeyInfo;
 import org.bouncycastle.asn1.x9.X962Parameters;
 import org.bouncycastle.asn1.x9.X9ObjectIdentifiers;
+import org.bouncycastle.cert.jcajce.JcaX509CertificateConverter;
+import org.bouncycastle.cert.jcajce.JcaX509ExtensionUtils;
+import org.bouncycastle.cert.jcajce.JcaX509v3CertificateBuilder;
 import org.bouncycastle.openssl.PEMParser;
+import org.bouncycastle.operator.jcajce.JcaContentSignerBuilder;
 import org.bouncycastle.operator.jcajce.JcaContentVerifierProviderBuilder;
 import org.bouncycastle.pkcs.PKCS10CertificationRequest;
 import org.bouncycastle.pkcs.jcajce.JcaPKCS10CertificationRequest;
@@ -24,6 +39,7 @@ import javax.net.ssl.SSLContext;
 
 import java.io.IOException;
 import java.io.StringReader;
+import java.math.BigInteger;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.nio.file.StandardCopyOption;
@@ -31,13 +47,18 @@ import java.nio.file.attribute.PosixFileAttributeView;
 import java.nio.file.attribute.PosixFilePermissions;
 import java.security.GeneralSecurityException;
 import java.security.KeyPair;
+import java.security.KeyPairGenerator;
 import java.security.KeyStore;
 import java.security.PrivateKey;
 import java.security.PublicKey;
 import java.security.SecureRandom;
 import java.security.cert.Certificate;
 import java.security.cert.X509Certificate;
+import java.security.spec.ECGenParameterSpec;
+import java.time.Duration;
 import java.time.Instant;
+import java.util.Base64;
+import java.util.Date;
 import java.util.HexFormat;
 import java.util.List;
 import java.util.Set;
@@ -232,6 +253,73 @@ public final class FlociCertificateAuthority {
         SSLContext context = SSLContext.getInstance("TLS");
         context.init(keyManagers.getKeyManagers(), null, new SecureRandom());
         return context;
+    }
+
+    /**
+     * An intermediate CA that may sign only names in or below {@code permittedNames}: path length
+     * 0, critical name constraints, an EC P-256 key, and validity from an hour ago until
+     * {@code notAfter}, never past this CA's own. A smolvm-pods node mints the leaves of routed
+     * hosts from it.
+     *
+     * @param subject its subject's common name, its only attribute
+     */
+    public RouteIssuer issueConstrainedIntermediate(String subject, List<String> permittedNames, Instant notAfter) {
+        try {
+            KeyPairGenerator generator = KeyPairGenerator.getInstance("EC");
+            generator.initialize(new ECGenParameterSpec("secp256r1"));
+            KeyPair pair = generator.generateKeyPair();
+            Instant caEnd = certificate.getNotAfter().toInstant();
+            Instant end = notAfter.isAfter(caEnd) ? caEnd : notAfter;
+            X500Name issuerName = X500Name.getInstance(certificate.getSubjectX500Principal().getEncoded());
+            X500Name subjectName = new X500NameBuilder(BCStyle.INSTANCE).addRDN(BCStyle.CN, subject).build();
+            JcaX509v3CertificateBuilder builder = new JcaX509v3CertificateBuilder(issuerName,
+                    new BigInteger(127, new SecureRandom()).add(BigInteger.ONE),
+                    Date.from(Instant.now().minus(Duration.ofHours(1))), Date.from(end), subjectName,
+                    pair.getPublic());
+            JcaX509ExtensionUtils extensions = new JcaX509ExtensionUtils();
+            SubjectKeyIdentifier keyId = extensions.createSubjectKeyIdentifier(pair.getPublic());
+            GeneralSubtree[] permitted = permittedNames.stream()
+                    .map(name -> new GeneralSubtree(new GeneralName(GeneralName.dNSName, name)))
+                    .toArray(GeneralSubtree[]::new);
+            builder.addExtension(Extension.basicConstraints, true, new BasicConstraints(0));
+            builder.addExtension(Extension.keyUsage, true, new KeyUsage(KeyUsage.keyCertSign | KeyUsage.cRLSign));
+            builder.addExtension(Extension.subjectKeyIdentifier, false, keyId);
+            builder.addExtension(Extension.authorityKeyIdentifier, false,
+                    extensions.createAuthorityKeyIdentifier(certificate));
+            builder.addExtension(Extension.nameConstraints, true, new NameConstraints(permitted, null));
+            String algorithm = "EC".equals(key.getAlgorithm()) ? "SHA256withECDSA" : "SHA256withRSA";
+            X509Certificate issued = new JcaX509CertificateConverter()
+                    .getCertificate(builder.build(new JcaContentSignerBuilder(algorithm).build(key)));
+            Base64.Encoder mime = Base64.getMimeEncoder(64, new byte[] {'\n'});
+            String certificatePem = "-----BEGIN CERTIFICATE-----\n" + mime.encodeToString(issued.getEncoded())
+                    + "\n-----END CERTIFICATE-----\n";
+            String keyPem = "-----BEGIN PRIVATE KEY-----\n" + mime.encodeToString(withPublicKey(pair))
+                    + "\n-----END PRIVATE KEY-----\n";
+            return new RouteIssuer(certificatePem, keyPem, subject, HexFormat.of().formatHex(keyId.getKeyIdentifier()),
+                    end);
+        } catch (Exception e) {
+            throw new IllegalStateException("Cannot issue the route intermediate CA: " + e.getMessage(), e);
+        }
+    }
+
+    /**
+     * The PKCS#8 encoding of an EC key pair's private key with its public key inside, as OpenSSL
+     * writes it. The JDK leaves the public key out, and ring, which smolvm-pods signs leaves
+     * with, refuses a key without it.
+     */
+    static byte[] withPublicKey(KeyPair pair) throws IOException {
+        PrivateKeyInfo info = PrivateKeyInfo.getInstance(pair.getPrivate().getEncoded());
+        ECPrivateKey key = ECPrivateKey.getInstance(info.parsePrivateKey());
+        ASN1BitString publicKey = SubjectPublicKeyInfo.getInstance(pair.getPublic().getEncoded()).getPublicKeyData();
+        ECPrivateKey complete = new ECPrivateKey(256, key.getKey(), publicKey, null);
+        return new PrivateKeyInfo(info.getPrivateKeyAlgorithm(), complete).getEncoded();
+    }
+
+    /**
+     * An intermediate from {@link #issueConstrainedIntermediate}: its certificate and PKCS#8 key in
+     * PEM, its subject's common name, and its subject key identifier in hex.
+     */
+    public record RouteIssuer(String certificatePem, String keyPem, String subject, String keyId, Instant notAfter) {
     }
 
     /**

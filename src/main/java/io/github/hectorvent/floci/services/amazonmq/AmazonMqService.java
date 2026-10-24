@@ -31,6 +31,7 @@ import java.util.List;
 import java.util.Map;
 import java.util.Set;
 import java.util.UUID;
+import java.util.concurrent.CopyOnWriteArrayList;
 import java.util.concurrent.Executors;
 import java.util.concurrent.ScheduledExecutorService;
 import java.util.concurrent.TimeUnit;
@@ -48,6 +49,7 @@ public class AmazonMqService implements ResourceProvider {
     private final RegionResolver regionResolver;
     private final RabbitMqManager rabbitMqManager;
     private final ScheduledExecutorService poller = Executors.newSingleThreadScheduledExecutor();
+    private final List<BrokerListener> listeners = new CopyOnWriteArrayList<>();
 
     @Inject
     public AmazonMqService(StorageFactory storageFactory, EmulatorConfig config,
@@ -70,6 +72,11 @@ public class AmazonMqService implements ResourceProvider {
         // RabbitMqManager.stopAll() (ordered with the other container managers);
         // here we only stop the readiness poller.
         poller.shutdown();
+    }
+
+    /** Tells {@code listener} from now on when a broker becomes {@code RUNNING} and when one is deleted. */
+    public void addBrokerListener(BrokerListener listener) {
+        listeners.add(listener);
     }
 
     public Broker createBroker(CreateBrokerParams params) {
@@ -217,6 +224,13 @@ public class AmazonMqService implements ResourceProvider {
         }
         storage.delete(brokerId);
         LOG.infov("Deleted Amazon MQ broker {0}", brokerId);
+        for (BrokerListener listener : listeners) {
+            try {
+                listener.brokerDeleted(broker);
+            } catch (RuntimeException e) {
+                LOG.errorv(e, "A listener failed on the deletion of broker {0}", brokerId);
+            }
+        }
     }
 
     public Broker rebootBroker(String brokerId) {
@@ -255,12 +269,23 @@ public class AmazonMqService implements ResourceProvider {
                         LOG.infov("Amazon MQ broker {0} is now RUNNING", broker.getBrokerName());
                         broker.setBrokerState(BrokerState.RUNNING);
                         putBroker(broker);
+                        running(broker);
                     }
                 }
             } catch (Exception e) {
                 LOG.error("Error in Amazon MQ readiness poller", e);
             }
         }, 1, 2, TimeUnit.SECONDS);
+    }
+
+    private void running(Broker broker) {
+        for (BrokerListener listener : listeners) {
+            try {
+                listener.brokerRunning(broker);
+            } catch (RuntimeException e) {
+                LOG.errorv(e, "A listener failed on broker {0} running", broker.getBrokerId());
+            }
+        }
     }
 
     private List<Broker> allBrokers() {

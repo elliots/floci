@@ -315,6 +315,8 @@ class EventBridgeSchedulerIntegrationTest {
             @Override
             public NetworkConfig network() { return null; }
             @Override
+            public RuntimeConfig runtime() { return null; }
+            @Override
             public DnsConfig dns() {
                 return new DnsConfig() {
                     @Override

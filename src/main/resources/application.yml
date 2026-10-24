@@ -355,6 +355,41 @@ floci:
     strict-claiming: false             # FLOCI_PROTOCOLS_STRICT_CLAIMING — reject RPC-signaled requests that no supported wire protocol claims
     reject-unknown-service-scope: true # FLOCI_PROTOCOLS_REJECT_UNKNOWN_SERVICE_SCOPE — reject REST requests signed for a service Floci does not implement
 
+  runtime:
+    config-file: ""                    # FLOCI_RUNTIME_CONFIG_FILE: the smolvm runtime file (docs/configuration/smolvm-runtime.md)
+    dns-listen: ""                     # FLOCI_RUNTIME_DNS_LISTEN: HOST:PORT of the smolvm-pods nodes' DNS; empty is 127.0.0.1:15353, or 0.0.0.0:15353 in a container
+    node:                              # the one smolvm-pods node of RDS and EKS (docs/configuration/smolvm-runtime.md)
+      name: ""                         # FLOCI_RUNTIME_NODE_NAME: the runtime file's node, by its key; empty takes the only one
+      # Floci creates the node on first use when the runtime file lists none: native on an Apple silicon Mac.
+      node-vm-script: ""               # absolute path of tools/smolvm-pods/scripts/node-vm.sh
+      smolvm-src: ""                   # the smolvm checkout that node-vm.sh runs (SMOLVM_SRC)
+      image: ""                        # the node image tar from node-vm.sh build
+      image-sha256: ""                 # its SHA-256
+      data-path: ./data/runtime-node   # the node's seed, with its secrets
+      cpus: 4
+      memory-mib: 8192                 # room for a few databases and an EKS cluster's pods
+      storage-gib: 64
+      overlay-gib: 8
+      rosetta: true                    # share Rosetta with the node, for amd64 pods
+      api-server-base-port: 6500       # the node's Kubernetes API, on a Mac port in this range
+      api-server-max-port: 6599
+      node-service-base-port: 6600     # the node service's API, on a Mac port in this range
+      node-service-max-port: 6699
+      node-ports: 32080-32099          # NodePorts on the same Mac ports: FIRST-LAST, PORT or none
+      floci-endpoint: ""               # where k3s and containerd in the node reach Floci; empty: host.docker.internal:<port>
+      keep-running-on-shutdown: true   # leave the node running when Floci stops, with persistent storage
+      ready-timeout-seconds: 600       # how long a created, started or adopted node may take to be ready
+      # Node service settings in the node's seed; empty keeps the node's own default.
+      idle-timeout: ""
+      cpu-threshold: ""
+      cpu-window: ""
+      max-awake-pods: ""
+      max-awake-memory-mib: ""
+      admission-wait: ""
+      reported-memory-gib: ""          # applies at the next node restart
+      reported-cpus: ""                # applies at the next node restart
+      rust-log: ""                     # applies at the next node restart
+
   docker:
     log-max-size: "10m"
     log-max-file: "3"
@@ -551,6 +586,9 @@ floci:
       proxy-max-connections: 100                  # Max concurrent proxy connections before new ones are refused
       aurora-auto-pause-enabled: true             # FLOCI_SERVICES_RDS_AURORA_AUTO_PAUSE_ENABLED; pause a MinCapacity=0 Aurora cluster after SecondsUntilAutoPause without connections
       aurora-resume-delay-millis: 0               # FLOCI_SERVICES_RDS_AURORA_RESUME_DELAY_MILLIS; hold the first connection this long while a paused cluster resumes (Aurora takes about 15000)
+      smolvm:
+        enabled: false                            # FLOCI_SERVICES_RDS_SMOLVM_ENABLED; run every database container as a hibernating microVM on the smolvm-pods node (floci.runtime.node)
+        idle-timeout: ""                          # FLOCI_SERVICES_RDS_SMOLVM_IDLE_TIMEOUT; how long a database is idle before it sleeps, such as 2m; empty takes the node's
     rds-data:
       enabled: true
       transaction-ttl-seconds: 180
@@ -797,7 +835,7 @@ floci:
       mock: false
       max-memory-mib: 0        # optional k3s container memory ceiling; 0 follows the node type
       max-vcpus: 0             # optional k3s container CPU ceiling; 0 follows the node type
-      provider: k3s
+      provider: k3s                # k3s: a k3s container per cluster; smolvm-pods: one cluster, on the smolvm-pods node of floci.runtime.node
       default-image: "rancher/k3s:latest"
       # image-template: "myregistry.io/k3s:v%s" # optional custom image format template taking cluster version
       api-server-base-port: 6500
@@ -815,6 +853,9 @@ floci:
       pod-identity-webhook: true   # register a mutating webhook that injects pod identity credentials (needs floci.tls.enabled)
       embedded-dns: true           # point cluster containers at Floci's embedded DNS to resolve Route 53 private zones
       vpc-route-programming: true  # program VPC routes into the cluster container for associated subnets
+      smolvm:                      # provider smolvm-pods: the one cluster runs on the node of floci.runtime.node
+        kubernetes-version: "1.35" # the version a cluster reports when CreateCluster names none
+        runtime-namespaces: ""     # namespaces whose pods the admission webhook gives RuntimeClass smolvm-pods ("*": all but kube-*); needs floci.tls.enabled
     mwaa:
       enabled: true
       mock: false

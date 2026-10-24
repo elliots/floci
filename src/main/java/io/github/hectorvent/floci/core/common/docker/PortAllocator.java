@@ -16,6 +16,7 @@ import java.util.Locale;
 import java.util.Set;
 import java.util.concurrent.ConcurrentSkipListSet;
 import java.util.function.IntFunction;
+import java.util.function.IntPredicate;
 
 /**
  * Allocates host ports from a configured range for callers that must know the port before
@@ -68,6 +69,25 @@ public class PortAllocator {
             if (!reserved.contains(port) && !published.contains(port) && isPortFree(port)) {
                 reserved.add(port);
                 LOG.debugv("Allocated port {0} from range {1}-{2}", String.valueOf(port), String.valueOf(basePort), String.valueOf(maxPort));
+                return port;
+            }
+        }
+        throw new RuntimeException("No free port available in range " + basePort + "-" + maxPort);
+    }
+
+    /**
+     * Reserves the first port in the range that this allocator has not reserved and that
+     * {@code free} accepts, without asking Docker. For host ports that a process other than Docker
+     * publishes, such as a smolvm machine on the Mac's loopback, which {@link #isPortFree} misses.
+     *
+     * @throws RuntimeException if no port in the range is free
+     */
+    public synchronized int allocate(int basePort, int maxPort, IntPredicate free) {
+        for (int port = basePort; port <= maxPort; port++) {
+            if (!reserved.contains(port) && free.test(port)) {
+                reserved.add(port);
+                LOG.debugv("Allocated port {0} from range {1}-{2}", String.valueOf(port), String.valueOf(basePort),
+                        String.valueOf(maxPort));
                 return port;
             }
         }

@@ -14,8 +14,11 @@ import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
 import org.mockito.Mockito;
 
+import java.time.Duration;
 import java.util.List;
+import java.util.concurrent.CopyOnWriteArrayList;
 
+import static org.awaitility.Awaitility.await;
 import static org.junit.jupiter.api.Assertions.*;
 import static org.mockito.Mockito.when;
 
@@ -115,6 +118,72 @@ class AmazonMqServiceTest {
     }
 
     @Test
+    void deleteBrokerTellsTheBrokerListeners() {
+        RecordingListener listener = new RecordingListener();
+        service.addBrokerListener(listener);
+        Broker broker = service.createBroker(rabbitParams("orders"));
+
+        service.deleteBroker(broker.getBrokerId());
+
+        assertEquals(List.of("deleted " + broker.getBrokerId()), listener.heard);
+    }
+
+    @Test
+    void aListenerThatFailsDoesNotFailTheDeletion() {
+        service.addBrokerListener(new BrokerListener() {
+            @Override
+            public void brokerRunning(Broker broker) {
+                throw new IllegalStateException("running");
+            }
+
+            @Override
+            public void brokerDeleted(Broker broker) {
+                throw new IllegalStateException("deleted");
+            }
+        });
+        RecordingListener listener = new RecordingListener();
+        service.addBrokerListener(listener);
+        Broker broker = service.createBroker(rabbitParams("orders"));
+
+        service.deleteBroker(broker.getBrokerId());
+
+        assertTrue(service.listBrokers().isEmpty());
+        assertEquals(List.of("deleted " + broker.getBrokerId()), listener.heard);
+    }
+
+    @Test
+    void theReadinessCheckTellsTheBrokerListenersOnceTheBrokerRuns() {
+        StorageFactory storageFactory = Mockito.mock(StorageFactory.class);
+        when(storageFactory.create(Mockito.anyString(), Mockito.anyString(), Mockito.any()))
+                .thenReturn(AccountAwareStorageBackend.inMemory("000000000000"));
+        EmulatorConfig config = Mockito.mock(EmulatorConfig.class);
+        EmulatorConfig.ServicesConfig servicesConfig = Mockito.mock(EmulatorConfig.ServicesConfig.class);
+        EmulatorConfig.AmazonMqServiceConfig mqConfig = Mockito.mock(EmulatorConfig.AmazonMqServiceConfig.class);
+        when(config.services()).thenReturn(servicesConfig);
+        when(servicesConfig.amazonmq()).thenReturn(mqConfig);
+        when(mqConfig.mock()).thenReturn(false);
+        RabbitMqManager manager = Mockito.mock(RabbitMqManager.class);
+        when(manager.isReady(Mockito.any())).thenReturn(false);
+        AmazonMqService real = new AmazonMqService(storageFactory, config,
+                new RegionResolver("us-east-1", "000000000000"), manager);
+        RecordingListener listener = new RecordingListener();
+        real.addBrokerListener(listener);
+        real.init();
+        try {
+            Broker broker = real.createBroker(rabbitParams("orders"));
+            assertEquals(BrokerState.CREATION_IN_PROGRESS, broker.getBrokerState());
+
+            when(manager.isReady(Mockito.any())).thenReturn(true);
+
+            await().atMost(Duration.ofSeconds(10)).until(() -> !listener.heard.isEmpty());
+            assertEquals(List.of("running " + broker.getBrokerId()), listener.heard);
+            assertEquals(BrokerState.RUNNING, real.describeBroker(broker.getBrokerId()).getBrokerState());
+        } finally {
+            real.shutdown();
+        }
+    }
+
+    @Test
     void userApiRejectedForRabbitMq() {
         // The standalone User API applies only to ActiveMQ; AWS rejects it for
         // RabbitMQ brokers, and every broker we host is RabbitMQ.
@@ -203,5 +272,20 @@ class AmazonMqServiceTest {
         Mockito.doThrow(new RuntimeException("docker unavailable"))
                 .when(failingManager).startContainer(Mockito.any());
         return new AmazonMqService(storageFactory, config, regionResolver, failingManager);
+    }
+
+    private static final class RecordingListener implements BrokerListener {
+
+        final List<String> heard = new CopyOnWriteArrayList<>();
+
+        @Override
+        public void brokerRunning(Broker broker) {
+            heard.add("running " + broker.getBrokerId());
+        }
+
+        @Override
+        public void brokerDeleted(Broker broker) {
+            heard.add("deleted " + broker.getBrokerId());
+        }
     }
 }

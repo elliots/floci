@@ -5,6 +5,7 @@ import io.github.hectorvent.floci.core.common.RegionResolver;
 import io.github.hectorvent.floci.core.common.docker.ContainerBuilder;
 import io.github.hectorvent.floci.core.common.docker.ContainerDetector;
 import io.github.hectorvent.floci.core.common.docker.ContainerLifecycleManager;
+import io.github.hectorvent.floci.core.common.docker.ContainerLifecycleManager.ContainerPresence;
 import io.github.hectorvent.floci.core.common.docker.ContainerLogStreamer;
 import io.github.hectorvent.floci.core.common.docker.ContainerSpec;
 import io.github.hectorvent.floci.core.common.docker.PortAllocator;
@@ -15,9 +16,12 @@ import org.mockito.Mockito;
 
 import java.util.Map;
 import java.util.Optional;
+import java.util.Set;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertThrows;
+import static org.junit.jupiter.api.Assertions.assertTrue;
 import static org.mockito.ArgumentMatchers.any;
 import static org.mockito.ArgumentMatchers.anyString;
 import static org.mockito.ArgumentMatchers.eq;
@@ -279,5 +283,64 @@ class RabbitMqManagerTest {
         verify(lifecycleManager).removeIfExists("floci-aws-amazonmq-b-2");
         verify(lifecycleManager).removeIfExists("floci-amazonmq-b-2");
         verifyNoMoreInteractions(lifecycleManager);
+    }
+
+    @Test
+    void aBrokerRunsFromItsContainersStartUntilItStops() {
+        EmulatorConfig config = configWithDefaultPortRanges();
+        ContainerLifecycleManager lifecycleManager = Mockito.mock(ContainerLifecycleManager.class);
+        when(lifecycleManager.createAndStart(any())).thenReturn(
+                new ContainerLifecycleManager.ContainerInfo("container-id", Map.of(
+                        5672, new ContainerLifecycleManager.EndpointInfo("localhost", 5672),
+                        15672, new ContainerLifecycleManager.EndpointInfo("localhost", 15672))));
+        ContainerBuilder containerBuilder = Mockito.mock(ContainerBuilder.class);
+        selfReturningBuilder(containerBuilder);
+        PortAllocator portAllocator = Mockito.mock(PortAllocator.class);
+        RabbitMqManager manager = new RabbitMqManager(containerBuilder, lifecycleManager,
+                Mockito.mock(ContainerLogStreamer.class), Mockito.mock(ContainerDetector.class),
+                portAllocator, config, regionResolver());
+        Broker broker = broker("b-1");
+
+        assertFalse(manager.running("b-1"));
+        assertEquals(ContainerPresence.ABSENT, manager.containerPresence("b-1"));
+
+        manager.startContainer(broker);
+        when(lifecycleManager.presenceOf("container-id")).thenReturn(ContainerPresence.RUNNING);
+
+        assertTrue(manager.running("b-1"));
+        assertEquals(ContainerPresence.RUNNING, manager.containerPresence("b-1"));
+
+        when(lifecycleManager.presenceOf("container-id")).thenReturn(ContainerPresence.STOPPED);
+        assertEquals(ContainerPresence.STOPPED, manager.containerPresence("b-1"));
+
+        when(lifecycleManager.presenceOf("container-id")).thenReturn(ContainerPresence.ABSENT);
+        assertTrue(manager.running("b-1"));
+        assertEquals(ContainerPresence.ABSENT, manager.containerPresence("b-1"));
+
+        manager.stopContainer(broker);
+
+        assertFalse(manager.running("b-1"));
+        assertEquals(ContainerPresence.ABSENT, manager.containerPresence("b-1"));
+    }
+
+    @Test
+    void aQueueThatPrintsNoCountsIsDownAndTheOthersAreCounted() {
+        RabbitMqManager.VirtualHostQueues queues = RabbitMqManager.virtualHostQueues("""
+                [{"name":"jobs","messages_ready":2,"messages_unacknowledged":1},
+                 {"name":"crashed","messages_ready":"","messages_unacknowledged":""},
+                 {"name":"leaderless"}]
+                """, "list_queues");
+
+        assertEquals(Map.of("jobs", new RabbitMqManager.QueueCounts(2, 1)), queues.counts());
+        assertEquals(Set.of("crashed", "leaderless"), queues.down());
+    }
+
+    @Test
+    void aCommandForABrokerWithoutAContainerFails() {
+        IllegalStateException failure = assertThrows(IllegalStateException.class,
+                () -> manager.traceOn("b-none", "/"));
+
+        assertEquals("Floci runs no container for broker b-none", failure.getMessage());
+        verify(lifecycleManager, never()).getDockerClient();
     }
 }

@@ -54,6 +54,7 @@ import java.util.Optional;
 import java.util.Set;
 import java.util.UUID;
 import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.CopyOnWriteArrayList;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
@@ -88,6 +89,30 @@ public class SqsService implements Resettable, ResourceProvider {
     private final StorageBackend<String, Map<String, Long>> dedupStore;
     private final StorageBackend<String, Map<String, Map<String, String>>> dedupIdentityStore;
     private final ConcurrentHashMap<String, GuardedMessageQueue> messagesByQueue = new ConcurrentHashMap<>();
+    private final List<SqsQueueListener> queueListeners = new CopyOnWriteArrayList<>();
+    private final SqsQueueListener queueEvents = new SqsQueueListener() {
+        @Override
+        public void messageAvailable(SqsQueueId queue, Instant at) {
+            for (SqsQueueListener listener : queueListeners) {
+                try {
+                    listener.messageAvailable(queue, at);
+                } catch (RuntimeException e) {
+                    LOG.errorv(e, "A listener of the SQS queue {0} failed on an added message", queue.name());
+                }
+            }
+        }
+
+        @Override
+        public void messagesChanged(SqsQueueId queue) {
+            for (SqsQueueListener listener : queueListeners) {
+                try {
+                    listener.messagesChanged(queue);
+                } catch (RuntimeException e) {
+                    LOG.errorv(e, "A listener of the SQS queue {0} failed on a change of its messages", queue.name());
+                }
+            }
+        }
+    };
     private final ConcurrentHashMap<String, Object> queueLocks = new ConcurrentHashMap<>();
     private final ConcurrentHashMap<String, RedrivePolicy> redrivePolicyCache = new ConcurrentHashMap<>();
     private final ConcurrentHashMap<String, ConcurrentHashMap<String, Instant>> deduplicationCache = new ConcurrentHashMap<>();
@@ -556,12 +581,13 @@ public class SqsService implements Resettable, ResourceProvider {
         }
         if (messageStore instanceof AccountAwareStorageBackend<List<Message>> aware) {
             aware.scanAllAccountsAsMap().forEach((key, msgs) ->
-                    messagesByQueue.put(key, new GuardedMessageQueue(msgs, messageStore, key, receiptHandleSecret)));
+                    messagesByQueue.put(key,
+                            new GuardedMessageQueue(msgs, messageStore, key, receiptHandleSecret, queueEvents)));
         } else {
             for (String key : messageStore.keys()) {
                 messageStore.get(key).ifPresent(msgs ->
                         messagesByQueue.put(key,
-                                new GuardedMessageQueue(msgs, messageStore, key, receiptHandleSecret)));
+                                new GuardedMessageQueue(msgs, messageStore, key, receiptHandleSecret, queueEvents)));
             }
         }
     }
@@ -633,7 +659,7 @@ public class SqsService implements Resettable, ResourceProvider {
 
     private GuardedMessageQueue getOrCreateQueue(String storageKey) {
         return messagesByQueue.computeIfAbsent(storageKey,
-                k -> new GuardedMessageQueue(new ArrayList<>(), messageStore, k, receiptHandleSecret));
+                k -> new GuardedMessageQueue(new ArrayList<>(), messageStore, k, receiptHandleSecret, queueEvents));
     }
 
     private void persistDedup(String storageKey) {
@@ -803,7 +829,7 @@ public class SqsService implements Resettable, ResourceProvider {
 
         queueStore.put(storageKey, queue);
         GuardedMessageQueue messages = new GuardedMessageQueue(new ArrayList<>(), messageStore, storageKey,
-                receiptHandleSecret);
+                receiptHandleSecret, queueEvents);
         messages.activity().accessed();
         messagesByQueue.put(storageKey, messages);
         LOG.infov("Created {0} queue: {1} in region {2}", queue.isFifo() ? "FIFO" : "standard", queueName, region);
@@ -838,7 +864,59 @@ public class SqsService implements Resettable, ResourceProvider {
         // Left alone they would survive a delete + recreate under the same URL
         // and consume deliveries that belong to the new queue's consumers.
         notifyReceivers(storageKey);
+        SqsQueueId id = SqsQueueId.ofStorageKey(storageKey);
+        if (id != null) {
+            queueEvents.messagesChanged(id);
+        }
         LOG.infov("Deleted queue: {0}", queueUrl);
+    }
+
+    /**
+     * Tells {@code listener} of every change to the messages of every queue from now on, on the
+     * thread that makes it, after the queue's lock is released.
+     */
+    public void addQueueListener(SqsQueueListener listener) {
+        queueListeners.add(listener);
+    }
+
+    /**
+     * The messages of a queue that a consumer has to handle.
+     *
+     * @param visible     messages a receive can take now
+     * @param inFlight    messages received and neither deleted nor visible again
+     * @param nextVisible when the first delayed message becomes visible, or null when none is delayed
+     */
+    public record QueueWork(long visible, long inFlight, Instant nextVisible) {
+
+        /** Whether a consumer has messages to receive or to finish. */
+        public boolean any() {
+            return visible > 0 || inFlight > 0;
+        }
+    }
+
+    /**
+     * The messages of {@code queue} that a consumer has to handle, read in one pass that changes
+     * nothing and reports nothing. Empty when the queue does not exist; reading a queue that does
+     * not exist creates nothing. It needs no request scope.
+     */
+    public Optional<QueueWork> queueWork(SqsQueueId queue) {
+        String storageKey = queue.storageKey();
+        String queueUrl = baseUrl + "/" + queue.accountId() + "/" + queue.name();
+        Optional<Queue> stored = getQueueByUrl(storageKey, queueUrl);
+        if (stored.isEmpty()) {
+            return Optional.empty();
+        }
+        GuardedMessageQueue messages = messagesByQueue.get(storageKey);
+        if (messages == null) {
+            return Optional.of(new QueueWork(0, 0, null));
+        }
+        return Optional.of(messages.work(retentionCutoff(stored.get())));
+    }
+
+    /** Whether the calling thread holds the lock of the messages of {@code queue}, for tests. */
+    boolean holdsQueueLock(SqsQueueId queue) {
+        GuardedMessageQueue messages = messagesByQueue.get(queue.storageKey());
+        return messages != null && messages.heldByCurrentThread();
     }
 
     public List<Queue> listQueues(String namePrefix, String region) {
