@@ -70,7 +70,8 @@ final class RdsEngineCatalog {
     }
 
     // The log types each engine has long published to CloudWatch Logs, per the RDS and Aurora user
-    // guides. Floci stores EnableCloudwatchLogsExports as given and ships nothing.
+    // guides. Floci accepts them all and ships the one its database container writes: postgresql
+    // for PostgreSQL, error for the others (RdsService.containerLogType).
     private static final Map<String, List<String>> EXPORTABLE_LOG_TYPES = Map.of(
             "postgres", List.of("postgresql", "upgrade"),
             "mysql", List.of("audit", "error", "general", "slowquery"),

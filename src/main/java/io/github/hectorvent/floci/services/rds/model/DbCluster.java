@@ -24,6 +24,7 @@ public class DbCluster {
     private boolean iamDatabaseAuthenticationEnabled;
     private boolean httpEndpointEnabled;
     private List<String> dbClusterMembers = new ArrayList<>();
+    private List<String> enabledCloudwatchLogsExports = new ArrayList<>();
     // The member that holds the writer role. Null on a cluster persisted before the role was
     // modelled, in which case the first member is the writer, as it always was reported.
     private String clusterWriterIdentifier;
@@ -127,6 +128,11 @@ public class DbCluster {
 
     public List<String> getDbClusterMembers() { return dbClusterMembers; }
     public void setDbClusterMembers(List<String> dbClusterMembers) { this.dbClusterMembers = dbClusterMembers; }
+
+    public List<String> getEnabledCloudwatchLogsExports() { return enabledCloudwatchLogsExports; }
+    public void setEnabledCloudwatchLogsExports(List<String> enabledCloudwatchLogsExports) {
+        this.enabledCloudwatchLogsExports = enabledCloudwatchLogsExports;
+    }
 
     public String getClusterWriterIdentifier() { return clusterWriterIdentifier; }
     public void setClusterWriterIdentifier(String clusterWriterIdentifier) { this.clusterWriterIdentifier = clusterWriterIdentifier; }

@@ -5,6 +5,7 @@ import io.github.hectorvent.floci.config.EmulatorConfig;
 import io.github.hectorvent.floci.core.common.AwsException;
 import io.github.hectorvent.floci.core.common.RegionResolver;
 import io.github.hectorvent.floci.core.common.docker.ContainerLiveness;
+import io.github.hectorvent.floci.core.common.docker.ContainerLogStreamer.LogDestination;
 import io.github.hectorvent.floci.core.common.docker.CurrentContainerNetworkResolver;
 import io.github.hectorvent.floci.core.common.docker.DockerHostResolver;
 import io.github.hectorvent.floci.core.storage.AccountAwareStorageBackend;
@@ -22,6 +23,7 @@ import io.github.hectorvent.floci.services.rds.container.AutoPauseListener;
 import io.github.hectorvent.floci.services.rds.container.RdsBackendGate;
 import io.github.hectorvent.floci.services.rds.container.RdsContainerHandle;
 import io.github.hectorvent.floci.services.rds.container.RdsContainerManager;
+import io.github.hectorvent.floci.services.rds.container.RdsLogExport;
 import io.github.hectorvent.floci.services.rds.export.SnapshotExportSource;
 import io.github.hectorvent.floci.services.rds.model.DatabaseEngine;
 import io.github.hectorvent.floci.services.rds.model.DbCluster;
@@ -43,6 +45,7 @@ import io.github.hectorvent.floci.services.rds.model.DbSnapshot;
 import io.github.hectorvent.floci.services.rds.model.DbSubnetGroup;
 import io.github.hectorvent.floci.services.rds.model.GlobalCluster;
 import io.github.hectorvent.floci.services.rds.model.GlobalClusterMember;
+import io.github.hectorvent.floci.services.rds.model.LogExportChanges;
 import io.github.hectorvent.floci.services.rds.model.OptionGroup;
 import io.github.hectorvent.floci.services.rds.model.OptionGroupOption;
 import io.github.hectorvent.floci.services.rds.model.PointInTimeRestoreRequest;
@@ -69,6 +72,7 @@ import java.lang.reflect.Field;
 import java.net.ServerSocket;
 import java.time.Duration;
 import java.time.Instant;
+import java.util.ArrayList;
 import java.util.Collection;
 import java.util.HashMap;
 import java.util.LinkedHashMap;
@@ -85,6 +89,7 @@ import java.util.concurrent.Future;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicReference;
+import java.util.function.Consumer;
 import java.util.function.Supplier;
 import java.util.logging.LogRecord;
 import java.util.stream.Collectors;
@@ -104,6 +109,7 @@ import static org.mockito.Mockito.doAnswer;
 import static org.mockito.Mockito.doCallRealMethod;
 import static org.mockito.Mockito.doReturn;
 import static org.mockito.Mockito.doThrow;
+import static org.mockito.Mockito.lenient;
 import static org.mockito.Mockito.mock;
 import static org.mockito.Mockito.never;
 import static org.mockito.Mockito.spy;
@@ -190,6 +196,7 @@ class RdsServiceTest {
 
         when(containerManager.tryStart(any(), any(), any(), any(), any(), any(), any(), any(), any(), any()))
                 .thenReturn(new RdsContainerHandle("cont-id", "id", "localhost", 5432));
+        lenient().when(containerManager.place(any(), any(), any(), any())).thenReturn(true);
         when(ec2Service.resolveDefaultVpcId(any()))
                 .thenAnswer(invocation -> Ec2Service.defaultVpcId(invocation.getArgument(0)));
         when(ec2Service.describeSubnets(any(), anyList(), any()))
@@ -4231,6 +4238,106 @@ class RdsServiceTest {
                 eq("rds-resource:" + created.getDbInstanceArn()), eq(created.getDbInstanceArn()),
                 any(), anyBoolean(), eq(created.getProxyPort()), eq("127.0.0.1"), eq(15432),
                 any(), any(), any(), any(), any(), any());
+    }
+
+    /** A container manager on a smolvm-pods node that is not ready, which keeps what waits for it. */
+    private RdsContainerManager nodeNotReady(List<Runnable> ready, List<Consumer<String>> failed) {
+        RdsContainerManager onNode = mock(RdsContainerManager.class);
+        when(onNode.onSmolvmNode()).thenReturn(true);
+        when(onNode.tryStart(any(), any(), any(), any(), any(), any(), any(), any(), any(), any()))
+                .thenReturn(new RdsContainerHandle("node-container", "id", "10.200.0.5", 5432));
+        doAnswer(invocation -> {
+            ready.add(invocation.getArgument(0));
+            failed.add(invocation.getArgument(1));
+            return null;
+        }).when(onNode).whenNodeReady(any(), any());
+        return onNode;
+    }
+
+    @Test
+    void aRestoreThatWaitsForTheNodeKeepsThePersistedPortsAndStartsTheDatabasesOnceItIsReady() {
+        StorageBackend<String, DbInstance> instances = new InMemoryStorage<>();
+        StorageBackend<String, DbCluster> clusters = new InMemoryStorage<>();
+        RdsService initial = newService(containerManager, proxyManager,
+                instances, clusters, new InMemoryStorage<>(), new InMemoryStorage<>(), new InMemoryStorage<>());
+        DbInstance persisted = initial.createDbInstance("persisted", "postgres", "16.3",
+                "admin", "secret", "app", "db.t3.micro", 20, false, null, null, null, null, false);
+        int persistedPort = persisted.getProxyPort();
+
+        List<Runnable> ready = new ArrayList<>();
+        RdsContainerManager onNode = nodeNotReady(ready, new ArrayList<>());
+        RdsProxyManager proxies = mock(RdsProxyManager.class);
+        RdsService restored = newService(onNode, proxies,
+                instances, clusters, new InMemoryStorage<>(), new InMemoryStorage<>(), new InMemoryStorage<>());
+        restored.restorePersistedRuntime();
+
+        DbInstance waiting = restored.getDbInstance("persisted");
+        assertEquals(DbInstanceStatus.CREATING, waiting.getStatus());
+        assertEquals(persistedPort, waiting.getEndpoint().port());
+        assertNull(waiting.getContainerHost());
+        DbInstance created = restored.createDbInstance("created", "postgres", "16.3",
+                "admin", "secret", "app", "db.t3.micro", 20, false, null, null, null, null, false);
+        assertNotEquals(persistedPort, created.getProxyPort());
+        verify(onNode, never()).tryStart(any(), any(), any(), any(), any(), any(), any(), any(), any(), any());
+
+        ready.forEach(Runnable::run);
+
+        DbInstance available = restored.getDbInstance("persisted");
+        assertEquals(DbInstanceStatus.AVAILABLE, available.getStatus());
+        assertEquals(persistedPort, available.getProxyPort());
+        assertEquals(persistedPort, available.getEndpoint().port());
+        assertEquals("10.200.0.5", available.getContainerHost());
+        assertEquals(DbInstanceStatus.AVAILABLE, restored.getDbInstance("created").getStatus());
+        verify(proxies).startProxy(eq("rds-resource:" + persisted.getDbInstanceArn()), any(), any(),
+                anyBoolean(), eq(persistedPort), eq("10.200.0.5"), eq(5432), any(), any(), any(), any(), any(), any());
+    }
+
+    @Test
+    void aMemberOfAClusterThatWaitsForTheNodeWaitsWithItAndStartsWithIt() {
+        List<Runnable> ready = new ArrayList<>();
+        RdsContainerManager onNode = nodeNotReady(ready, new ArrayList<>());
+        RdsService service = newService(onNode, proxyManager, new InMemoryStorage<>(), new InMemoryStorage<>(),
+                new InMemoryStorage<>(), new InMemoryStorage<>(), new InMemoryStorage<>());
+
+        DbCluster cluster = service.createDbCluster("waiting-cluster", "aurora-postgresql", "16.3",
+                "admin", "password", "dbname", false, null, null, null, false, "us-east-1");
+        DbInstance member = service.createDbInstance("waiting-member", "aurora-postgresql", "16.3",
+                null, null, "dbname", "db.r5.large", 20, false, null, null,
+                "waiting-cluster", null, false, false, null, Map.of(), List.of(), "us-east-1");
+
+        assertEquals(DbInstanceStatus.CREATING, cluster.getStatus());
+        assertEquals(DbInstanceStatus.CREATING, member.getStatus());
+        assertEquals(1, ready.size(), "the member waits with its cluster");
+        verify(onNode, never()).tryStart(any(), any(), any(), any(), any(), any(), any(), any(), any(), any());
+
+        ready.getFirst().run();
+
+        assertEquals(DbInstanceStatus.AVAILABLE, service.getDbCluster("waiting-cluster", "us-east-1").getStatus());
+        DbInstance started = service.getDbInstance("waiting-member", "us-east-1");
+        assertEquals(DbInstanceStatus.AVAILABLE, started.getStatus());
+        assertEquals("10.200.0.5", started.getContainerHost());
+        verify(onNode, times(1)).tryStart(any(), any(), any(), any(), any(), any(), any(), any(), any(), any());
+        verify(proxyManager).startProxy(eq("rds-resource:" + member.getDbInstanceArn()),
+                eq(cluster.getDbClusterArn()), any(), anyBoolean(), eq(member.getProxyPort()), eq("10.200.0.5"),
+                eq(5432), any(), any(), any(), any(), any(), any());
+    }
+
+    @Test
+    void aClusterWhoseNodeFailsFailsWithTheMembersThatWaitWithIt() {
+        List<Consumer<String>> failed = new ArrayList<>();
+        RdsContainerManager onNode = nodeNotReady(new ArrayList<>(), failed);
+        RdsService service = newService(onNode, proxyManager, new InMemoryStorage<>(), new InMemoryStorage<>(),
+                new InMemoryStorage<>(), new InMemoryStorage<>(), new InMemoryStorage<>());
+        service.createDbCluster("failing-cluster", "aurora-postgresql", "16.3",
+                "admin", "password", "dbname", false, null, null, null, false, "us-east-1");
+        service.createDbInstance("failing-member", "aurora-postgresql", "16.3",
+                null, null, "dbname", "db.r5.large", 20, false, null, null,
+                "failing-cluster", null, false, false, null, Map.of(), List.of(), "us-east-1");
+
+        failed.getFirst().accept("the node did not start");
+
+        assertEquals(DbInstanceStatus.FAILED, service.getDbCluster("failing-cluster", "us-east-1").getStatus());
+        assertEquals(DbInstanceStatus.FAILED, service.getDbInstance("failing-member", "us-east-1").getStatus());
     }
 
     @Test
@@ -10954,5 +11061,44 @@ class RdsServiceTest {
         rdsService.addTagsToResource(arn, Map.of("team", "data"));
         rdsService.removeTagsFromResource(arn, List.of("env"));
         assertEquals(Map.of("team", "data"), rdsService.listTagsForResource(arn));
+    }
+
+    @Test
+    void anInstanceShipsOnlyTheEnabledLogTypeOfItsContainer() {
+        DbInstance instance = rdsService.createDbInstance("logs-db", "postgres", "16",
+                "admin", "password", "dbname", "db.t3.micro",
+                20, false, null, null, null, null, false);
+        String arn = instance.getDbInstanceArn();
+        verify(containerManager, atLeastOnce()).exportLogs(arn, new RdsLogExport("123456789012", "us-east-1", List.of()));
+
+        rdsService.modifyDbInstance("logs-db", null, null, null, null, null, null, null,
+                new DbInstanceSettings(null, null, null, null, null, null, null, null, null, null, null, null,
+                        new LogExportChanges(List.of("postgresql", "upgrade"), null), null));
+
+        verify(containerManager, atLeastOnce()).exportLogs(arn, new RdsLogExport("123456789012", "us-east-1",
+                List.of(new LogDestination("/aws/rds/instance/logs-db/postgresql", "logs-db"))));
+        assertEquals("error", RdsService.containerLogType(DatabaseEngine.MYSQL));
+        assertEquals("error", RdsService.containerLogType(DatabaseEngine.MARIADB));
+    }
+
+    @Test
+    void anAuroraClusterShipsOneStreamPerMember() {
+        DbCluster cluster = rdsService.createDbCluster("logs-cluster", "aurora-postgresql", "16.3",
+                "admin", "password", "dbname", false, null, null, null, false, "us-east-1");
+        DbCluster changed = rdsService.changeClusterLogExports("us-east-1", "logs-cluster",
+                new LogExportChanges(List.of("postgresql"), null));
+        rdsService.createDbInstance("logs-writer", "aurora-postgresql", "16.3",
+                null, null, "dbname", "db.r5.large", 20, false, null, null,
+                "logs-cluster", null, false, false, null, Map.of(), List.of(), "us-east-1");
+
+        assertEquals(List.of("postgresql"), changed.getEnabledCloudwatchLogsExports());
+        verify(containerManager, atLeastOnce()).exportLogs(cluster.getDbClusterArn(),
+                new RdsLogExport("123456789012", "us-east-1",
+                        List.of(new LogDestination("/aws/rds/cluster/logs-cluster/postgresql", "logs-writer"))));
+
+        rdsService.changeClusterLogExports("us-east-1", "logs-cluster",
+                new LogExportChanges(null, List.of("postgresql")));
+        verify(containerManager, atLeastOnce()).exportLogs(cluster.getDbClusterArn(),
+                new RdsLogExport("123456789012", "us-east-1", List.of()));
     }
 }

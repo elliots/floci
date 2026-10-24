@@ -1302,6 +1302,10 @@ public class RdsQueryHandler {
             if (enableHttpEndpoint) {
                 cluster = service.setHttpEndpoint(region, id, true);
             }
+            List<String> logExports = cloudwatchLogsExports(params);
+            if (logExports != null) {
+                cluster = service.changeClusterLogExports(region, id, new LogExportChanges(logExports, null));
+            }
             String result = dbClusterXml(cluster);
             return Response.ok(AwsQueryResponse.envelope("CreateDBCluster", AwsNamespaces.RDS, result)).build();
         } catch (AwsException e) {
@@ -1421,6 +1425,10 @@ public class RdsQueryHandler {
                     params.getFirst("DBClusterParameterGroupName"), region);
             if (enableHttpEndpoint != null) {
                 cluster = service.setHttpEndpoint(region, id, enableHttpEndpoint);
+            }
+            LogExportChanges logExportChanges = cloudwatchLogsExportChanges(params);
+            if (logExportChanges != null) {
+                cluster = service.changeClusterLogExports(region, id, logExportChanges);
             }
             String result = dbClusterXml(cluster);
             return Response.ok(AwsQueryResponse.envelope("ModifyDBCluster", AwsNamespaces.RDS, result)).build();
@@ -3191,6 +3199,11 @@ public class RdsQueryHandler {
             // The restorable window runs from creation to now; see RestoreDBClusterToPointInTime.
             xml.elem("EarliestRestorableTime", c.getCreatedAt().toString())
                .elem("LatestRestorableTime", Instant.now().toString());
+        }
+        if (c.getEnabledCloudwatchLogsExports() != null && !c.getEnabledCloudwatchLogsExports().isEmpty()) {
+            xml.start("EnabledCloudwatchLogsExports");
+            c.getEnabledCloudwatchLogsExports().forEach(t -> xml.elem("member", t));
+            xml.end("EnabledCloudwatchLogsExports");
         }
         xml.elem("IAMDatabaseAuthenticationEnabled", c.isIamDatabaseAuthenticationEnabled())
            .elem("HttpEndpointEnabled", c.isHttpEndpointEnabled())

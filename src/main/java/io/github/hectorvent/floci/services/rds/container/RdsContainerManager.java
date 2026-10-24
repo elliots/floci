@@ -1,11 +1,21 @@
 package io.github.hectorvent.floci.services.rds.container;
 
+import com.fasterxml.jackson.databind.JsonNode;
+import com.fasterxml.jackson.databind.ObjectMapper;
 import com.github.dockerjava.api.async.ResultCallback;
 import com.github.dockerjava.api.command.InspectContainerResponse;
+import com.github.dockerjava.api.command.StatsCmd;
 import com.github.dockerjava.api.exception.NotFoundException;
+import com.github.dockerjava.api.model.CpuStatsConfig;
 import com.github.dockerjava.api.model.Frame;
+import com.github.dockerjava.api.model.MemoryStatsConfig;
+import com.github.dockerjava.api.model.Statistics;
+import com.github.dockerjava.core.DockerClientImpl;
+import com.github.dockerjava.transport.DockerHttpClient;
+import com.github.dockerjava.transport.DockerHttpClient.Request;
 import io.github.hectorvent.floci.config.EmulatorConfig;
 import io.github.hectorvent.floci.core.common.AwsArnUtils;
+import io.github.hectorvent.floci.core.common.AwsException;
 import io.github.hectorvent.floci.core.common.RegionResolver;
 import io.github.hectorvent.floci.core.common.Resettable;
 import io.github.hectorvent.floci.core.common.ServiceConfigAccess;
@@ -30,24 +40,34 @@ import org.jboss.logging.Logger;
 import java.io.ByteArrayOutputStream;
 import java.io.Closeable;
 import java.io.IOException;
+import java.net.Socket;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Path;
 import java.time.Clock;
 import java.time.Duration;
+import java.time.Instant;
 import java.util.ArrayList;
+import java.util.Arrays;
+import java.util.Base64;
 import java.util.List;
 import java.util.Locale;
 import java.util.Map;
 import java.util.Optional;
 import java.util.Set;
 import java.util.TreeMap;
+import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.CompletionException;
 import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.ExecutionException;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 import java.util.concurrent.Future;
 import java.util.concurrent.RejectedExecutionException;
 import java.util.concurrent.ScheduledExecutorService;
 import java.util.concurrent.TimeUnit;
+import java.util.concurrent.TimeoutException;
+import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.function.Consumer;
 import java.util.regex.Pattern;
 
 /**
@@ -73,8 +93,13 @@ public class RdsContainerManager implements RdsBackendGate, RdsBackendEndpointRe
             "skip_networking", "socket");
     /** RDS parameters whose server option has another name: {@code time_zone} has no option of its own. */
     private static final Map<String, String> MYSQL_OPTION_NAMES = Map.of("time_zone", "default-time-zone");
+    /** The bytes of each exec that writes a file on a smolvm-pods node, 87 KiB in base64. */
+    static final int EXEC_WRITE_CHUNK_BYTES = 64 * 1024;
     /** How long a server started with a parameter group's options gets to start listening. */
     private static final int PARAMETER_GROUP_START_SECONDS = 120;
+    /** How long a docker stats sample, which reads the CPU twice a second apart, may take. */
+    private static final int STATS_TIMEOUT_SECONDS = 10;
+    private static final ObjectMapper JSON = new ObjectMapper();
 
     private final ContainerBuilder containerBuilder;
     private final ContainerLifecycleManager lifecycleManager;
@@ -83,7 +108,10 @@ public class RdsContainerManager implements RdsBackendGate, RdsBackendEndpointRe
     private final EmulatorConfig config;
     private final RegionResolver regionResolver;
     private final ServiceConfigAccess serviceConfigAccess;
+    /** The databases on a smolvm-pods node, when that is on; null in tests that predate it. */
+    private final RdsSmolvmBackend smolvm;
     private final long uploadBackoffMillis;
+    private final AtomicBoolean hostPathOnNodeLogged = new AtomicBoolean();
     private final Map<String, RdsContainerHandle> activeContainers = new ConcurrentHashMap<>();
     private final Map<String, String> activeStorageOwners = new ConcurrentHashMap<>();
     private final Set<String> claimedRuntimes = ConcurrentHashMap.newKeySet();
@@ -121,9 +149,21 @@ public class RdsContainerManager implements RdsBackendGate, RdsBackendEndpointRe
                                ContainerDetector containerDetector,
                                EmulatorConfig config,
                                RegionResolver regionResolver,
+                               ServiceConfigAccess serviceConfigAccess,
+                               RdsSmolvmBackend smolvm) {
+        this(containerBuilder, lifecycleManager, logStreamer, containerDetector, config,
+                regionResolver, serviceConfigAccess, smolvm, RetryingTarCopier.DEFAULT_BACKOFF_MS);
+    }
+
+    public RdsContainerManager(ContainerBuilder containerBuilder,
+                               ContainerLifecycleManager lifecycleManager,
+                               ContainerLogStreamer logStreamer,
+                               ContainerDetector containerDetector,
+                               EmulatorConfig config,
+                               RegionResolver regionResolver,
                                ServiceConfigAccess serviceConfigAccess) {
         this(containerBuilder, lifecycleManager, logStreamer, containerDetector, config,
-                regionResolver, serviceConfigAccess, RetryingTarCopier.DEFAULT_BACKOFF_MS);
+                regionResolver, serviceConfigAccess, null, RetryingTarCopier.DEFAULT_BACKOFF_MS);
     }
 
     RdsContainerManager(ContainerBuilder containerBuilder,
@@ -134,6 +174,20 @@ public class RdsContainerManager implements RdsBackendGate, RdsBackendEndpointRe
                         RegionResolver regionResolver,
                         ServiceConfigAccess serviceConfigAccess,
                         long uploadBackoffMillis) {
+        this(containerBuilder, lifecycleManager, logStreamer, containerDetector, config,
+                regionResolver, serviceConfigAccess, null, uploadBackoffMillis);
+    }
+
+    RdsContainerManager(ContainerBuilder containerBuilder,
+                        ContainerLifecycleManager lifecycleManager,
+                        ContainerLogStreamer logStreamer,
+                        ContainerDetector containerDetector,
+                        EmulatorConfig config,
+                        RegionResolver regionResolver,
+                        ServiceConfigAccess serviceConfigAccess,
+                        RdsSmolvmBackend smolvm,
+                        long uploadBackoffMillis) {
+        this.smolvm = smolvm;
         this.containerBuilder = containerBuilder;
         this.lifecycleManager = lifecycleManager;
         this.logStreamer = logStreamer;
@@ -142,6 +196,68 @@ public class RdsContainerManager implements RdsBackendGate, RdsBackendEndpointRe
         this.regionResolver = regionResolver;
         this.serviceConfigAccess = serviceConfigAccess;
         this.uploadBackoffMillis = uploadBackoffMillis;
+    }
+
+    /** Whether the databases run on a smolvm-pods node. */
+    public boolean onSmolvmNode() {
+        return smolvm != null && smolvm.enabled();
+    }
+
+    /**
+     * Places a new database: with the databases on the smolvm-pods node, it uses the node, and
+     * has Floci create it when there is none. A database whose node is not ready yet waits for
+     * {@link #whenNodeReady}.
+     *
+     * @param errorCode the AWS error of the operation, such as {@code InsufficientDBInstanceCapacity}
+     * @param user      the database, for the logs, such as {@code RDS instance orders}
+     * @return whether the database can start now
+     * @throws AwsException {@code errorCode} when there is no node to run the database on
+     */
+    public boolean place(String errorCode, String user, String accountId, String region) {
+        if (!onSmolvmNode()) {
+            return true;
+        }
+        try {
+            return smolvm.place(user, accountId, region);
+        } catch (RdsSmolvmBackend.NoNodeException e) {
+            throw new AwsException(errorCode, e.getMessage(), 400);
+        }
+    }
+
+    /**
+     * Runs {@code ready} once the smolvm-pods node is ready, and {@code failed} with the reason when
+     * it fails first, both on a thread of their own.
+     */
+    public void whenNodeReady(Runnable ready, Consumer<String> failed) {
+        smolvm.whenReady().whenCompleteAsync((node, error) -> {
+            if (error == null) {
+                ready.run();
+            } else {
+                Throwable cause = error instanceof CompletionException && error.getCause() != null
+                        ? error.getCause() : error;
+                failed.accept(cause.getMessage());
+            }
+        }, task -> Thread.ofVirtual().name("rds-smolvm-node-ready").start(task));
+    }
+
+    /**
+     * A new connection to a database's server on the smolvm-pods node, at its address on the
+     * node's Docker network, through the node's tunnel, which wakes a sleeping database.
+     */
+    public Socket connectOnNode(String host, int port, int timeoutMillis) throws IOException {
+        if (!onSmolvmNode()) {
+            throw new IllegalStateException("RDS does not run its databases on a smolvm-pods node");
+        }
+        return smolvm.connect(host, port, timeoutMillis);
+    }
+
+    /** The daemon of the databases: the node's dockerd, or Floci's Docker. */
+    private ContainerLifecycleManager docker() {
+        return onSmolvmNode() ? smolvm.target().lifecycle() : lifecycleManager;
+    }
+
+    private ContainerLogStreamer logs() {
+        return onSmolvmNode() ? smolvm.target().logs() : logStreamer;
     }
 
     public RdsContainerHandle start(String instanceId, String volumeId, DatabaseEngine engine,
@@ -195,6 +311,8 @@ public class RdsContainerManager implements RdsBackendGate, RdsBackendEndpointRe
                     engineParameters);
             dockerUnavailableLogged = false;
             return handle;
+        } catch (RdsSmolvmBackend.NoNodeException e) {
+            throw new AwsException("InsufficientDBInstanceCapacity", e.getMessage(), 400);
         } catch (ParameterGroupRefusedException e) {
             parameterGroupRefusals.add(effectiveRuntimeId);
             LOG.warnv("The database of {0} did not start with its parameter group, so it reports "
@@ -235,7 +353,7 @@ public class RdsContainerManager implements RdsBackendGate, RdsBackendEndpointRe
      */
     public boolean isDockerReachable() {
         try {
-            lifecycleManager.getDockerClient().pingCmd().exec();
+            docker().getDockerClient().pingCmd().exec();
             return true;
         } catch (Exception e) {
             LOG.debugv("Docker daemon is not reachable: {0}", e.getMessage());
@@ -280,6 +398,10 @@ public class RdsContainerManager implements RdsBackendGate, RdsBackendEndpointRe
             String masterUsername, String masterPassword, String dbName,
             Map<String, String> engineParameters) {
         LOG.infov("Starting RDS backend container for instance: {0} engine={1}", instanceId, engine);
+        if (onSmolvmNode()) {
+            // Before anything is claimed, so that a start with no node to run on leaves nothing behind.
+            smolvm.target();
+        }
 
         String effectiveRuntimeId = runtimeId == null || runtimeId.isBlank()
                 ? instanceId : runtimeId;
@@ -318,10 +440,10 @@ public class RdsContainerManager implements RdsBackendGate, RdsBackendEndpointRe
             // secured. The legacy-named twin must go too: a container left by a pre-migration
             // version still holds this volume's engine lock, and failing to clear it must abort
             // the start rather than surface later as a corrupt-looking database.
-            lifecycleManager.removeIfExistsStrict(containerName);
+            docker().removeIfExistsStrict(containerName);
             String legacyContainerName = ContainerStorageHelper.legacyDockerName(config, exactVolumeName);
             if (!legacyContainerName.equals(containerName)) {
-                lifecycleManager.removeIfExistsStrict(legacyContainerName);
+                docker().removeIfExistsStrict(legacyContainerName);
             }
             cleanupContainerId = null;
 
@@ -336,15 +458,20 @@ public class RdsContainerManager implements RdsBackendGate, RdsBackendEndpointRe
             ContainerBuilder.Builder specBuilder = containerBuilder.newContainer(image)
                     .withName(containerName)
                     .withEnv(envVars)
-                    .withDockerNetwork(config.services().rds().dockerNetwork())
                     .withLogRotation()
                     .withLabels(ContainerStorageHelper.resourceIdentityLabels(
                             "rds", instanceId, runtimeIdentity.accountId(), runtimeIdentity.region()));
 
-            if (!containerDetector.isRunningInContainer()) {
-                specBuilder.withDynamicPort(enginePort);
-            } else {
+            if (onSmolvmNode()) {
+                // On the node's default bridge, reached through the node's tunnel: nothing is published.
                 specBuilder.withExposedPort(enginePort);
+            } else {
+                specBuilder.withDockerNetwork(config.services().rds().dockerNetwork());
+                if (!containerDetector.isRunningInContainer()) {
+                    specBuilder.withDynamicPort(enginePort);
+                } else {
+                    specBuilder.withExposedPort(enginePort);
+                }
             }
 
         // Handle persistence mounting
@@ -363,13 +490,18 @@ public class RdsContainerManager implements RdsBackendGate, RdsBackendEndpointRe
             // The fixed name remains a valid cleanup identity if create succeeds but its response
             // is lost before Docker returns the generated ID.
             cleanupContainerId = containerName;
-            String createdContainerId = lifecycleManager.create(spec);
+            if (onSmolvmNode()) {
+                smolvm.ensureImage(smolvm.target(), spec.image());
+            }
+            String createdContainerId = docker().create(spec);
             cleanupContainerId = createdContainerId;
             if (needsMasterGrant(engine, masterUsername)) {
                 installMasterGrantInitScript(createdContainerId, masterUsername);
             }
-            ContainerInfo info = lifecycleManager.startCreated(createdContainerId, spec);
-            EndpointInfo endpoint = info.getEndpoint(enginePort);
+            ContainerInfo info = docker().startCreated(createdContainerId, spec);
+            EndpointInfo endpoint = onSmolvmNode()
+                    ? new EndpointInfo(docker().resolveContainerNetworkIp(info.containerId(), null), enginePort)
+                    : info.getEndpoint(enginePort);
 
             LOG.infov("RDS backend for instance {0}: {1}", instanceId, endpoint);
             if (!engineParameterOptions(engine, engineParameters).isEmpty()) {
@@ -381,24 +513,12 @@ public class RdsContainerManager implements RdsBackendGate, RdsBackendEndpointRe
                     info.containerId(), effectiveRuntimeId, instanceId,
                     endpoint.host(), endpoint.port(), storageKey, containerKey);
 
-        // Attach log streaming
-            String shortId = info.containerId().length() >= 8
-                    ? info.containerId().substring(0, 8)
-                    : info.containerId();
-            String logGroup = "/aws/rds/instance/" + instanceId + "/error";
-            String logStream = logStreamer.generateLogStreamName(shortId);
-
-            Closeable logHandle = runtimeIdentity.arnAccountId() != null
-                    ? logStreamer.attachForAccount(
-                            runtimeIdentity.arnAccountId(), info.containerId(), logGroup,
-                            logStream, runtimeIdentity.region(), "rds:" + effectiveRuntimeId)
-                    : logStreamer.attach(
-                            info.containerId(), logGroup, logStream, runtimeIdentity.region(),
-                            "rds:" + effectiveRuntimeId);
-            handle.setLogStream(logHandle);
             // Before the handle is returned, so that the connections of every proxy started on it
-            // are counted from the first one.
-            registerAutoPause(effectiveRuntimeId, handle);
+            // are counted from the first one. A database on a smolvm-pods node sleeps by itself, and
+            // its runtime has no docker pause.
+            if (!onSmolvmNode()) {
+                registerAutoPause(effectiveRuntimeId, handle);
+            }
             activeContainers.put(effectiveRuntimeId, handle);
 
             return handle;
@@ -409,7 +529,7 @@ public class RdsContainerManager implements RdsBackendGate, RdsBackendEndpointRe
             boolean cleaned = cleanupContainerId == null;
             if (cleanupContainerId != null) {
                 try {
-                    lifecycleManager.stopAndRemoveStrict(
+                    docker().stopAndRemoveStrict(
                             cleanupContainerId,
                             handle != null ? handle.getLogStream() : null);
                     cleaned = true;
@@ -434,14 +554,12 @@ public class RdsContainerManager implements RdsBackendGate, RdsBackendEndpointRe
     }
 
     /**
-     * Resolves the region and account id backing an RDS runtime identity. {@code accountId} is
-     * never blank (falls back to {@link RegionResolver#getAccountId}); {@code arnAccountId} keeps
-     * the pre-existing null-when-absent semantics that log-stream routing depends on to pick
-     * between {@code attach} and {@code attachForAccount}.
+     * Resolves the region and account id of an RDS runtime identity, for the container's labels.
+     * A legacy identity takes the default region and account.
      */
     private RuntimeIdentity resolveRuntimeIdentity(String runtimeId) {
         String region = regionResolver.getDefaultRegion();
-        String arnAccountId = null;
+        String accountId = regionResolver.getAccountId();
         try {
             AwsArnUtils.Arn runtimeArn = AwsArnUtils.parse(runtimeId);
             if ("rds".equals(runtimeArn.service())) {
@@ -449,17 +567,53 @@ public class RdsContainerManager implements RdsBackendGate, RdsBackendEndpointRe
                     region = runtimeArn.region();
                 }
                 if (!runtimeArn.accountId().isBlank()) {
-                    arnAccountId = runtimeArn.accountId();
+                    accountId = runtimeArn.accountId();
                 }
             }
         } catch (IllegalArgumentException ignored) {
-            LOG.debugv("Using legacy RDS runtime identity for log routing: {0}", runtimeId);
+            LOG.debugv("Using legacy RDS runtime identity for container labels: {0}", runtimeId);
         }
-        String accountId = arnAccountId != null ? arnAccountId : regionResolver.getAccountId();
-        return new RuntimeIdentity(region, accountId, arnAccountId);
+        return new RuntimeIdentity(region, accountId);
     }
 
-    private record RuntimeIdentity(String region, String accountId, String arnAccountId) {}
+    private record RuntimeIdentity(String region, String accountId) {}
+
+    /**
+     * Ships the output of {@code runtimeId}'s database container to the destinations of
+     * {@code export}, and to the Floci console. The first export of a container ships its output
+     * from the container's start; a changed export closes the follow and ships from now on. The
+     * same export again changes nothing, and a runtime with no running container has none.
+     */
+    public void exportLogs(String runtimeId, RdsLogExport export) {
+        RdsContainerHandle handle = runtimeId == null ? null : activeContainers.get(runtimeId);
+        if (handle == null || handle.getHost() == null || cleanupPending.contains(runtimeId)) {
+            return;
+        }
+        synchronized (handle) {
+            if (export.equals(handle.getLogExport())) {
+                return;
+            }
+            Instant since = handle.getLogExport() == null ? null : Instant.now();
+            closeLogStream(handle);
+            handle.setLogStream(logs().attachToDestinations(export.accountId(), handle.getContainerId(),
+                    export.destinations(), export.region(), "rds:" + runtimeId, since));
+            handle.setLogExport(export);
+        }
+    }
+
+    private static void closeLogStream(RdsContainerHandle handle) {
+        Closeable stream = handle.getLogStream();
+        handle.setLogStream(null);
+        if (stream == null) {
+            return;
+        }
+        try {
+            stream.close();
+        } catch (IOException e) {
+            LOG.debugv("Could not close the log follow of RDS container {0}: {1}", handle.getContainerId(),
+                    e.getMessage());
+        }
+    }
 
     public void stop(RdsContainerHandle handle) {
         if (handle == null) {
@@ -469,7 +623,7 @@ public class RdsContainerManager implements RdsBackendGate, RdsBackendEndpointRe
         RdsContainerHandle effectiveHandle = active != null ? active : handle;
         releaseAutoPause(effectiveHandle.getRuntimeId());
         try {
-            lifecycleManager.stopAndRemoveStrict(
+            docker().stopAndRemoveStrict(
                     effectiveHandle.getContainerId(), effectiveHandle.getLogStream());
         } catch (RuntimeException | Error e) {
             activeContainers.putIfAbsent(effectiveHandle.getRuntimeId(), effectiveHandle);
@@ -500,6 +654,120 @@ public class RdsContainerManager implements RdsBackendGate, RdsBackendEndpointRe
         }
     }
 
+    /** The CPU and memory of a database container, from one docker stats sample. */
+    public record ContainerUsage(double cpuPercent, long memoryUsedBytes, long memoryLimitBytes) {
+    }
+
+    /**
+     * One docker stats sample of the runtime's container, or empty when it has none or the sample
+     * fails. On a smolvm-pods node the shim answers from its last sample of the microVM, and for a
+     * sleeping one with no memory and a CPU total that does not move, so a sample never wakes it.
+     */
+    public Optional<ContainerUsage> usage(String runtimeId) {
+        RdsContainerHandle handle = runtimeId == null ? null : activeContainers.get(runtimeId);
+        if (handle == null || handle.getHost() == null) {
+            return Optional.empty();
+        }
+        CompletableFuture<Statistics> sample = new CompletableFuture<>();
+        ResultCallback.Adapter<Statistics> callback = new ResultCallback.Adapter<>() {
+            @Override
+            public void onNext(Statistics statistics) {
+                sample.complete(statistics);
+            }
+
+            @Override
+            public void onError(Throwable throwable) {
+                sample.completeExceptionally(throwable);
+            }
+
+            @Override
+            public void onComplete() {
+                sample.complete(null);
+            }
+        };
+        try (StatsCmd command = docker().getDockerClient().statsCmd(handle.getContainerId()).withNoStream(true)) {
+            command.exec(callback);
+            return Optional.ofNullable(sample.get(STATS_TIMEOUT_SECONDS, TimeUnit.SECONDS))
+                    .map(RdsContainerManager::usageOf);
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+            return Optional.empty();
+        } catch (ExecutionException | TimeoutException | RuntimeException e) {
+            LOG.debugv("No stats sample of RDS container {0}: {1}", handle.getContainerId(), e.getMessage());
+            return Optional.empty();
+        } finally {
+            closeQuietly(callback);
+        }
+    }
+
+    /**
+     * The share of the daemon's CPU time that the container used between the sample's two
+     * readings, and its memory without the page cache it can give back.
+     */
+    static ContainerUsage usageOf(Statistics statistics) {
+        double cpuPercent = 0;
+        CpuStatsConfig now = statistics.getCpuStats();
+        CpuStatsConfig before = statistics.getPreCpuStats();
+        if (now != null && before != null && now.getCpuUsage() != null && before.getCpuUsage() != null) {
+            long cpu = orZero(now.getCpuUsage().getTotalUsage()) - orZero(before.getCpuUsage().getTotalUsage());
+            long system = orZero(now.getSystemCpuUsage()) - orZero(before.getSystemCpuUsage());
+            if (cpu > 0 && system > 0) {
+                cpuPercent = Math.min(100.0, 100.0 * cpu / system);
+            }
+        }
+        MemoryStatsConfig memory = statistics.getMemoryStats();
+        long used = 0;
+        long limit = 0;
+        if (memory != null) {
+            long cache = memory.getStats() == null ? 0
+                    : memory.getStats().getInactiveFile() != null ? memory.getStats().getInactiveFile()
+                    : orZero(memory.getStats().getCache());
+            used = Math.max(0, orZero(memory.getUsage()) - cache);
+            limit = orZero(memory.getLimit());
+        }
+        return new ContainerUsage(cpuPercent, used, limit);
+    }
+
+    private static long orZero(Long value) {
+        return value == null ? 0 : value;
+    }
+
+    /**
+     * The bytes in each Docker volume of the databases' daemon, by name, from {@code docker system
+     * df}, which dockerd reads from its own disk without a container. Empty when it cannot be read.
+     */
+    public Map<String, Long> volumeSizes() {
+        if (!(docker().getDockerClient() instanceof DockerClientImpl client)) {
+            return Map.of();
+        }
+        Request request = Request.builder().method(Request.Method.GET).path("/system/df?type=volume").build();
+        try (DockerHttpClient.Response response = client.getHttpClient().execute(request)) {
+            if (response.getStatusCode() != 200) {
+                LOG.debugv("docker system df answered {0}", response.getStatusCode());
+                return Map.of();
+            }
+            Map<String, Long> sizes = new TreeMap<>();
+            for (JsonNode volume : JSON.readTree(response.getBody()).path("Volumes")) {
+                long size = volume.path("UsageData").path("Size").asLong(-1);
+                if (size >= 0) {
+                    sizes.put(volume.path("Name").asText(), size);
+                }
+            }
+            return sizes;
+        } catch (IOException | RuntimeException e) {
+            LOG.debugv("Could not read docker system df: {0}", e.getMessage());
+            return Map.of();
+        }
+    }
+
+    private static void closeQuietly(Closeable closeable) {
+        try {
+            closeable.close();
+        } catch (IOException e) {
+            LOG.debugv("Could not close a Docker stats sample: {0}", e.getMessage());
+        }
+    }
+
     /**
      * Probes a backing RDS container. UNKNOWN means the Docker probe failed and the container's
      * state is not known, which is not the same as the container being gone.
@@ -508,7 +776,15 @@ public class RdsContainerManager implements RdsBackendGate, RdsBackendEndpointRe
         if (containerId == null || containerId.isBlank()) {
             return ContainerLiveness.NOT_RUNNING;
         }
-        return lifecycleManager.probeContainer(containerId);
+        if (onSmolvmNode()) {
+            try {
+                return smolvm.probe(smolvm.target(), containerId);
+            } catch (RdsSmolvmBackend.NoNodeException e) {
+                LOG.warnv("RDS container {0} has no smolvm node to ask; state unknown: {1}", containerId, e.getMessage());
+                return ContainerLiveness.UNKNOWN;
+            }
+        }
+        return docker().probeContainer(containerId);
     }
 
     /** Resolves the current endpoint for the container owned by an RDS runtime. */
@@ -520,9 +796,13 @@ public class RdsContainerManager implements RdsBackendGate, RdsBackendEndpointRe
         if (handle == null) {
             throw new IllegalStateException("RDS runtime " + runtimeId + " has no active container");
         }
+        if (onSmolvmNode()) {
+            return new EndpointInfo(docker().resolveContainerNetworkIp(handle.getContainerId(), null),
+                    engine.defaultPort());
+        }
         String preferredNetwork = containerBuilder.resolveDockerNetwork(
                 config.services().rds().dockerNetwork()).orElse(null);
-        return lifecycleManager.resolveEndpoint(
+        return docker().resolveEndpoint(
                 handle.getContainerId(), engine.defaultPort(), preferredNetwork);
     }
 
@@ -666,7 +946,7 @@ public class RdsContainerManager implements RdsBackendGate, RdsBackendEndpointRe
 
     private void pauseContainer(String containerId) {
         try {
-            lifecycleManager.getDockerClient().pauseContainerCmd(containerId).exec();
+            docker().getDockerClient().pauseContainerCmd(containerId).exec();
         } catch (RuntimeException e) {
             // Docker refuses to pause a paused container; that one is where it should be.
             if (!isRunning(containerId, true)) {
@@ -677,7 +957,7 @@ public class RdsContainerManager implements RdsBackendGate, RdsBackendEndpointRe
 
     private void unpauseContainer(String containerId) {
         try {
-            lifecycleManager.getDockerClient().unpauseContainerCmd(containerId).exec();
+            docker().getDockerClient().unpauseContainerCmd(containerId).exec();
         } catch (RuntimeException e) {
             // Docker refuses to unpause a container that is not paused, as after a manual
             // `docker unpause`; one still running is where it should be.
@@ -691,7 +971,7 @@ public class RdsContainerManager implements RdsBackendGate, RdsBackendEndpointRe
     private boolean isRunning(String containerId, boolean paused) {
         try {
             InspectContainerResponse.ContainerState state =
-                    lifecycleManager.getDockerClient().inspectContainerCmd(containerId).exec().getState();
+                    docker().getDockerClient().inspectContainerCmd(containerId).exec().getState();
             return state != null && Boolean.TRUE.equals(state.getRunning())
                     && paused == Boolean.TRUE.equals(state.getPaused());
         } catch (RuntimeException e) {
@@ -703,9 +983,14 @@ public class RdsContainerManager implements RdsBackendGate, RdsBackendEndpointRe
     private void addPersistenceMounts(
             ContainerBuilder.Builder specBuilder, String storageResourceId,
             String exactVolumeName, DatabaseEngine engine, String image) {
-        if (ContainerStorageHelper.isNamedVolumeMode(config)) {
+        if (onSmolvmNode() && !ContainerStorageHelper.isNamedVolumeMode(config)
+                && hostPathOnNodeLogged.compareAndSet(false, true)) {
+            LOG.warnv("FLOCI_STORAGE_HOST_PERSISTENT_PATH does not apply to databases on a smolvm-pods node: "
+                    + "their data is in named Docker volumes on the node");
+        }
+        if (onSmolvmNode() || ContainerStorageHelper.isNamedVolumeMode(config)) {
             ContainerStorageHelper.applyNamedVolume(
-                    specBuilder, lifecycleManager, exactVolumeName,
+                    specBuilder, docker(), exactVolumeName,
                     engineDefaultDataPath(engine, image));
             return;
         }
@@ -922,7 +1207,7 @@ public class RdsContainerManager implements RdsBackendGate, RdsBackendEndpointRe
      */
     private void installMasterGrantInitScript(String containerId, String masterUsername) {
         byte[] sql = mysqlMasterGrantSql(masterUsername).getBytes(StandardCharsets.UTF_8);
-        RetryingTarCopier.copyBytes(lifecycleManager.getDockerClient(), containerId,
+        RetryingTarCopier.copyBytes(docker().getDockerClient(), containerId,
                 "/docker-entrypoint-initdb.d", "floci-master-grants.sql", sql, 0644,
                 RetryingTarCopier.DEFAULT_MAX_ATTEMPTS, uploadBackoffMillis);
     }
@@ -984,7 +1269,7 @@ public class RdsContainerManager implements RdsBackendGate, RdsBackendEndpointRe
     private boolean hasStopped(String containerId) {
         try {
             InspectContainerResponse.ContainerState state =
-                    lifecycleManager.getDockerClient().inspectContainerCmd(containerId).exec().getState();
+                    docker().getDockerClient().inspectContainerCmd(containerId).exec().getState();
             return state != null && Boolean.FALSE.equals(state.getRunning());
         } catch (RuntimeException e) {
             LOG.debugv("Could not inspect RDS container {0}: {1}", containerId, e.getMessage());
@@ -1039,7 +1324,7 @@ public class RdsContainerManager implements RdsBackendGate, RdsBackendEndpointRe
             }
         };
         try (callback) {
-            boolean completed = lifecycleManager.getDockerClient().logContainerCmd(containerId)
+            boolean completed = docker().getDockerClient().logContainerCmd(containerId)
                     .withStdOut(true).withStdErr(true).withTimestamps(true).withTail(MAX_LOG_LINES)
                     .exec(callback)
                     .awaitCompletion(timeout.toMillis(), TimeUnit.MILLISECONDS);
@@ -1089,18 +1374,23 @@ public class RdsContainerManager implements RdsBackendGate, RdsBackendEndpointRe
         try (Lease _ = holdContainer(containerId)) {
             String restoreScript = postgresRestoreScript();
 
-            ByteArrayOutputStream bos = new ByteArrayOutputStream();
-            try (TarArchiveOutputStream tar = new TarArchiveOutputStream(bos)) {
-                tar.setLongFileMode(TarArchiveOutputStream.LONGFILE_GNU);
+            if (onSmolvmNode()) {
+                writeFileByExec(containerId, "/tmp/dump.sql", sqlDump.getBytes(StandardCharsets.UTF_8));
+                writeFileByExec(containerId, "/tmp/restore.sh", restoreScript.getBytes(StandardCharsets.UTF_8));
+            } else {
+                ByteArrayOutputStream bos = new ByteArrayOutputStream();
+                try (TarArchiveOutputStream tar = new TarArchiveOutputStream(bos)) {
+                    tar.setLongFileMode(TarArchiveOutputStream.LONGFILE_GNU);
 
-                addTarEntry(tar, "dump.sql", sqlDump);
-                addTarEntry(tar, "restore.sh", restoreScript);
+                    addTarEntry(tar, "dump.sql", sqlDump);
+                    addTarEntry(tar, "restore.sh", restoreScript);
+                }
+
+                byte[] archive = bos.toByteArray();
+                RetryingTarCopier.copyStreamed(docker().getDockerClient(), containerId,
+                        "/tmp", "postgres-restore", out -> out.write(archive),
+                        RetryingTarCopier.DEFAULT_MAX_ATTEMPTS, uploadBackoffMillis);
             }
-
-            byte[] archive = bos.toByteArray();
-            RetryingTarCopier.copyStreamed(lifecycleManager.getDockerClient(), containerId,
-                    "/tmp", "postgres-restore", out -> out.write(archive),
-                    RetryingTarCopier.DEFAULT_MAX_ATTEMPTS, uploadBackoffMillis);
 
             String[] cmd = { "sh", "/tmp/restore.sh", effectiveUser };
 
@@ -1205,8 +1495,34 @@ public class RdsContainerManager implements RdsBackendGate, RdsBackendEndpointRe
         tar.closeArchiveEntry();
     }
 
+    /**
+     * Writes a file into a running container on the smolvm-pods node. Docker's archive upload
+     * writes Docker's copy of the container's files on the node, which the container's microVM no
+     * longer reads once it runs, so the bytes go in through exec instead, in base64 pieces that
+     * each fit one argument.
+     *
+     * @param path an absolute path of plain characters, which the shell takes as it is
+     */
+    void writeFileByExec(String containerId, String path, byte[] content) {
+        execOrFail(containerId, new String[]{"sh", "-c", ": > " + path}, "create " + path);
+        for (int offset = 0; offset < content.length; offset += EXEC_WRITE_CHUNK_BYTES) {
+            int length = Math.min(EXEC_WRITE_CHUNK_BYTES, content.length - offset);
+            String chunk = Base64.getEncoder().encodeToString(Arrays.copyOfRange(content, offset, offset + length));
+            execOrFail(containerId, new String[]{"sh", "-c", "printf %s \"$1\" | base64 -d >> " + path, "sh", chunk},
+                    "write " + path);
+        }
+    }
+
+    private void execOrFail(String containerId, String[] cmd, String what) {
+        ContainerExec.Result result = execInContainer(containerId, cmd, 60);
+        if (result.exitCode() != 0) {
+            throw new IllegalStateException("Could not " + what + " in container " + containerId + ": "
+                    + result.summary());
+        }
+    }
+
     private ContainerExec.Result execInContainer(String containerId, String[] cmd, int timeoutSeconds) {
-        return ContainerExec.run(lifecycleManager.getDockerClient(), containerId, cmd, timeoutSeconds);
+        return ContainerExec.run(docker().getDockerClient(), containerId, cmd, timeoutSeconds);
     }
 
     public void removeVolume(String instanceId, String volumeId) {
@@ -1216,7 +1532,7 @@ public class RdsContainerManager implements RdsBackendGate, RdsBackendEndpointRe
 
     public void removeVolume(
             String runtimeId, String containerStorageResourceId, String dockerVolumeName) {
-        if (ContainerStorageHelper.isNamedVolumeMode(config)) {
+        if (onSmolvmNode() || ContainerStorageHelper.isNamedVolumeMode(config)) {
             requireSafeStorageComponent(
                     containerStorageResourceId, "container storage resource ID");
             String exactVolumeName = requireSafeStorageComponent(
@@ -1229,13 +1545,13 @@ public class RdsContainerManager implements RdsBackendGate, RdsBackendEndpointRe
                                 + ", owned by " + owner);
             }
             ContainerStorageHelper.removeNamedVolumeStrict(
-                    config, lifecycleManager, exactVolumeName);
+                    config, docker(), exactVolumeName);
         }
         // host-path mode: host directories are not removed automatically
     }
 
     private String storageKey(String storageResourceId, String exactVolumeName) {
-        if (ContainerStorageHelper.isNamedVolumeMode(config)) {
+        if (onSmolvmNode() || ContainerStorageHelper.isNamedVolumeMode(config)) {
             return "volume:" + exactVolumeName;
         }
         Path hostPath = ContainerStorageHelper.hostResourcePath(

@@ -14,6 +14,7 @@ import io.github.hectorvent.floci.core.common.RegionResolver;
 import io.github.hectorvent.floci.core.common.RequestScopes;
 import io.github.hectorvent.floci.core.common.Resettable;
 import io.github.hectorvent.floci.core.common.docker.ContainerLiveness;
+import io.github.hectorvent.floci.core.common.docker.ContainerLogStreamer.LogDestination;
 import io.github.hectorvent.floci.core.common.docker.ContainerStorageHelper;
 import io.github.hectorvent.floci.core.common.docker.CurrentContainerNetworkResolver;
 import io.github.hectorvent.floci.core.common.docker.DockerHostResolver;
@@ -34,6 +35,7 @@ import io.github.hectorvent.floci.services.kms.model.KmsKey;
 import io.github.hectorvent.floci.services.rds.container.AutoPauseListener;
 import io.github.hectorvent.floci.services.rds.container.RdsContainerHandle;
 import io.github.hectorvent.floci.services.rds.container.RdsContainerManager;
+import io.github.hectorvent.floci.services.rds.container.RdsLogExport;
 import io.github.hectorvent.floci.services.rds.export.SnapshotExportSource;
 import io.github.hectorvent.floci.services.rds.model.DatabaseEngine;
 import io.github.hectorvent.floci.services.rds.model.DbCluster;
@@ -57,6 +59,7 @@ import io.github.hectorvent.floci.services.rds.model.DbSubnetGroup;
 import io.github.hectorvent.floci.services.rds.model.EventSubscription;
 import io.github.hectorvent.floci.services.rds.model.GlobalCluster;
 import io.github.hectorvent.floci.services.rds.model.GlobalClusterMember;
+import io.github.hectorvent.floci.services.rds.model.LogExportChanges;
 import io.github.hectorvent.floci.services.rds.model.OptionGroup;
 import io.github.hectorvent.floci.services.rds.model.OptionGroupOption;
 import io.github.hectorvent.floci.services.rds.model.PointInTimeRestoreRequest;
@@ -206,6 +209,8 @@ public class RdsService implements Resettable, ResourceProvider {
     private final CloudWatchMetricsService metricsService;
     private final Set<Integer> usedPorts = ConcurrentHashMap.newKeySet();
     private final Set<String> reportedMemberRelayFailures = ConcurrentHashMap.newKeySet();
+    /** The ARNs of the DB clusters that are creating until the smolvm-pods node is ready. */
+    private final Set<String> clustersWaitingForNode = ConcurrentHashMap.newKeySet();
     private static final Pattern IMAGE_TAG_VERSION_PATTERN = Pattern.compile("^(\\d+(?:\\.\\d+)*)(.*)$");
     private static final Pattern SAFE_IMAGE_TAG_PATTERN = Pattern.compile("[A-Za-z0-9._-]+");
     private static final int SERVERLESS_V2_DEFAULT_AUTO_PAUSE_SECONDS = 300;
@@ -428,6 +433,146 @@ public class RdsService implements Resettable, ResourceProvider {
     }
 
     public void restorePersistedRuntime() {
+        if (config.services().rds().mock() || !containerManager.onSmolvmNode() || !hasPersistedDatabases()) {
+            restoreRuntime();
+            return;
+        }
+        // The databases come back once the smolvm-pods node is adopted, started or created again.
+        boolean ready;
+        try {
+            ready = containerManager.place("InsufficientDBInstanceCapacity", "the persisted RDS databases", null,
+                    null);
+        } catch (AwsException e) {
+            LOG.warnv("The persisted RDS databases have no smolvm-pods node: {0}", e.getMessage());
+            restoreRuntime();
+            return;
+        }
+        if (ready) {
+            restoreRuntime();
+            return;
+        }
+        // Every persisted port stays with its owner now, so a create while the node starts takes
+        // another; only the databases and the relays wait for the node.
+        Map<Integer, String> persistedPortOwners = reservePersistedProxyPorts();
+        List<DbCluster> waitingClusters = holdClustersForNode(persistedPortOwners);
+        List<DbInstance> waitingInstances = holdInstancesForNode(persistedPortOwners);
+        backfillManagedSecretOwnership();
+        backfillInstanceEngineIdentifiers();
+        LOG.infov("The persisted RDS databases are creating until the smolvm-pods node is ready");
+        containerManager.whenNodeReady(() -> {
+            for (DbCluster cluster : waitingClusters) {
+                runInScopeOf(cluster.getDbClusterArn(),
+                        region -> startWaitingCluster(cluster.getDbClusterIdentifier(), region));
+            }
+            for (DbInstance instance : waitingInstances) {
+                runInScopeOf(instance.getDbInstanceArn(),
+                        region -> startWaitingInstance(instance.getDbInstanceIdentifier(), region));
+            }
+            restoreProxiesLocked(persistedPortOwners);
+        }, failure -> {
+            LOG.warnv("The persisted RDS databases waited for a smolvm-pods node that failed: {0}", failure);
+            for (DbCluster cluster : waitingClusters) {
+                runInScopeOf(cluster.getDbClusterArn(),
+                        region -> failWaitingCluster(cluster.getDbClusterIdentifier(), region, failure));
+            }
+            for (DbInstance instance : waitingInstances) {
+                runInScopeOf(instance.getDbInstanceArn(),
+                        region -> failWaitingInstance(instance.getDbInstanceIdentifier(), region, failure));
+            }
+            restoreProxiesLocked(persistedPortOwners);
+        });
+    }
+
+    /** Runs {@code task} with the region of {@code arn}, in the account and region of {@code arn}. */
+    private void runInScopeOf(String arn, Consumer<String> task) {
+        String region = regionFromArn(arn);
+        RequestScopes.runAs(accountIdFromArn(arn), region, () -> task.accept(region));
+    }
+
+    /** Restores the DB proxies' relays while no API call changes a proxy. */
+    private synchronized void restoreProxiesLocked(Map<Integer, String> persistedPortOwners) {
+        restoreProxies(persistedPortOwners);
+    }
+
+    /**
+     * Gives each persisted cluster its persisted port and endpoint, and makes those that run a
+     * database creating until the smolvm-pods node is ready: the clusters that wait.
+     */
+    private List<DbCluster> holdClustersForNode(Map<Integer, String> persistedPortOwners) {
+        List<DbCluster> waiting = new ArrayList<>();
+        for (DbCluster cluster : allClusters()) {
+            if (cluster.getStatus() == DbInstanceStatus.DELETING) {
+                continue;
+            }
+            int port = claimRestoredProxyPort(persistedPortOwners, cluster.getDbClusterArn(), cluster.getProxyPort());
+            DbEndpoint endpoint = proxyEndpoint(port);
+            cluster.setProxyPort(port);
+            cluster.setEndpoint(endpoint);
+            cluster.setReaderEndpoint(endpoint);
+            cluster.setContainerStorageResourceId(resolvedClusterStorageResourceId(cluster));
+            cluster.setDockerVolumeName(resolvedClusterDockerVolumeName(cluster));
+            if (cluster.getStatus() != DbInstanceStatus.STOPPED) {
+                cluster.setContainerHost(null);
+                cluster.setContainerPort(0);
+                cluster.setStatus(DbInstanceStatus.CREATING);
+                clustersWaitingForNode.add(cluster.getDbClusterArn());
+                waiting.add(cluster);
+            }
+            putClusterForScope(accountIdFromArn(cluster.getDbClusterArn()), regionFromArn(cluster.getDbClusterArn()),
+                    cluster.getDbClusterIdentifier(), cluster);
+        }
+        return waiting;
+    }
+
+    /**
+     * As {@link #holdClustersForNode}, for the persisted instances: a member of a waiting cluster
+     * waits with it, and the standalone instances that wait are returned.
+     */
+    private List<DbInstance> holdInstancesForNode(Map<Integer, String> persistedPortOwners) {
+        List<DbInstance> waiting = new ArrayList<>();
+        for (DbInstance instance : allInstances()) {
+            if (instance.getStatus() == DbInstanceStatus.DELETING) {
+                continue;
+            }
+            String accountId = accountIdFromArn(instance.getDbInstanceArn());
+            String instanceRegion = regionFromArn(instance.getDbInstanceArn());
+            int port = claimRestoredProxyPort(persistedPortOwners, instance.getDbInstanceArn(),
+                    instance.getProxyPort());
+            instance.setProxyPort(port);
+            instance.setEndpoint(proxyEndpoint(port));
+            String clusterId = instance.getDbClusterIdentifier();
+            DbCluster cluster = isBlank(clusterId) ? null : findClusterForScope(accountId, instanceRegion, clusterId);
+            if (cluster != null) {
+                instance.setContainerStorageResourceId(resolvedClusterStorageResourceId(cluster));
+                instance.setDockerVolumeName(resolvedClusterDockerVolumeName(cluster));
+            } else if (isBlank(clusterId)) {
+                instance.setContainerStorageResourceId(resolvedInstanceStorageResourceId(instance));
+                instance.setDockerVolumeName(resolvedInstanceDockerVolumeName(instance));
+            }
+            if (instance.getStatus() != DbInstanceStatus.STOPPED) {
+                instance.setContainerHost(null);
+                instance.setContainerPort(0);
+                if (isBlank(clusterId) || (cluster != null && waitsForNode(cluster))) {
+                    instance.setStatus(DbInstanceStatus.CREATING);
+                    if (isBlank(clusterId)) {
+                        waiting.add(instance);
+                    }
+                } else {
+                    // Its cluster runs no database, as a restore without a daemon leaves it.
+                    instance.setStatus(DbInstanceStatus.AVAILABLE);
+                }
+            }
+            putInstanceForScope(accountId, instanceRegion, instance.getDbInstanceIdentifier(), instance);
+        }
+        return waiting;
+    }
+
+    /** Whether storage holds an instance or a cluster that runs a database. */
+    private boolean hasPersistedDatabases() {
+        return !allInstances().isEmpty() || !allClusters().isEmpty();
+    }
+
+    private void restoreRuntime() {
         Map<Integer, String> persistedPortOwners = reservePersistedProxyPorts();
         restoreClusters(persistedPortOwners);
         restoreInstances(persistedPortOwners);
@@ -439,6 +584,7 @@ public class RdsService implements Resettable, ResourceProvider {
     public void clear() {
         usedPorts.clear();
         reportedMemberRelayFailures.clear();
+        clustersWaitingForNode.clear();
     }
 
     // ── DB Instances ──────────────────────────────────────────────────────────
@@ -759,6 +905,10 @@ public class RdsService implements Resettable, ResourceProvider {
         }
         String effectiveSecretKmsKeyId = manageInstancePassword
                 ? resolveManagedSecretKmsKeyId(masterUserSecretKmsKeyId, effectiveRegion) : null;
+        // A standalone instance whose smolvm-pods node is still being created stays creating
+        // until the node is ready, and then starts its database.
+        boolean waitsForNode = !mock && isBlank(dbClusterIdentifier) && !containerManager.place(
+                "InsufficientDBInstanceCapacity", "RDS instance " + id, currentAccountId(), effectiveRegion);
         // Always reserve a unique port (even in mock) so endpoints stay distinct and usedPorts
         // is consistent; mock mode only skips starting the container and auth proxy.
         int proxyPort = reserveProxyPort(requestedPort);
@@ -815,7 +965,7 @@ public class RdsService implements Resettable, ResourceProvider {
                 instanceVolumeId = String.format("%06x", new SecureRandom().nextInt(0xFFFFFF));
                 instanceDockerVolumeName = newVolumeName(
                         instanceVolumeId, instanceStorageResourceId);
-                RdsContainerHandle handle = containerManager.tryStart(
+                RdsContainerHandle handle = waitsForNode ? null : containerManager.tryStart(
                         dbInstanceArn, id, instanceStorageResourceId,
                         instanceDockerVolumeName, engine, image,
                         masterUsername, masterPassword, dbName,
@@ -826,6 +976,8 @@ public class RdsService implements Resettable, ResourceProvider {
                     containerId = handle.getContainerId();
                     containerHost = handle.getHost();
                     containerPort = handle.getPort();
+                } else if (waitsForNode) {
+                    LOG.infov("DB instance {0} is creating until the smolvm-pods node is ready", id);
                 } else if (!containerManager.refusedParameterGroup(dbInstanceArn)) {
                     LOG.warnv("DB instance {0} created without a backing database container: no "
                             + "Docker daemon is reachable. Metadata operations work; connections to "
@@ -876,7 +1028,9 @@ public class RdsService implements Resettable, ResourceProvider {
                             "DB cluster changed during member creation.", 400);
                 }
                 if (currentCluster != null) {
-                    if (currentCluster.getStatus() != null
+                    // A member of a cluster that waits for the smolvm-pods node waits with it.
+                    waitsForNode = !mock && waitsForNode(currentCluster);
+                    if (currentCluster.getStatus() != null && !waitsForNode
                             && currentCluster.getStatus() != DbInstanceStatus.AVAILABLE) {
                         releaseProxyPort(proxyPort);
                         throw new AwsException("InvalidDBClusterStateFault",
@@ -949,12 +1103,147 @@ public class RdsService implements Resettable, ResourceProvider {
                 putClusterForScope(accountId, effectiveRegion, dbClusterIdentifier, currentCluster);
             }
 
-            instance.setStatus(DbInstanceStatus.AVAILABLE);
+            instance.setStatus(waitsForNode ? DbInstanceStatus.CREATING : DbInstanceStatus.AVAILABLE);
             putInstanceForScope(accountId, effectiveRegion, id, instance);
+        }
+        if (waitsForNode && publicationCluster == null) {
+            startInstanceWhenNodeIsReady(accountId, effectiveRegion, id);
         }
         LOG.infov("DB instance {0} created, engine={1}, endpoint={2}:{3}",
                 id, engine, endpoint.address(), String.valueOf(endpoint.port()));
         return instance;
+    }
+
+    /**
+     * Starts the database of instance {@code id}, created while the smolvm-pods node was being
+     * created, once the node is ready, and makes the instance available; makes it failed when the
+     * node fails. An instance deleted in between is left so.
+     */
+    private void startInstanceWhenNodeIsReady(String accountId, String region, String id) {
+        containerManager.whenNodeReady(
+                () -> RequestScopes.runAs(accountId, region, () -> startWaitingInstance(id, region)),
+                failure -> RequestScopes.runAs(accountId, region, () -> failWaitingInstance(id, region, failure)));
+    }
+
+    private void startWaitingInstance(String id, String region) {
+        try {
+            withInstancePublication(id, region, () -> startWaitingInstanceLocked(id, region));
+        } catch (AwsException e) {
+            if (!"DBInstanceNotFound".equals(e.getErrorCode())) {
+                failWaitingInstance(id, region, e.getMessage());
+            }
+        } catch (RuntimeException e) {
+            LOG.debugv(e, "The database of DB instance {0} did not start", id);
+            failWaitingInstance(id, region, e.getMessage());
+        }
+    }
+
+    /** Starts the database of a waiting instance and makes it available; the caller holds its publication. */
+    private DbInstance startWaitingInstanceLocked(String id, String region) {
+        DbInstance instance = doEnsureInstanceBackend(id, region);
+        if (instance.getStatus() == DbInstanceStatus.CREATING) {
+            instance.setStatus(DbInstanceStatus.AVAILABLE);
+            putInstanceForScope(currentAccountId(), effectiveRegion(region), id, instance);
+        }
+        LOG.infov("DB instance {0} is available on the smolvm-pods node", id);
+        return instance;
+    }
+
+    private synchronized void failWaitingInstance(String id, String region, String reason) {
+        String effectiveRegion = effectiveRegion(region);
+        DbInstance instance = findInstanceForScope(currentAccountId(), effectiveRegion, id);
+        if (instance == null || instance.getStatus() != DbInstanceStatus.CREATING) {
+            return;
+        }
+        instance.setStatus(DbInstanceStatus.FAILED);
+        putInstanceForScope(currentAccountId(), effectiveRegion, id, instance);
+        LOG.warnv("DB instance {0} failed, since its database could not start on the smolvm-pods node: {1}", id,
+                reason);
+    }
+
+    /** As {@link #startInstanceWhenNodeIsReady}, for DB cluster {@code id} and the members that wait with it. */
+    private void startClusterWhenNodeIsReady(String accountId, String region, String id) {
+        containerManager.whenNodeReady(
+                () -> RequestScopes.runAs(accountId, region, () -> startWaitingCluster(id, region)),
+                failure -> RequestScopes.runAs(accountId, region, () -> failWaitingCluster(id, region, failure)));
+    }
+
+    /**
+     * Starts the database of a cluster that waits for the smolvm-pods node, makes it available,
+     * and starts the members that wait with it, all under the cluster's publication: a member
+     * created meanwhile either waits with the cluster or finds it available.
+     */
+    private void startWaitingCluster(String id, String region) {
+        try {
+            withClusterPublication(id, region, () -> {
+                DbCluster cluster = ensureClusterBackend(id, region, false);
+                clustersWaitingForNode.remove(cluster.getDbClusterArn());
+                if (cluster.getStatus() == DbInstanceStatus.CREATING) {
+                    cluster.setStatus(DbInstanceStatus.AVAILABLE);
+                    putClusterForScope(currentAccountId(), effectiveRegion(region), id, cluster);
+                }
+                applyAutoPause(cluster);
+                LOG.infov("DB cluster {0} is available on the smolvm-pods node", id);
+                for (DbInstance member : waitingMembers(cluster, region)) {
+                    String memberId = member.getDbInstanceIdentifier();
+                    try {
+                        startWaitingInstanceLocked(memberId, region);
+                    } catch (RuntimeException e) {
+                        LOG.debugv(e, "Member {0} of DB cluster {1} did not start", memberId, id);
+                        failWaitingInstance(memberId, region, e.getMessage());
+                    }
+                }
+                return cluster;
+            });
+        } catch (AwsException e) {
+            if (!"DBClusterNotFoundFault".equals(e.getErrorCode())) {
+                failWaitingCluster(id, region, e.getMessage());
+            }
+        } catch (RuntimeException e) {
+            LOG.debugv(e, "The database of DB cluster {0} did not start", id);
+            failWaitingCluster(id, region, e.getMessage());
+        }
+    }
+
+    /** Makes a waiting cluster and the members that wait with it failed, under the cluster's publication. */
+    private void failWaitingCluster(String id, String region, String reason) {
+        try {
+            withClusterPublication(id, region, () -> {
+                DbCluster cluster = getDbCluster(id, effectiveRegion(region));
+                clustersWaitingForNode.remove(cluster.getDbClusterArn());
+                if (cluster.getStatus() != DbInstanceStatus.CREATING) {
+                    return cluster;
+                }
+                cluster.setStatus(DbInstanceStatus.FAILED);
+                putClusterForScope(currentAccountId(), effectiveRegion(region), id, cluster);
+                LOG.warnv("DB cluster {0} failed, since its database could not start on the smolvm-pods node: {1}",
+                        id, reason);
+                for (DbInstance member : waitingMembers(cluster, region)) {
+                    failWaitingInstance(member.getDbInstanceIdentifier(), region, reason);
+                }
+                return cluster;
+            });
+        } catch (AwsException e) {
+            LOG.debugv("DB cluster {0} is gone, so it does not fail: {1}", id, e.getMessage());
+        }
+    }
+
+    /** The members of {@code cluster} that are creating, which wait for its database. */
+    private List<DbInstance> waitingMembers(DbCluster cluster, String region) {
+        List<DbInstance> members = new ArrayList<>();
+        for (String memberId : List.copyOf(cluster.getDbClusterMembers())) {
+            DbInstance member = findInstanceForScope(currentAccountId(), effectiveRegion(region), memberId);
+            if (member != null && member.getStatus() == DbInstanceStatus.CREATING) {
+                members.add(member);
+            }
+        }
+        return members;
+    }
+
+    /** Whether {@code cluster} is creating because it waits for the smolvm-pods node. */
+    private boolean waitsForNode(DbCluster cluster) {
+        return cluster.getStatus() == DbInstanceStatus.CREATING
+                && clustersWaitingForNode.contains(cluster.getDbClusterArn());
     }
 
     public DbSnapshot createDbSnapshot(String snapshotId, String instanceId) {
@@ -4673,6 +4962,10 @@ public class RdsService implements Resettable, ResourceProvider {
         boolean mock = config.services().rds().mock();
         String effectiveSecretKmsKeyId = manageMasterUserPassword
                 ? resolveManagedSecretKmsKeyId(masterUserSecretKmsKeyId, effectiveRegion) : null;
+        // A cluster whose smolvm-pods node is still being created stays creating until the node
+        // is ready, and then starts its database.
+        boolean waitsForNode = !mock && !containerManager.place("InsufficientDBClusterCapacityFault",
+                "RDS cluster " + id, currentAccountId(), effectiveRegion);
         // Always reserve a unique port (even in mock) so endpoints stay distinct and usedPorts
         // is consistent; mock mode only skips starting the container and auth proxy.
         int proxyPort = reserveProxyPort(requestedPort);
@@ -4681,7 +4974,7 @@ public class RdsService implements Resettable, ResourceProvider {
         }
         DbEndpoint endpoint = mock ? new DbEndpoint("localhost", proxyPort) : proxyEndpoint(proxyPort);
         DbCluster cluster = new DbCluster(id, engine, engineVersion, masterUsername, masterPassword,
-                databaseName, DbInstanceStatus.AVAILABLE, endpoint, endpoint,
+                databaseName, waitsForNode ? DbInstanceStatus.CREATING : DbInstanceStatus.AVAILABLE, endpoint, endpoint,
                 iamEnabled, new ArrayList<>(), paramGroupName, Instant.now(), proxyPort);
         cluster.setEngineIdentifier(effectiveEngineName(engineParam).toLowerCase(Locale.ROOT));
         cluster.setEngineMode(engineMode != null && !engineMode.isBlank() ? engineMode : "provisioned");
@@ -4693,7 +4986,7 @@ public class RdsService implements Resettable, ResourceProvider {
             String clusterVolumeId = String.format("%06x", new SecureRandom().nextInt(0xFFFFFF));
             String clusterDockerVolumeName = newVolumeName(
                     clusterVolumeId, clusterResourceId);
-            RdsContainerHandle handle = containerManager.tryStart(
+            RdsContainerHandle handle = waitsForNode ? null : containerManager.tryStart(
                     clusterArn, id, clusterResourceId, clusterDockerVolumeName,
                     engine, image,
                     masterUsername, masterPassword, databaseName,
@@ -4702,6 +4995,8 @@ public class RdsService implements Resettable, ResourceProvider {
                 cluster.setContainerId(handle.getContainerId());
                 cluster.setContainerHost(handle.getHost());
                 cluster.setContainerPort(handle.getPort());
+            } else if (waitsForNode) {
+                LOG.infov("DB cluster {0} is creating until the smolvm-pods node is ready", id);
             } else if (!containerManager.refusedParameterGroup(clusterArn)) {
                 LOG.warnv("DB cluster {0} created without a backing database container: no Docker "
                         + "daemon is reachable. Metadata operations work; connections to the "
@@ -4749,6 +5044,9 @@ public class RdsService implements Resettable, ResourceProvider {
             cluster.setServerlessV2MinCapacity(serverlessV2MinCapacity);
             cluster.setServerlessV2MaxCapacity(serverlessV2MaxCapacity);
             cluster.setServerlessV2SecondsUntilAutoPause(effectiveAutoPauseSeconds);
+            if (waitsForNode) {
+                clustersWaitingForNode.add(clusterArn);
+            }
             putClusterForScope(currentAccountId(), effectiveRegion, id, cluster);
         } catch (RuntimeException e) {
             // The cluster is not persisted, so DeleteDBCluster cannot reach the secret we just
@@ -4758,7 +5056,11 @@ public class RdsService implements Resettable, ResourceProvider {
             }
             throw e;
         }
-        applyAutoPause(cluster);
+        if (waitsForNode) {
+            startClusterWhenNodeIsReady(currentAccountId(), effectiveRegion, id);
+        } else {
+            applyAutoPause(cluster);
+        }
         LOG.infov("DB cluster {0} created (mock={1}), engine={2}, endpoint={3}:{4}",
                 id, String.valueOf(mock), engine, endpoint.address(), String.valueOf(endpoint.port()));
         return cluster;
@@ -9259,6 +9561,7 @@ public class RdsService implements Resettable, ResourceProvider {
         } else {
             clusters.put(key, cluster);
         }
+        exportLogs(cluster);
     }
 
     private void deleteClusterForScope(String accountId, String region, String clusterId) {
@@ -9278,6 +9581,117 @@ public class RdsService implements Resettable, ResourceProvider {
         } else {
             instances.put(key, instance);
         }
+        exportLogs(instance);
+    }
+
+    /**
+     * The log type that RDS ships from a database container's output: PostgreSQL's log, and the
+     * error log of the other engines. Their other log types are not in the container's output.
+     */
+    static String containerLogType(DatabaseEngine engine) {
+        return engine == DatabaseEngine.POSTGRES ? "postgresql" : "error";
+    }
+
+    /**
+     * Ships a DB instance's database output to {@code /aws/rds/instance/ID/TYPE}, stream ID, when
+     * the instance exports that log type. A cluster member's database is its cluster's.
+     */
+    private void exportLogs(DbInstance instance) {
+        String arn = instance.getDbInstanceArn();
+        if (config.services().rds().mock() || arn == null
+                || (instance.getDbClusterIdentifier() != null && !instance.getDbClusterIdentifier().isBlank())) {
+            return;
+        }
+        String id = instance.getDbInstanceIdentifier();
+        String type = containerLogType(instance.getEngine());
+        List<LogDestination> destinations = exports(instance.getEnabledCloudwatchLogsExports(), type)
+                ? List.of(new LogDestination("/aws/rds/instance/" + id + "/" + type, id))
+                : List.of();
+        containerManager.exportLogs(arn, new RdsLogExport(accountIdFromArn(arn), regionFromArn(arn), destinations));
+    }
+
+    /**
+     * Ships an Aurora cluster's database output to {@code /aws/rds/cluster/ID/TYPE}, one stream per
+     * member instance, named by its id, when the cluster exports that log type.
+     */
+    private void exportLogs(DbCluster cluster) {
+        String arn = cluster.getDbClusterArn();
+        if (config.services().rds().mock() || arn == null) {
+            return;
+        }
+        String type = containerLogType(cluster.getEngine());
+        List<LogDestination> destinations = new ArrayList<>();
+        if (exports(cluster.getEnabledCloudwatchLogsExports(), type)) {
+            for (String member : cluster.getDbClusterMembers()) {
+                destinations.add(new LogDestination(
+                        "/aws/rds/cluster/" + cluster.getDbClusterIdentifier() + "/" + type, member));
+            }
+        }
+        containerManager.exportLogs(arn, new RdsLogExport(accountIdFromArn(arn), regionFromArn(arn), destinations));
+    }
+
+    /**
+     * What the AWS/RDS metrics of an available DB instance come from: the runtime of its database,
+     * the relays of the endpoints it serves, and, outside Aurora and the smolvm-pods node, its storage
+     * and volume. A database's microVM on the node writes to its own copy of the volume, which
+     * {@code docker system df} does not see.
+     *
+     * @param clusterId     the Aurora cluster of a member, else null
+     * @param relayKeys     the proxies of the instance's endpoint, and the cluster endpoint's for a writer
+     * @param storageBytes  AllocatedStorage in bytes, or 0 when there is no FreeStorageSpace
+     * @param volumeName    the Docker volume of the database, or null when there is no FreeStorageSpace
+     */
+    public record InstanceMetricSource(String accountId, String region, String instanceId, String clusterId,
+                                       String runtimeId, List<String> relayKeys, long storageBytes,
+                                       String volumeName) {
+    }
+
+    /** Every available DB instance of every account, as {@link InstanceMetricSource}s; none in mock mode. */
+    public synchronized List<InstanceMetricSource> instanceMetricSources() {
+        if (config.services().rds().mock()) {
+            return List.of();
+        }
+        List<InstanceMetricSource> sources = new ArrayList<>();
+        for (DbInstance instance : allInstances()) {
+            String arn = instance.getDbInstanceArn();
+            if (arn == null || instance.getStatus() != DbInstanceStatus.AVAILABLE) {
+                continue;
+            }
+            String id = instance.getDbInstanceIdentifier();
+            String accountId = accountIdFromArn(arn);
+            String region = regionFromArn(arn);
+            List<String> relayKeys = new ArrayList<>(List.of(rdsResourceRelayKey(arn, id)));
+            String clusterId = isBlank(instance.getDbClusterIdentifier()) ? null : instance.getDbClusterIdentifier();
+            if (clusterId != null) {
+                DbCluster cluster = findClusterForScope(accountId, region, clusterId);
+                if (cluster != null && id.equals(cluster.resolveWriterIdentifier())) {
+                    relayKeys.add(rdsResourceRelayKey(cluster.getDbClusterArn(), clusterId));
+                }
+            }
+            boolean storage = clusterId == null && !containerManager.onSmolvmNode();
+            sources.add(new InstanceMetricSource(accountId, region, id, clusterId, instanceBackendRuntimeId(instance),
+                    List.copyOf(relayKeys), storage ? instance.getAllocatedStorage() * GIB : 0,
+                    storage ? resolvedInstanceDockerVolumeName(instance) : null));
+        }
+        return sources;
+    }
+
+    private static final long GIB = 1024L * 1024 * 1024;
+
+    private static boolean exports(List<String> enabled, String type) {
+        return enabled != null && enabled.contains(type);
+    }
+
+    /**
+     * Applies the log types of CreateDBCluster's EnableCloudwatchLogsExports, or ModifyDBCluster's
+     * CloudwatchLogsExportConfiguration, to the cluster, which ships them from now on.
+     */
+    public synchronized DbCluster changeClusterLogExports(String region, String clusterId, LogExportChanges changes) {
+        String effectiveRegion = effectiveRegion(region);
+        DbCluster cluster = getDbCluster(clusterId, effectiveRegion);
+        cluster.setEnabledCloudwatchLogsExports(changes.applyTo(cluster.getEnabledCloudwatchLogsExports()));
+        putClusterForScope(currentAccountId(), effectiveRegion, clusterId, cluster);
+        return RESPONSE_COPIER.convertValue(cluster, DbCluster.class);
     }
 
     private void deleteInstanceForScope(String accountId, String region, String instanceId) {
