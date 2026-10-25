@@ -49,11 +49,7 @@ Each step ends with the [runtime's acceptance tests](#runtime) passing, each sui
    code. A research pass comes first: for each candidate, whether it fits where the code runs (the
    probe responder runs on smoltcp in one epoll thread, not on tokio), and what it adds to the
    binary and to `Cargo.lock`, which is smolvm's lock reduced to this crate's dependencies.
-4. **Save only changed memory.** Keep the last checkpoint as a base and write only the 2 MiB
-   blocks that changed since, found by hashing at pause or by userfaultfd write-protect set once
-   before the vCPUs start. It is done when the bytes written per sleep and wake cycle after a short
-   wake drop, with resume time and memory integrity unchanged.
-5. **Scale, observability, Linux hosts and the final tests**, in this order:
+4. **Scale, observability, Linux hosts and the final tests**, in this order:
    - **Scale with real applications.** Run 500 VM pods of real applications, including public
      Java and Node apps, several using about 1 GB, pinned by digest. Size each pod VM from its
      pod's resources, and admit wakes within real RAM by that size. Account for checkpoint disk
@@ -126,8 +122,10 @@ Each step ends with the [runtime's acceptance tests](#runtime) passing, each sui
 - **A pod sleeps only when every probe passes** right before the freeze. Probes are answered from
   those results while it sleeps, and failures stay visible.
 - **SIGTERM does not wake a sleeping pod** unless the pod opts in.
-- **The guest clock is stepped after every resume**, using E2B's thresholds: when the guest is
-  more than 50 ms behind or 5 s ahead.
+- **The guest clock follows the host's through a pause**: the restore moves the guest's counter
+  on by the time the VM was paused, so the guest wakes with the right time and its monotonic
+  clock never goes back. A cold boot steps it to the host's exactly, and a resume steps it only
+  when it is more than 50 ms behind or 5 s ahead.
 - **On Mac nodes, khugepaged sleeps a day between scans**, and nothing calls `MADV_COLLAPSE`.
 - **Rosetta and TSO are on by default on arm64 nodes**, guarded by the TSO canary.
 - **The node reports a configured, larger capacity to kubelet**, so that sleeping pods' requests
@@ -135,10 +133,11 @@ Each step ends with the [runtime's acceptance tests](#runtime) passing, each sui
   set. Memory eviction and the CPU and memory managers stay off, and the runtime has a cgroup of
   its own.
 - **Restores read the checkpoint eagerly into anonymous huge-page memory.**
-- **Saving only changed memory** tracks memory in 2 MiB blocks, and the tracking must keep stage-2
-  huge mappings. KVM dirty logging on arm64 makes every new stage-2 mapping 4 KiB while it is on
-  and never collapses them back. With it on, a cold first touch of 1 GiB in the nested node took
-  7.1 s even with huge pages, 13 times as long as the same VM took with it off.
+- **Saving only changed memory** hashes each page at the pause, with nothing tracking writes while
+  the guest runs, so stage-2 huge mappings stay. KVM dirty logging on arm64 makes every new stage-2
+  mapping 4 KiB while it is on and never collapses them back. With it on, a cold first touch of
+  1 GiB in the nested node took 7.1 s even with huge pages, 13 times as long as the same VM took
+  with it off.
 - **Checkpoint compression is not needed for now.**
 - **Admission caps are off by default.** A refused wake waits up to 10 s, then held connections get
   a RST.
@@ -165,9 +164,6 @@ Each step ends with the [runtime's acceptance tests](#runtime) passing, each sui
 - Checkpoint page cache is charged to the runtime's cgroup; wake admission within real RAM must
   account for it.
 - Each k3s restart leaves an old mount namespace alive while old shims run.
-- Every pause writes all guest RAM, uncompressed: about 1.3 GB for a pod using 1 GiB. That costs
-  disk, and SSD wear of about 2 TB a day for 500 pods sleeping 10 times a day. Saving only changed
-  memory addresses it.
 - A crash of the front shim recreates every pod (new IPs, memory lost); it is kept small to make
   this unlikely.
 - Hypervisor.framework crashed the nested node twice when huge pages were collapsed
@@ -176,9 +172,8 @@ Each step ends with the [runtime's acceptance tests](#runtime) passing, each sui
   Rosetta after macOS 27.
 - Upgrading smolvm, libkrun or the node kernel may make saved checkpoints unloadable; sleeping pods
   would need waking and saving first.
-- While a pod sleeps, the far ends of its outbound connections may close them (broker heartbeats,
-  database idle timeouts, Kubernetes watches); the app reconnects after it wakes. Work driven by the
-  pod's own timers pauses while it sleeps.
+- A pod resets its TCP connections with peers outside its VM as it goes to sleep; the app
+  reconnects after it wakes. Work driven by the pod's own timers pauses while it sleeps.
 - The node VM's memory is not returned to macOS.
 - Huge pages on a full, fragmented node, and slowdowns between nested VMs, are not measured yet.
 - The smolvm and libkrun patches are carried locally and are not upstream yet. The smolvm patch
@@ -216,8 +211,8 @@ end-to-end suites in `tools/smolvm-pods/tests/e2e`, each on a fresh node:
   containerd and of the front shim; delete while asleep.
 - **Wake on traffic and idle sleep:** pods with every kind of probe sleep by themselves and stay
   Ready; traffic through a Service wakes them with the client's IP; first-request latency; ten
-  concurrent requests cause one resume; streams and WebSockets keep a pod awake; keepalive probes
-  to a sleeping pod, outbound connections and UDP do not wake it; a request during the recheck
+  concurrent requests cause one resume; streams and WebSockets keep a pod awake; a sleeping pod's
+  connections are reset, and outbound pushes and UDP do not wake it; a request during the recheck
   before a sleep cancels it; failing apps still fail, and so does a pod whose resume keeps
   failing; the API over TCP; admission; 40 sleeping pods for 10 minutes.
 - **Scale:** 500 runc pods and 5 VM pods on an 8 vCPU, 16 GiB node, requesting 10 times the node,
