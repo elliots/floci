@@ -216,6 +216,14 @@ impl VmOps for MockVms {
         })
     }
 
+    fn freeze(&self, _machine: &str) -> Result<u32, String> {
+        Ok(0)
+    }
+
+    fn thaw(&self, _machine: &str) -> Result<(), String> {
+        Ok(())
+    }
+
     fn signal(
         &self,
         machine: &str,

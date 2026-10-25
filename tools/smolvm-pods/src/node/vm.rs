@@ -16,7 +16,7 @@ use log::{debug, info, warn};
 use smolvm::agent::AgentClient;
 use smolvm::embedded::{EmbeddedRuntime, PauseStage};
 use smolvm::RecordState;
-use smolvm_protocol::AgentRequest;
+use smolvm_protocol::{AgentRequest, AgentResponse, PodFreezeReply};
 use tokio::io::unix::AsyncFd;
 
 use crate::engine::{delete_sandbox_vm, expect_ok, pod_request, CURSOR_ROOT};
@@ -229,6 +229,27 @@ impl VmOps for SmolvmOps {
             skew_ns: step.skew_ns,
             stepped: step.stepped,
         })
+    }
+
+    fn freeze(&self, machine: &str) -> Result<u32, String> {
+        match pod_request(&agent_socket(machine), &AgentRequest::PodFreeze)? {
+            AgentResponse::Ok { data } => {
+                let reply: PodFreezeReply = data
+                    .map(serde_json::from_value)
+                    .transpose()
+                    .map_err(|e| format!("PodFreeze: {e}"))?
+                    .unwrap_or_default();
+                Ok(reply.reset)
+            }
+            other => expect_ok(other, "PodFreeze").map(|()| 0),
+        }
+    }
+
+    fn thaw(&self, machine: &str) -> Result<(), String> {
+        expect_ok(
+            pod_request(&agent_socket(machine), &AgentRequest::PodThaw)?,
+            "PodThaw",
+        )
     }
 
     fn signal(

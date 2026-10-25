@@ -241,6 +241,15 @@ pub trait VmOps: Send + Sync + 'static {
     /// The agent's `SetClock { host_realtime_ns }`.
     fn set_clock(&self, machine: &str, host_realtime_ns: i64) -> Result<ClockStep, String>;
 
+    /// The agent's `PodFreeze`, before a pause: the pod's containers freeze,
+    /// and each TCP connection that leaves the guest is reset. Returns how
+    /// many it reset.
+    fn freeze(&self, machine: &str) -> Result<u32, String>;
+
+    /// The agent's `PodThaw`: the containers that [`VmOps::freeze`] froze
+    /// thaw.
+    fn thaw(&self, machine: &str) -> Result<(), String>;
+
     /// `PodSignal` to a guest process. An exec of `None` is the container's
     /// init, and `all` signals every process of the container.
     fn signal(

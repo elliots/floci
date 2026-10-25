@@ -333,8 +333,8 @@ the workload's pods are not woken until it does.
 Floci runs SQS, so it learns of every change to a queue's messages as it happens, and reads a
 queue only at the moments below. A message that a consumer can receive wakes the workload's pods
 at once, within the time of the wake. A delayed message wakes them when it becomes visible. A
-long poll that the consumer opened before it slept may claim a message as it arrives; the message
-wakes the consumer all the same, and the consumer gets it in the poll's answer.
+consumer's long poll ends when its pod goes to sleep, which resets the poll's connection, so it
+claims no message while the consumer sleeps: the consumer's next poll after the wake gets it.
 
 Every producer inside Floci sends through SQS, so SNS subscriptions, EventBridge rules, IoT rules,
 S3 notifications, EventBridge Scheduler, Pipes, Step Functions and redrives that deliver into a
@@ -539,8 +539,8 @@ and reads each of them once then. It watches them while the runtime file has ena
   refused wake resets the answer to a poll that waits at the pod. In the AWS SDK for JavaScript
   v3, `requestTimeout` only logs a warning unless the client's `requestHandler` also has
   `throwOnRequestTimeout: true`.
-- While a consumer sleeps past two AMQP heartbeats, the broker closes its connection and requeues
-  its unacknowledged messages. The consumer reconnects when it wakes. A queue that the consumer
+- A consumer's connection to its broker is reset as its pod goes to sleep, so the broker requeues
+  its unacknowledged messages at once. The consumer reconnects when it wakes. A queue that the consumer
   declared exclusive or auto-delete goes with the connection, so its messages are lost: give
   consumers that sleep durable queues, which keep the messages for the next connection.
 

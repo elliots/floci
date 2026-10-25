@@ -413,6 +413,16 @@ impl VmOps for MockVm {
         })
     }
 
+    fn freeze(&self, machine: &str) -> Result<u32, String> {
+        self.call(format!("freeze {machine}"));
+        Ok(0)
+    }
+
+    fn thaw(&self, machine: &str) -> Result<(), String> {
+        self.call(format!("thaw {machine}"));
+        Ok(())
+    }
+
     fn signal(
         &self,
         machine: &str,
@@ -569,6 +579,14 @@ impl VmOps for RunningVms {
             skew_ns: 0,
             stepped: false,
         })
+    }
+
+    fn freeze(&self, _: &str) -> Result<u32, String> {
+        Ok(0)
+    }
+
+    fn thaw(&self, _: &str) -> Result<(), String> {
+        Ok(())
     }
 
     fn signal(&self, _: &str, _: &str, _: Option<&str>, _: u32, _: bool) -> Result<(), String> {

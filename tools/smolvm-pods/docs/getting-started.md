@@ -229,7 +229,8 @@ The smolvm Linux release has a `libkrunfw.so` for pod VMs. This builds the same 
 (libkrunfw's Linux 6.18.55, from the same pinned sources and builder as the node kernel) with the
 options in `node/podkernel/pod.config`, so that Istio's `istio-init` can set up a sidecar's
 traffic redirection inside the pod: its rules need iptables' `REDIRECT` target and `owner` match,
-which the release's kernel lacks. `node-vm.sh build` installs the result in place of the
+which the release's kernel lacks. It also has `sock_diag` with `SOCK_DESTROY`, with which the guest
+agent resets a pod's connections before it sleeps. `node-vm.sh build` installs the result in place of the
 release's library, by checksum. It takes 3 to 10 minutes on an M4 Max, with the first download of
 the kernel tarball (which `node/kernel/build.sh` keeps, so it is shared). `build.sh --stock`
 builds the release's own config and checks that the library is the release's, byte for byte,
@@ -599,8 +600,9 @@ works while it sleeps.
   room, then is refused.
 - `kubectl exec -i` and `-t`, `kubectl attach`, `kubectl cp` into a pod, and containers with
   `stdin: true` or `tty: true` are refused. So are pods with `hostNetwork`.
-- A sleeping pod's peers may close its outbound connections, such as database pools and broker
-  connections, and its own timers stop until it wakes. The app should reconnect after a wake.
+- A pod resets its TCP connections with peers outside its VM as it goes to sleep, such as database
+  pools, broker connections and its clients' idle keep-alive connections, and its own timers stop
+  until it wakes. The app finds its connections closed after a wake and should reconnect.
 - Connection pools and TCP keepalives to an awake pod keep it awake.
 - A restart of the node VM loses every pod's memory and processes, awake or asleep, and kubelet
   then starts the pods again from scratch.

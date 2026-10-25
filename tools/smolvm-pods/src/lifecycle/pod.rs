@@ -13,7 +13,7 @@ use std::sync::{Arc, Mutex};
 use std::task::{Context, Poll};
 use std::time::{Duration, Instant};
 
-use log::{info, warn};
+use log::{debug, info, warn};
 use tokio::sync::{mpsc, oneshot};
 use tokio::task::{JoinError, JoinHandle};
 
@@ -1393,8 +1393,15 @@ impl Actor {
     }
 }
 
-/// The `pausing` hook, the stop of the output pumps and the VM pause, in
-/// their own task. The slot limits pauses across pods.
+/// The freeze of the pod's containers, the `pausing` hook, the stop of the
+/// output pumps and the VM pause, in their own task. The slot limits pauses
+/// across pods.
+///
+/// The freeze resets the pod's TCP connections that leave its VM, so that no
+/// peer keeps a connection to a sleeping pod, and comes before the hold of
+/// the `pausing` hook, which would keep the resets from its peers. A freeze
+/// that fails does not stop the pause: the pod then sleeps with its
+/// connections.
 async fn pause(
     shared: Arc<Shared>,
     info: PodInfo,
@@ -1418,6 +1425,18 @@ async fn pause(
         if reason == Reason::Idle {
             faults.hit(FaultPoint::IdleDecided);
         }
+        let started = Instant::now();
+        match vm.freeze(&info.identity.machine) {
+            Ok(reset) => debug!(
+                "pod sandbox {}: froze it and reset {reset} connections",
+                info.identity.sandbox_id
+            ),
+            Err(e) => warn!(
+                "pod sandbox {}: freeze it before the pause: {e}",
+                info.identity.sandbox_id
+            ),
+        }
+        steps.push("freeze", started.elapsed());
         let started = Instant::now();
         if let Err(refusal) = hooks.pausing(&info, &reason) {
             return Ok(Err(PauseError::Refused(refusal)));
@@ -1520,7 +1539,7 @@ async fn resume(
     Ok((steps, held))
 }
 
-/// The post-resume steps (`tso`, `ping`, `clock`, `deferred_kills`,
+/// The post-resume steps (`tso`, `ping`, `clock`, `thaw`, `deferred_kills`,
 /// `before_release` and `release`), in their own task. Each is idempotent, so
 /// recovery runs them again after a crash.
 async fn post_resume(shared: Arc<Shared>, pod: Arc<Pod>) -> Result<PostResume, String> {
@@ -1588,6 +1607,16 @@ async fn post_resume(shared: Arc<Shared>, pod: Arc<Pod>) -> Result<PostResume, S
         })
         .await?;
     steps.push("clock", started.elapsed());
+
+    // The containers thaw, if the guest did not thaw them as it resumed or
+    // the pause never came.
+    let started = Instant::now();
+    let m = machine.clone();
+    if let Err(e) = shared.vm_call(move |vm| vm.thaw(&m)).await {
+        warn!("thaw pod sandbox {}: {e}", pod.id);
+        warning = Some(format!("thaw: {e}"));
+    }
+    steps.push("thaw", started.elapsed());
 
     // The deferred kills, then the before_release hook.
     let started = Instant::now();

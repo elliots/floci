@@ -849,12 +849,12 @@ fails:
 - **SNS and MQTT into SQS**: a message published to the SNS topic wakes `orders` by Floci at
   once, and it sleeps after the linger; then a message published over MQTT 3.1.1 at QoS 1 to
   Floci's IoT broker on `devices/e2e/events` does the same through the IoT rule.
-- **A parked poll**: a poll of the sleeping `orders` waits in Floci, started less than 12 s
-  before: its last poll, if it is that young and has no answer, or else its next one. For that,
-  the test wakes the pod through the API, holds it with a lease until the consumer sends its next
-  poll, and hibernates it. A message sent then is claimed by that poll, and is in flight: Floci
-  wakes the pod, and the poll's answer, held while the pod slept, brings the message
-  (`messages=1` on that poll), received once with the receive count 1.
+- **A poll reset by the sleep**: the sleeping `orders` went to sleep with a poll in flight,
+  started less than 12 s before: its last poll, if it is that young and has no answer, or else its
+  next one. For that, the test wakes the pod through the API, holds it with a lease until the
+  consumer sends its next poll, and hibernates it. The sleep reset the poll's connection, so Floci
+  ended the poll: a message sent then stays visible, Floci wakes the pod, the poll claims nothing,
+  and the consumer's next poll gets the message within 10 s, received once.
 - **Replicas share a queue**: six messages of 3 s of work each in `shared` wake each of its three
   pods by Floci; each message is received and deleted once, each pod holds `floci:shared`, and
   each sleeps after the linger.
@@ -868,8 +868,8 @@ fails:
   node answered with a RST, ended after the wake: it failed, the SDK sent it again, or it got its
   answer after all; the test prints which. The node service then starts again without the cap,
   and the leases are released.
-- **An AMQP consumer reconnects**: while `amqp` sleeps, the broker closes its connection for the
-  missed heartbeats (the queue has no consumer) without waking it. A message published to `tasks`
+- **An AMQP consumer reconnects**: `amqp` resets its connection to the broker as it sleeps, so the
+  queue has no consumer, and nothing wakes it. A message published to `tasks`
   through the management API wakes it by Floci at once; the consumer reconnects by itself,
   receives the message once and acknowledges it, the queue empties, and the pod sleeps after the
   linger.
