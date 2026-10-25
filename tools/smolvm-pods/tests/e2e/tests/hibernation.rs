@@ -66,7 +66,7 @@ const RESUME_SLEEP: Duration = Duration::from_secs(2);
 
 /// The guest's realtime after a wake may be this far from the node's.
 const REALTIME_SKEW_NS: i64 = 100_000_000;
-/// The guest's monotonic clock may be this far outside its expected range.
+/// The guest's monotonic clock may be this far from the node's advance.
 const MONOTONIC_TOLERANCE_NS: i64 = 50_000_000;
 /// After a hibernate, the node's anonymous memory must have dropped by this
 /// share of the VM process's at least.
@@ -623,15 +623,7 @@ crictl pods -o json | jq -r '.items[] | "\(.id) \(.state)"'"#;
         expect(self.api.events_of(cursor, &pod.sandbox))
     }
 
-    fn record_clock(
-        &self,
-        name: &str,
-        cycle: u32,
-        before: &ClockSample,
-        after: &ClockSample,
-        hibernate: Window,
-        wake: Window,
-    ) {
+    fn record_clock(&self, name: &str, cycle: u32, before: &ClockSample, after: &ClockSample) {
         let mut records = self.records.borrow_mut();
         records.clock_samples += 1;
         let skew = after.realtime_skew();
@@ -641,13 +633,7 @@ crictl pods -o json | jq -r '.items[] | "\(.id) \(.state)"'"#;
                 skew as f64 / 1e6
             ));
         }
-        let monotonic = check_monotonic(
-            before,
-            after,
-            (hibernate.start_ns, hibernate.end_ns),
-            (wake.start_ns, wake.end_ns),
-            MONOTONIC_TOLERANCE_NS,
-        );
+        let monotonic = check_monotonic(before, after, MONOTONIC_TOLERANCE_NS);
         if let Err(e) = monotonic {
             records
                 .clock_failures
@@ -724,16 +710,15 @@ fn cycles(suite: &Suite) {
         };
         step(&format!("cycle {cycle} of {CYCLES}, sleeping {sleep:?}"));
         let mut before = HashMap::new();
-        let mut hibernated = HashMap::new();
         for name in CYCLED {
             before.insert(name, expect(suite.clock_sample(name)));
-            hibernated.insert(name, expect(suite.hibernate(suite.pod(name))));
+            expect(suite.hibernate(suite.pod(name)));
         }
         expect(suite.sleep_watching(&CYCLED, sleep));
         for name in CYCLED {
-            let (_, window) = expect(suite.wake(suite.pod(name)));
+            expect(suite.wake(suite.pod(name)));
             let after = expect(suite.clock_sample(name));
-            suite.record_clock(name, cycle, &before[name], &after, hibernated[name], window);
+            suite.record_clock(name, cycle, &before[name], &after);
             expect(suite.check_unchanged(name));
             suite.record_tso(name, cycle);
             if cycle == 1 || cycle == CYCLES {
@@ -790,8 +775,8 @@ fn logs(suite: &Suite) {
 }
 
 /// After each wake of the cycles, the guest's realtime was within 100 ms of
-/// the node's, and its monotonic clock had advanced by about the time it ran;
-/// each wake's event records the clock step.
+/// the node's, and its monotonic clock had advanced by about the node's time,
+/// sleep included; each wake's event records the clock step.
 fn clock(suite: &Suite) {
     require_cycles(suite);
     let records = suite.records.borrow();

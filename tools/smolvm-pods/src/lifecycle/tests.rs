@@ -893,6 +893,65 @@ async fn a_wake_that_waits_for_admission_has_an_event() {
     );
 }
 
+/// A pod with nothing to do in its guest first gets its traffic as soon as
+/// its VM runs, before the agent answers; the release after is a no-op.
+#[tokio::test]
+async fn a_pod_with_nothing_pending_gets_its_traffic_while_it_resumes() {
+    let h = Harness::asleep("pod").await;
+    h.vm.runs_early.store(true, Ordering::SeqCst);
+    *lock(&h.hooks.held_for) = Some(Duration::from_micros(12_500));
+    h.wake("pod").await.unwrap();
+    let awake = h.events("pod").pop().unwrap();
+    assert_eq!((awake.from, awake.state), (Some(Waking), Awake));
+    let steps: Vec<_> = awake.steps.iter().map(|s| s.step.as_str()).collect();
+    assert_eq!(
+        steps,
+        [
+            "admit",
+            "slot",
+            "resume",
+            "early_release",
+            "tso",
+            "ping",
+            "clock",
+            "deferred_kills",
+            "before_release",
+            "release"
+        ]
+    );
+    assert_eq!(awake.capture_to_release_ms, Some(12.5));
+    let calls = h.hooks.calls();
+    let first_release = calls.iter().position(|c| c.starts_with("release")).unwrap();
+    let before_release = calls
+        .iter()
+        .position(|c| c.starts_with("before-release"))
+        .unwrap();
+    assert!(first_release < before_release, "{calls:?}");
+}
+
+/// A deferred kill must reach the guest before its traffic does.
+#[tokio::test]
+async fn a_pod_with_a_deferred_kill_gets_its_traffic_after_the_kill() {
+    let h = Harness::asleep("pod").await;
+    h.vm.runs_early.store(true, Ordering::SeqCst);
+    let deferred = h.life().kill("pod", kill("app", None, 15)).await.unwrap();
+    assert!(
+        matches!(deferred, KillOutcome::Deferred { .. }),
+        "{deferred:?}"
+    );
+    h.wake("pod").await.unwrap();
+    let awake = h.events("pod").pop().unwrap();
+    let steps: Vec<_> = awake.steps.iter().map(|s| s.step.as_str()).collect();
+    assert!(!steps.contains(&"early_release"), "{steps:?}");
+    let calls = h.hooks.calls();
+    let first_release = calls.iter().position(|c| c.starts_with("release")).unwrap();
+    let before_release = calls
+        .iter()
+        .position(|c| c.starts_with("before-release"))
+        .unwrap();
+    assert!(before_release < first_release, "{calls:?}");
+}
+
 #[tokio::test]
 async fn the_release_hook_times_the_held_traffic() {
     let h = Harness::asleep("pod").await;

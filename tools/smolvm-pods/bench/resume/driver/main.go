@@ -117,6 +117,22 @@ func (d *driver) getJSON(path string) (record, error) {
 	return r, nil
 }
 
+// guestClock is how far memhold's wall clock is from the node's, in ms: its
+// time against the middle of the request that read it.
+func (d *driver) guestClock() (float64, error) {
+	t := time.Now()
+	r, err := d.getJSON("/clock")
+	if err != nil {
+		return 0, err
+	}
+	ns, ok := r["realtime_ns"].(float64)
+	if !ok {
+		return 0, fmt.Errorf("GET /clock: no realtime_ns in %v", r)
+	}
+	mid := t.Add(time.Since(t) / 2)
+	return (ns - float64(mid.UnixNano())) / 1e6, nil
+}
+
 // latencies requests path n times and summarises the durations in ms.
 func (d *driver) latencies(path string, n int) (record, error) {
 	var ms []float64

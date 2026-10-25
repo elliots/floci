@@ -226,6 +226,14 @@ pub trait VmOps: Send + Sync + 'static {
     /// Whether `process` turned TSO on (`boot::has_tso`).
     fn has_tso(&self, machine: &str, process: &VmProcess) -> bool;
 
+    /// During a resume: waits until the new VM process runs the guest
+    /// (libkrun's control socket answers `OK running`) and, with `rosetta`,
+    /// has turned TSO on. Returns false if `stop` is set first, which the
+    /// resume does once it returns, or after a timeout.
+    fn wait_running(&self, _machine: &str, _rosetta: bool, _stop: &AtomicBool) -> bool {
+        false
+    }
+
     /// One ping of the guest agent, with a timeout of its own, so that it
     /// fails fast if the agent does not answer.
     fn ping(&self, machine: &str) -> Result<(), String>;

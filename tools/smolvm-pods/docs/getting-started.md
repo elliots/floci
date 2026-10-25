@@ -504,7 +504,7 @@ curl -s -o /dev/null -w '%{http_code} %{time_total}s\n' http://127.0.0.1:32080/
 ```
 
 It answers 200. The first connection woke the pod: its packets were held while the VM resumed,
-in about 0.2 seconds, then reached nginx unchanged. The events show `asleep` to `waking` and
+about 35 ms, then reached nginx unchanged. The events show `asleep` to `waking` and
 `waking` to `awake` with the reason `traffic` and a `reason_detail` with the caller and port 80.
 `ctl get` shows the pod `awake` with a new `vm_pid`; its IP, containers and memory are the same.
 After another 30 to 45 seconds without requests, it sleeps again.

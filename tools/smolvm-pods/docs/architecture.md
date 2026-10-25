@@ -307,25 +307,32 @@ for a Java app (PetClinic) whose RAM image is 0.75 GB.
 
 ### Wake
 
-The wake steps are `admit`, `slot`, `resume`, `tso`, `ping`, `clock`, `deferred_kills`,
-`before_release` and `release`:
+The wake steps are `admit`, `slot`, `resume`, `early_release`, `tso`, `ping`, `clock`,
+`deferred_kills`, `before_release` and `release`:
 
 1. Admission (see [Admission](#admission)), then the wait for one of the node's 4 resume slots.
 2. smolvm's `resume_machine` starts the VM process as `/proc/self/exe _boot-vm`, this binary's
    entry point, so TSO and the pod's network namespace are set as at a cold boot, with the same
-   tap, MAC and IP.
-3. For a Rosetta pod, the new VM process must have recorded that it turned TSO on, or the pod
+   tap, MAC and IP. It returns once the guest agent answers, which takes the guest's handling of
+   the vsock transport reset that every restore sends it, 10 to 15 ms after the VM runs.
+3. Meanwhile, for a pod with no deferred kill and nothing deleted while it slept, the `release`
+   hook writes the traffic held while the pod slept into the VM as soon as libkrun's control
+   socket answers `OK running` and, for a Rosetta pod, the new VM process has recorded that it
+   turned TSO on (`early_release`, timed from the start of the resume). The guest's clock is
+   already right then (see [Guest clock](#guest-clock)), and nothing it would get later changes
+   what it serves.
+4. For a Rosetta pod, the new VM process must have recorded that it turned TSO on, or the pod
    fails.
-4. The guest agent is pinged with a 1 s timeout, retried for up to 30 s.
-5. The guest clock is stepped (see [Guest clock](#guest-clock)).
-6. Deferred kills are sent (`deferred_kills`).
-7. `before_release` deletes in the guest the containers and execs that were deleted while the pod
+5. The guest agent is pinged with a 1 s timeout, retried for up to 30 s.
+6. The guest clock is checked, and stepped if it is off (see [Guest clock](#guest-clock)).
+7. Deferred kills are sent (`deferred_kills`).
+8. `before_release` deletes in the guest the containers and execs that were deleted while the pod
    slept, which the pod's record keeps until then, also across a restart of the node service.
    Then the `release` hook writes the traffic held while the pod slept into the VM, in arrival
-   order, and the pod is awake and its pumps attach again.
+   order, if step 3 did not, and the pod is awake and its pumps attach again.
 
 A wake that cancelled a pause resumes the frozen VM in place if the freeze had begun (the step
-`resume`, with no restore), then runs the steps from step 3.
+`resume`, with no restore), then runs the steps from step 4.
 
 **Memory after a resume.** The node's libkrun is patched to read the checkpoint into new anonymous
 memory, 2 MiB aligned and advised for huge pages, with parallel reads before any vCPU runs. With
@@ -337,26 +344,36 @@ patch lets libkrun take the RAM image read-only, and smolvm then skips its priva
 of it, which would cost 0.3 to 0.7 s per resume. `patches/libkrun/README.md` in the smolvm
 checkout has the patches and their measurements.
 
-**Timings.** Through the shim and pod networking, the first answer at the pod's IP came a median
-of 160 to 169 ms after the wake call (134 to 203 ms), with 98% of the guest's RAM in huge pages;
-with 505 pods on the node, wakes took a median of 147 to 156 ms. Through smolvm alone, in the
-[resume check](../README.md#tests), the first answer came 0.15 s after the start of the resume for
-a pod holding 1 GiB and 0.21 s for PetClinic, whose warm requests were then as fast as after a
-cold boot (median 4.0 ms against 7.5 ms). About 0.15 s of a resume is spent inside the VM process.
-The first read of 1 GiB after a resume still takes 385 ms, against 52 ms warm.
+**Timings.** On a Mac node, a pod of nginx that had slept 2 s answered the request that woke it
+a median of 53 ms after the client sent it (47 to 88 ms over 20 wakes). Its held traffic reached
+the guest a median of 33 ms after the start of the resume (`early_release`), 15 ms before smolvm's
+resume returned, and the guest answered about 20 ms after that. Most of the 33 ms is the nested
+node: reading the guest's RAM takes 10 to 17 ms for nginx's 94 MB, much of it the Mac backing node
+memory that the node had not touched recently, and the VM process takes about 7 ms to start the
+VM, of it about 3 ms for the pod network. The e2e wake test's app answered through a Service in
+28 to 35 ms. Through smolvm alone, in the [save benchmark](../README.md#tests), memhold holding
+1 GiB answered a median of 48 to 51 ms after the start of the resume, that path waiting for the
+guest agent first. The first read of 1 GiB after a resume still takes 385 ms, against 52 ms warm.
 
 ### Guest clock
 
-A resumed guest's wall clock is behind by the time it slept: arm64 KVM freezes the guest's
-counter, smolvm does not restamp the wall clock on a resume from a local pause, and libkrun's
-vsock time sync is built only for macOS and Windows. A guest was 192 s behind after 3.2 minutes
-asleep.
+On arm64, KVM gives a guest its time through the generic timer's virtual counter, which a restore
+would set back to its value at the pause, so that the guest's clocks stood still while it slept.
+The node's libkrun is patched to move the counter on by the node's time since it was saved, as
+an x86 guest's kvmclock does, before the vCPUs run. The guest's monotonic and wall clocks then
+show the time gone by, as if it had run through it, and its timers that fell due meanwhile fire at
+the wake. smolvm sets a VM's wall clock to the node's right after it boots, which its RTC, counting
+whole seconds, would leave up to a second off, and the guest agent turns off the RCU stall
+warnings that the counter's jump would otherwise print after a long sleep. In the save benchmark,
+the guest clock was within 7 ms of the node's, median 1 ms, after its boot, before every pause
+and after every wake, that much being the time to read it over HTTP.
 
-So every wake sends the guest agent `SetClock` with the node's time, before the deferred kills
-and before any held traffic is released. The agent steps `CLOCK_REALTIME` only if the guest is
-more than 50 ms behind or more than 5 s ahead, the rule E2B uses, and answers with the skew it
-found. The wake's event records it as `clock`. After every wake the guest clock is within 100 ms
-of the node's. Monotonic time advances only by the time the pod was awake.
+After every wake the node service still sends the guest agent `SetClock` with the node's time,
+after the ping. The agent steps `CLOCK_REALTIME` only if the guest is more than 50 ms behind or
+more than 5 s ahead, the rule E2B uses, and answers with the skew it found, which the wake's event
+records as `clock`. While a guest is awake its clock runs on its counter alone, and drifts from the
+node's by about 1 ms a minute on a Mac node; a step of the node's own clock, such as libkrun's time
+sync of a node on a Mac, reaches an awake guest at its next wake.
 
 ### Output and logs
 
@@ -547,7 +564,7 @@ and, when the idle loop gets to it, no lease, exec or container create blocks th
 not have `hibernate: "false"`, and it passes the [pre-sleep probe check](#the-pre-sleep-check).
 
 Quiet open connections do not keep a pod awake, because any later packet on a connection to the
-pod wakes it. A wrong sleep costs a wake, about 0.2 s, and a pause; it never loses a request.
+pod wakes it. A wrong sleep costs a wake, about 50 ms, and a pause; it never loses a request.
 
 ### Only connections opened to the pod count
 

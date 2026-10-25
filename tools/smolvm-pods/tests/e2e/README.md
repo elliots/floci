@@ -199,11 +199,9 @@ The checks run in this order, each also after one fails:
 - **Logs**: each pod's `tick N` lines in `kubectl logs` run from 1 to the app's latest counter
   (`/ticks`), with no gap and no repeat.
 - **Clock**: after each wake, the guest's realtime was within 100 ms of the node's, and its
-  monotonic clock advanced by the time the guest ran, within 50 ms: the node's time between the
-  samples, less the time it was frozen, which lies between the end of the hibernate call and the
-  start of the wake call at least, and between the start of the one and the end of the other at
-  most (`checkers::check_monotonic`). Each `waking` to `awake` event of the cycles records the
-  clock step.
+  monotonic clock advanced by the node's time between the samples, sleep included, within 50 ms
+  (`checkers::check_monotonic`). Each `waking` to `awake` event of the cycles records the clock
+  step.
 - **TSO**: at setup, the VM processes of `arm64`, `amd64` and `resume` had TSO on (the marker
   in the [runtime contract](#runtime-contract)) and those of the `rosetta: "false"` pods had not;
   after each wake of the cycles the same held for the new VM process; after the last cycle, the

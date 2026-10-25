@@ -10,6 +10,7 @@
 //	/dirty   changes memory with a pattern, then records the SHA-256 of the
 //	         memory in use as the expected one (see dirty)
 //	/verify  compares the SHA-256 of the memory in use with the expected one
+//	/clock   the guest's wall clock, in ns since the Unix epoch
 package main
 
 import (
@@ -259,6 +260,9 @@ func main() {
 
 	http.HandleFunc("/ping", func(w http.ResponseWriter, _ *http.Request) {
 		reply(w, map[string]any{"pid": os.Getpid(), "uptime_s": time.Since(h.started).Seconds()})
+	})
+	http.HandleFunc("/clock", func(w http.ResponseWriter, _ *http.Request) {
+		reply(w, map[string]any{"realtime_ns": time.Now().UnixNano()})
 	})
 	http.HandleFunc("/stats", func(w http.ResponseWriter, _ *http.Request) {
 		reply(w, map[string]any{"mib": *mib, "first_touch_ms": h.firstMs, "rewrite_ms": h.rewriteMs,

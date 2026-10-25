@@ -8,8 +8,9 @@
 
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use log::{debug, info, warn};
 use smolvm::agent::AgentClient;
@@ -26,6 +27,8 @@ use crate::proto::valid_id;
 
 /// How long a check of the TSO marker waits for a new VM process to write it.
 const TSO_MARKER_WAIT: Duration = Duration::from_secs(2);
+/// How long [`VmOps::wait_running`] waits for a resumed VM to run.
+const RUNNING_WAIT: Duration = Duration::from_secs(5);
 
 /// The lifecycle's VM operations on the node's smolvm.
 pub struct SmolvmOps;
@@ -187,6 +190,25 @@ impl VmOps for SmolvmOps {
             }
             std::thread::sleep(Duration::from_millis(5));
         }
+    }
+
+    fn wait_running(&self, machine: &str, rosetta: bool, stop: &AtomicBool) -> bool {
+        let socket = smolvm::agent::fork::control_socket_path(machine);
+        let dir = smolvm::agent::vm_data_dir(machine);
+        let deadline = Instant::now() + RUNNING_WAIT;
+        while !stop.load(Ordering::Acquire) && Instant::now() < deadline {
+            let running = smolvm::agent::fork::control_socket_cmd_with_timeout(
+                &socket,
+                "STATUS",
+                Duration::from_millis(100),
+            )
+            .is_ok_and(|status| status.trim() == "OK running");
+            if running && (!rosetta || crate::boot::has_live_tso(&dir)) {
+                return true;
+            }
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        false
     }
 
     /// With a read timeout of 1 s, which lets a resumed guest's vsock finish

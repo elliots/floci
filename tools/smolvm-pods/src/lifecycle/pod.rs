@@ -8,6 +8,7 @@ use std::collections::VecDeque;
 use std::fmt;
 use std::future::Future;
 use std::pin::Pin;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::task::{Context, Poll};
 use std::time::{Duration, Instant};
@@ -1087,11 +1088,12 @@ impl Actor {
     }
 
     async fn resume_and_finish(&mut self, mut t: Transition, started: Instant, mut during: During) {
-        let work = resume(self.shared.clone(), self.pod.id.clone(), self.machine());
+        let work = resume(self.shared.clone(), self.pod.clone(), self.machine());
         let resumed = self.drive(&mut during, work).await.and_then(|r| r);
         let e = match resumed {
-            Ok(steps) => {
+            Ok((steps, held)) => {
                 t.steps.extend(steps);
+                t.capture_to_release_ms = held.map(ms);
                 return self
                     .finish_wake(t, started, during, AwakeCause::Woke, true)
                     .await;
@@ -1151,7 +1153,9 @@ impl Actor {
         };
         t.steps.extend(post.steps);
         t.clock = Some(post.clock);
-        t.capture_to_release_ms = post.held.map(ms);
+        if let Some(held) = post.held {
+            t.capture_to_release_ms = Some(ms(held));
+        }
         t.cancelled = cause == AwakeCause::PauseCancelled;
         if t.error.is_none() {
             t.error = post.warning;
@@ -1444,7 +1448,18 @@ async fn pause(
 }
 
 /// The VM resume, in its own task. The slot limits resumes across pods.
-async fn resume(shared: Arc<Shared>, id: String, machine: String) -> Result<Steps, String> {
+///
+/// smolvm's resume returns once the guest agent answers, which takes the
+/// guest's vsock reset. A pod with nothing to do in its guest before it
+/// serves (no deferred kill, no deletion while it slept) gets its held
+/// traffic as soon as the new VM process runs the guest, alongside the rest
+/// of the resume: the `early_release` step. Its time since the capture of the
+/// first held frame comes back with the steps.
+async fn resume(
+    shared: Arc<Shared>,
+    pod: Arc<Pod>,
+    machine: String,
+) -> Result<(Steps, Option<Duration>), String> {
     let mut steps = Steps::default();
     let started = Instant::now();
     let _slot = shared
@@ -1453,8 +1468,34 @@ async fn resume(shared: Arc<Shared>, id: String, machine: String) -> Result<Step
         .await
         .map_err(|e| e.to_string())?;
     steps.push("slot", started.elapsed());
-    let faults = shared.config.faults.for_pod(&id);
-    let took = shared
+    let record = pod.record();
+    let stop = Arc::new(AtomicBool::new(false));
+    let early = (record.deferred_kills.is_empty() && record.guest_deletes.is_empty()).then(|| {
+        let (shared, pod, machine, stop) =
+            (shared.clone(), pod.clone(), machine.clone(), stop.clone());
+        let rosetta = record.identity.rosetta;
+        tokio::spawn(async move {
+            let started = Instant::now();
+            let running = shared
+                .vm_call(move |vm| Ok(vm.wait_running(&machine, rosetta, &stop)))
+                .await
+                .unwrap_or(false);
+            if !running {
+                return None;
+            }
+            let hooks = shared.hooks.clone();
+            let info = pod.info(shared.now_ms());
+            match blocking(move || hooks.release(&info)).await {
+                Ok(held) => Some((started.elapsed(), held)),
+                Err(e) => {
+                    warn!("the early release of pod sandbox {} failed: {e}", pod.id);
+                    None
+                }
+            }
+        })
+    });
+    let faults = shared.config.faults.for_pod(&pod.id);
+    let resumed = shared
         .vm_call(move |vm| {
             faults.check(FaultPoint::WakeResumeError)?;
             let started = Instant::now();
@@ -1463,9 +1504,20 @@ async fn resume(shared: Arc<Shared>, id: String, machine: String) -> Result<Step
             faults.hit(FaultPoint::WakeResumed);
             Ok(took)
         })
-        .await?;
+        .await;
+    stop.store(true, Ordering::Release);
+    let released = match early {
+        Some(task) => task.await.ok().flatten(),
+        None => None,
+    };
+    let took = resumed?;
     steps.push("resume", took);
-    Ok(steps)
+    let mut held = None;
+    if let Some((took, delivered)) = released {
+        steps.push("early_release", took);
+        held = delivered;
+    }
+    Ok((steps, held))
 }
 
 /// The post-resume steps (`tso`, `ping`, `clock`, `deferred_kills`,

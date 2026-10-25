@@ -74,6 +74,19 @@ pub fn has_tso(vm_dir: &Path, pid: i32) -> bool {
     marker.is_ok_and(|marker| Some(marker) == process_identity(pid))
 }
 
+/// Whether a live VM process of the VM in `vm_dir` turned TSO on: the one
+/// that the marker names, if it still runs.
+pub fn has_live_tso(vm_dir: &Path) -> bool {
+    let Ok(marker) = std::fs::read_to_string(vm_dir.join(TSO_MARKER)) else {
+        return false;
+    };
+    let pid = marker
+        .split_whitespace()
+        .next()
+        .and_then(|pid| pid.parse().ok());
+    pid.is_some_and(|pid| Some(marker) == process_identity(pid))
+}
+
 /// A pid and the start time of its process, which tell it from a later
 /// process with the same pid.
 fn process_identity(pid: i32) -> Option<String> {
