@@ -60,6 +60,7 @@ import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicLong;
+import java.util.function.BooleanSupplier;
 import java.util.stream.Collectors;
 
 @ApplicationScoped
@@ -1457,6 +1458,17 @@ public class SqsService implements Resettable, ResourceProvider {
 
     public List<Message> receiveMessage(String queueUrl, int maxMessages, int visibilityTimeout,
                                         Integer waitTimeSeconds, String region) {
+        return receiveMessage(queueUrl, maxMessages, visibilityTimeout, waitTimeSeconds, region, () -> false);
+    }
+
+    /**
+     * {@link #receiveMessage(String, int, int, Integer, String)} for a caller that can go away while
+     * the call waits, as when a client closes its connection during a long poll: once
+     * {@code callerGone} says so, the call ends with no messages, so that none goes in flight for
+     * a caller that will never get it.
+     */
+    public List<Message> receiveMessage(String queueUrl, int maxMessages, int visibilityTimeout,
+                                        Integer waitTimeSeconds, String region, BooleanSupplier callerGone) {
         String storageKey = regionKey(region, queueUrl);
         Queue queue = getQueueByUrl(storageKey, queueUrl)
                 .orElseThrow(() -> new AwsException("AWS.SimpleQueueService.NonExistentQueue",
@@ -1487,6 +1499,9 @@ public class SqsService implements Resettable, ResourceProvider {
                 // burn ApproximateReceiveCount / redrive budget — that belong
                 // to the new queue's consumers.
                 return Collections.emptyList();
+            }
+            if (callerGone.getAsBoolean()) {
+                return recordReceive(polledQueue, Collections.emptyList());
             }
             List<Message> result = doReceiveMessage(storageKey, queueUrl, maxMessages, visibilityTimeout, region);
             if (!result.isEmpty() || maxWait <= 0) {
