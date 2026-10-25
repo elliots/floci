@@ -42,14 +42,7 @@ Each step ends with the [runtime's acceptance tests](#runtime) passing, each sui
    projected token volumes at every wake, in the `before_release` step, after the clock and before
    traffic, keeping their owners and modes ("Known limits" in
    `tools/smolvm-pods/docs/architecture.md`). Account for and clean up emptyDir storage.
-3. **Standard libraries for protocol code.** Replace hand-written protocol code where a standard
-   crate fits. The candidates are `h2` and `tonic-health` for the gRPC health answer and the
-   pre-sleep gRPC check, `httparse` for the HTTP/1.1 that the probe responder and `ctl` parse,
-   `kube-rs` for the Kubernetes client and the pod watch, and netlink crates for the raw netlink
-   code. A research pass comes first: for each candidate, whether it fits where the code runs (the
-   probe responder runs on smoltcp in one epoll thread, not on tokio), and what it adds to the
-   binary and to `Cargo.lock`, which is smolvm's lock reduced to this crate's dependencies.
-4. **Scale, observability, Linux hosts and the final tests**, in this order:
+3. **Scale, observability, Linux hosts and the final tests**, in this order:
    - **Scale with real applications.** Run 500 VM pods of real applications, including public
      Java and Node apps, several using about 1 GB, pinned by digest. Size each pod VM from its
      pod's resources, and admit wakes within real RAM by that size. Account for checkpoint disk
@@ -143,6 +136,12 @@ Each step ends with the [runtime's acceptance tests](#runtime) passing, each sui
   a RST.
 - **Traffic metrics between pods only if they come almost free**, from conntrack accounting, and
   never at the cost of the packet path.
+- **Protocol code uses a standard crate from smolvm's lock where one fits**: hyper for HTTP
+  clients, httparse for request heads, x509-parser for certificates. The probe responder's gRPC
+  answer, the Kubernetes client and watch, and the netlink code stay hand-written: h2 and
+  tonic-health need tokio, which the responder's smoltcp thread does not run; kube-rs and
+  k8s-openapi would add dozens of crates and megabytes; and no netlink crate covers ctnetlink's
+  counters, ids, timeouts and TCP states.
 - **Observability uses OpenTelemetry.**
 - **The API is served over TCP with a bearer token**; TLS comes with Linux hosts.
 - **Floci's Java changes** go in new classes and are off by default.
