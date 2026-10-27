@@ -266,20 +266,24 @@ log fifos stay, and Kubernetes keeps seeing it Running and Ready.
 
 ### Pause
 
-The pause steps are `slot`, `pausing`, `stop-pumps` and `pause`, then `stop-paused` when the VM
-process outlives a durable pause:
+The pause steps are `slot`, `freeze`, `pausing`, `stop-pumps` and `pause`, then `stop-paused` when
+the VM process outlives a durable pause:
 
 1. Wait for one of the node's 2 pause slots.
-2. The `pausing` hook holds the pod's traffic (see [Waking on incoming
+2. The guest agent freezes the pod's containers with the cgroup freezer and resets each TCP
+   connection that leaves the VM (see [Connections of a sleeping
+   pod](#connections-of-a-sleeping-pod)). A freeze that fails is logged and the pause goes on, the
+   pod then sleeping with its connections.
+3. The `pausing` hook holds the pod's traffic (see [Waking on incoming
    connections](#waking-on-incoming-connections)). For an idle pause it then checks conntrack
    again, and a packet since the idle decision refuses the pause.
-3. The output pumps finish the frame they are reading, record their cursors and close their agent
+4. The output pumps finish the frame they are reading, record their cursors and close their agent
    connections, so the checkpoint holds no host connection.
-4. smolvm's `pause_machine_local_with` freezes the VM and writes the checkpoint into the VM's
+5. smolvm's `pause_machine_local_with` freezes the VM and writes the checkpoint into the VM's
    directory (`pause-*.smolcheckpoint`), unpacked, with a SHA-256 of each 2 MiB block of the RAM
    image bound to its inode. A resume on the same node then needs no extraction or verification,
    which would cost 0.6 to 0.7 s. The pause can be cancelled until the checkpoint is durable.
-5. Once smolvm's record says Paused and the VM process is verified gone, the pod is asleep. A VM
+6. Once smolvm's record says Paused and the VM process is verified gone, the pod is asleep. A VM
    process that is still there after a durable pause is stopped first.
 
 **Only changed memory is written.** smolvm keeps each VM's last RAM image as its RAM base
@@ -307,7 +311,7 @@ for a Java app (PetClinic) whose RAM image is 0.75 GB.
 
 ### Wake
 
-The wake steps are `admit`, `slot`, `resume`, `early_release`, `tso`, `ping`, `clock`,
+The wake steps are `admit`, `slot`, `resume`, `early_release`, `tso`, `ping`, `clock`, `thaw`,
 `deferred_kills`, `before_release` and `release`:
 
 1. Admission (see [Admission](#admission)), then the wait for one of the node's 4 resume slots.
@@ -319,14 +323,17 @@ The wake steps are `admit`, `slot`, `resume`, `early_release`, `tso`, `ping`, `c
    hook writes the traffic held while the pod slept into the VM as soon as libkrun's control
    socket answers `OK running` and, for a Rosetta pod, the new VM process has recorded that it
    turned TSO on (`early_release`, timed from the start of the resume). The guest's clock is
-   already right then (see [Guest clock](#guest-clock)), and nothing it would get later changes
-   what it serves.
+   already right then (see [Guest clock](#guest-clock)), the guest agent thaws the containers
+   within a few milliseconds (see [Connections of a sleeping
+   pod](#connections-of-a-sleeping-pod)), and nothing the pod would get later changes what it
+   serves.
 4. For a Rosetta pod, the new VM process must have recorded that it turned TSO on, or the pod
    fails.
 5. The guest agent is pinged with a 1 s timeout, retried for up to 30 s.
 6. The guest clock is checked, and stepped if it is off (see [Guest clock](#guest-clock)).
-7. Deferred kills are sent (`deferred_kills`).
-8. `before_release` deletes in the guest the containers and execs that were deleted while the pod
+7. The guest agent thaws the pod's containers, if it has not already (`thaw`).
+8. Deferred kills are sent (`deferred_kills`).
+9. `before_release` deletes in the guest the containers and execs that were deleted while the pod
    slept, which the pod's record keeps until then, also across a restart of the node service.
    Then the `release` hook writes the traffic held while the pod slept into the VM, in arrival
    order, if step 3 did not, and the pod is awake and its pumps attach again.
@@ -517,8 +524,8 @@ The queue holds at most 1,024 frames or 4 MiB, drops exact repeats, and past the
 newest frame, which the client retransmits. Frames received before the hold was set passed the
 bridge and are not held. Segmented frames never go to the responder.
 
-Keepalive probes to a sleeping pod are dropped, so a client eventually resets an idle pooled
-connection; the RST is held for the guest, and the pool's next connection wakes the pod.
+A sleeping pod has no connection open with a peer outside its VM, since it reset them all as it
+paused, so frames on an old connection are rare: they come from a peer that missed the RST.
 
 **Traffic wakes.** For a frame that may wake the pod, the netloop asks the traffic waker, never
 while the pod wakes. The waker looks the frame's inverse, from the pod to the frame's source, up in
@@ -573,15 +580,14 @@ source. That covers connections to the pod's IP, and those through a Service or 
 DNAT. An entry whose original source is the pod is one of the pod's own connections, with no NAT,
 after SNAT or after DNAT, as for the frames of a sleeping pod ([Frame rules](#frame-rules)). Traffic
 on the pod's own connections, such as its DNS lookups, a database pool, a broker's pushes through
-its Service or a server's heartbeats from the Mac, neither keeps it awake nor wakes it; while it
-sleeps, data on those connections is held for the next wake.
+its Service or a server's heartbeats from the Mac, does not keep it awake.
 
 The reason: a pod is idle when nobody calls it, whatever it keeps open toward others. If outbound
 traffic counted, a heartbeat, a watch or a pool with keepalives toward another service would keep a
 pod awake for good. The costs:
 
-- The far ends of a sleeping pod's outbound connections see silence and may close them (broker
-  heartbeats, database idle timeouts, Kubernetes watches). The app reconnects after it wakes.
+- The pod's connections are reset as it pauses ([Connections of a sleeping
+  pod](#connections-of-a-sleeping-pod)), so the app reconnects after it wakes.
 - Messages pushed to a sleeping consumer wait until something calls it. Floci wakes consumers of
   AWS and broker messages through the API, with a lease.
 - Work driven by the pod's own timers, such as a poll loop or a retry with a sleep, pauses while
@@ -646,12 +652,35 @@ the reason (its numbers left out) until the pod sleeps. The monitor itself keeps
 recent traffic, a recent wake, CPU above the threshold, CPU not measured yet, conntrack that could
 not be read, or no recorded IP.
 
-**Hold, recheck, freeze.** The `pausing` hook sets the hold before the freeze, then reads
+**Hold, recheck, freeze.** The `pausing` hook sets the hold before the VM freezes, then reads
 conntrack again, and any packet newer than the idle decision refuses the pause. Without the
 recheck, a request could reach the guest between the decision and the freeze; the guest would
 acknowledge it and freeze before it answered, and the client would wait with nothing to
 retransmit. With the hold set first, every later frame reaches the catcher and wakes the pod, and
-every earlier one is in conntrack.
+every earlier one is in conntrack. The containers freeze and the connections are reset before the
+hold, so that the resets reach the peers; the recheck does not count an entry whose only new
+packet is the RST that closed it, and a refused pause thaws the containers.
+
+### Connections of a sleeping pod
+
+A sleeping pod keeps no connection with a peer outside its VM. Before the hold, the `freeze` step
+asks the guest agent to:
+
+1. Freeze the pod's containers: `cgroup.freeze` of `/sys/fs/cgroup/smolvm`, the parent of every
+   container's cgroup, so that no app sees a connection close, or opens one, before the pause.
+2. Reset each TCP connection whose peer is not in the VM, IPv4 and IPv6, with `SOCK_DESTROY` over
+   `sock_diag` (the pod kernel has `CONFIG_INET_DIAG_DESTROY`). The kernel sends the peer a RST with
+   the right sequence numbers and fails the socket for the app with `ECONNABORTED`. Listening
+   sockets, `TIME_WAIT` and connections over loopback or to the pod's own address stay.
+
+The agent thaws the containers by itself as soon as the guest runs again: a thread that ticks every
+5 ms sees the monotonic clock jump by more than 250 ms, which only a pause makes, so the apps run
+by the time the held traffic is released. The `thaw` step after a wake, and after a pause that did
+not happen, thaws them too. The apps then find their connections closed, as after a network
+failure, and reconnect; their peers saw the RST at the pause, not silence until a timeout. A
+client of the pod, such as a pool with an idle connection or a WebSocket, sees its connection
+reset, and its next connection wakes the pod. Lambda SnapStart and CRaC ask the app to close its
+connections in a hook before the snapshot; the node does it for every app, with no hook.
 
 ### Admission
 
@@ -1062,7 +1091,8 @@ The node keeps 4 KiB pages: libkrun's Linux checkpoint code assumes them, and on
 every pause failed reading the guest RAM's page map. Pod VMs keep the smolvm release's guest
 kernel, which has no huge pages, plus the netfilter options that Istio's `istio-init` needs
 ([node/podkernel](../node/podkernel/pod.config)): iptables' `REDIRECT` target and `owner` match,
-and the `MARK` target and `mark` match.
+and the `MARK` target and `mark` match. It also has TCP `sock_diag` with `SOCK_DESTROY`
+(`CONFIG_INET_DIAG_DESTROY`), for the resets before a pause.
 
 The node kernel has no tc (`NET_SCHED`), NFQUEUE, TPROXY, BPF JIT, conntrack events, `INET_DIAG` or
 nftables logging, and at most 16 CPUs (`CONFIG_NR_CPUS`).
@@ -1215,6 +1245,9 @@ the token on its own requests.
 - Other clients on the node that connect straight to a pod's probe port are taken for kubelet.
 - TCP keepalives and connection pools keep an awake pod awake, because conntrack counts packets,
   not payload.
+- A pause resets every TCP connection between the pod and a peer outside its VM, also when a wake
+  then cancels it or the recheck refuses it. A pod whose guest has no cgroups for its containers
+  is not frozen first, so an app may react to the resets before the pause.
 - A process that exits just before a freeze reports its exit only at the next wake.
 - A crash right after a resume can leave the used checkpoint on disk until the pod is deleted.
 - A node service killed with SIGKILL, or by the OOM killer, cannot close its catchers at once: the
@@ -1224,5 +1257,4 @@ the token on its own requests.
   measured yet.
 - At most 2 pauses and 4 resumes run at once on a node, so 50 pods woken together take about 2.5 s
   for the last.
-- Every pause writes all of the guest's RAM, uncompressed.
 - The node VM's memory is not returned to macOS.

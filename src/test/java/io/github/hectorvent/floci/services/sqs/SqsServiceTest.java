@@ -2335,6 +2335,33 @@ class SqsServiceTest {
                 "The pre-delete long poll must not consume the recreated queue's delivery");
     }
 
+    @Test
+    void longPollOfAGoneCallerTakesNoMessage() throws InterruptedException {
+        String region = "eu-west-1";
+        Queue queue = sqsService.createQueue("gone-caller-queue", null, region);
+        String queueUrl = queue.getQueueUrl();
+
+        AtomicBoolean gone = new AtomicBoolean();
+        CountDownLatch pollerEntered = new CountDownLatch(1);
+        AtomicReference<List<Message>> goneResult = new AtomicReference<>();
+        Thread goner = new Thread(() -> {
+            pollerEntered.countDown();
+            goneResult.set(sqsService.receiveMessage(queueUrl, 1, 30, 8, region, gone::get));
+        });
+        goner.start();
+        assertTrue(pollerEntered.await(5, TimeUnit.SECONDS));
+        Thread.sleep(300); // let the poller park inside its long-poll wait
+
+        gone.set(true);
+        sqsService.sendMessage(queueUrl, "for-a-live-caller", 0, region);
+        goner.join(2000);
+        assertFalse(goner.isAlive(), "the long poll of a gone caller ends at the next message");
+        assertTrue(goneResult.get().isEmpty(), "the long poll of a gone caller takes no message");
+
+        List<Message> received = sqsService.receiveMessage(queueUrl, 1, 30, 0, region);
+        assertEquals(1, received.size());
+        assertEquals(1, received.get(0).getReceiveCount());
+    }
 
     // --- ReceiveMessage falls back to the queue's ReceiveMessageWaitTimeSeconds ---
 

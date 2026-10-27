@@ -81,39 +81,27 @@ fn tls(data: &[u8]) -> Hello {
 }
 
 fn http(data: &[u8]) -> Hello {
-    let Some(end) = find(data, b"\r\n\r\n") else {
-        // A method, such as GET, then a space, or the start of one.
-        let method = data.iter().take_while(|b| b.is_ascii_uppercase()).count();
-        let looks_http =
-            (1..=10).contains(&method) && (method == data.len() || data[method] == b' ');
-        return if looks_http && data.len() < 16 * 1024 {
-            Hello::More
-        } else {
-            Hello::Other
-        };
-    };
-    let head = String::from_utf8_lossy(&data[..end]);
-    let mut lines = head.split("\r\n");
-    let request = lines.next().unwrap_or_default();
-    if !request.contains(" HTTP/1.") {
-        return Hello::Other;
+    let mut headers = [httparse::EMPTY_HEADER; 64];
+    let mut request = httparse::Request::new(&mut headers);
+    match request.parse(data) {
+        Ok(status) if status.is_complete() => {}
+        Ok(_) if data.len() < 16 * 1024 => return Hello::More,
+        _ => return Hello::Other,
     }
-    let host = lines.find_map(|line| {
-        let (name, value) = line.split_once(':')?;
-        name.trim().eq_ignore_ascii_case("host").then(|| {
+    let host = request
+        .headers
+        .iter()
+        .find(|h| h.name.eq_ignore_ascii_case("host"))
+        .map(|h| {
+            let value = String::from_utf8_lossy(h.value);
             let value = value.trim();
             let host = match value.rsplit_once(':') {
                 Some((h, p)) if p.bytes().all(|b| b.is_ascii_digit()) => h,
                 _ => value,
             };
             host.to_ascii_lowercase()
-        })
-    });
+        });
     Hello::Http(host)
-}
-
-fn find(data: &[u8], needle: &[u8]) -> Option<usize> {
-    data.windows(needle.len()).position(|w| w == needle)
 }
 
 struct Reader<'a>(&'a [u8]);

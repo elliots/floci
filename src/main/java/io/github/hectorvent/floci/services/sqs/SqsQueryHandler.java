@@ -4,6 +4,7 @@ import io.github.hectorvent.floci.core.common.AwsErrorMessages;
 import io.github.hectorvent.floci.core.common.AwsException;
 import io.github.hectorvent.floci.core.common.AwsNamespaces;
 import io.github.hectorvent.floci.core.common.AwsQueryResponse;
+import io.github.hectorvent.floci.core.common.ClientConnection;
 import io.github.hectorvent.floci.core.common.PaginatedResult;
 import io.github.hectorvent.floci.core.common.XmlBuilder;
 import io.github.hectorvent.floci.services.sqs.model.Message;
@@ -34,10 +35,12 @@ public class SqsQueryHandler {
     private static final Logger LOG = Logger.getLogger(SqsQueryHandler.class);
 
     private final SqsService sqsService;
+    private final ClientConnection clientConnection;
 
     @Inject
-    public SqsQueryHandler(SqsService sqsService) {
+    public SqsQueryHandler(SqsService sqsService, ClientConnection clientConnection) {
         this.sqsService = sqsService;
+        this.clientConnection = clientConnection;
     }
 
     public Response handle(String action, MultivaluedMap<String, String> params, String region) {
@@ -283,7 +286,8 @@ public class SqsQueryHandler {
         requestedAttrs.addAll(collectIndexed(params, "MessageSystemAttributeName."));
         Set<String> requestedMessageAttrs = new LinkedHashSet<>(collectIndexed(params, "MessageAttributeName."));
 
-        List<Message> messages = sqsService.receiveMessage(queueUrl, maxMessages, visibilityTimeout, waitTimeSeconds, region);
+        List<Message> messages = sqsService.receiveMessage(queueUrl, maxMessages, visibilityTimeout, waitTimeSeconds,
+                region, clientConnection.closedCheck());
         String defaultSenderId = sqsService.senderIdFor(queueUrl);
 
         XmlBuilder xml = new XmlBuilder();

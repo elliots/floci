@@ -115,9 +115,10 @@ const PROBE_WINDOW: Duration = Duration::from_secs(180);
 /// The stream and the WebSocket of the streams check last 3 idle timeouts.
 const STREAM_SECONDS: u64 = 3 * IDLE.as_secs();
 const WS_PING_SECONDS: u64 = 5;
-/// The keepalive check waits this long asleep, for two of the client's
-/// keepalive probes (Go: after 15 s idle, then every 15 s).
-const KEEPALIVE_WAIT: Duration = Duration::from_secs(40);
+/// The keepalive check waits this long asleep, past the first keepalive
+/// probe that Go would send on the connection had it stayed (after 15 s
+/// idle).
+const KEEPALIVE_WAIT: Duration = Duration::from_secs(20);
 /// After a restart of the node service, probes are answered within this time.
 const PROBES_BACK: Duration = Duration::from_secs(5);
 /// The probes' timeout, after which a probe that started during an outage
@@ -780,6 +781,21 @@ impl<'a> Suite<'a> {
             slept.asleep.as_secs_f64()
         ));
         Ok(slept)
+    }
+
+    /// Fails unless no resume of the pod started after `cursor`.
+    fn check_no_resume(&self, cursor: u64, name: &str) -> Result<(), String> {
+        let resumes: Vec<String> = self
+            .events_since(cursor, name)?
+            .iter()
+            .filter(|e| e.is_resume())
+            .map(|e| e.raw.to_string())
+            .collect();
+        if resumes.is_empty() {
+            Ok(())
+        } else {
+            Err(format!("pod {name} resumed: {resumes:?}"))
+        }
     }
 
     /// Fails unless no pause of the pod started after `cursor`.
@@ -1621,8 +1637,8 @@ fn check_call(suite: &Suite, call: &Fetched) -> Result<(), String> {
 
 /// A stream and a WebSocket with pings, each 3 idle timeouts long, keep `web`
 /// awake, and it sleeps within the idle timeout and 15 s after each ends.
-/// Then a quiet WebSocket lets it sleep, and the next message wakes it on the
-/// same connection.
+/// Then a quiet WebSocket lets it sleep, and the pod resets it as it pauses:
+/// the client's next message fails at once, and wakes nothing.
 fn streams(suite: &Suite) {
     let mut failed = Vec::new();
     let mut report = |what: &str, result: Result<(), String>| {
@@ -1684,21 +1700,15 @@ fn streams(suite: &Suite) {
             suite.sleeps_within(WEB, cursor, SLEEP_START)?;
             let cursor = suite.cursor();
             ws.trigger()?;
-            let out = pairs(&ws.wait(Duration::from_secs(60))?);
-            let (first, second) = (out.get("first_conn"), out.get("second_conn"));
-            if first.is_none() || first != second {
-                return Err(format!(
-                    "the second message came on another connection: {out:?}"
-                ));
+            match ws.wait(Duration::from_secs(10)) {
+                Err(e) if e.contains("second message") => {}
+                other => {
+                    return Err(format!(
+                        "the second message should fail on the reset connection: {other:?}"
+                    ))
+                }
             }
-            let ms: f64 = out
-                .get("second_ms")
-                .and_then(|ms| ms.parse().ok())
-                .unwrap_or(f64::MAX);
-            if ms >= 5000.0 {
-                return Err(format!("the second message took {ms} ms"));
-            }
-            suite.check_woken_by(cursor, WEB, &suite.qualified(CLIENT))
+            suite.check_no_resume(cursor, WEB)
         })(),
     );
     assert_none(&failed);
@@ -1710,10 +1720,9 @@ fn streams(suite: &Suite) {
 /// client pod through its Service, whose pushes reach `follower` from the
 /// Service's address after DNAT; and to a server on the Mac at the node's
 /// default gateway, after SNAT. Each stream reaches the pod, which sleeps by
-/// itself after its idle timeout anyway, and the pushes do not wake it while
-/// the node holds them. A request to it through its Service then wakes it
-/// once, from the client, and the test reports what became of each stream:
-/// it goes on, it stalled, or the app saw it end.
+/// itself after its idle timeout anyway, and the pushes do not wake it. A request to it through its Service then wakes it
+/// once, from the client, and the app finds each stream ended: the pod reset
+/// its connections as it paused.
 fn outbound(suite: &Suite) {
     expect(suite.ensure_awake(FOLLOWER));
     let mac = Pusher::start(
@@ -1780,47 +1789,25 @@ fn outbound(suite: &Suite) {
         })
         .collect();
     expect(suite.check_woken_by(cursor, FOLLOWER, &suite.qualified(CLIENT)));
-    let held_ms = expect(suite.events_since(cursor, FOLLOWER))
-        .iter()
-        .find(|e| e.from == "waking" && e.to == "awake")
-        .and_then(wake::capture_to_release_ms);
-    // A push came within PUSH_EVERY of the sleep and waited for the wake.
-    let held_at_least_ms = (ASLEEP_WITH_PUSHES.as_secs() - PUSH_EVERY) as f64 * 1000.0;
-    assert!(
-        held_ms.is_some_and(|ms| ms >= held_at_least_ms),
-        "the pushes should have reached {FOLLOWER} while it slept: its first held frame \
-         waited {held_ms:?} ms for the release, less than {held_at_least_ms} ms"
-    );
-    step(&format!(
-        "the first frame held while {FOLLOWER} slept waited {:.1} s",
-        held_ms.unwrap_or_default() / 1000.0
-    ));
-    thread::sleep(Duration::from_secs(2 * PUSH_EVERY + 1));
-    for ((name, _), woken) in streams.iter().zip(&woken) {
-        let later = followed(name);
-        let outcome = match (later.value("ended"), later.value("error")) {
-            (Ok("false"), _) if lines(&later) != lines(woken) => "it went on".to_string(),
-            (Ok("true"), Ok(error)) if !error.is_empty() => {
-                format!("the app saw it end: {error}")
-            }
-            _ => "it stalled".to_string(),
-        };
-        step(&format!(
-            "the stream {name} after the wake: {outcome}; lines {} at the wake, {} {} s later, \
-             the last {:?} {} ms before",
-            lines(woken),
-            lines(&later),
-            2 * PUSH_EVERY + 1,
-            later.value("last").unwrap_or("?"),
-            later.value("last_ago_ms").unwrap_or("?"),
-        ));
+    let mut failed = Vec::new();
+    for ((name, server), woken) in streams.iter().zip(&woken) {
+        match (woken.value("ended"), woken.value("error")) {
+            (Ok("true"), Ok(error)) if !error.is_empty() => step(&format!(
+                "the stream {name} from {server} ended for the app after {} lines: {error}",
+                lines(woken)
+            )),
+            _ => failed.push(format!(
+                "the stream {name} from {server} should have ended with an error: {woken}, {:?}",
+                woken.body
+            )),
+        }
     }
+    assert_none(&failed);
 }
 
-/// An idle connection of a keep-alive pool with Go's default TCP keepalive to
-/// a sleeping pod: its keepalive probes reach the node unanswered and wake
-/// nothing, and the next request on the same connection wakes the pod and is
-/// answered.
+/// An idle connection of a keep-alive pool to a pod: the pod resets it as it
+/// pauses, so the client closes it, nothing wakes the pod, and the pool's
+/// next request opens a new connection, which wakes the pod and is answered.
 fn keepalive(suite: &Suite) {
     expect(suite.ensure_awake(WEB));
     let trigger = suite.client.trigger_file("pool");
@@ -1844,41 +1831,34 @@ fn keepalive(suite: &Suite) {
     expect(suite.ensure_asleep(WEB));
     let cursor = suite.cursor();
     thread::sleep(KEEPALIVE_WAIT);
-    let resumes = expect(suite.events_since(cursor, WEB))
-        .into_iter()
-        .filter(|e| e.is_resume())
-        .count();
-    assert_eq!(resumes, 0, "the keepalive probes woke the pod");
+    expect(suite.check_no_resume(cursor, WEB));
     assert_eq!(suite.vm_count(WEB), 0, "the pod has a VM process");
     expect(pool.trigger());
     let out = pairs(&expect(pool.wait(Duration::from_secs(90))));
-    let probes: u64 = out
-        .get("keepalive_probes")
-        .and_then(|p| p.parse().ok())
-        .unwrap_or(0);
     let mut failed = Vec::new();
-    if probes == 0 {
+    // TCP_CLOSE, or the pool closed the connection already.
+    let closed =
+        out.get("tcp_state").map(String::as_str) == Some("7") || out.contains_key("tcp_info_error");
+    if !closed {
         failed.push(format!(
-            "the connection has no unanswered keepalive probes after {KEEPALIVE_WAIT:?} asleep: {out:?}"
+            "the pool's connection should be closed after {KEEPALIVE_WAIT:?} asleep: {out:?}"
         ));
     }
-    let same =
-        out.contains_key("second.local") && out.get("second.local") == out.get("first.local");
+    let other =
+        out.contains_key("second.local") && out.get("second.local") != out.get("first.local");
     if out.get("second.status").map(String::as_str) != Some("200")
-        || out.get("second.reused").map(String::as_str) != Some("true")
-        || !same
+        || out.get("second.reused").map(String::as_str) != Some("false")
+        || !other
     {
         failed.push(format!(
-            "the second request should be answered on the same connection (held data): {out:?}"
+            "the second request should be answered on a new connection: {out:?}"
         ));
     }
     if let Err(e) = suite.check_woken_by(cursor, WEB, &suite.qualified(CLIENT)) {
         failed.push(e);
     }
     assert_none(&failed);
-    step(&format!(
-        "{probes} keepalive probes unanswered while asleep; the pool's next request was answered"
-    ));
+    step("the pod reset the pool's connection as it paused; the pool's next request was answered");
 }
 
 /// UDP to a sleeping pod is dropped and wakes nothing, `ping` is answered,

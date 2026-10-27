@@ -57,7 +57,7 @@ RUN --mount=type=bind,from=inputs,source=docker.tgz,target=/tmp/docker.tgz \
 ARG SMOLVM_RELEASE=smolvm-1.32.1-linux-arm64
 ARG SMOLVM_RELEASE_SHA256=2c7147cc8e13ffe9446c915517ccdc7a812d9421e4f6133fdebadc6bd2214800
 ARG SMOLVM_SUMS_SHA256=6b013d2761a3ef695731839c8712fb675cab05b160d67d51740c9f6bd4d56768
-ARG AGENT_SHA256=0a1eeeaecf61bd0f9d149e363e3ddd4d0008b9d203ba8def916cbc638c841cd3
+ARG AGENT_SHA256=458fe3df9de70247ad2d60f92bcecb9091df722b3db1e1e4baf8e6a37b24454f
 ARG LIBKRUN_SHA256=e5b5ada371ed1dbd989e4d9ac99e9b64312758b59fa438b7729f6fdefde79fa0
 ARG POD_KERNEL_SHA256
 RUN --mount=type=bind,from=inputs,source=release,target=/tmp/release \

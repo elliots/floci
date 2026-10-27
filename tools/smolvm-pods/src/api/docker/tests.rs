@@ -340,7 +340,7 @@ fn body_of(mut stream: StdTcpStream, head: &str) -> Vec<u8> {
     let mut rest = Vec::new();
     stream.read_to_end(&mut rest).unwrap();
     if head.contains("transfer-encoding: chunked") {
-        crate::api::dechunk(&rest).unwrap()
+        crate::api::tests::dechunk(&rest).unwrap()
     } else {
         rest
     }
@@ -424,7 +424,7 @@ async fn the_proxy_streams_a_request_body() {
         stream.write_all(b"0\r\n\r\n").unwrap();
         let mut response = Vec::new();
         stream.read_to_end(&mut response).unwrap();
-        crate::api::parse_response(&response).unwrap()
+        crate::api::tests::parse_response(&response).unwrap()
     })
     .await;
     assert_eq!(status, 200);

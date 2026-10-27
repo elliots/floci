@@ -8,10 +8,9 @@
 
 use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::convert::Infallible;
-use std::io::{Read, Write};
+use std::io::Read;
 use std::net::SocketAddr;
 use std::os::unix::fs::{MetadataExt, PermissionsExt};
-use std::os::unix::net::UnixStream;
 use std::path::Path;
 use std::sync::Arc;
 use std::time::{Duration, UNIX_EPOCH};
@@ -20,7 +19,7 @@ use axum::body::{Body, Bytes};
 use axum::extract::rejection::QueryRejection;
 use axum::extract::{Extension, Path as UrlPath, Query, Request, State};
 use axum::http::header::{
-    AUTHORIZATION, CACHE_CONTROL, CONTENT_SECURITY_POLICY, CONTENT_TYPE, WWW_AUTHENTICATE,
+    AUTHORIZATION, CACHE_CONTROL, CONTENT_SECURITY_POLICY, CONTENT_TYPE, HOST, WWW_AUTHENTICATE,
 };
 use axum::http::{HeaderValue, Method, StatusCode};
 use axum::middleware::{self, Next};
@@ -28,6 +27,9 @@ use axum::response::{IntoResponse, Response};
 use axum::routing::{any, get, post, put};
 use axum::serve::ListenerExt;
 use axum::{Json, Router};
+use http_body_util::{BodyExt, Full};
+use hyper::client::conn::http1;
+use hyper_util::rt::TokioIo;
 use log::warn;
 use serde::Deserialize;
 use serde_json::{json, Value};
@@ -1308,87 +1310,40 @@ fn request(
     path: &str,
     body: Option<&Value>,
 ) -> Result<(u16, Vec<u8>), Unreachable> {
-    let unreachable = |what: &str, e: std::io::Error| Unreachable(format!("{what}: {e}"));
-    let mut stream = UnixStream::connect(socket)
-        .map_err(|e| unreachable(&format!("connect to {}", socket.display()), e))?;
-    let body = body.map(|b| b.to_string()).unwrap_or_default();
-    let head = format!(
-        "{method} {path} HTTP/1.1\r\nHost: smolvm-pods\r\nConnection: close\r\n\
-         Content-Type: application/json\r\nContent-Length: {}\r\n\r\n",
-        body.len()
-    );
-    stream
-        .write_all(head.as_bytes())
-        .and_then(|()| stream.write_all(body.as_bytes()))
-        .map_err(|e| unreachable("send the request", e))?;
-    let mut response = Vec::new();
-    stream
-        .read_to_end(&mut response)
-        .map_err(|e| unreachable("read the answer", e))?;
-    parse_response(&response).map_err(Unreachable)
-}
-
-/// The status and body of a whole HTTP/1.1 response.
-fn parse_response(response: &[u8]) -> Result<(u16, Vec<u8>), String> {
-    let end = response
-        .windows(4)
-        .position(|w| w == b"\r\n\r\n")
-        .ok_or("the connection closed before the answer")?;
-    let head = String::from_utf8_lossy(&response[..end]);
-    let mut lines = head.split("\r\n");
-    let status = lines
-        .next()
-        .and_then(|line| line.split(' ').nth(1))
-        .and_then(|code| code.parse().ok())
-        .ok_or_else(|| format!("not an HTTP answer: {head:?}"))?;
-    let mut length = None;
-    let mut chunked = false;
-    for line in lines {
-        let Some((name, value)) = line.split_once(':') else {
-            continue;
-        };
-        let (name, value) = (name.trim().to_ascii_lowercase(), value.trim());
-        if name == "content-length" {
-            length = value.parse::<usize>().ok();
-        } else if name == "transfer-encoding" && value.eq_ignore_ascii_case("chunked") {
-            chunked = true;
-        }
-    }
-    let rest = &response[end + 4..];
-    let body = if chunked {
-        dechunk(rest)?
-    } else {
-        match length {
-            Some(n) if rest.len() < n => {
-                return Err("the connection closed before the whole answer".into())
-            }
-            Some(n) => rest[..n].to_vec(),
-            None => rest.to_vec(),
-        }
-    };
-    Ok((status, body))
-}
-
-fn dechunk(mut data: &[u8]) -> Result<Vec<u8>, String> {
-    let mut body = Vec::new();
-    loop {
-        let line_end = data
-            .windows(2)
-            .position(|w| w == b"\r\n")
-            .ok_or("a chunk was cut off")?;
-        let size = String::from_utf8_lossy(&data[..line_end]);
-        let size = usize::from_str_radix(size.split(';').next().unwrap_or("").trim(), 16)
-            .map_err(|e| format!("a chunk size: {e}"))?;
-        data = &data[line_end + 2..];
-        if size == 0 {
-            return Ok(body);
-        }
-        if data.len() < size + 2 {
-            return Err("a chunk was cut off".into());
-        }
-        body.extend_from_slice(&data[..size]);
-        data = &data[size + 2..];
-    }
+    let unreachable = |what: &str, e: &dyn std::fmt::Display| Unreachable(format!("{what}: {e}"));
+    let request = axum::http::Request::builder()
+        .method(method)
+        .uri(path)
+        .header(HOST, "smolvm-pods")
+        .header(CONTENT_TYPE, "application/json")
+        .body(Full::new(Bytes::from(
+            body.map(Value::to_string).unwrap_or_default(),
+        )))
+        .map_err(|e| unreachable("make the request", &e))?;
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_io()
+        .build()
+        .map_err(|e| unreachable("start a runtime", &e))?;
+    runtime.block_on(async {
+        let stream = tokio::net::UnixStream::connect(socket)
+            .await
+            .map_err(|e| unreachable(&format!("connect to {}", socket.display()), &e))?;
+        let (mut sender, connection) = http1::handshake(TokioIo::new(stream))
+            .await
+            .map_err(|e| unreachable("start HTTP", &e))?;
+        tokio::spawn(connection);
+        let response = sender
+            .send_request(request)
+            .await
+            .map_err(|e| unreachable("send the request", &e))?;
+        let status = response.status().as_u16();
+        let body = response
+            .into_body()
+            .collect()
+            .await
+            .map_err(|e| unreachable("read the answer", &e))?;
+        Ok((status, body.to_bytes().to_vec()))
+    })
 }
 
 /// `smolvm-pods ctl ARGS`. Prints one JSON document, or one event per line,

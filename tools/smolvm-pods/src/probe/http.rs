@@ -12,6 +12,8 @@ use super::{PodProbes, ProbeAction};
 
 /// The most of a request that is read.
 pub const REQUEST_MAX: usize = 4096;
+/// The most headers a request may have.
+const MAX_HEADERS: usize = 32;
 /// How long a request may take to arrive.
 pub const REQUEST_WAIT: Duration = Duration::from_secs(1);
 /// Kubelet's `User-Agent` starts with this, unless the probe sets its own.
@@ -62,31 +64,27 @@ impl RequestReader {
         self.head.len() >= REQUEST_MAX || self.head.windows(4).any(|w| w == b"\r\n\r\n")
     }
 
-    /// The request, from the lines that arrived whole. None without a request line.
+    /// The request, from the lines that arrived whole. None without a request line, or for one
+    /// that is not HTTP/1.x.
     pub fn request(&self) -> Option<Request> {
-        let text = String::from_utf8_lossy(&self.head);
-        let mut lines = text.split("\r\n");
-        let mut whole = text.matches("\r\n").count();
-        let mut parts = lines.next().filter(|_| whole > 0)?.split(' ');
-        let (method, target) = (parts.next()?, parts.next()?);
-        if !parts.next()?.starts_with("HTTP/1.") {
+        let lines = self.head.windows(2).rposition(|w| w == b"\r\n")? + 2;
+        let mut head = self.head[..lines].to_vec();
+        if !head.ends_with(b"\r\n\r\n") {
+            head.extend_from_slice(b"\r\n");
+        }
+        let mut headers = [httparse::EMPTY_HEADER; MAX_HEADERS];
+        let mut request = httparse::Request::new(&mut headers);
+        if !request.parse(&head).ok()?.is_complete() {
             return None;
         }
-        let mut user_agent = None;
-        for line in lines {
-            whole -= 1;
-            if whole == 0 || line.is_empty() {
-                break;
-            }
-            if let Some((name, value)) = line.split_once(':') {
-                if name.eq_ignore_ascii_case("user-agent") {
-                    user_agent = Some(value.trim().to_string());
-                }
-            }
-        }
+        let user_agent = request
+            .headers
+            .iter()
+            .find(|h| h.name.eq_ignore_ascii_case("user-agent"))
+            .map(|h| String::from_utf8_lossy(h.value).trim().to_string());
         Some(Request {
-            method: method.to_string(),
-            target: target.to_string(),
+            method: request.method?.to_string(),
+            target: request.path?.to_string(),
             user_agent,
         })
     }
@@ -248,6 +246,7 @@ User-Agent: kube-probe/1.35\r\nAccept: */*\r\nConnection: close\r\n\r\n";
         assert_eq!(request.target, "/healthz");
         assert_eq!(request.user_agent, None, "the User-Agent line is cut");
         assert_eq!(read(b"GET /healthz HTTP/1.1").request(), None);
+        assert_eq!(read(b"GET /healthz HTTP/2.0\r\n\r\n").request(), None);
         assert_eq!(read(b"\x16\x03\x01\x02\x00\x01\r\n").request(), None);
 
         let mut long = read(b"GET /healthz HTTP/1.1\r\nX-Pad: ");

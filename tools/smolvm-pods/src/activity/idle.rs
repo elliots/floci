@@ -54,6 +54,9 @@ use crate::sync::lock;
 /// reads means that a packet reset it. `CTA_TIMEOUT` rounds to the second.
 const COUNTDOWN_SLACK: f64 = 2.0;
 
+/// conntrack's TCP state after a RST.
+const TCP_CONNTRACK_CLOSE: u8 = 8;
+
 /// What the monitor reads from the node. Tests replace it.
 pub trait Source: Send + Sync {
     fn dump(&self) -> Result<Vec<Conn>, String>;
@@ -156,10 +159,16 @@ fn estimate(conn: &Conn, timeouts: &Timeouts, now: SystemTime) -> SystemTime {
     at.max(started).min(now)
 }
 
-/// Whether the entry saw a packet in the `elapsed` since `old` was seen.
+/// Whether the entry saw a packet in the `elapsed` since `old` was seen. A
+/// lone RST that closed it is none: the pod resets its connections as it
+/// pauses, after the idle decision.
 fn moved(old: &Seen, conn: &Conn, elapsed: Duration) -> bool {
     if let (Some(then), Some(now)) = (old.counters, conn.counters) {
-        return then != now;
+        let packets = |c: Counters| c.original.packets + c.reply.packets;
+        let reset = old.tcp_state != Some(TCP_CONNTRACK_CLOSE)
+            && conn.tcp_state == Some(TCP_CONNTRACK_CLOSE)
+            && packets(now) == packets(then) + 1;
+        return then != now && !reset;
     }
     if old.tcp_state != conn.tcp_state {
         return true;
@@ -770,6 +779,25 @@ mod tests {
         // On the 300 s timeout of unacknowledged data, counting down.
         assert_eq!(f.dump(75, &[with(296, 3)]), Some(at(72)));
         assert_eq!(f.dump(90, &[with(281, 3)]), Some(at(72)));
+    }
+
+    #[test]
+    fn a_lone_reset_is_no_activity() {
+        let mut f = Fixture::new();
+        let flow = tcp([10, 42, 0, 9], 41000, [10, 42, 0, 2], 80);
+        let with = |left: u32, state: u8, c| Conn {
+            tcp_state: Some(state),
+            counters: Some(c),
+            ..ct(flow, flow.inverse(), left)
+        };
+        let decided = f.dump(0, &[with(86_300, 3, counters(5, 500, 4, 400))]);
+        let reset = with(10, TCP_CONNTRACK_CLOSE, counters(5, 500, 5, 440));
+        assert_eq!(f.dump(3, &[reset]), decided);
+        // A request, then the reset.
+        let mut f = Fixture::new();
+        f.dump(0, &[with(86_300, 3, counters(5, 500, 4, 400))]);
+        let reset = with(10, TCP_CONNTRACK_CLOSE, counters(6, 560, 6, 500));
+        assert_eq!(f.dump(3, &[reset]), Some(at(3)));
     }
 
     #[test]

@@ -217,11 +217,11 @@ Every body field is optional, and an empty body is an empty object.
 - **incarnation**, when given, must be the pod's current incarnation, or the call fails with
   `stale_incarnation`, so that a caller cannot act on a newer pod of the same name by mistake.
 - **steps_ms** has the duration of each step that ran, in order, by name: `admit`, `slot`,
-  `resume`, `early_release`, `tso`, `ping`, `clock`, `deferred_kills`, `before_release` and
-  `release` for a wake, `early_release` being the time from the start of the resume to the
+  `resume`, `early_release`, `tso`, `ping`, `clock`, `thaw`, `deferred_kills`, `before_release`
+  and `release` for a wake, `early_release` being the time from the start of the resume to the
   release of the held traffic when that came before the agent answered
   ([Wake](architecture.md#wake));
-  `slot`, `pausing`, `stop-pumps` and `pause` for a pause, then `stop-paused` when the VM process
+  `slot`, `freeze`, `pausing`, `stop-pumps` and `pause` for a pause, then `stop-paused` when the VM process
   outlived a durable pause. A wake that cancelled a pause, and its `pausing` to `awake` event, have
   the pause's steps that ran, then `resume` if smolvm resumed the frozen VM in place, then the
   wake's steps from `tso`. **clock** is `{"skew_ns", "stepped"}`: the guest's realtime less the

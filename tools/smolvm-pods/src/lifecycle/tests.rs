@@ -253,7 +253,7 @@ async fn concurrent_wakes_resume_once() {
         resumed += usize::from(wake.await.unwrap().unwrap().resumed);
     }
     assert_eq!(resumed, 1, "only the wake that resumed the pod says so");
-    assert_eq!(h.vm.calls(), ["resume pod", "set-clock pod"]);
+    assert_eq!(h.vm.calls(), ["resume pod", "set-clock pod", "thaw pod"]);
     assert_eq!(
         h.states("pod"),
         [Creating, Awake, Pausing, Asleep, Waking, Awake]
@@ -323,7 +323,7 @@ async fn a_wake_resumes_an_interrupted_hibernation() {
     h.open().await;
     let report = h.wake("pod").await.unwrap();
     assert!(!report.resumed);
-    assert_eq!(h.vm.calls(), ["resume pod", "set-clock pod"]);
+    assert_eq!(h.vm.calls(), ["resume pod", "set-clock pod", "thaw pod"]);
     assert_eq!(h.state("pod"), Some(Awake));
 }
 
@@ -366,7 +366,7 @@ async fn hibernate_checks_that_the_vm_process_exits() {
     let h = Harness::awake("pod").await;
     h.vm.with("pod", |m| m.survive_pause = true);
     h.hibernate("pod").await.unwrap();
-    assert_eq!(h.vm.calls(), ["pause pod", "stop-paused pod"]);
+    assert_eq!(h.vm.calls(), ["freeze pod", "pause pod", "stop-paused pod"]);
     assert_eq!(h.state("pod"), Some(Asleep));
 
     // It survives the stop too: the pod fails.
@@ -380,7 +380,7 @@ async fn hibernate_checks_that_the_vm_process_exits() {
         matches!(&e, LifecycleError::Failed(why) if why.contains("survived the pause")),
         "{e}"
     );
-    assert_eq!(h.vm.calls(), ["pause pod", "stop-paused pod"]);
+    assert_eq!(h.vm.calls(), ["freeze pod", "pause pod", "stop-paused pod"]);
     assert_eq!(h.state("pod"), Some(Failed));
 
     // smolvm reports no running VM process: refused before any pause.
@@ -425,7 +425,7 @@ async fn events_have_cursors_filters_and_a_stream() {
     );
     assert!(asleep.duration_ms.is_some());
     let steps: Vec<_> = asleep.steps.iter().map(|s| s.step.as_str()).collect();
-    assert_eq!(steps, ["slot", "pausing", "stop-pumps", "pause"]);
+    assert_eq!(steps, ["slot", "freeze", "pausing", "stop-pumps", "pause"]);
 
     let page = h.life().events(&EventQuery::after(2).pod("pod")).unwrap();
     assert_eq!(page.events.len(), 2);
@@ -451,6 +451,7 @@ async fn events_have_cursors_filters_and_a_stream() {
             "tso",
             "ping",
             "clock",
+            "thaw",
             "deferred_kills",
             "before_release",
             "release"
@@ -519,7 +520,7 @@ async fn hibernate_writes_the_record_before_and_after_and_pauses_once() {
     assert_eq!(h.disk_state("pod"), Some(Asleep));
 
     assert!(h.hibernate("pod").await.unwrap().already_asleep);
-    assert_eq!(h.vm.calls(), ["pause pod"]);
+    assert_eq!(h.vm.calls(), ["freeze pod", "pause pod"]);
     assert_eq!(
         h.hooks.calls(),
         ["pausing-idle pod", "stop-pumps pod", "asleep pod"]
@@ -548,7 +549,13 @@ async fn a_wake_cancels_a_pause_that_is_saving() {
     );
     assert_eq!(
         h.vm.calls(),
-        ["pause pod", "set-clock pod", "signal pod app 9"]
+        [
+            "freeze pod",
+            "pause pod",
+            "set-clock pod",
+            "thaw pod",
+            "signal pod app 9"
+        ]
     );
     assert_eq!(h.vm.machine("pod").unwrap().process, before);
     assert_eq!(h.info("pod").vm, before);
@@ -607,7 +614,10 @@ async fn wakes_during_a_saving_pause_merge_without_a_resume() {
         wake.await.unwrap().unwrap();
     }
     assert!(sleeping.await.unwrap().is_err());
-    assert_eq!(h.vm.calls(), ["pause pod", "set-clock pod"]);
+    assert_eq!(
+        h.vm.calls(),
+        ["freeze pod", "pause pod", "set-clock pod", "thaw pod"]
+    );
     assert_eq!(h.state("pod"), Some(Awake));
 }
 
@@ -625,7 +635,16 @@ async fn a_wake_after_the_pause_is_durable_resumes_once_it_stops() {
     for wake in waking {
         wake.await.unwrap().unwrap();
     }
-    assert_eq!(h.vm.calls(), ["pause pod", "resume pod", "set-clock pod"]);
+    assert_eq!(
+        h.vm.calls(),
+        [
+            "freeze pod",
+            "pause pod",
+            "resume pod",
+            "set-clock pod",
+            "thaw pod"
+        ]
+    );
     assert_eq!(h.states("pod")[2..], [Pausing, Asleep, Waking, Awake]);
     assert_eq!(h.state("pod"), Some(Awake));
 }
@@ -658,7 +677,10 @@ async fn a_failed_pause_leaves_the_pod_awake_with_the_error() {
     let e = h.hibernate("pod").await.unwrap_err();
     assert_eq!(e, LifecycleError::Vm("no space left".into()));
     assert_eq!(h.state("pod"), Some(Awake));
-    assert_eq!(h.vm.calls(), ["pause pod", "set-clock pod"]);
+    assert_eq!(
+        h.vm.calls(),
+        ["freeze pod", "pause pod", "set-clock pod", "thaw pod"]
+    );
     assert_eq!(h.hooks.calls().last().unwrap(), "awake-PauseFailed pod");
     let event = h.events("pod").pop().unwrap();
     assert_eq!(event.state, Awake);
@@ -699,7 +721,7 @@ async fn a_pausing_hook_that_refuses_keeps_the_pod_awake_and_releases() {
     );
     assert_eq!(e.to_string(), "pausing: traffic since the idle decision");
     assert_eq!(h.state("pod"), Some(Awake));
-    assert_eq!(h.vm.calls(), ["set-clock pod"]);
+    assert_eq!(h.vm.calls(), ["freeze pod", "set-clock pod", "thaw pod"]);
     assert_eq!(
         h.hooks.calls(),
         [
@@ -914,6 +936,7 @@ async fn a_pod_with_nothing_pending_gets_its_traffic_while_it_resumes() {
             "tso",
             "ping",
             "clock",
+            "thaw",
             "deferred_kills",
             "before_release",
             "release"
@@ -1182,6 +1205,7 @@ async fn kills_while_asleep_are_deferred_to_the_next_wake() {
         [
             "resume pod",
             "set-clock pod",
+            "thaw pod",
             "signal pod app 9",
             "signal pod app/e1 9"
         ]
@@ -1204,7 +1228,12 @@ async fn other_signals_wake_a_sleeping_pod() {
     assert_eq!(outcome, KillOutcome::Delivered);
     assert_eq!(
         h.vm.calls(),
-        ["resume pod", "set-clock pod", "signal pod app 10"]
+        [
+            "resume pod",
+            "set-clock pod",
+            "thaw pod",
+            "signal pod app 10"
+        ]
     );
     let waking = h.events("pod").into_iter().find(|e| e.state == Waking);
     assert_eq!(waking.unwrap().reason, Reason::Signal);
@@ -1487,14 +1516,14 @@ async fn recovery_after_a_crash_at_every_step() {
             record: Pausing,
             vm: Some((Running, true, false)),
             want: Some(Awake),
-            calls: &["set-clock pod"],
+            calls: &["set-clock pod", "thaw pod"],
             hooks: awake_hooks,
         },
         Row {
             record: Pausing,
             vm: Some((Saving, true, true)),
             want: Some(Awake),
-            calls: &["resume pod", "set-clock pod"],
+            calls: &["resume pod", "set-clock pod", "thaw pod"],
             hooks: awake_hooks,
         },
         Row {
@@ -1557,14 +1586,14 @@ async fn recovery_after_a_crash_at_every_step() {
             record: Waking,
             vm: Some((Paused, false, true)),
             want: Some(Awake),
-            calls: &["resume pod", "set-clock pod"],
+            calls: &["resume pod", "set-clock pod", "thaw pod"],
             hooks: &["before-release pod", "release pod", "awake-Woke pod"],
         },
         Row {
             record: Waking,
             vm: Some((Running, true, false)),
             want: Some(Awake),
-            calls: &["set-clock pod"],
+            calls: &["set-clock pod", "thaw pod"],
             hooks: awake_hooks,
         },
         Row {
@@ -1652,7 +1681,16 @@ async fn a_crash_at_pause_saving_recovers_awake() {
     h.open().await;
     sleeping.abort();
     assert_eq!(h.state("pod"), Some(Awake));
-    assert_eq!(h.vm.calls(), ["pause pod", "resume pod", "set-clock pod"]);
+    assert_eq!(
+        h.vm.calls(),
+        [
+            "freeze pod",
+            "pause pod",
+            "resume pod",
+            "set-clock pod",
+            "thaw pod"
+        ]
+    );
     let last = h.events("pod").pop().unwrap();
     assert!(last.recovered);
     assert_eq!(last.reason, Reason::Recovery);
@@ -1670,7 +1708,7 @@ async fn a_crash_at_pause_durable_recovers_asleep() {
     h.open().await;
     sleeping.abort();
     assert_eq!(h.state("pod"), Some(Asleep));
-    assert_eq!(h.vm.calls(), ["pause pod", "stop-paused pod"]);
+    assert_eq!(h.vm.calls(), ["freeze pod", "pause pod", "stop-paused pod"]);
     assert!(h.events("pod").pop().unwrap().recovered);
     h.wake("pod").await.unwrap();
 }
@@ -1688,7 +1726,7 @@ async fn a_crash_at_wake_resumed_recovers_awake() {
     h.open().await;
     waking.abort();
     assert_eq!(h.state("pod"), Some(Awake));
-    assert_eq!(h.vm.calls(), ["resume pod", "set-clock pod"]);
+    assert_eq!(h.vm.calls(), ["resume pod", "set-clock pod", "thaw pod"]);
     assert!(h.info("pod").last_wake.is_some());
     assert!(!h.hooks.calls().contains(&"failed pod".to_string()));
 }
@@ -1761,7 +1799,7 @@ async fn a_crash_at_wake_clock_recovers_awake() {
     assert_eq!(h.state("pod"), Some(Awake));
     assert_eq!(
         h.vm.calls(),
-        ["resume pod", "set-clock pod", "set-clock pod"]
+        ["resume pod", "set-clock pod", "set-clock pod", "thaw pod"]
     );
 }
 

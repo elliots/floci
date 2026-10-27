@@ -59,7 +59,7 @@ const DELIVERY: Duration = Duration::from_secs(10);
 /// The long poll of the SQS consumers: an answer that Floci gives a sleeping
 /// consumer's poll waits at most this long in Floci.
 const WAIT_TIME: Duration = Duration::from_secs(20);
-/// The parked poll check sends its message at most this long after the
+/// The reset poll check sends its message at most this long after the
 /// consumer's poll started, and holds the pod with [`POLL_LEASE`] while it
 /// waits for that poll.
 const PARKED: Duration = Duration::from_secs(12);
@@ -214,7 +214,9 @@ fn messages() {
             expect(a_dead_letter_queues_drainer(&suite))
         }),
         ("SNS and MQTT into SQS", &|| expect(sns_and_mqtt(&suite))),
-        ("a parked poll", &|| expect(a_parked_poll(&suite))),
+        ("a poll reset by the sleep", &|| {
+            expect(a_reset_poll(&suite))
+        }),
         ("replicas share a queue", &|| expect(replicas(&suite))),
         ("a refused wake", &|| a_refused_wake(&suite)),
         ("an AMQP consumer reconnects", &|| {
@@ -1568,44 +1570,41 @@ fn sns_and_mqtt(suite: &Suite) -> Result<(), String> {
     suite.check_empty(ORDERS_QUEUE)
 }
 
-/// 8. A message that comes while the sleeping consumer's long poll still
-///    waits in Floci is claimed by that poll, so it is in flight; Floci wakes
-///    the consumer for it, and the poll's held answer gives the consumer the
-///    message, received once.
-fn a_parked_poll(suite: &Suite) -> Result<(), String> {
+/// 8. A message that comes while the sleeping consumer's last long poll
+///    would still wait: the pod reset the poll's connection as it paused, so
+///    Floci ended the poll and the message stays visible. Floci wakes the
+///    consumer for it, the reset poll fails, and the next poll gets the
+///    message at once, received once.
+fn a_reset_poll(suite: &Suite) -> Result<(), String> {
     let pod = suite.pod(ORDERS);
     suite.ensure_asleep(pod)?;
     let poll = parked_poll(suite, pod)?;
     let cursor = suite.cursor()?;
     let sent = suite.now_ms();
-    let parked = sent - poll.time_ms;
-    if parked > ms(WAIT_TIME) - 5000 {
-        return Err(format!(
-            "the consumer's poll started {parked} ms before the message, too close to its end"
-        ));
-    }
     suite.send(ORDERS_QUEUE, &body("parked", &[]), None)?;
-    let deleted =
-        suite.wait_for_message(pod, "deleted", "parked", DELIVERY + Duration::from_secs(20))?;
+    let deleted = suite.wait_for_message(pod, "deleted", "parked", DELIVERY)?;
     suite.received_once(pod, "parked")?;
     let n = poll.get("n").unwrap_or_default();
-    let answered = suite.wait_for(pod, Duration::ZERO, |l| {
-        l.event == "polled" && l.get("n") == Some(n)
-    })?;
-    if answered.get("messages") != Some("1") {
+    let lines = suite.lines(pod)?;
+    if lines
+        .iter()
+        .any(|l| l.event == "polled" && l.get("n") == Some(n) && l.get("messages") != Some("0"))
+    {
         return Err(format!(
-            "the poll that waited in Floci while the consumer slept should have claimed the message: {answered}"
+            "the poll that the sleep reset should have claimed nothing: {}",
+            lines_text(&lines)
         ));
     }
     suite.woken_by_floci(cursor, pod, &arn("sqs", ORDERS_QUEUE))?;
     step(&format!(
-        "poll {n}, {parked} ms old, claimed the message while the consumer slept"
+        "poll {n} ended with the sleep; the next poll got the message {} ms after it was sent",
+        deleted.time_ms - sent
     ));
     suite.sleeps_after_linger(pod, cursor, deleted.time_ms)
 }
 
-/// A poll of the sleeping consumer that waits in Floci and started at most
-/// [`PARKED`] ago: its last poll when it is that young and unanswered, or
+/// A poll of the sleeping consumer that was in flight when it slept and
+/// started at most [`PARKED`] ago: its last poll when it is that young and unanswered, or
 /// else the next one, which the consumer sends once the test wakes it and
 /// the last poll's answer comes. The test then hibernates the pod.
 fn parked_poll(suite: &Suite, pod: &Consumer) -> Result<Line, String> {
@@ -1902,8 +1901,8 @@ fn hold_awake_pods(suite: &Suite, held: &mut Vec<String>) -> Result<(), String> 
     Ok(())
 }
 
-/// 11. The AMQP consumer sleeps past its heartbeats, so the broker closes its
-///     connection. A message in its durable queue wakes it, and it reconnects
+/// 11. The AMQP consumer's pod resets its connection to the broker as it
+///     sleeps, so the broker drops the consumer. A message in its durable queue wakes it, and it reconnects
 ///     by itself and gets the message.
 fn an_amqp_consumer_reconnects(suite: &Suite) -> Result<(), String> {
     let pod = suite.pod(AMQP);
@@ -1915,7 +1914,7 @@ fn an_amqp_consumer_reconnects(suite: &Suite) -> Result<(), String> {
             break;
         }
         if Instant::now() >= deadline {
-            return Err("the broker kept the sleeping consumer's connection for 120 s".to_string());
+            return Err("the broker kept the sleeping consumer for 120 s".to_string());
         }
         thread::sleep(Duration::from_secs(2));
     }
