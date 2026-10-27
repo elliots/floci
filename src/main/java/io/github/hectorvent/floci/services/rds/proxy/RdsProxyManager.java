@@ -91,8 +91,13 @@ public class RdsProxyManager {
                             RdsProxyBinding binding, RdsAuthProxy.EndpointKind endpointKind) {
         tlsCertificates.ensureHost(advertisedHost);
         EmulatorConfig.RdsServiceConfig rdsConfig = config.services().rds();
+        // A database on a smolvm-pods node is reached through the node's tunnel, which wakes it.
+        RdsAuthProxy.BackendDialer dialer = containerManager.onSmolvmNode()
+                ? (endpoint, timeoutMillis) -> containerManager.connectOnNode(
+                        endpoint.host(), endpoint.port(), timeoutMillis)
+                : RdsAuthProxy.BackendDialer.DIRECT;
         RdsAuthProxy proxy = new RdsAuthProxy(
-                instanceId, backendHost, backendPort, endpointResolver, backendRuntimeId,
+                instanceId, backendHost, backendPort, endpointResolver, dialer, backendRuntimeId,
                 engine, iamEnabled, masterUsername, masterPassword, dbName, sigV4Validator,
                 tlsCertificates, passwordValidator, rdsConfig.proxyHandshakeTimeoutMillis(),
                 rdsConfig.proxyBackendConnectTimeoutMillis(), rdsConfig.proxyMaxConnections(),
@@ -149,6 +154,12 @@ public class RdsProxyManager {
             proxy.updateIamEnabled(enabled);
             LOG.infov("Updated RDS proxy IAM authentication for instance {0}", instanceId);
         }
+    }
+
+    /** The client connections of the proxy {@code instanceId}, or 0 when it has none. */
+    public int openConnections(String instanceId) {
+        RdsAuthProxy proxy = proxies.get(instanceId);
+        return proxy == null ? 0 : proxy.openConnections();
     }
 
     public synchronized void stopProxy(String instanceId) {

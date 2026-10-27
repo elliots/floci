@@ -43,7 +43,9 @@ public class RdsAuthProxy {
     private final int handshakeTimeoutMillis;
     private final int backendConnectTimeoutMillis;
     private final Semaphore connectionPermits;
+    private final int maxConnections;
     private final RdsBackendGate backendGate;
+    private final BackendDialer backendDialer;
 
     private volatile boolean running;
     private ServerSocket serverSocket;
@@ -122,6 +124,23 @@ public class RdsAuthProxy {
                         int maxConnections, RdsProxyBinding binding,
                         MySqlProtocolHandler.IamUserChecker iamUserChecker,
                         RdsBackendGate backendGate, EndpointKind endpointKind) {
+        this(instanceId, backendHost, backendPort, backendEndpointResolver, BackendDialer.DIRECT,
+                backendRuntimeId, engine, iamEnabled, masterUsername, masterPassword, dbName, sigV4,
+                tlsCertificates, passwordValidator, handshakeTimeoutMillis, backendConnectTimeoutMillis,
+                maxConnections, binding, iamUserChecker, backendGate, endpointKind);
+    }
+
+    public RdsAuthProxy(String instanceId, String backendHost, int backendPort,
+                        BackendEndpointResolver backendEndpointResolver, BackendDialer backendDialer,
+                        String backendRuntimeId,
+                        DatabaseEngine engine, boolean iamEnabled,
+                        String masterUsername, String masterPassword, String dbName,
+                        RdsSigV4Validator sigV4, RdsProxyTlsCertificates tlsCertificates,
+                        MasterPasswordCheck passwordValidator,
+                        int handshakeTimeoutMillis, int backendConnectTimeoutMillis,
+                        int maxConnections, RdsProxyBinding binding,
+                        MySqlProtocolHandler.IamUserChecker iamUserChecker,
+                        RdsBackendGate backendGate, EndpointKind endpointKind) {
         if (backendRuntimeId == null || backendRuntimeId.isBlank()) {
             throw new IllegalArgumentException("RDS backend runtime ID is required");
         }
@@ -143,8 +162,15 @@ public class RdsAuthProxy {
         this.passwordValidator = passwordValidator;
         this.handshakeTimeoutMillis = handshakeTimeoutMillis;
         this.backendConnectTimeoutMillis = backendConnectTimeoutMillis;
-        this.connectionPermits = new Semaphore(Math.max(1, maxConnections));
+        this.maxConnections = Math.max(1, maxConnections);
+        this.connectionPermits = new Semaphore(this.maxConnections);
         this.backendGate = backendGate;
+        this.backendDialer = backendDialer;
+    }
+
+    /** The client connections the proxy holds now, each of which has a connection permit. */
+    public int openConnections() {
+        return maxConnections - connectionPermits.availablePermits();
     }
 
     public void start(int proxyPort) throws IOException {
@@ -247,9 +273,7 @@ public class RdsAuthProxy {
 
             PostgresProtocolHandler.BackendConnector connector = () -> {
                 BackendEndpoint endpoint = backendEndpointResolver.resolve();
-                Socket backendSocket = new Socket();
-                backendSocket.connect(new InetSocketAddress(endpoint.host(), endpoint.port()),
-                        backendConnectTimeoutMillis);
+                Socket backendSocket = backendDialer.dial(endpoint, backendConnectTimeoutMillis);
                 backendSocket.setTcpNoDelay(true);
                 return backendSocket;
             };
@@ -319,6 +343,23 @@ public class RdsAuthProxy {
     @FunctionalInterface
     public interface BackendEndpointResolver {
         BackendEndpoint resolve() throws IOException;
+    }
+
+    /**
+     * Opens a connection to the backend: straight to its address, or through a smolvm-pods node's
+     * tunnel to a database in a pod VM there.
+     */
+    @FunctionalInterface
+    public interface BackendDialer {
+
+        /** A TCP connection to the endpoint's address. */
+        BackendDialer DIRECT = (endpoint, timeoutMillis) -> {
+            Socket socket = new Socket();
+            socket.connect(new InetSocketAddress(endpoint.host(), endpoint.port()), timeoutMillis);
+            return socket;
+        };
+
+        Socket dial(BackendEndpoint endpoint, int timeoutMillis) throws IOException;
     }
 
     /**

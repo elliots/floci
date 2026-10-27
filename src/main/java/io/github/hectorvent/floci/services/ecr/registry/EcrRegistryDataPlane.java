@@ -67,6 +67,12 @@ public class EcrRegistryDataPlane {
                 context.request().host(), context.request().path(), context.request().query(),
                 config.services().ecr().uriStyle());
         if (request.isEmpty() || !config.services().ecr().enabled()) {
+            String mirrored = queryParameter(context.request().query(), "ns");
+            if (!mirrored.isEmpty()) {
+                // A containerd that mirrors every registry to Floci asks for one that is not its ECR.
+                notFloci(context, mirrored);
+                return;
+            }
             context.next();
             return;
         }
@@ -234,6 +240,17 @@ public class EcrRegistryDataPlane {
                         .put("message", message)))
                 .encode();
         context.response().setStatusCode(400)
+                .putHeader("Content-Type", "application/json")
+                .end(body);
+    }
+
+    private static void notFloci(RoutingContext context, String registry) {
+        String body = new JsonObject()
+                .put("errors", new JsonArray().add(new JsonObject()
+                        .put("code", "NAME_UNKNOWN")
+                        .put("message", "Floci serves only its ECR repositories, not registry " + registry)))
+                .encode();
+        context.response().setStatusCode(404)
                 .putHeader("Content-Type", "application/json")
                 .end(body);
     }

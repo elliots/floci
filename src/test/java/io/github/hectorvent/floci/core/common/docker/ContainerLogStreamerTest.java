@@ -2,6 +2,8 @@ package io.github.hectorvent.floci.core.common.docker;
 
 import com.github.dockerjava.api.DockerClient;
 import com.github.dockerjava.api.async.ResultCallback;
+import com.github.dockerjava.api.command.InspectContainerCmd;
+import com.github.dockerjava.api.command.InspectContainerResponse;
 import com.github.dockerjava.api.command.LogContainerCmd;
 import com.github.dockerjava.api.model.Frame;
 import com.github.dockerjava.api.model.StreamType;
@@ -20,12 +22,14 @@ import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.Collections;
 import java.util.List;
+import java.util.Map;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.TimeUnit;
 import java.util.function.BiFunction;
 import java.util.logging.LogRecord;
 import java.util.stream.Stream;
 
+import static org.junit.jupiter.api.Assertions.assertDoesNotThrow;
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertTrue;
@@ -37,6 +41,8 @@ import static org.mockito.ArgumentMatchers.eq;
 import static org.mockito.Mockito.RETURNS_SELF;
 import static org.mockito.Mockito.mock;
 import static org.mockito.Mockito.never;
+import static org.mockito.Mockito.timeout;
+import static org.mockito.Mockito.times;
 import static org.mockito.Mockito.verify;
 import static org.mockito.Mockito.when;
 
@@ -642,5 +648,98 @@ class ContainerLogStreamerTest {
         assertTrue(since.getValue() >= before && since.getValue() <= after,
                 "since must be the attach time so an adopted container's history is not replayed");
         verify(command).withFollowStream(true);
+    }
+
+    @Test
+    void attachToDestinationsForwardsEachLineToEveryDestination() {
+        DockerClient dockerClient = mock(DockerClient.class);
+        LogContainerCmd command = mock(LogContainerCmd.class, RETURNS_SELF);
+        when(dockerClient.logContainerCmd("container-1")).thenReturn(command);
+        CloudWatchLogsService cloudWatchLogsService = mock(CloudWatchLogsService.class);
+        ContainerLogStreamer streamer = new ContainerLogStreamer(dockerClient, cloudWatchLogsService);
+
+        streamer.attachToDestinations("555555555555", "container-1", List.of(
+                new ContainerLogStreamer.LogDestination("/aws/rds/cluster/c1/postgresql", "writer"),
+                new ContainerLogStreamer.LogDestination("/aws/rds/cluster/c1/postgresql", "reader")),
+                "us-east-1", "rds:c1", null);
+        ArgumentCaptor<ContainerLogStreamer.LogReassemblyCallback> callback =
+                ArgumentCaptor.forClass(ContainerLogStreamer.LogReassemblyCallback.class);
+        verify(command).exec(callback.capture());
+        callback.getValue().onNext(new Frame(StreamType.STDOUT, utf8("checkpoint complete\n")));
+
+        verify(command, never()).withSince(anyInt());
+        for (String stream : List.of("writer", "reader")) {
+            verify(cloudWatchLogsService).createLogStreamForAccount(
+                    "555555555555", "/aws/rds/cluster/c1/postgresql", stream, "us-east-1");
+            verify(cloudWatchLogsService).putLogEventsForAccount(eq("555555555555"),
+                    eq("/aws/rds/cluster/c1/postgresql"), eq(stream),
+                    argThat(events -> "checkpoint complete".equals(events.getFirst().get("message"))),
+                    eq("us-east-1"));
+        }
+    }
+
+    @Test
+    void reattachingFollowFollowsAgainFromItsLastLineWhileTheContainerRuns() {
+        DockerClient dockerClient = mock(DockerClient.class);
+        LogContainerCmd command = mock(LogContainerCmd.class, RETURNS_SELF);
+        when(dockerClient.logContainerCmd("container-1")).thenReturn(command);
+        stubRunning(dockerClient, true);
+        CloudWatchLogsService cloudWatchLogsService = mock(CloudWatchLogsService.class);
+        ContainerLogStreamer streamer = new ContainerLogStreamer(dockerClient, cloudWatchLogsService, true, 10);
+        List<String> forwarded = Collections.synchronizedList(new ArrayList<>());
+        when(cloudWatchLogsService.putLogEventsForAccount(any(), any(), any(), anyList(), any())).thenAnswer(call -> {
+            List<Map<String, Object>> events = call.getArgument(3);
+            forwarded.add((String) events.getFirst().get("message"));
+            return null;
+        });
+
+        Closeable follow = streamer.attachFromNowForAccount("555555555555", "container-1", "/aws/rds/instance/db1/error",
+                "db1", "us-east-1", "rds:db1");
+        ArgumentCaptor<ContainerLogStreamer.LogReassemblyCallback> callbacks =
+                ArgumentCaptor.forClass(ContainerLogStreamer.LogReassemblyCallback.class);
+        verify(command).exec(callbacks.capture());
+        verify(command).withTimestamps(true);
+        callbacks.getValue().onNext(new Frame(StreamType.STDOUT, utf8("2026-10-25T01:00:00.500000000Z first\n")));
+        callbacks.getValue().onError(new IllegalStateException("connection reset"));
+
+        verify(command, timeout(5_000).times(2)).exec(callbacks.capture());
+        verify(command).withSince((int) Instant.parse("2026-10-25T01:00:00Z").getEpochSecond());
+        ContainerLogStreamer.LogReassemblyCallback again = callbacks.getAllValues().getLast();
+        again.onNext(new Frame(StreamType.STDOUT, utf8("2026-10-25T01:00:00.500000000Z first\n")));
+        again.onNext(new Frame(StreamType.STDOUT, utf8("2026-10-25T01:00:01.000000000Z second\n")));
+
+        assertEquals(List.of("first", "second"), forwarded);
+        assertDoesNotThrow(follow::close);
+    }
+
+    @Test
+    void reattachingFollowEndsWithItsContainer() throws Exception {
+        DockerClient dockerClient = mock(DockerClient.class);
+        LogContainerCmd command = mock(LogContainerCmd.class, RETURNS_SELF);
+        when(dockerClient.logContainerCmd("container-1")).thenReturn(command);
+        stubRunning(dockerClient, false);
+        ContainerLogStreamer streamer = new ContainerLogStreamer(dockerClient, mock(CloudWatchLogsService.class),
+                true, 10);
+
+        streamer.attachForAccount("555555555555", "container-1", "/aws/rds/instance/db1/error", "db1",
+                "us-east-1", "rds:db1");
+        ArgumentCaptor<ContainerLogStreamer.LogReassemblyCallback> callback =
+                ArgumentCaptor.forClass(ContainerLogStreamer.LogReassemblyCallback.class);
+        verify(command).exec(callback.capture());
+        callback.getValue().onComplete();
+
+        verify(dockerClient, timeout(5_000)).inspectContainerCmd("container-1");
+        Thread.sleep(100);
+        verify(command, times(1)).exec(any());
+    }
+
+    private static void stubRunning(DockerClient dockerClient, boolean running) {
+        InspectContainerCmd inspect = mock(InspectContainerCmd.class);
+        InspectContainerResponse response = mock(InspectContainerResponse.class);
+        InspectContainerResponse.ContainerState state = mock(InspectContainerResponse.ContainerState.class);
+        when(dockerClient.inspectContainerCmd("container-1")).thenReturn(inspect);
+        when(inspect.exec()).thenReturn(response);
+        when(response.getState()).thenReturn(state);
+        when(state.getRunning()).thenReturn(running);
     }
 }

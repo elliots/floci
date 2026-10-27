@@ -128,6 +128,17 @@ floci:
     strict-claiming: false
     reject-unknown-service-scope: true
 
+  runtime:
+    config-file: ""
+    dns-listen: "127.0.0.1:0"
+    node:
+      name: ""
+      node-vm-script: ""
+      smolvm-src: ""
+      image: ""
+      image-sha256: ""
+      data-path: ./target/runtime-node
+
   docker:
     log-max-size: "10m"
     log-max-file: "3"
@@ -238,6 +249,9 @@ floci:
       proxy-max-connections: 100
       aurora-auto-pause-enabled: true
       aurora-resume-delay-millis: 0
+      smolvm:
+        enabled: false
+        idle-timeout: ""
     rds-data:
       enabled: true
       transaction-ttl-seconds: 180
@@ -383,6 +397,9 @@ floci:
       imds: false
       irsa-signing-key: true
       embedded-dns: true
+      provider: k3s
+      smolvm:
+        kubernetes-version: "1.35"
     mwaa:
       enabled: true
       mock: true

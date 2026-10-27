@@ -4,6 +4,7 @@ import com.fasterxml.jackson.databind.ObjectMapper;
 import io.github.hectorvent.floci.services.iam.AssumeRolePolicyEvaluator.TrustDecision;
 import org.junit.jupiter.api.Test;
 
+import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
 
@@ -314,6 +315,68 @@ class AssumeRolePolicyEvaluatorTest {
               {"Effect":"Deny","Principal":{"Service":"redshift.amazonaws.com"},"Action":"sts:AssumeRole"}]}
             """;
         assertFalse(evaluator.allowsService(doc, "redshift.amazonaws.com"));
+    }
+
+    @Test
+    void aServiceActionNeedsAStatementThatNamesIt() {
+        String pods = "pods.eks.amazonaws.com";
+        String assumeOnly = trust("{\"Service\":\"pods.eks.amazonaws.com\"}");
+        assertTrue(evaluator.allowsServiceAction(assumeOnly, pods, "sts:AssumeRole", Map.of()));
+        assertFalse(evaluator.allowsServiceAction(assumeOnly, pods, "sts:TagSession", Map.of()));
+
+        String both = assumeOnly.replace("\"sts:AssumeRole\"", "[\"sts:AssumeRole\",\"sts:TagSession\"]");
+        assertTrue(evaluator.allowsServiceAction(both, pods, "sts:TagSession", Map.of()));
+        assertFalse(evaluator.allowsServiceAction(both, "ec2.amazonaws.com", "sts:TagSession", Map.of()));
+
+        String wildcard = assumeOnly.replace("\"sts:AssumeRole\"", "\"sts:*\"");
+        assertTrue(evaluator.allowsServiceAction(wildcard, pods, "sts:TagSession", Map.of()));
+
+        String allButTags = assumeOnly.replace("\"Action\":\"sts:AssumeRole\"", "\"NotAction\":\"sts:TagSession\"");
+        assertTrue(evaluator.allowsServiceAction(allButTags, pods, "sts:AssumeRole", Map.of()));
+        assertFalse(evaluator.allowsServiceAction(allButTags, pods, "sts:TagSession", Map.of()));
+    }
+
+    @Test
+    void aDenyOfOneServiceActionLeavesTheOthersAllowed() {
+        String doc = """
+            {"Version":"2012-10-17","Statement":[
+              {"Effect":"Allow","Principal":{"Service":"pods.eks.amazonaws.com"},"Action":"sts:*"},
+              {"Effect":"Deny","Principal":{"Service":"pods.eks.amazonaws.com"},"Action":"sts:TagSession"}]}
+            """;
+        assertTrue(evaluator.allowsServiceAction(doc, "pods.eks.amazonaws.com", "sts:AssumeRole", Map.of()));
+        assertFalse(evaluator.allowsServiceAction(doc, "pods.eks.amazonaws.com", "sts:TagSession", Map.of()));
+    }
+
+    @Test
+    void aServiceActionSeesTheRequestTagsAndSourceOfItsContext() {
+        String doc = """
+            {"Version":"2012-10-17","Statement":[
+              {"Effect":"Allow","Principal":{"Service":"pods.eks.amazonaws.com"},
+               "Action":["sts:AssumeRole","sts:TagSession"],
+               "Condition":{
+                 "StringEquals":{"aws:RequestTag/kubernetes-namespace":"payments",
+                                 "aws:SourceAccount":"111111111111"},
+                 "ArnLike":{"aws:SourceArn":"arn:aws:eks:us-east-1:111111111111:cluster/*"},
+                 "ForAllValues:StringEquals":{"aws:TagKeys":["eks-cluster-name","kubernetes-namespace"]}}}]}
+            """;
+        Map<String, List<String>> context = Map.of(
+                "aws:SourceAccount", List.of("111111111111"),
+                "aws:SourceArn", List.of("arn:aws:eks:us-east-1:111111111111:cluster/orders"),
+                "aws:RequestTag/kubernetes-namespace", List.of("payments"),
+                "aws:TagKeys", List.of("eks-cluster-name", "kubernetes-namespace"));
+        assertTrue(evaluator.allowsServiceAction(doc, "pods.eks.amazonaws.com", "sts:TagSession", context));
+
+        Map<String, List<String>> otherNamespace = new HashMap<>(context);
+        otherNamespace.put("aws:RequestTag/kubernetes-namespace", List.of("billing"));
+        assertFalse(evaluator.allowsServiceAction(doc, "pods.eks.amazonaws.com", "sts:TagSession", otherNamespace));
+
+        Map<String, List<String>> otherAccount = new HashMap<>(context);
+        otherAccount.put("aws:SourceArn", List.of("arn:aws:eks:us-east-1:222222222222:cluster/orders"));
+        assertFalse(evaluator.allowsServiceAction(doc, "pods.eks.amazonaws.com", "sts:AssumeRole", otherAccount));
+
+        Map<String, List<String>> extraTag = new HashMap<>(context);
+        extraTag.put("aws:TagKeys", List.of("eks-cluster-name", "kubernetes-namespace", "team"));
+        assertFalse(evaluator.allowsServiceAction(doc, "pods.eks.amazonaws.com", "sts:TagSession", extraTag));
     }
 
     @Test

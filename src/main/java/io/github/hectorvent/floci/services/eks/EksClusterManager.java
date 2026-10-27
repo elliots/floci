@@ -185,6 +185,10 @@ public class EksClusterManager
     @Inject
     jakarta.enterprise.inject.Instance<Ec2Service> ec2ServiceInstance;
     private Ec2Service ec2Service;
+    // Qualified: the EC2 model's Instance is imported.
+    @Inject
+    jakarta.enterprise.inject.Instance<EksSmolvmCluster> smolvmClusterInstance;
+    private EksSmolvmCluster smolvmCluster;
     private final StorageBackend<String, Nodegroup> nodeGroupStorage;
     private final Map<String, Set<String>> programmedClusterRoutes = new ConcurrentHashMap<>();
     private final ConcurrentHashMap<String, Object> clusterRouteLocks = new ConcurrentHashMap<>();
@@ -209,6 +213,53 @@ public class EksClusterManager
 
     public void addNodeRegistrationListener(Consumer<Instance> listener) {
         this.nodeRegistrationListeners.add(listener);
+    }
+
+    void setSmolvmCluster(EksSmolvmCluster smolvmCluster) {
+        this.smolvmCluster = smolvmCluster;
+    }
+
+    /** The cluster on the smolvm-pods node, or null where there is none to reach, as in a test without CDI. */
+    private EksSmolvmCluster smolvmCluster() {
+        if (smolvmCluster != null) {
+            return smolvmCluster;
+        }
+        if (smolvmClusterInstance != null && smolvmClusterInstance.isResolvable()) {
+            return smolvmClusterInstance.get();
+        }
+        return null;
+    }
+
+    private EksSmolvmCluster requireSmolvmCluster() {
+        EksSmolvmCluster smolvm = smolvmCluster();
+        if (smolvm == null) {
+            throw new IllegalStateException("The cluster on the smolvm-pods node is not available");
+        }
+        return smolvm;
+    }
+
+    /** Whether {@code cluster} runs on a smolvm-pods node rather than in a k3s container. */
+    static boolean onSmolvmNode(Cluster cluster) {
+        return cluster != null && EksSmolvmSettings.PROVIDER_SMOLVM_PODS.equals(cluster.getProvider());
+    }
+
+    /**
+     * Claims the smolvm-pods node for a new cluster, when new clusters run on it.
+     *
+     * @throws AwsException {@code ResourceLimitExceededException} when another cluster holds it
+     */
+    void claimSmolvmNode(Cluster cluster) {
+        if (EksSmolvmSettings.smolvmProvider(config) && !config.services().eks().mock()) {
+            requireSmolvmCluster().claim(cluster);
+        }
+    }
+
+    /** Releases the smolvm-pods node of a cluster that was not created. */
+    void releaseSmolvmNode(Cluster cluster) {
+        EksSmolvmCluster smolvm = smolvmCluster();
+        if (smolvm != null) {
+            smolvm.release(cluster);
+        }
     }
 
     record ClusterNodeRecord(String accountId, String region, Instance instance) {}
@@ -500,6 +551,9 @@ public class EksClusterManager
      * @return true when the k3s container was created and started
      */
     public boolean tryStartCluster(Cluster cluster) {
+        if (EksSmolvmSettings.smolvmProvider(config)) {
+            return requireSmolvmCluster().create(cluster);
+        }
         try {
             startCluster(cluster);
             return true;
@@ -695,10 +749,7 @@ public class EksClusterManager
             webhookLocalFile = writeWebhookKubeconfig(cluster);
             if (webhookLocalFile != null) {
                 specBuilder.withHostDockerInternalOnLinux();
-                serverArgs.add("--kube-apiserver-arg=authentication-token-webhook-config-file="
-                        + WEBHOOK_CONFIG_PATH);
-                serverArgs.add("--kube-apiserver-arg=authentication-token-webhook-version=v1");
-                serverArgs.add("--kube-apiserver-arg=authentication-token-webhook-cache-ttl=30s");
+                serverArgs.addAll(buildTokenWebhookServerArgs(WEBHOOK_CONFIG_PATH));
             }
         }
 
@@ -794,8 +845,15 @@ public class EksClusterManager
      * recreated via {@link #startCluster}; the named k3s data volume is reused if it survived.
      * Callers should put the cluster back into CREATING so the readiness poller re-verifies the API
      * server and re-extracts the certificate authority before marking it ACTIVE again.
+     *
+     * <p>A cluster on the smolvm-pods node uses the node again, and this never throws for it
+     * ({@link EksSmolvmCluster#restore}).
      */
     public void restoreCluster(Cluster cluster) {
+        if (onSmolvmNode(cluster)) {
+            requireSmolvmCluster().restore(cluster);
+            return;
+        }
         String endpointHost = endpointHost();
         if (cluster.getDockerName() == null) {
             cluster.setDockerName(resolveRestoredDockerName(cluster));
@@ -996,6 +1054,9 @@ public class EksClusterManager
      * Checks whether the k3s API server is ready by polling its /readyz endpoint.
      */
     public boolean isReady(Cluster cluster) {
+        if (onSmolvmNode(cluster)) {
+            return requireSmolvmCluster().isReady(cluster);
+        }
         // Prefer internalEndpoint (IP-based) for connectivity — works on both user-defined
         // networks and the default bridge where container-name DNS is unavailable.
         String endpoint = cluster.getInternalEndpoint() != null
@@ -1028,6 +1089,10 @@ public class EksClusterManager
      * and sets the certificate authority data on the cluster.
      */
     public void finalizeCluster(Cluster cluster) {
+        if (onSmolvmNode(cluster)) {
+            requireSmolvmCluster().finalizeCluster(cluster);
+            return;
+        }
         String containerId = cluster.getContainerId();
         if (containerId == null) {
             return;
@@ -1086,6 +1151,11 @@ public class EksClusterManager
      * cluster's workloads survive a Floci restart and are re-latched by {@link #restoreCluster}.
      */
     public void stopCluster(Cluster cluster) {
+        if (onSmolvmNode(cluster)) {
+            requireSmolvmCluster().delete(cluster);
+            unregisterMetadataEndpoint(cluster);
+            return;
+        }
         String resourceName = clusterResourceName(cluster);
         if (cluster.getContainerId() == null) {
             unregisterMetadataEndpoint(cluster);
@@ -1186,8 +1256,15 @@ public class EksClusterManager
                 ? cluster.getNodeInstanceType() : DEFAULT_NODE_INSTANCE_TYPE;
     }
 
-    /** Recreate the shared node with its named data volume intact, restoring its old type on failure. */
+    /**
+     * Recreate the shared node with its named data volume intact, restoring its old type on failure.
+     * A smolvm-pods node keeps the size that Floci's settings give it, whatever the instance type.
+     */
     boolean restartForNodeCapacity(Cluster cluster, String previousType) {
+        if (onSmolvmNode(cluster)) {
+            requireSmolvmCluster().logUnsupported(cluster, "resizing the node for a node group's instance type");
+            return true;
+        }
         if (cluster.getContainerId() == null) {
             return true;
         }
@@ -1201,10 +1278,94 @@ public class EksClusterManager
      */
     public void detachCluster(Cluster cluster) {
         unregisterMetadataEndpoint(cluster);
+        if (onSmolvmNode(cluster)) {
+            return;
+        }
         closeQuietly(clusterLogHandles.remove(clusterResourceName(cluster)));
         if (cluster.getContainerId() != null) {
             LOG.infov("Leaving k3s container for cluster {0} running", cluster.getName());
         }
+    }
+
+    /**
+     * Releases the given cluster as Floci stops. A k3s container is left running when
+     * {@code keep-running-on-shutdown} is set ({@link #detachCluster}) and removed otherwise
+     * ({@link #stopCluster}). A cluster on the smolvm-pods node leaves the node to Floci's node,
+     * which decides what Floci's stop does to it.
+     */
+    public void shutdownCluster(Cluster cluster) {
+        if (onSmolvmNode(cluster)) {
+            unregisterMetadataEndpoint(cluster);
+            return;
+        }
+        if (config.services().eks().keepRunningOnShutdown()) {
+            detachCluster(cluster);
+        } else {
+            stopCluster(cluster);
+        }
+    }
+
+    /** Why the creation of {@code cluster}'s smolvm-pods node failed; always empty for a k3s container. */
+    public Optional<String> creationFailure(Cluster cluster) {
+        if (!onSmolvmNode(cluster)) {
+            return Optional.empty();
+        }
+        return requireSmolvmCluster().creationFailure(cluster);
+    }
+
+    /**
+     * Whether the pods of {@code cluster} reach Floci's Pod Identity credentials endpoint, as they
+     * do in a k3s container. On the smolvm-pods node, {@link EksSmolvmCluster#supportsPodIdentity}
+     * decides, and logs once per cluster when they do not.
+     */
+    public boolean supportsPodIdentity(Cluster cluster) {
+        return !onSmolvmNode(cluster) || requireSmolvmCluster().supportsPodIdentity(cluster);
+    }
+
+    /**
+     * Whether the pod admission webhook gives a pod of {@code namespace} the {@code smolvm-pods}
+     * RuntimeClass: {@code cluster} runs on a smolvm-pods node and the namespace is listed in
+     * {@code floci.services.eks.smolvm.runtime-namespaces}, or that list has {@code *} and the
+     * namespace is not one of Kubernetes' own.
+     */
+    public boolean wantsSmolvmRuntime(Cluster cluster, String namespace) {
+        if (!onSmolvmNode(cluster) || namespace == null) {
+            return false;
+        }
+        List<String> listed = config.services().eks().smolvm().runtimeNamespaces().orElse(List.of());
+        if (listed.contains(namespace)) {
+            return true;
+        }
+        return listed.contains("*") && !namespace.startsWith("kube-");
+    }
+
+    /**
+     * Reads the ServiceAccounts of {@code cluster}: with {@code kubectl} in its k3s container, or
+     * from the Kubernetes API of its smolvm-pods node.
+     */
+    EksServiceAccountReader serviceAccountReader(Cluster cluster) {
+        if (onSmolvmNode(cluster)) {
+            return requireSmolvmCluster().serviceAccountReader(cluster);
+        }
+        return (namespace, name) -> {
+            String containerId = cluster.getContainerId();
+            if (containerId == null || containerId.isBlank()) {
+                return Optional.empty();
+            }
+            int timeout = (int) EksServiceAccountReader.TIMEOUT.toSeconds();
+            ContainerExec.Result result = execInContainerForResult(containerId, new String[]{
+                    "kubectl", "--request-timeout=" + timeout + "s", "get", "serviceaccount", name,
+                    "--namespace", namespace, "--output=json", "--ignore-not-found"
+            }, timeout);
+            if (result.timedOut()) {
+                throw new IllegalStateException("Reading ServiceAccount " + namespace + "/" + name
+                        + " timed out after " + timeout + " s");
+            }
+            if (result.exitCode() != 0) {
+                throw new IllegalStateException("Cannot read EKS service account annotations");
+            }
+            return result.stdout().isBlank() ? Optional.empty() : Optional.of(result.stdout());
+        };
     }
 
     private static void closeQuietly(Closeable closeable) {
@@ -1260,7 +1421,18 @@ public class EksClusterManager
     }
 
     private void attachClusterLogs(Cluster cluster, boolean fromNow) {
-        if (logStreamer == null || cluster == null || !hasLoggingEnabled(cluster)) {
+        if (cluster == null) {
+            return;
+        }
+        if (onSmolvmNode(cluster)) {
+            requireSmolvmCluster().attachLogs(cluster);
+            return;
+        }
+        if (!hasLoggingEnabled(cluster)) {
+            closeQuietly(clusterLogHandles.remove(clusterResourceName(cluster)));
+            return;
+        }
+        if (logStreamer == null) {
             return;
         }
         String containerId = cluster.getContainerId();
@@ -1919,12 +2091,17 @@ public class EksClusterManager
      * both the standard Kubernetes in-cluster audience and STS_AUDIENCE.
      */
     static List<String> buildIrsaServerArgs(String issuerUrl) {
+        return buildIrsaServerArgs(issuerUrl, SA_SIGNING_KEY_CONTAINER_PATH, SA_PUBLIC_KEY_CONTAINER_PATH);
+    }
+
+    /** {@link #buildIrsaServerArgs(String)} with the key files at {@code signingKeyPath} and {@code publicKeyPath}. */
+    static List<String> buildIrsaServerArgs(String issuerUrl, String signingKeyPath, String publicKeyPath) {
         if (issuerUrl == null || issuerUrl.isBlank()) {
             throw new IllegalArgumentException("issuerUrl is required");
         }
         return List.of(
-                "--kube-apiserver-arg=service-account-signing-key-file=" + SA_SIGNING_KEY_CONTAINER_PATH,
-                "--kube-apiserver-arg=service-account-key-file=" + SA_PUBLIC_KEY_CONTAINER_PATH,
+                "--kube-apiserver-arg=service-account-signing-key-file=" + signingKeyPath,
+                "--kube-apiserver-arg=service-account-key-file=" + publicKeyPath,
                 "--kube-apiserver-arg=service-account-issuer=" + issuerUrl,
                 "--kube-apiserver-arg=service-account-issuer=" + KUBERNETES_DEFAULT_ISSUER,
                 "--kube-apiserver-arg=api-audiences=" + KUBERNETES_DEFAULT_ISSUER + "," + EksOidcService.STS_AUDIENCE
@@ -2331,7 +2508,7 @@ public class EksClusterManager
         return yaml.toString();
     }
 
-    private static void appendMirror(StringBuilder yaml, String host, String endpoint) {
+    static void appendMirror(StringBuilder yaml, String host, String endpoint) {
         yaml.append("  \"").append(host).append("\":\n")
                 .append("    endpoint:\n")
                 .append("      - \"").append(endpoint).append("\"\n");
@@ -2356,6 +2533,14 @@ public class EksClusterManager
 
     static String webhookPath(String clusterName) {
         return "/_floci/eks/clusters/" + clusterName + "/token-webhook";
+    }
+
+    /** The API server arguments that wire the token-authentication webhook whose kubeconfig is at {@code configPath}. */
+    static List<String> buildTokenWebhookServerArgs(String configPath) {
+        return List.of(
+                "--kube-apiserver-arg=authentication-token-webhook-config-file=" + configPath,
+                "--kube-apiserver-arg=authentication-token-webhook-version=v1",
+                "--kube-apiserver-arg=authentication-token-webhook-cache-ttl=30s");
     }
 
     /**
@@ -2402,6 +2587,18 @@ public class EksClusterManager
             LOG.warnv("Could not register cluster node instance for EKS cluster {0}: {1}",
                     cluster.getName(), e.getMessage());
         }
+    }
+
+    /**
+     * Registers the EC2 instance of a cluster's smolvm-pods node, which EC2's describe calls list.
+     * Floci reaches the node only through the Mac's loopback, so the instance has the default
+     * private address and no VPC addresses for Route 53 Resolver rules.
+     */
+    void registerSmolvmNodeInstance(Cluster cluster) {
+        String accountId = resolveClusterAccountId(cluster);
+        String region = clusterRegion(cluster);
+        Instance nodeInstance = synthesizeClusterNodeInstance(cluster, null, region, accountId);
+        clusterNodeInstances.put(clusterResourceName(cluster), new ClusterNodeRecord(accountId, region, nodeInstance));
     }
 
     void configureLinkLocalMetadataEndpoint(Cluster cluster, String containerId) {
@@ -2701,6 +2898,22 @@ public class EksClusterManager
     }
 
     String buildNodeLabels(Cluster cluster, Nodegroup nodegroup, String az, String region) {
+        Map<String, String> labels = nodeLabels(cluster, nodegroup, az, region);
+        if (labels.isEmpty()) {
+            return null;
+        }
+        StringBuilder sb = new StringBuilder();
+        for (Map.Entry<String, String> entry : labels.entrySet()) {
+            if (!sb.isEmpty()) {
+                sb.append(",");
+            }
+            sb.append(entry.getKey()).append("=").append(entry.getValue());
+        }
+        return sb.toString();
+    }
+
+    /** The labels of the cluster's node: its topology and, with a node group, the group's labels. */
+    Map<String, String> nodeLabels(Cluster cluster, Nodegroup nodegroup, String az, String region) {
         Map<String, String> labels = new LinkedHashMap<>();
         if (az != null && !az.isBlank()) {
             labels.put("topology.kubernetes.io/zone", az);
@@ -2738,18 +2951,7 @@ public class EksClusterManager
                 }
             }
         }
-
-        if (labels.isEmpty()) {
-            return null;
-        }
-        StringBuilder sb = new StringBuilder();
-        for (Map.Entry<String, String> entry : labels.entrySet()) {
-            if (!sb.isEmpty()) {
-                sb.append(",");
-            }
-            sb.append(entry.getKey()).append("=").append(entry.getValue());
-        }
-        return sb.toString();
+        return labels;
     }
 
     private static boolean isReservedNodeLabelKey(String key) {
@@ -2762,7 +2964,8 @@ public class EksClusterManager
         if (nodegroup != null && nodegroup.getInstanceTypes() != null && !nodegroup.getInstanceTypes().isEmpty()) {
             String first = nodegroup.getInstanceTypes().getFirst();
             if (first != null && !first.isBlank()) {
-                return selectNodeInstanceType(first.trim());
+                // The node group's creation warned about a type absent from the catalog; labels are read often.
+                return instanceTypeCatalog.find(first.trim()).isPresent() ? first.trim() : DEFAULT_NODE_INSTANCE_TYPE;
             }
         }
         return nodeInstanceType(cluster);
@@ -2864,6 +3067,11 @@ public class EksClusterManager
     }
 
     String deriveClusterNodeInstanceId(Cluster cluster, String region, String accountId) {
+        Optional<String> nodeName = smolvmNodeName(cluster);
+        if (nodeName.isPresent()) {
+            int dot = nodeName.get().indexOf('.');
+            return dot < 0 ? nodeName.get() : nodeName.get().substring(0, dot);
+        }
         String safeClusterName = (cluster != null && cluster.getName() != null && !cluster.getName().isBlank())
                 ? cluster.getName()
                 : "eks-cluster";
@@ -2897,11 +3105,24 @@ public class EksClusterManager
         return deriveClusterNodeProviderId(cluster, region, accountId);
     }
 
+    /** The Kubernetes name of the smolvm-pods node that {@code cluster} runs on, when it runs on one. */
+    private Optional<String> smolvmNodeName(Cluster cluster) {
+        if (!onSmolvmNode(cluster)) {
+            return Optional.empty();
+        }
+        EksSmolvmCluster smolvm = smolvmCluster();
+        return smolvm == null ? Optional.empty() : smolvm.nodeName();
+    }
+
     String deriveClusterNodePrivateDnsDomain(String region) {
         return AwsRegions.ec2PrivateDnsDomain(region);
     }
 
     String deriveClusterNodePrivateDnsName(Cluster cluster, String region, String accountId) {
+        Optional<String> nodeName = smolvmNodeName(cluster);
+        if (nodeName.isPresent()) {
+            return nodeName.get();
+        }
         String safeRegion = (region != null && !region.isBlank())
                 ? region
                 : clusterRegion(cluster);
@@ -3019,6 +3240,11 @@ public class EksClusterManager
         if (cluster == null || instance == null) {
             return;
         }
+        if (onSmolvmNode(cluster)) {
+            throw new AwsException("InvalidParameterException", "Instance " + instance.getInstanceId()
+                    + " cannot join cluster " + cluster.getName() + ": it runs on a smolvm-pods node, which EC2 "
+                    + "instances do not join", 400);
+        }
         String clusterKey = clusterResourceName(cluster);
         synchronized (joinedClusterInstances) {
             for (Map.Entry<String, Map<String, Instance>> entry : joinedClusterInstances.entrySet()) {
@@ -3071,6 +3297,10 @@ public class EksClusterManager
         if (cluster == null || instance == null) {
             return;
         }
+        if (onSmolvmNode(cluster)) {
+            requireSmolvmCluster().logUnsupported(cluster, "the join of EC2 instance " + instance.getInstanceId());
+            return;
+        }
         cluster.recordJoinedInstance(instance.getInstanceId(),
                 instance.getRegion() != null ? instance.getRegion() : clusterRegion(cluster));
     }
@@ -3084,7 +3314,7 @@ public class EksClusterManager
     }
 
     boolean isInstanceJoined(Cluster cluster, String instanceId) {
-        if (cluster == null || instanceId == null) {
+        if (cluster == null || instanceId == null || onSmolvmNode(cluster)) {
             return false;
         }
         Map<String, Instance> map = joinedClusterInstances.get(clusterResourceName(cluster));
@@ -3228,6 +3458,10 @@ public class EksClusterManager
             Cluster cluster,
             String nodegroupName,
             String userData) {
+        if (onSmolvmNode(cluster)) {
+            requireSmolvmCluster().logUnsupported(cluster, "launch template user data");
+            return UserDataPipeline.ExecutionResult.skipped("A smolvm-pods node runs no launch template user data");
+        }
         if (cluster == null || cluster.getContainerId() == null || cluster.getContainerId().isBlank()) {
             return UserDataPipeline.ExecutionResult.skipped("Cluster has no running container");
         }

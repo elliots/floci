@@ -56,6 +56,7 @@ import java.util.List;
 import java.util.Map;
 import java.util.Objects;
 import java.util.concurrent.TimeUnit;
+import java.util.function.Supplier;
 import java.util.stream.Collectors;
 import java.util.stream.Stream;
 
@@ -91,10 +92,13 @@ public final class FlociDockerHttpClient implements DockerHttpClient {
     private final String pathPrefix;
     /** The same settings with no response timeout, for requests that hold a stream open (see isLongLivedStream). */
     private final RequestConfig streamRequestConfig;
+    /** The {@code Authorization} header of every request, or null for none. */
+    private final Supplier<String> authorization;
 
     private FlociDockerHttpClient(URI dockerHost, SSLConfig sslConfig, int maxConnections,
                                   Duration connectionTimeout, Duration responseTimeout,
-                                  Duration connectionRequestTimeout) {
+                                  Duration connectionRequestTimeout, Supplier<String> authorization) {
+        this.authorization = authorization;
         SSLContext sslContext;
         try {
             sslContext = sslConfig != null ? sslConfig.getSSLContext() : null;
@@ -190,6 +194,9 @@ public final class FlociDockerHttpClient implements DockerHttpClient {
         httpRequest.setAuthority(new URIAuthority(host.getHostName(), host.getPort()));
 
         request.headers().forEach(httpRequest::addHeader);
+        if (authorization != null) {
+            httpRequest.setHeader(HttpHeaders.AUTHORIZATION, authorization.get());
+        }
 
         byte[] bodyBytes = request.bodyBytes();
         if (bodyBytes != null) {
@@ -278,6 +285,7 @@ public final class FlociDockerHttpClient implements DockerHttpClient {
         private Duration connectionTimeout;
         private Duration responseTimeout;
         private Duration connectionRequestTimeout;
+        private Supplier<String> authorization;
 
         public Builder dockerHost(URI value) {
             this.dockerHost = Objects.requireNonNull(value, "dockerHost");
@@ -313,10 +321,19 @@ public final class FlociDockerHttpClient implements DockerHttpClient {
             return this;
         }
 
+        /**
+         * The value of the {@code Authorization} header of every request, read for each one, such
+         * as the bearer token of a smolvm-pods node's API in front of its dockerd.
+         */
+        public Builder authorization(Supplier<String> value) {
+            this.authorization = value;
+            return this;
+        }
+
         public FlociDockerHttpClient build() {
             Objects.requireNonNull(dockerHost, "dockerHost");
             return new FlociDockerHttpClient(dockerHost, sslConfig, maxConnections, connectionTimeout, responseTimeout,
-                    connectionRequestTimeout);
+                    connectionRequestTimeout, authorization);
         }
     }
 

@@ -15,6 +15,7 @@ public class RdsContainerHandle {
     private final String storageKey;
     private final String containerKey;
     private Closeable logStream;
+    private RdsLogExport logExport;
 
     public RdsContainerHandle(String containerId, String instanceId, String host, int port) {
         this(containerId, instanceId, instanceId, host, port, null);
@@ -52,4 +53,7 @@ public class RdsContainerHandle {
     public String getContainerKey() { return containerKey; }
     public Closeable getLogStream() { return logStream; }
     public void setLogStream(Closeable logStream) { this.logStream = logStream; }
+    /** Where the container's output goes, or null until it is first exported. */
+    public RdsLogExport getLogExport() { return logExport; }
+    public void setLogExport(RdsLogExport logExport) { this.logExport = logExport; }
 }

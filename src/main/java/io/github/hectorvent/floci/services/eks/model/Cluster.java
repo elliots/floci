@@ -128,6 +128,19 @@ public class Cluster {
     @JsonInclude(JsonInclude.Include.NON_NULL)
     private Boolean defaultStorageClass;
 
+    /**
+     * The provider the cluster was created with: {@code smolvm-pods}, or null for a k3s container.
+     * Internal persisted metadata omitted from AWS API responses.
+     */
+    @JsonProperty("provider")
+    @JsonInclude(JsonInclude.Include.NON_NULL)
+    private String provider;
+
+    /** The id of the smolvm-pods node a {@code smolvm-pods} cluster runs on. Internal persisted metadata omitted from AWS API responses. */
+    @JsonProperty("smolvmNodeId")
+    @JsonInclude(JsonInclude.Include.NON_NULL)
+    private String smolvmNodeId;
+
     // Internal persisted map of joined EC2 instance IDs to their region.
     @JsonProperty("joinedInstanceIds")
     @JsonInclude(JsonInclude.Include.NON_EMPTY)
@@ -236,6 +249,12 @@ public class Cluster {
     public Boolean getDefaultStorageClass() { return defaultStorageClass; }
     public void setDefaultStorageClass(Boolean defaultStorageClass) { this.defaultStorageClass = defaultStorageClass; }
 
+    public String getProvider() { return provider; }
+    public void setProvider(String provider) { this.provider = provider; }
+
+    public String getSmolvmNodeId() { return smolvmNodeId; }
+    public void setSmolvmNodeId(String smolvmNodeId) { this.smolvmNodeId = smolvmNodeId; }
+
     public Cluster copy() {
         Cluster c = new Cluster();
         c.name = this.name;
@@ -264,6 +283,8 @@ public class Cluster {
         c.nodeInstanceType = this.nodeInstanceType;
         c.clusterArgs = this.clusterArgs != null ? new ArrayList<>(this.clusterArgs) : null;
         c.defaultStorageClass = this.defaultStorageClass;
+        c.provider = this.provider;
+        c.smolvmNodeId = this.smolvmNodeId;
         c.joinedInstanceIds = this.joinedInstanceIds != null ? new ConcurrentHashMap<>(this.joinedInstanceIds) : null;
         c.accessConfig = this.accessConfig;
         return c;

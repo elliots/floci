@@ -16,6 +16,7 @@ import io.github.hectorvent.floci.services.eks.model.Nodegroup;
 import io.github.hectorvent.floci.services.eks.model.PodIdentityAssociation;
 import io.github.hectorvent.floci.services.eks.model.Update;
 import io.github.hectorvent.floci.services.eks.model.UpdateAddonRequest;
+import io.github.hectorvent.floci.services.eks.model.UpdateClusterConfigRequest;
 import io.github.hectorvent.floci.services.eks.model.UpdatePodIdentityAssociationRequest;
 import jakarta.inject.Inject;
 import jakarta.ws.rs.Consumes;
@@ -103,10 +104,11 @@ public class EksController {
      * across restarts and must not be included on the wire. Clearing it on a copy
      * causes Jackson to omit the property due to @JsonInclude(NON_DEFAULT).
      */
-    private Cluster toClusterResponse(Cluster cluster) {
+    static Cluster toClusterResponse(Cluster cluster) {
         if (cluster == null || (!cluster.isExplicitVersion() && cluster.getNodeInstanceType() == null
                 && cluster.getClusterArgs() == null && cluster.getDefaultStorageClass() == null
-                && cluster.getJoinedInstanceIds() == null)) {
+                && cluster.getJoinedInstanceIds() == null && cluster.getProvider() == null
+                && cluster.getSmolvmNodeId() == null)) {
             return cluster;
         }
         Cluster response = cluster.copy();
@@ -115,6 +117,8 @@ public class EksController {
         response.setClusterArgs(null);
         response.setDefaultStorageClass(null);
         response.setJoinedInstanceIds(null);
+        response.setProvider(null);
+        response.setSmolvmNodeId(null);
         return response;
     }
 
@@ -290,6 +294,12 @@ public class EksController {
         Cluster cluster = eksService.describeCluster(name);
         Update update = addons.update(cluster, addonName, request);
         return Response.ok(Map.of("update", update)).build();
+    }
+
+    @POST
+    @Path("/clusters/{name}/update-config")
+    public Response updateClusterConfig(@PathParam("name") String name, UpdateClusterConfigRequest request) {
+        return Response.ok(Map.of("update", eksService.updateClusterConfig(name, request))).build();
     }
 
     @GET

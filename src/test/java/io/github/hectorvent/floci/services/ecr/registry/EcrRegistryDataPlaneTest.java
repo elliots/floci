@@ -551,6 +551,47 @@ class EcrRegistryDataPlaneTest {
         }
     }
 
+    @Test
+    void aMirroredPullOfAnotherRegistryIsNotFound() throws Exception {
+        HttpServer registry = vertx.createHttpServer()
+                .requestHandler(request -> request.response().setStatusCode(500).end())
+                .listen(0, "127.0.0.1")
+                .toCompletionStage().toCompletableFuture().get(2, TimeUnit.SECONDS);
+        HttpServer dataPlane = null;
+        HttpClient client = vertx.createHttpClient();
+        try {
+            dataPlane = dataPlane(registry, false);
+            int port = dataPlane.actualPort();
+            ManifestResponse answer = client.request(new RequestOptions().setHost("127.0.0.1").setPort(port)
+                            .setMethod(HttpMethod.GET).setURI("/v2/library/nginx/manifests/1.27?ns=docker.io"))
+                    .compose(request -> request.send())
+                    .compose(response -> response.body()
+                            .map(body -> new ManifestResponse(response.statusCode(), body.toString())))
+                    .toCompletionStage().toCompletableFuture().get(2, TimeUnit.SECONDS);
+
+            assertEquals(404, answer.statusCode());
+            assertEquals("NAME_UNKNOWN", new JsonObject(answer.body()).getJsonArray("errors").getJsonObject(0)
+                    .getString("code"));
+        } finally {
+            client.close().toCompletionStage().toCompletableFuture().get(2, TimeUnit.SECONDS);
+            if (dataPlane != null) {
+                dataPlane.close().toCompletionStage().toCompletableFuture().get(2, TimeUnit.SECONDS);
+            }
+            registry.close().toCompletionStage().toCompletableFuture().get(2, TimeUnit.SECONDS);
+        }
+    }
+
+    @Test
+    void aMirroredPullOfAnyAccountsEcrReachesItsRepository() {
+        EcrRegistryDataPlane.RegistryRequest request = EcrRegistryDataPlane.requestFor("host.docker.internal:4566",
+                "/v2/team/app/manifests/v1", "ns=111111111111.dkr.ecr.eu-west-1.localhost%3A4566", "hostname")
+                .orElseThrow();
+
+        assertEquals("111111111111", request.accountId());
+        assertEquals("eu-west-1", request.region());
+        assertEquals("/v2/111111111111/eu-west-1/team/app/manifests/v1", request.backendUri());
+    }
+
     /**
      * A data plane in front of {@code registry}, on plain HTTP that a client can speak HTTP/1.1 or,
      * with prior knowledge, HTTP/2 to. Repository {@code platform/api} of account 000000000000 in

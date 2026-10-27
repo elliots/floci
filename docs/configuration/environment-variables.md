@@ -182,6 +182,35 @@ See [Initialization Hooks](./initialization-hooks.md) for lifecycle phases and s
 
 ---
 
+## smolvm Runtime
+
+| Variable | Default | Description |
+|---|---|---|
+| `FLOCI_RUNTIME_CONFIG_FILE` | _(none)_ | The runtime file: the smolvm-pods nodes that Floci did not create, the message consumers that Floci wakes, and the nodes' network. Floci refuses to start when it is set and the file is missing or invalid, and reads the file again within 2 seconds of a change |
+| `FLOCI_RUNTIME_DNS_LISTEN` | _(empty)_ | `HOST:PORT` where Floci answers the DNS of smolvm-pods nodes; empty is `127.0.0.1:15353`, or `0.0.0.0:15353` when Floci runs in a container |
+| `FLOCI_RUNTIME_NODE_NAME` | _(empty)_ | The runtime file's node that RDS and EKS use, by its key; empty takes the only one |
+| `FLOCI_RUNTIME_NODE_NODE_VM_SCRIPT` | _(none)_ | Absolute path of `tools/smolvm-pods/scripts/node-vm.sh`, with which Floci creates the node when the runtime file lists none |
+| `FLOCI_RUNTIME_NODE_SMOLVM_SRC` | _(none)_ | Absolute path of the smolvm checkout that `node-vm.sh` runs |
+| `FLOCI_RUNTIME_NODE_IMAGE` | _(none)_ | Absolute path of the node image tar |
+| `FLOCI_RUNTIME_NODE_IMAGE_SHA256` | _(none)_ | The node image tar's SHA-256 |
+| `FLOCI_RUNTIME_NODE_DATA_PATH` | `./data/runtime-node` | Where Floci keeps the seed of the node it creates |
+| `FLOCI_RUNTIME_NODE_CPUS` | `4` | vCPUs of the node |
+| `FLOCI_RUNTIME_NODE_MEMORY_MIB` | `8192` | Memory of the node, in MiB |
+| `FLOCI_RUNTIME_NODE_STORAGE_GIB` | `64` | Disk for the image, the node's volumes and the databases' data, in GiB |
+| `FLOCI_RUNTIME_NODE_OVERLAY_GIB` | `8` | Disk for changes to the node's root file system, in GiB |
+| `FLOCI_RUNTIME_NODE_ROSETTA` | `true` | Share Rosetta with the node, for amd64 pods |
+| `FLOCI_RUNTIME_NODE_API_SERVER_BASE_PORT`, `_MAX_PORT` | `6500`, `6599` | Mac ports of the node's Kubernetes API |
+| `FLOCI_RUNTIME_NODE_NODE_SERVICE_BASE_PORT`, `_MAX_PORT` | `6600`, `6699` | Mac ports of the node service's API |
+| `FLOCI_RUNTIME_NODE_NODE_PORTS` | `32080-32099` | The node's NodePorts on the same Mac ports: `FIRST-LAST`, `PORT` or `none` |
+| `FLOCI_RUNTIME_NODE_FLOCI_ENDPOINT` | _(empty)_ | `HOST:PORT` where the node's k3s and containerd reach Floci; empty is `host.docker.internal:<FLOCI_PORT>` |
+| `FLOCI_RUNTIME_NODE_KEEP_RUNNING_ON_SHUTDOWN` | `true` | Leave the node running when Floci stops with persistent storage |
+| `FLOCI_RUNTIME_NODE_READY_TIMEOUT_SECONDS` | `600` | How long a node may take to be ready before its users fail |
+| `FLOCI_RUNTIME_NODE_IDLE_TIMEOUT`, `_CPU_THRESHOLD`, `_CPU_WINDOW`, `_MAX_AWAKE_PODS`, `_MAX_AWAKE_MEMORY_MIB`, `_ADMISSION_WAIT`, `_REPORTED_MEMORY_GIB`, `_REPORTED_CPUS`, `_RUST_LOG` | _(empty)_ | The node's settings; empty keeps the node's own. See [The Floci node](./smolvm-runtime.md#the-floci-node) |
+
+See [smolvm Runtime](./smolvm-runtime.md) for the file's rules, its `nodes` and `workloads` sections, and the node that Floci creates.
+
+---
+
 ## Services — Shared
 
 | Variable | Default | Description |
@@ -512,13 +541,15 @@ These services spawn Docker containers. They require access to the Docker socket
 |---|---|---|
 | `FLOCI_SERVICES_EKS_ENABLED` | `true` | Enable the EKS service |
 | `FLOCI_SERVICES_EKS_MOCK` | `false` | When `true`, clusters are created instantly without a real container |
-| `FLOCI_SERVICES_EKS_PROVIDER` | `k3s` | Kubernetes provider (`k3s`) |
+| `FLOCI_SERVICES_EKS_PROVIDER` | `k3s` | What new clusters run on: `k3s`, a k3s container each, or `smolvm-pods`, the k3s of the smolvm-pods node, which holds one cluster and which Floci creates with the `FLOCI_RUNTIME_NODE_*` settings, natively on an Apple silicon Mac |
 | `FLOCI_SERVICES_EKS_DEFAULT_IMAGE` | `rancher/k3s:latest` | Docker image for EKS clusters |
 | `FLOCI_SERVICES_EKS_IMAGE_TEMPLATE` | _(none)_ | Format string for custom k3s images (e.g. `myrepo/k3s:v%s`), taking cluster version |
 | `FLOCI_SERVICES_EKS_API_SERVER_BASE_PORT` | `6500` | First port in the Kubernetes API server range |
 | `FLOCI_SERVICES_EKS_API_SERVER_MAX_PORT` | `6599` | Last port in the Kubernetes API server range |
 | `FLOCI_SERVICES_EKS_KEEP_RUNNING_ON_SHUTDOWN` | `false` | Keep EKS containers running when Floci stops |
 | `FLOCI_SERVICES_EKS_DOCKER_NETWORK` | _(none)_ | Docker network for EKS containers |
+| `FLOCI_SERVICES_EKS_SMOLVM_KUBERNETES_VERSION` | `1.35` | `smolvm-pods`: the version a cluster reports when `CreateCluster` names none |
+| `FLOCI_SERVICES_EKS_SMOLVM_RUNTIME_NAMESPACES` | _(empty)_ | `smolvm-pods`: comma-separated namespaces whose pods the admission webhook gives the `smolvm-pods` RuntimeClass when they name none; `*` is every namespace except `kube-*`. Needs `FLOCI_TLS_ENABLED=true` |
 
 ### ECS (Elastic Container Service)
 

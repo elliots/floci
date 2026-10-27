@@ -34,6 +34,7 @@ import io.github.hectorvent.floci.core.common.docker.ContainerLogStreamer;
 import io.github.hectorvent.floci.core.common.docker.ContainerSpec;
 import io.github.hectorvent.floci.core.common.docker.DockerHostResolver;
 import io.github.hectorvent.floci.core.common.docker.PortAllocator;
+import io.github.hectorvent.floci.core.common.docker.UserDataPipeline;
 import io.github.hectorvent.floci.core.storage.InMemoryStorage;
 import io.github.hectorvent.floci.core.storage.StorageBackend;
 import io.github.hectorvent.floci.services.ec2.Ec2InstanceTypeCatalog;
@@ -94,6 +95,7 @@ import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertNotEquals;
 import static org.junit.jupiter.api.Assertions.assertNotNull;
 import static org.junit.jupiter.api.Assertions.assertNull;
+import static org.junit.jupiter.api.Assertions.assertSame;
 import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 import static org.mockito.ArgumentMatchers.any;
@@ -3825,6 +3827,31 @@ class EksClusterManagerTest {
         }
 
         @Test
+        void shutdownClusterLeavesTheContainerRunningWhenShutdownRetentionIsEnabled() throws Exception {
+            when(eks.keepRunningOnShutdown()).thenReturn(true);
+            Cluster cluster = new Cluster();
+            cluster.setName("prod-cluster");
+            cluster.setLogging(new Logging(List.of(new LogSetup(List.of("api"), true))));
+
+            manager.startCluster(cluster);
+            manager.shutdownCluster(cluster);
+
+            verify(mockHandle).close();
+            verify(lifecycleManager, never()).stopAndRemoveStrict(anyString(), any());
+        }
+
+        @Test
+        void shutdownClusterRemovesTheContainerWhenShutdownRetentionIsDisabled() {
+            Cluster cluster = new Cluster();
+            cluster.setName("prod-cluster");
+
+            manager.startCluster(cluster);
+            manager.shutdownCluster(cluster);
+
+            verify(lifecycleManager).stopAndRemoveStrict("container-id-123456789012345678901234567890", null);
+        }
+
+        @Test
         void restoreClusterAttachesLogsForAdoptedContainer() {
             Container container = Mockito.mock(Container.class);
             when(container.getId()).thenReturn("adopted-container-id-12345678901234567890");
@@ -4317,6 +4344,139 @@ class EksClusterManagerTest {
             inst.setArchitecture(arch);
             inst.setPrivateIpAddress(ip);
             return inst;
+        }
+    }
+
+    @Nested
+    class SmolvmNodeGuards {
+
+        private EmulatorConfig.EksServiceConfig eks;
+        private ContainerLifecycleManager lifecycleManager;
+        private EksSmolvmCluster nodes;
+        private EksClusterManager manager;
+        private Cluster cluster;
+
+        @BeforeEach
+        void setUp() {
+            EmulatorConfig config = Mockito.mock(EmulatorConfig.class);
+            EmulatorConfig.ServicesConfig services = Mockito.mock(EmulatorConfig.ServicesConfig.class);
+            eks = Mockito.mock(EmulatorConfig.EksServiceConfig.class);
+            when(config.services()).thenReturn(services);
+            when(services.eks()).thenReturn(eks);
+            when(eks.provider()).thenReturn(EksSmolvmSettings.PROVIDER_SMOLVM_PODS);
+            lifecycleManager = Mockito.mock(ContainerLifecycleManager.class);
+            manager = new EksClusterManager(Mockito.mock(ContainerBuilder.class), lifecycleManager,
+                    Mockito.mock(ContainerDetector.class), Mockito.mock(PortAllocator.class),
+                    Mockito.mock(DockerHostResolver.class), Mockito.mock(EcrRegistryManager.class), config,
+                    new RegionResolver("us-east-1", "000000000000"), null, null,
+                    Mockito.mock(ContainerLogStreamer.class));
+            nodes = Mockito.mock(EksSmolvmCluster.class);
+            manager.setSmolvmCluster(nodes);
+            cluster = new Cluster();
+            cluster.setName("orders");
+            cluster.setArn("arn:aws:eks:us-east-1:000000000000:cluster/orders");
+            cluster.setProvider(EksSmolvmSettings.PROVIDER_SMOLVM_PODS);
+            cluster.setLogging(new Logging(List.of(new LogSetup(List.of("api", "audit"), true))));
+        }
+
+        @Test
+        void newClustersGoToSmolvmNodesWithThatProvider() {
+            Cluster created = new Cluster();
+            created.setName("orders");
+            when(nodes.create(created)).thenReturn(true);
+
+            assertTrue(manager.tryStartCluster(created));
+
+            verify(nodes).create(created);
+            verify(lifecycleManager, never()).create(any());
+        }
+
+        @Test
+        void theLifecycleOfASmolvmClusterGoesToItsNode() {
+            when(nodes.isReady(cluster)).thenReturn(true);
+            when(nodes.creationFailure(cluster)).thenReturn(Optional.of("node-vm.sh create failed"));
+
+            manager.restoreCluster(cluster);
+            assertTrue(manager.isReady(cluster));
+            manager.finalizeCluster(cluster);
+            assertEquals(Optional.of("node-vm.sh create failed"), manager.creationFailure(cluster));
+            manager.stopCluster(cluster);
+            manager.shutdownCluster(cluster);
+            manager.detachCluster(cluster);
+
+            verify(nodes).restore(cluster);
+            verify(nodes).finalizeCluster(cluster);
+            verify(nodes).delete(cluster);
+            Mockito.verifyNoInteractions(lifecycleManager);
+        }
+
+        @Test
+        void whatASmolvmNodeDoesNotSupportIsSkipped() {
+            Instance instance = new Instance();
+            instance.setInstanceId("i-0123456789abcdef0");
+            instance.setRegion("us-east-1");
+
+            assertTrue(manager.restartForNodeCapacity(cluster, "m5.large"));
+            UserDataPipeline.ExecutionResult userData = manager.executeUserData(cluster, "workers",
+                    "#!/bin/sh\necho hi\n");
+            assertTrue(userData.isSuccess(), "skipped, so the node group is not failed");
+            assertEquals("A smolvm-pods node runs no launch template user data", userData.getOutputSummary());
+            AwsException join = assertThrows(AwsException.class, () -> manager.joinInstance(cluster, instance));
+            assertEquals("InvalidParameterException", join.getErrorCode());
+            assertEquals(400, join.getHttpStatus());
+            manager.recordJoinedInstanceId(cluster, instance);
+            assertNull(cluster.getJoinedInstanceIds());
+            assertFalse(manager.isInstanceJoined(cluster, "i-0123456789abcdef0"));
+            manager.attachClusterLogs(cluster);
+            manager.attachClusterLogsFromNow(cluster);
+            assertNull(manager.getLogHandle(cluster));
+
+            verify(nodes).logUnsupported(cluster, "resizing the node for a node group's instance type");
+            verify(nodes).logUnsupported(cluster, "launch template user data");
+            verify(nodes).logUnsupported(cluster, "the join of EC2 instance i-0123456789abcdef0");
+            verify(nodes, Mockito.times(2)).attachLogs(cluster);
+            Mockito.verifyNoInteractions(lifecycleManager);
+        }
+
+        @Test
+        void aSmolvmClusterReadsServiceAccountsFromItsNodeAndHasNoPodIdentity() {
+            EksServiceAccountReader reader = (namespace, name) -> Optional.of("{}");
+            when(nodes.serviceAccountReader(cluster)).thenReturn(reader);
+            when(nodes.supportsPodIdentity(cluster)).thenReturn(false);
+            Cluster k3s = new Cluster();
+            k3s.setName("legacy");
+
+            assertSame(reader, manager.serviceAccountReader(cluster));
+            assertFalse(manager.supportsPodIdentity(cluster));
+            assertTrue(manager.supportsPodIdentity(k3s));
+            assertEquals(Optional.empty(), manager.serviceAccountReader(k3s).read("team", "app"),
+                    "a k3s cluster without a container has no ServiceAccounts to read");
+            Mockito.verifyNoInteractions(lifecycleManager);
+        }
+
+        @Test
+        void theNodeNamesTheInstanceOfASmolvmClusterAndNotOfAK3sCluster() {
+            when(nodes.nodeName()).thenReturn(Optional.of("i-0abcdef0123456789.ec2.internal"));
+            Cluster k3s = new Cluster();
+            k3s.setName("legacy");
+            k3s.setArn("arn:aws:eks:us-east-1:000000000000:cluster/legacy");
+
+            assertEquals("i-0abcdef0123456789", manager.deriveClusterNodeInstanceId(cluster));
+            assertEquals("i-0abcdef0123456789.ec2.internal", manager.deriveClusterNodePrivateDnsName(cluster));
+            assertEquals("aws:///us-east-1a/i-0abcdef0123456789", manager.deriveClusterNodeProviderId(cluster));
+            assertFalse(manager.deriveClusterNodeInstanceId(k3s).equals("i-0abcdef0123456789"));
+        }
+
+        @Test
+        void aK3sClusterNeverReachesTheSmolvmNodes() {
+            Cluster k3s = new Cluster();
+            k3s.setName("legacy");
+
+            assertEquals(Optional.empty(), manager.creationFailure(k3s));
+            assertFalse(manager.isReady(k3s));
+
+            verify(nodes, never()).isReady(any());
+            verify(nodes, never()).creationFailure(any());
         }
     }
 }

@@ -36,6 +36,8 @@ class EksPodIdentityWebhookTest {
     private EksService eks;
     private EksAddonService addons;
     private EksPodIdentityAssociationService associations;
+    private EksIrsaWebhook irsa;
+    private EksClusterManager clusters;
     private EksPodIdentityWebhook webhook;
 
     @BeforeEach
@@ -43,7 +45,10 @@ class EksPodIdentityWebhookTest {
         eks = Mockito.mock(EksService.class);
         addons = Mockito.mock(EksAddonService.class);
         associations = Mockito.mock(EksPodIdentityAssociationService.class);
-        webhook = new EksPodIdentityWebhook(eks, addons, associations);
+        irsa = Mockito.mock(EksIrsaWebhook.class);
+        clusters = Mockito.mock(EksClusterManager.class);
+        when(clusters.supportsPodIdentity(any())).thenReturn(true);
+        webhook = new EksPodIdentityWebhook(eks, addons, associations, irsa, clusters);
 
         Cluster cluster = new Cluster();
         cluster.setName(CLUSTER_NAME);
@@ -90,6 +95,78 @@ class EksPodIdentityWebhookTest {
         assertEquals("JSONPatch", response(review).get("patchType"));
         assertEquals(3, patchOf(review).size());
         Mockito.verify(associations).list(any(), eq("payments"), eq("checkout"), any(), any());
+        Mockito.verifyNoInteractions(irsa);
+    }
+
+    @Test
+    void irsaIsConsideredWithoutThePodIdentityAddonOrAssociation() throws Exception {
+        when(addons.describe(any(), anyString())).thenThrow(new AwsException("ResourceNotFoundException", "gone", 404));
+        List<Map<String, Object>> irsaPatch = List.of(Map.of("op", "add", "path", "/spec/volumes", "value", List.of()));
+        when(irsa.patch(any(), eq("payments"), eq("checkout"), any())).thenReturn(irsaPatch);
+
+        JsonNode actual = patchOf(webhook.review(CLUSTER_NAME, ACCOUNT_ID,
+                admissionReview(pod("checkout", List.of(Map.of("name", "app"))))));
+
+        assertEquals(MAPPER.valueToTree(irsaPatch), actual);
+        Mockito.verify(irsa).patch(any(), eq("payments"), eq("checkout"), any());
+        Mockito.verifyNoInteractions(associations);
+        Mockito.verify(clusters, Mockito.never()).supportsPodIdentity(any());
+    }
+
+    @Test
+    void aClusterWhosePodsDoNotReachThePodIdentityEndpointGetsIrsaEvenWithAnAssociation() throws Exception {
+        when(clusters.supportsPodIdentity(any())).thenReturn(false);
+        List<Map<String, Object>> irsaPatch = List.of(Map.of("op", "add", "path", "/spec/volumes", "value", List.of()));
+        when(irsa.patch(any(), eq("payments"), eq("checkout"), any())).thenReturn(irsaPatch);
+
+        for (int review = 0; review < 2; review++) {
+            JsonNode actual = patchOf(webhook.review(CLUSTER_NAME, ACCOUNT_ID,
+                    admissionReview(pod("checkout", List.of(Map.of("name", "app"))))));
+
+            assertEquals(MAPPER.valueToTree(irsaPatch), actual);
+        }
+        Mockito.verify(irsa, Mockito.times(2)).patch(any(), eq("payments"), eq("checkout"), any());
+        Mockito.verify(clusters, Mockito.times(2)).supportsPodIdentity(any());
+    }
+
+    @Test
+    void aPodOfAConfiguredNamespaceGetsTheSmolvmRuntimeClass() throws Exception {
+        when(addons.describe(any(), anyString())).thenThrow(new AwsException("ResourceNotFoundException", "gone", 404));
+        when(clusters.wantsSmolvmRuntime(any(), eq("payments"))).thenReturn(true);
+
+        JsonNode actual = patchOf(webhook.review(CLUSTER_NAME, ACCOUNT_ID,
+                admissionReview(pod("checkout", List.of(Map.of("name", "app"))))));
+
+        assertEquals(MAPPER.readTree("[{\"op\":\"add\",\"path\":\"/spec/runtimeClassName\",\"value\":\"smolvm-pods\"}]"),
+                actual);
+    }
+
+    @Test
+    void theSmolvmRuntimeClassFollowsTheCredentialsPatch() throws Exception {
+        when(clusters.wantsSmolvmRuntime(any(), eq("payments"))).thenReturn(true);
+
+        JsonNode actual = patchOf(webhook.review(CLUSTER_NAME, ACCOUNT_ID,
+                admissionReview(pod("checkout", List.of(Map.of("name", "app"))))));
+
+        assertEquals(4, actual.size());
+        assertEquals("/spec/runtimeClassName", actual.get(3).get("path").asText());
+    }
+
+    @Test
+    void aPodThatNamesARuntimeClassOrCannotRunInAVmKeepsItsRuntime() throws Exception {
+        when(addons.describe(any(), anyString())).thenThrow(new AwsException("ResourceNotFoundException", "gone", 404));
+        when(clusters.wantsSmolvmRuntime(any(), eq("payments"))).thenReturn(true);
+        List<Map<String, Object>> specs = List.of(
+                Map.of("runtimeClassName", "crun", "containers", List.of(Map.of("name", "app"))),
+                Map.of("hostNetwork", true, "containers", List.of(Map.of("name", "app"))),
+                Map.of("containers", List.of(Map.of("name", "app", "tty", true))),
+                Map.of("initContainers", List.of(Map.of("name", "init", "stdin", true)),
+                        "containers", List.of(Map.of("name", "app"))));
+
+        for (Map<String, Object> spec : specs) {
+            Map<String, Object> pod = Map.of("kind", "Pod", "spec", spec);
+            assertNull(patchOf(webhook.review(CLUSTER_NAME, ACCOUNT_ID, admissionReview(pod))));
+        }
     }
 
     /**

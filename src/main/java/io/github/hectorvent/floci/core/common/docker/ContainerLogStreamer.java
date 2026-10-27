@@ -2,7 +2,9 @@ package io.github.hectorvent.floci.core.common.docker;
 
 import com.github.dockerjava.api.DockerClient;
 import com.github.dockerjava.api.async.ResultCallback;
+import com.github.dockerjava.api.command.InspectContainerResponse;
 import com.github.dockerjava.api.command.LogContainerCmd;
+import com.github.dockerjava.api.exception.NotFoundException;
 import com.github.dockerjava.api.model.Frame;
 import com.github.dockerjava.api.model.StreamType;
 import io.github.hectorvent.floci.core.common.AwsException;
@@ -18,6 +20,7 @@ import java.nio.charset.StandardCharsets;
 import java.time.Instant;
 import java.time.LocalDate;
 import java.time.format.DateTimeFormatter;
+import java.time.format.DateTimeParseException;
 import java.util.ArrayDeque;
 import java.util.ArrayList;
 import java.util.Arrays;
@@ -32,6 +35,7 @@ import java.util.concurrent.ScheduledExecutorService;
 import java.util.concurrent.ScheduledFuture;
 import java.util.concurrent.ScheduledThreadPoolExecutor;
 import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.locks.ReentrantReadWriteLock;
 import java.util.function.BiConsumer;
 import java.util.function.Consumer;
@@ -46,8 +50,20 @@ public class ContainerLogStreamer {
     private static final Logger LOG = Logger.getLogger(ContainerLogStreamer.class);
     private static final DateTimeFormatter LOG_STREAM_DATE_FMT = DateTimeFormatter.ofPattern("yyyy/MM/dd");
 
+    /** How long a follow that ended waits before it follows again, at first and at most. */
+    static final long REATTACH_FIRST_DELAY_MILLIS = 1_000;
+    static final long REATTACH_MAX_DELAY_MILLIS = 30_000;
+    /** A follow that lasted this long ended for a reason of its own, so the next one waits the first delay again. */
+    private static final long REATTACH_STEADY_MILLIS = 10_000;
+
     private final DockerClient dockerClient;
     private final CloudWatchLogsService cloudWatchLogsService;
+    private final boolean reattach;
+    private final long reattachFirstDelayMillis;
+
+    /** Where a container's output goes in CloudWatch Logs. */
+    public record LogDestination(String logGroup, String logStream) {
+    }
 
     // Log-follow attaches hold their connection open for the whole container lifetime, so
     // this class is the primary consumer of the streaming pool: sharing the control-plane
@@ -55,8 +71,25 @@ public class ContainerLogStreamer {
     // (see DockerClientProducer / StreamingDocker).
     @Inject
     public ContainerLogStreamer(@StreamingDocker DockerClient dockerClient, CloudWatchLogsService cloudWatchLogsService) {
+        this(dockerClient, cloudWatchLogsService, false, REATTACH_FIRST_DELAY_MILLIS);
+    }
+
+    ContainerLogStreamer(DockerClient dockerClient, CloudWatchLogsService cloudWatchLogsService, boolean reattach,
+                         long reattachFirstDelayMillis) {
         this.dockerClient = dockerClient;
         this.cloudWatchLogsService = cloudWatchLogsService;
+        this.reattach = reattach;
+        this.reattachFirstDelayMillis = reattachFirstDelayMillis;
+    }
+
+    /**
+     * A streamer for a daemon reached over the network, such as a smolvm-pods node's dockerd, whose
+     * follows outlive a dropped connection: a follow that ends while its container still runs
+     * follows again from the time of its last line, and skips the lines it already forwarded.
+     */
+    public static ContainerLogStreamer reattaching(DockerClient dockerClient,
+                                                   CloudWatchLogsService cloudWatchLogsService) {
+        return new ContainerLogStreamer(dockerClient, cloudWatchLogsService, true, REATTACH_FIRST_DELAY_MILLIS);
     }
 
     /**
@@ -107,7 +140,21 @@ public class ContainerLogStreamer {
     Closeable attachForAccount(
             String accountId, String containerId, String logGroup, String logStream,
             String region, String logPrefix, Instant since) {
-        ensureLogGroupAndStreamForAccount(accountId, logGroup, logStream, region);
+        return attachToDestinations(accountId, containerId, List.of(new LogDestination(logGroup, logStream)),
+                region, logPrefix, since);
+    }
+
+    /**
+     * Forwards each line of the container's output to every one of {@code destinations}.
+     *
+     * @param since the time of the first line to forward, or null for the container's complete history
+     */
+    public Closeable attachToDestinations(
+            String accountId, String containerId, List<LogDestination> destinations,
+            String region, String logPrefix, Instant since) {
+        for (LogDestination destination : destinations) {
+            ensureLogGroupAndStreamForAccount(accountId, destination.logGroup(), destination.logStream(), region);
+        }
 
         // Trim trailing whitespace and drop blank lines, then fan each reassembled line out to the
         // console logger and CloudWatch Logs.
@@ -115,7 +162,10 @@ public class ContainerLogStreamer {
             String trimmed = line.stripTrailing();
             if (!trimmed.isEmpty()) {
                 LOG.infov("[{0}] {1}", logPrefix, trimmed);
-                forwardToCloudWatchLogs(accountId, logGroup, logStream, region, trimmed);
+                for (LogDestination destination : destinations) {
+                    forwardToCloudWatchLogs(accountId, destination.logGroup(), destination.logStream(), region,
+                            trimmed);
+                }
             }
         };
         return follow(containerId, since, emitter);
@@ -165,6 +215,16 @@ public class ContainerLogStreamer {
     }
 
     private Closeable follow(String containerId, Instant since, Consumer<String> emitter) {
+        if (reattach) {
+            try {
+                ReattachingFollow follow = new ReattachingFollow(containerId, emitter);
+                follow.start(since);
+                return follow;
+            } catch (Exception e) {
+                LOG.warnv("Could not attach log stream for container {0}: {1}", containerId, e.getMessage());
+                return null;
+            }
+        }
         return follow(containerId, since, new LogReassemblyCallback(emitter));
     }
 
@@ -183,6 +243,124 @@ public class ContainerLogStreamer {
         } catch (Exception e) {
             LOG.warnv("Could not attach log stream for container {0}: {1}", containerId, e.getMessage());
             return null;
+        }
+    }
+
+    private LogReassemblyCallback startFollow(String containerId, Instant since, boolean timestamps,
+                                              Consumer<String> emitter, Runnable ended) {
+        LogReassemblyCallback callback = new LogReassemblyCallback(emitter, ended);
+        LogContainerCmd command = dockerClient.logContainerCmd(containerId)
+                .withStdOut(true)
+                .withStdErr(true)
+                .withFollowStream(true)
+                .withTimestamps(timestamps);
+        if (since != null) {
+            command = command.withSince((int) since.getEpochSecond());
+        }
+        command.exec(callback);
+        return callback;
+    }
+
+    /**
+     * A follow that follows again when Docker ends it while the container still runs. Docker
+     * stamps each line, so the next follow starts at the second of the last line forwarded and
+     * skips the lines up to it.
+     */
+    final class ReattachingFollow implements Closeable {
+
+        private final String containerId;
+        private final Consumer<String> emitter;
+        private volatile LogReassemblyCallback current;
+        private volatile boolean closed;
+        private volatile Instant lastLine;
+        private volatile Instant skipThrough;
+        private volatile long startedNanos;
+        private volatile Instant startedAt;
+        private volatile long delayMillis = reattachFirstDelayMillis;
+
+        ReattachingFollow(String containerId, Consumer<String> emitter) {
+            this.containerId = containerId;
+            this.emitter = emitter;
+        }
+
+        void start(Instant since) {
+            startedNanos = System.nanoTime();
+            startedAt = Instant.now();
+            current = startFollow(containerId, since, true, this::line, this::ended);
+            if (closed) {
+                current.closeAfterContainerStopped();
+            }
+        }
+
+        private void line(String stamped) {
+            int space = stamped.indexOf(' ');
+            Instant at;
+            try {
+                at = Instant.parse(space > 0 ? stamped.substring(0, space) : stamped);
+            } catch (DateTimeParseException e) {
+                // The rest of a line longer than an event, which Docker stamped only once.
+                emitter.accept(stamped);
+                return;
+            }
+            Instant skip = skipThrough;
+            if (skip != null && !at.isAfter(skip)) {
+                return;
+            }
+            lastLine = at;
+            emitter.accept(space > 0 ? stamped.substring(space + 1) : "");
+        }
+
+        private void ended() {
+            if (closed) {
+                return;
+            }
+            if (System.nanoTime() - startedNanos >= TimeUnit.MILLISECONDS.toNanos(REATTACH_STEADY_MILLIS)) {
+                delayMillis = reattachFirstDelayMillis;
+            }
+            Thread.ofVirtual().name("container-log-reattach").start(this::reattach);
+        }
+
+        private void reattach() {
+            while (!closed) {
+                try {
+                    Thread.sleep(delayMillis);
+                } catch (InterruptedException e) {
+                    Thread.currentThread().interrupt();
+                    return;
+                }
+                delayMillis = Math.min(delayMillis * 2, REATTACH_MAX_DELAY_MILLIS);
+                if (closed) {
+                    return;
+                }
+                try {
+                    InspectContainerResponse.ContainerState state =
+                            dockerClient.inspectContainerCmd(containerId).exec().getState();
+                    if (state == null || !Boolean.TRUE.equals(state.getRunning())) {
+                        LOG.debugv("The log follow of container {0} ended with the container", containerId);
+                        return;
+                    }
+                    Instant since = lastLine != null ? lastLine : startedAt;
+                    skipThrough = since;
+                    LOG.infov("The log follow of container {0} ended while it runs; following again from {1}",
+                            containerId, since);
+                    start(since);
+                    return;
+                } catch (NotFoundException e) {
+                    LOG.debugv("The log follow of container {0} ended, and the container is gone", containerId);
+                    return;
+                } catch (RuntimeException e) {
+                    LOG.debugv("Could not follow the log of container {0} again: {1}", containerId, e.getMessage());
+                }
+            }
+        }
+
+        @Override
+        public void close() {
+            closed = true;
+            LogReassemblyCallback callback = current;
+            if (callback != null) {
+                callback.closeAfterContainerStopped();
+            }
         }
     }
 
@@ -342,6 +520,9 @@ public class ContainerLogStreamer {
         // any later callback until the transport has been closed and the final tail has been flushed.
         private final ReentrantReadWriteLock callbackGate = new ReentrantReadWriteLock(true);
         private final BiConsumer<StreamType, String> lineConsumer;
+        private final Runnable ended;
+        // Docker may end a follow with both onError and onComplete; it ends once.
+        private final AtomicBoolean endedRun = new AtomicBoolean();
         private final long closeGraceMillis;
         // Guarded by 'buffers'. Set only by the Docker transport terminal callback; afterwards onNext
         // refuses to append, so nothing is ever buffered past the final flush.
@@ -355,15 +536,30 @@ public class ContainerLogStreamer {
         private boolean emitting;
 
         LogReassemblyCallback(Consumer<String> lineConsumer) {
-            this(lineConsumer, DEFAULT_CLOSE_GRACE_MILLIS);
+            this(lineConsumer, null, DEFAULT_CLOSE_GRACE_MILLIS);
+        }
+
+        /** @param ended runs when Docker ends the follow, and not when it is closed; null for nothing */
+        LogReassemblyCallback(Consumer<String> lineConsumer, Runnable ended) {
+            this(lineConsumer, ended, DEFAULT_CLOSE_GRACE_MILLIS);
         }
 
         LogReassemblyCallback(Consumer<String> lineConsumer, long closeGraceMillis) {
-            this(closeGraceMillis, (stream, line) -> lineConsumer.accept(line));
+            this(lineConsumer, null, closeGraceMillis);
+        }
+
+        LogReassemblyCallback(Consumer<String> lineConsumer, Runnable ended, long closeGraceMillis) {
+            this(closeGraceMillis, (stream, line) -> lineConsumer.accept(line), ended);
         }
 
         LogReassemblyCallback(long closeGraceMillis, BiConsumer<StreamType, String> lineConsumer) {
+            this(closeGraceMillis, lineConsumer, null);
+        }
+
+        private LogReassemblyCallback(long closeGraceMillis, BiConsumer<StreamType, String> lineConsumer,
+                                       Runnable ended) {
             this.lineConsumer = lineConsumer;
+            this.ended = ended;
             this.closeGraceMillis = closeGraceMillis;
         }
 
@@ -406,6 +602,7 @@ public class ContainerLogStreamer {
             } finally {
                 callbackGate.readLock().unlock();
             }
+            runEnded();
         }
 
         @Override
@@ -416,6 +613,13 @@ public class ContainerLogStreamer {
                 super.onError(throwable);
             } finally {
                 callbackGate.readLock().unlock();
+            }
+            runEnded();
+        }
+
+        private void runEnded() {
+            if (ended != null && endedRun.compareAndSet(false, true)) {
+                ended.run();
             }
         }
 

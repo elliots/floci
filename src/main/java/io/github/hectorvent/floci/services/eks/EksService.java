@@ -1,6 +1,8 @@
 package io.github.hectorvent.floci.services.eks;
 
+import com.fasterxml.jackson.core.JsonProcessingException;
 import com.fasterxml.jackson.core.type.TypeReference;
+import com.fasterxml.jackson.databind.ObjectMapper;
 import io.github.hectorvent.floci.config.EmulatorConfig;
 import io.github.hectorvent.floci.core.common.AwsArnUtils;
 import io.github.hectorvent.floci.core.common.AwsException;
@@ -46,6 +48,9 @@ import io.github.hectorvent.floci.services.eks.model.NodegroupStatus;
 import io.github.hectorvent.floci.services.eks.model.OidcIdentity;
 import io.github.hectorvent.floci.services.eks.model.Provider;
 import io.github.hectorvent.floci.services.eks.model.ResourcesVpcConfig;
+import io.github.hectorvent.floci.services.eks.model.Update;
+import io.github.hectorvent.floci.services.eks.model.UpdateClusterConfigRequest;
+import io.github.hectorvent.floci.services.eks.model.UpdateParam;
 import jakarta.annotation.PostConstruct;
 import jakarta.annotation.PreDestroy;
 import jakarta.enterprise.context.ApplicationScoped;
@@ -221,7 +226,7 @@ public class EksService implements TagHandler, ResourceProvider, Ec2InstanceLaun
                 continue;
             }
             try {
-                LOG.infov("Restoring k3s container for persisted EKS cluster {0}", cluster.getName());
+                LOG.infov("Restoring the Kubernetes node of persisted EKS cluster {0}", cluster.getName());
                 cluster.setStatus(ClusterStatus.CREATING);
                 cluster.setPodCidr(EksClusterManager.DEFAULT_POD_CIDR);
                 if (cluster.getNodeInstanceType() == null) {
@@ -238,7 +243,7 @@ public class EksService implements TagHandler, ResourceProvider, Ec2InstanceLaun
                             + "comes back as metadata only.", cluster.getName());
                     markMetadataOnlyActive(cluster);
                 } else {
-                    LOG.errorv("Failed to restore k3s container for EKS cluster {0}: {1}",
+                    LOG.errorv("Failed to restore the Kubernetes node of EKS cluster {0}: {1}",
                             cluster.getName(), e.getMessage());
                     cluster.setStatus(ClusterStatus.FAILED);
                 }
@@ -581,14 +586,9 @@ public class EksService implements TagHandler, ResourceProvider, Ec2InstanceLaun
     public void shutdown() {
         poller.shutdownNow();
         if (!config.services().eks().mock()) {
-            boolean keepRunning = config.services().eks().keepRunningOnShutdown();
             for (Cluster cluster : allClusters()) {
                 try {
-                    if (keepRunning) {
-                        clusterManager.detachCluster(cluster);
-                    } else {
-                        clusterManager.stopCluster(cluster);
-                    }
+                    clusterManager.shutdownCluster(cluster);
                 } catch (RuntimeException e) {
                     LOG.warnv("Could not clean up EKS cluster {0} during shutdown: {1}",
                             cluster.getName(), e.getMessage());
@@ -637,7 +637,22 @@ public class EksService implements TagHandler, ResourceProvider, Ec2InstanceLaun
         cluster.setArn(arn);
         cluster.setAccountId(accountId);
         cluster.setCreatedAt(Instant.now());
+        // One cluster runs on the smolvm-pods node; the claim fails before anything is created.
+        if (clusterManager == null) {
+            return createClaimedCluster(request, cluster, name, region, resolvedVpcId);
+        }
+        clusterManager.claimSmolvmNode(cluster);
+        try {
+            return createClaimedCluster(request, cluster, name, region, resolvedVpcId);
+        } finally {
+            if (storage.get(name).isEmpty()) {
+                clusterManager.releaseSmolvmNode(cluster);
+            }
+        }
+    }
 
+    private Cluster createClaimedCluster(CreateClusterRequest request, Cluster cluster, String name, String region,
+                                         String resolvedVpcId) {
         if (request.getVersion() != null && !request.getVersion().isBlank()) {
             String requestedVersion = request.getVersion().trim();
             Matcher matcher = K8S_VERSION_PATTERN.matcher(requestedVersion);
@@ -663,6 +678,7 @@ public class EksService implements TagHandler, ResourceProvider, Ec2InstanceLaun
         List<String> clusterArgs;
         try {
             clusterArgs = EksClusterArgs.parseAndValidateClusterArgs(request.getTags(), name);
+            EksClusterArgs.validateProviderArgs(config.services().eks().provider(), clusterArgs);
         } catch (IllegalArgumentException e) {
             throw new AwsException("InvalidParameterException", e.getMessage(), 400);
         }
@@ -711,7 +727,7 @@ public class EksService implements TagHandler, ResourceProvider, Ec2InstanceLaun
                         markMetadataOnlyActive(cluster);
                     }
                 } catch (Exception e) {
-                    LOG.errorv("Failed to start k3s container for cluster {0}: {1}", name, e.getMessage());
+                    LOG.errorv("Failed to start the Kubernetes node of EKS cluster {0}: {1}", name, e.getMessage());
                     cluster.setStatus(ClusterStatus.FAILED);
                 }
             }
@@ -778,6 +794,55 @@ public class EksService implements TagHandler, ResourceProvider, Ec2InstanceLaun
             return Optional.empty();
         }
     }
+
+    /**
+     * {@code UpdateClusterConfig} of the cluster's {@code logging}: the types the request names are
+     * turned on or off, the others stay, and the control plane logs ship as they now say, from now
+     * on. Floci changes nothing else, so a request with another member is refused.
+     */
+    public Update updateClusterConfig(String name, UpdateClusterConfigRequest request) {
+        if (request != null && !request.otherMembers().isEmpty()) {
+            throw new AwsException("InvalidParameterException", "Floci's UpdateClusterConfig changes the logging "
+                    + "configuration only, not " + String.join(", ", request.otherMembers()), 400);
+        }
+        if (request == null || request.getLogging() == null || request.getLogging().getClusterLogging() == null
+                || request.getLogging().getClusterLogging().isEmpty()) {
+            throw new AwsException("InvalidParameterException", "The type for cluster update was not provided.", 400);
+        }
+        Cluster cluster = describeCluster(name);
+        if (cluster.getStatus() != ClusterStatus.ACTIVE) {
+            throw new AwsException("ResourceInUseException",
+                    "Cluster " + name + " is in " + cluster.getStatus() + " state, not ACTIVE", 409);
+        }
+        List<LogSetup> merged = new ArrayList<>();
+        for (String type : ALL_LOG_TYPES) {
+            if (EksClusterManager.hasLoggingEnabled(cluster, type)) {
+                merged.add(new LogSetup(List.of(type), true));
+            }
+        }
+        merged.addAll(request.getLogging().getClusterLogging());
+        Logging logging = buildLogging(new Logging(merged));
+        if (logging.equals(buildLogging(cluster.getLogging()))) {
+            throw new AwsException("InvalidParameterException", "No changes needed for the logging config provided",
+                    400);
+        }
+        cluster.setLogging(logging);
+        storage.put(cluster.getName(), cluster);
+        clusterManager.attachClusterLogsFromNow(cluster);
+        String value;
+        try {
+            value = UPDATE_JSON.writeValueAsString(logging);
+        } catch (JsonProcessingException e) {
+            throw new IllegalStateException("Could not write the logging of EKS cluster " + name, e);
+        }
+        Update update = new Update(UUID.randomUUID().toString(), "Successful", "LoggingUpdate",
+                List.of(new UpdateParam("ClusterLogging", value)), Instant.now().toEpochMilli() / 1000.0, List.of());
+        addons.recordClusterUpdate(cluster, update);
+        LOG.infov("Updated the logging of EKS cluster {0}: {1}", name, value);
+        return update;
+    }
+
+    private static final ObjectMapper UPDATE_JSON = new ObjectMapper();
 
     public Cluster describeCluster(String name) {
         Cluster cluster = storage.get(name)
@@ -1671,6 +1736,15 @@ public class EksService implements TagHandler, ResourceProvider, Ec2InstanceLaun
             for (AccountAwareStorageBackend.AccountEntry<Cluster> entry : allClusterEntries()) {
                 Cluster cluster = entry.value();
                 boolean replacedNode = cluster.getStatus() == ClusterStatus.ACTIVE && cluster.isFinalizePending();
+                if (cluster.getStatus() == ClusterStatus.CREATING) {
+                    Optional<String> failure = clusterManager.creationFailure(cluster);
+                    if (failure.isPresent()) {
+                        LOG.errorv("EKS cluster {0} is FAILED: {1}", cluster.getName(), failure.get());
+                        saveClusterIfNotDeleting(entry.accountId(), cluster.getName(),
+                                current -> current.setStatus(ClusterStatus.FAILED));
+                        continue;
+                    }
+                }
                 if (cluster.getStatus() == ClusterStatus.CREATING || replacedNode) {
                     if (clusterManager.isReady(cluster)) {
                         clusterManager.finalizeCluster(cluster);

@@ -55,6 +55,7 @@ just test-java
 | ---------------- | ----------------------- | -------------------------------------------------- |
 | `FLOCI_ENDPOINT` | `http://localhost:4566` | Floci emulator endpoint                            |
 | `AWS_REGION`     | `us-east-1`             | Region the `TestFixtures` clients sign for         |
+| `FLOCI_EKS_SMOLVM_E2E` | _(unset)_         | `1` runs `EksSmolvmPodsTest`, which needs a Floci that creates its smolvm-pods node (`FLOCI_SERVICES_EKS_PROVIDER=smolvm-pods` and the `FLOCI_RUNTIME_NODE_*` settings, natively on an Apple silicon Mac) |
 
 AWS credentials are always `test` / `test`. Setting `AWS_REGION=cn-north-1` (with Floci started
 with `FLOCI_DEFAULT_REGION=cn-north-1`) runs the suite in the China partition; the nightly

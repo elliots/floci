@@ -94,6 +94,21 @@ class PortAllocatorTest {
     }
 
     @Test
+    void allocateWithAProbeSkipsReservedPortsAndPortsTheProbeRefuses() {
+        PortAllocator allocator = new PortAllocator();
+        allocator.markReserved(19900);
+
+        int port = allocator.allocate(19900, 19902, candidate -> candidate != 19901);
+
+        assertEquals(19902, port);
+        assertThrows(RuntimeException.class, () -> allocator.allocate(19902, 19902, candidate -> true),
+                "the port stays reserved");
+        allocator.release(port);
+        assertEquals(19901, allocator.allocate(19900, 19902, candidate -> true),
+                "a refused port is not kept reserved");
+    }
+
+    @Test
     void allocateAndStartMovesPastPortsDockerReportsInUseAndReleasesThem() {
         PortAllocator allocator = new HostBlindPortAllocator();
         List<Integer> tried = new ArrayList<>();

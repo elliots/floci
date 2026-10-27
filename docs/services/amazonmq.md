@@ -68,6 +68,17 @@ authentication, and other Docker settings see [Docker Configuration](../configur
 - **Readiness**: The broker state transitions to `RUNNING` once the RabbitMQ management
   API answers on its port.
 
+## Waking sleeping consumers
+
+The workloads of Floci's [runtime file](../configuration/smolvm-runtime.md#rabbitmq-queues) can
+name queues on a broker. Floci then turns the broker's firehose on in each of their virtual hosts
+and follows it as its own broker user, `floci-wakes-RANDOM`: a publish to one of the queues wakes
+the workloads' sleeping consumers on smolvm-pods nodes, and every publish and delivery keeps them
+awake. At the end of a workload's linger, Floci reads the queues' ready and unacknowledged counts
+once, with `rabbitmqctl list_queues` in the broker's container. It takes no message from the
+queues. Floci's user, its connection `floci message wakes` and the tracing show in the broker's
+listings while a workload names the broker.
+
 ## Examples
 
 ```bash

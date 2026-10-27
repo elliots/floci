@@ -132,6 +132,30 @@ public class EksOidcService implements OidcIssuerKeyLookup {
         keyStore.delete(clusterName);
     }
 
+    /**
+     * The signing key of smolvm-pods node {@code nodeId}, which its k3s signs service account
+     * tokens with whichever cluster runs on it, generated with a new issuer in {@code region} the
+     * first time. Stored under a name that no cluster can have.
+     */
+    public synchronized ClusterOidcKey nodeKey(String accountId, String nodeId, String region) {
+        String name = nodeKeyName(nodeId);
+        Optional<ClusterOidcKey> existing = readKey(accountId, name);
+        if (existing.isPresent()) {
+            return existing.get();
+        }
+        return ensureKey(accountId, name, newIssuerUrl(region));
+    }
+
+    /** Gives cluster {@code clusterName} the key of its node, so that its tokens and STS use the node's issuer. */
+    public synchronized void adoptKey(String accountId, String clusterName, ClusterOidcKey key) {
+        writeKey(accountId, clusterName, new ClusterOidcKey(key.getIssuer(), key.getKeyId(), key.getPublicKey(),
+                key.getPrivateKey()));
+    }
+
+    private static String nodeKeyName(String nodeId) {
+        return "smolvm-node:" + nodeId;
+    }
+
     public Optional<ClusterOidcKey> findKeyByCluster(String clusterName) {
         return keyStore.get(clusterName);
     }

@@ -1,7 +1,10 @@
 package io.github.hectorvent.floci.services.eks;
 
+import com.fasterxml.jackson.databind.JsonNode;
+import com.fasterxml.jackson.databind.node.MissingNode;
 import io.github.hectorvent.floci.core.common.AwsArnUtils;
 import io.github.hectorvent.floci.core.common.RequestScopes;
+import io.github.hectorvent.floci.core.common.ServicePrincipals;
 import io.github.hectorvent.floci.core.common.WebIdentityToken;
 import io.github.hectorvent.floci.core.common.WebIdentityTokenVerifier;
 import io.github.hectorvent.floci.core.common.WebIdentityTokenVerifier.ExpiredTokenException;
@@ -9,6 +12,7 @@ import io.github.hectorvent.floci.core.common.WebIdentityTokenVerifier.InvalidTo
 import io.github.hectorvent.floci.services.eks.model.Cluster;
 import io.github.hectorvent.floci.services.eks.model.EksPodIdentityCredentialsResponse;
 import io.github.hectorvent.floci.services.eks.model.PodIdentityAssociation;
+import io.github.hectorvent.floci.services.iam.AssumeRolePolicyEvaluator;
 import io.github.hectorvent.floci.services.iam.IamService;
 import io.github.hectorvent.floci.services.iam.model.IamRole;
 import jakarta.enterprise.context.ApplicationScoped;
@@ -25,6 +29,10 @@ import java.security.interfaces.RSAPublicKey;
 import java.time.Duration;
 import java.time.Instant;
 import java.time.format.DateTimeFormatter;
+import java.util.ArrayList;
+import java.util.HashMap;
+import java.util.List;
+import java.util.Map;
 import java.util.Optional;
 import java.util.concurrent.ThreadLocalRandom;
 
@@ -51,18 +59,21 @@ public class EksPodIdentityCredentialsController {
     private final EksPodIdentityAssociationService associationService;
     private final IamService iamService;
     private final WebIdentityTokenVerifier tokenVerifier;
+    private final AssumeRolePolicyEvaluator trustPolicies;
 
     @Inject
     public EksPodIdentityCredentialsController(EksService eksService,
                                                EksOidcService oidcService,
                                                EksPodIdentityAssociationService associationService,
                                                IamService iamService,
-                                               WebIdentityTokenVerifier tokenVerifier) {
+                                               WebIdentityTokenVerifier tokenVerifier,
+                                               AssumeRolePolicyEvaluator trustPolicies) {
         this.eksService = eksService;
         this.oidcService = oidcService;
         this.associationService = associationService;
         this.iamService = iamService;
         this.tokenVerifier = tokenVerifier;
+        this.trustPolicies = trustPolicies;
     }
 
     @GET
@@ -112,7 +123,7 @@ public class EksPodIdentityCredentialsController {
         }
         String rest = sub.substring(SERVICE_ACCOUNT_PREFIX.length());
         int colon = rest.indexOf(':');
-        if (colon <= 0 || colon == rest.length() - 1) {
+        if (colon <= 0 || colon == rest.length() - 1 || rest.indexOf(':', colon + 1) != -1) {
             return error(400, "Service account token subject is invalid\n");
         }
         String namespace = rest.substring(0, colon);
@@ -147,6 +158,16 @@ public class EksPodIdentityCredentialsController {
             return error(400, "AccessDeniedException: The role of the association cannot be assumed: "
                     + roleArn + "\n");
         }
+        JsonNode pod = tokenVerifier.peekClaims(token).map(claims -> claims.path("kubernetes.io").path("pod"))
+                .orElse(MissingNode.getInstance());
+        Map<String, List<String>> context = trustContext(cluster, association, callerAccountId, pod);
+        String service = ServicePrincipals.of("pods.eks");
+        String trust = role.get().getAssumeRolePolicyDocument();
+        if (!trustPolicies.allowsServiceAction(trust, service, "sts:AssumeRole", context)
+                || (!Boolean.TRUE.equals(association.disableSessionTags())
+                    && !trustPolicies.allowsServiceAction(trust, service, "sts:TagSession", context))) {
+            return error(400, "AccessDeniedException: The role trust policy does not allow this pod identity\n");
+        }
         String assumedRoleId = role.map(IamRole::getRoleId).filter(id -> !id.isBlank())
                 .map(id -> id + ":" + sessionName)
                 .orElse(null);
@@ -167,6 +188,40 @@ public class EksPodIdentityCredentialsController {
         );
 
         return Response.ok(response, MediaType.APPLICATION_JSON).build();
+    }
+
+    /**
+     * The condition keys of the trust policy check: the source account and cluster and, with session
+     * tags, the tags EKS Pod Identity sets, the pod's name and UID from the token's
+     * {@code kubernetes.io} claims among them.
+     */
+    private static Map<String, List<String>> trustContext(Cluster cluster, PodIdentityAssociation association,
+                                                         String accountId, JsonNode pod) {
+        Map<String, List<String>> context = new HashMap<>();
+        context.put("aws:SourceAccount", List.of(accountId));
+        if (cluster.getArn() != null) {
+            context.put("aws:SourceArn", List.of(cluster.getArn()));
+        }
+        if (!Boolean.TRUE.equals(association.disableSessionTags())) {
+            Map<String, String> tags = new HashMap<>();
+            tags.put("eks-cluster-name", cluster.getName());
+            if (cluster.getArn() != null) {
+                tags.put("eks-cluster-arn", cluster.getArn());
+            }
+            tags.put("kubernetes-namespace", association.namespace());
+            tags.put("kubernetes-service-account", association.serviceAccount());
+            putText(tags, "kubernetes-pod-name", pod.path("name"));
+            putText(tags, "kubernetes-pod-uid", pod.path("uid"));
+            tags.forEach((name, value) -> context.put("aws:RequestTag/" + name, List.of(value)));
+            context.put("aws:TagKeys", new ArrayList<>(tags.keySet()));
+        }
+        return context;
+    }
+
+    private static void putText(Map<String, String> tags, String name, JsonNode value) {
+        if (value.isTextual() && !value.asText().isBlank()) {
+            tags.put(name, value.asText());
+        }
     }
 
     private Response error(int status, String message) {

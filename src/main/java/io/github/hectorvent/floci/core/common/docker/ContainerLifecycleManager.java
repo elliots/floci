@@ -91,6 +91,8 @@ public class ContainerLifecycleManager {
     private final ContainerDetector containerDetector;
     private final EmulatorConfig config;
     private final long archiveRetryBackoffMillis;
+    /** The runtime of every container this manager creates, or null for the daemon's default. */
+    private final OciRuntime runtime;
 
     /** Volumes whose shared-ownership root has already been initialised this process (run-once guard). */
     private final ConcurrentHashMap<String, Boolean> initializedSharedVolumes = new ConcurrentHashMap<>();
@@ -104,7 +106,20 @@ public class ContainerLifecycleManager {
                                      ContainerDetector containerDetector,
                                      EmulatorConfig config) {
         this(dockerClient, imageCacheService, containerDetector, config,
-                RetryingTarCopier.DEFAULT_BACKOFF_MS);
+                RetryingTarCopier.DEFAULT_BACKOFF_MS, null);
+    }
+
+    /**
+     * A manager for another daemon than the CDI one, such as a smolvm-pods node's, whose
+     * containers all run with {@code runtime}.
+     */
+    public ContainerLifecycleManager(DockerClient dockerClient,
+                                     ImageCacheService imageCacheService,
+                                     ContainerDetector containerDetector,
+                                     EmulatorConfig config,
+                                     OciRuntime runtime) {
+        this(dockerClient, imageCacheService, containerDetector, config,
+                RetryingTarCopier.DEFAULT_BACKOFF_MS, runtime);
     }
 
     ContainerLifecycleManager(DockerClient dockerClient,
@@ -112,11 +127,21 @@ public class ContainerLifecycleManager {
                               ContainerDetector containerDetector,
                               EmulatorConfig config,
                               long archiveRetryBackoffMillis) {
+        this(dockerClient, imageCacheService, containerDetector, config, archiveRetryBackoffMillis, null);
+    }
+
+    private ContainerLifecycleManager(DockerClient dockerClient,
+                                      ImageCacheService imageCacheService,
+                                      ContainerDetector containerDetector,
+                                      EmulatorConfig config,
+                                      long archiveRetryBackoffMillis,
+                                      OciRuntime runtime) {
         this.dockerClient = dockerClient;
         this.imageCacheService = imageCacheService;
         this.containerDetector = containerDetector;
         this.config = config;
         this.archiveRetryBackoffMillis = archiveRetryBackoffMillis;
+        this.runtime = runtime;
     }
 
     /**
@@ -1449,6 +1474,13 @@ public class ContainerLifecycleManager {
         // container Floci launches.
         if (spec.hasDeviceRequests()) {
             hostConfig.withDeviceRequests(spec.deviceRequests());
+        }
+
+        if (runtime != null) {
+            hostConfig.withRuntime(runtime.name());
+            if (!runtime.annotations().isEmpty()) {
+                hostConfig.withAnnotations(runtime.annotations());
+            }
         }
 
         return hostConfig;

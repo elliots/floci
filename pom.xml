@@ -176,6 +176,13 @@
             <artifactId>vertx-mqtt</artifactId>
         </dependency>
 
+        <!-- AMQP 0-9-1 client for the firehose of Amazon MQ brokers that message wakes follow -->
+        <dependency>
+            <groupId>com.rabbitmq</groupId>
+            <artifactId>amqp-client</artifactId>
+            <version>5.37.0</version>
+        </dependency>
+
         <!-- cron-utils for EventBridge schedule expression parsing -->
         <dependency>
             <groupId>com.cronutils</groupId>
@@ -481,6 +488,12 @@
             <scope>test</scope>
         </dependency>
         <dependency>
+            <groupId>software.amazon.awssdk</groupId>
+            <artifactId>eks</artifactId>
+            <version>${aws.sdk.version}</version>
+            <scope>test</scope>
+        </dependency>
+        <dependency>
             <groupId>io.quarkus</groupId>
             <artifactId>quarkus-junit</artifactId>
             <scope>test</scope>
@@ -597,6 +610,18 @@
             <groupId>org.neo4j.driver</groupId>
             <artifactId>neo4j-java-driver</artifactId>
             <version>6.3.0</version>
+            <scope>test</scope>
+        </dependency>
+        <dependency>
+            <groupId>software.amazon.awssdk</groupId>
+            <artifactId>iot</artifactId>
+            <version>${aws.sdk.version}</version>
+            <scope>test</scope>
+        </dependency>
+        <dependency>
+            <groupId>software.amazon.awssdk</groupId>
+            <artifactId>mq</artifactId>
+            <version>${aws.sdk.version}</version>
             <scope>test</scope>
         </dependency>
     </dependencies>

@@ -204,7 +204,7 @@ public final class ContainerCaBundle {
     }
 
     /** Every trust anchor the running JVM accepts by default. */
-    private static List<X509Certificate> systemRoots() throws GeneralSecurityException {
+    public static List<X509Certificate> systemRoots() throws GeneralSecurityException {
         TrustManagerFactory factory = TrustManagerFactory.getInstance(TrustManagerFactory.getDefaultAlgorithm());
         factory.init((KeyStore) null);
         List<X509Certificate> roots = new ArrayList<>();
@@ -230,7 +230,7 @@ public final class ContainerCaBundle {
         return certificates;
     }
 
-    private static String toPem(X509Certificate certificate) throws CertificateEncodingException {
+    public static String toPem(X509Certificate certificate) throws CertificateEncodingException {
         return "-----BEGIN CERTIFICATE-----\n"
                 + Base64.getMimeEncoder(64, new byte[] {'\n'}).encodeToString(certificate.getEncoded())
                 + "\n-----END CERTIFICATE-----\n";

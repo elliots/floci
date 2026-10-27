@@ -224,4 +224,45 @@ class EksClusterArgsTest {
         List<String> args = EksClusterArgs.parseAndValidateClusterArgs(tags, "demo");
         assertEquals(List.of("--kubelet-arg=max-pods=250"), args);
     }
+
+    @ParameterizedTest
+    @ValueSource(strings = {
+            "--kubelet-arg=resolv-conf=/etc/other-resolv.conf",
+            "--kube-apiserver-arg=token-auth-file=/tmp/tokens.csv",
+            "--kube-apiserver-arg=service-cluster-ip-range=10.200.0.0/16",
+            "--kube-controller-manager-arg=cluster-cidr=10.244.0.0/16",
+            "--kube-controller-manager-arg=service-cluster-ip-range=10.200.0.0/16",
+            "--kubelet-arg=hostname-override=other",
+            "--kubelet-arg=node-name=other",
+            "--kubelet-arg=service-cidr=10.200.0.0/16",
+            "--kubelet-arg=eviction-soft=memory.available<500Mi",
+            "--kubelet-arg=eviction-hard=Memory.available<5%",
+            "--kubelet-arg=cpu-manager-policy=static",
+            "--kubelet-arg=cpu-manager-policy",
+            "--kubelet-arg=memory-manager-policy=Static"
+    })
+    void smolvmPodsClustersRefuseWhatTheirNodeSets(String arg) {
+        assertThrows(EksClusterArgs.CollisionException.class,
+                () -> EksClusterArgs.validateProviderArgs("smolvm-pods", List.of(arg)));
+        EksClusterArgs.validateProviderArgs("k3s", List.of(arg));
+    }
+
+    @Test
+    void smolvmPodsClustersTakeOtherArgs() {
+        EksClusterArgs.validateProviderArgs("smolvm-pods", List.of(
+                "--kubelet-arg=max-pods=250",
+                "--kubelet-arg=eviction-soft=nodefs.available<10%",
+                "--kubelet-arg=cpu-manager-policy=none",
+                "--kubelet-arg=memory-manager-policy=None",
+                "--kube-apiserver-arg=feature-gates=CSIStorageCapacity=true"));
+    }
+
+    @Test
+    void smolvmPodsRefusalNamesTheArgument() {
+        EksClusterArgs.CollisionException refused = assertThrows(EksClusterArgs.CollisionException.class,
+                () -> EksClusterArgs.validateProviderArgs("smolvm-pods",
+                        List.of("--kubelet-arg=resolv-conf=/etc/other-resolv.conf")));
+        assertEquals("Cluster argument 'resolv-conf' is set by the smolvm-pods node and cannot be overridden on a "
+                + "smolvm-pods cluster.", refused.getMessage());
+    }
 }

@@ -126,6 +126,137 @@ public interface EmulatorConfig {
 
     ProtocolsConfig protocols();
 
+    RuntimeConfig runtime();
+
+    interface RuntimeConfig {
+        /**
+         * The smolvm runtime file, read at startup and again whenever it changes. See
+         * {@code docs/configuration/smolvm-runtime.md}.
+         */
+        Optional<String> configFile();
+
+        /**
+         * Where Floci answers the DNS queries of smolvm-pods nodes, as {@code HOST:PORT}. Empty
+         * listens on {@code 127.0.0.1:15353}, or on {@code 0.0.0.0:15353} when Floci runs in a
+         * container. See {@code docs/configuration/smolvm-runtime.md}.
+         */
+        Optional<String> dnsListen();
+
+        /**
+         * The one smolvm-pods node that RDS and EKS share: the runtime file's, or one that Floci
+         * creates on first use. See {@code docs/configuration/smolvm-runtime.md}.
+         */
+        NodeConfig node();
+
+        interface NodeConfig {
+            /**
+             * The runtime file's node to use, by its key under {@code nodes}. Empty takes the only
+             * one. Env: FLOCI_RUNTIME_NODE_NAME
+             */
+            Optional<String> name();
+
+            /** Absolute path of {@code tools/smolvm-pods/scripts/node-vm.sh}. */
+            Optional<String> nodeVmScript();
+
+            /** The smolvm checkout that {@code node-vm.sh} runs, passed as {@code SMOLVM_SRC}. */
+            Optional<String> smolvmSrc();
+
+            /** The node image tar that {@code node-vm.sh build} wrote. */
+            Optional<String> image();
+
+            /** The SHA-256 of {@link #image()}, 64 hex digits. */
+            Optional<String> imageSha256();
+
+            /** Where Floci keeps the seed of the node it creates, with the node's secrets. */
+            @WithDefault("./data/runtime-node")
+            String dataPath();
+
+            @WithDefault("4")
+            int cpus();
+
+            /** Room for a few databases and an EKS cluster's pods. */
+            @WithDefault("8192")
+            int memoryMib();
+
+            /** The disk for the image and the node's volumes, in GiB. */
+            @WithDefault("64")
+            int storageGib();
+
+            /** The disk for changes to the node's root file system, in GiB. */
+            @WithDefault("8")
+            int overlayGib();
+
+            /** Share Rosetta with the node, so that amd64 pods run. */
+            @WithDefault("true")
+            boolean rosetta();
+
+            /** First Mac port of the node's Kubernetes API. */
+            @WithDefault("6500")
+            int apiServerBasePort();
+
+            /** Last Mac port of the node's Kubernetes API. */
+            @WithDefault("6599")
+            int apiServerMaxPort();
+
+            /** First Mac port of the node service's API. */
+            @WithDefault("6600")
+            int nodeServiceBasePort();
+
+            /** Last Mac port of the node service's API. */
+            @WithDefault("6699")
+            int nodeServiceMaxPort();
+
+            /**
+             * The node's NodePorts, published on the same Mac ports: {@code FIRST-LAST},
+             * {@code PORT} or {@code none}.
+             */
+            @WithDefault("32080-32099")
+            String nodePorts();
+
+            /**
+             * {@code HOST:PORT} where k3s and containerd in the node reach Floci: the token
+             * webhook, the admission webhook and the ECR mirror. Empty means
+             * {@code host.docker.internal:<floci port>}.
+             */
+            Optional<String> flociEndpoint();
+
+            /** Leave the node running when Floci stops with persistent storage. */
+            @WithDefault("true")
+            boolean keepRunningOnShutdown();
+
+            /** How long Floci waits for a node it created, started or adopted to be ready, in seconds. */
+            @WithDefault("600")
+            int readyTimeoutSeconds();
+
+            /** The node service's {@code --idle-timeout}, a Go duration such as {@code 5m}. */
+            Optional<String> idleTimeout();
+
+            /** The node service's {@code --cpu-threshold}: vCPUs, or {@code off}. */
+            Optional<String> cpuThreshold();
+
+            /** The node service's {@code --cpu-window}, a Go duration. */
+            Optional<String> cpuWindow();
+
+            /** The node service's {@code --max-awake-pods}; 0 is no cap. */
+            OptionalInt maxAwakePods();
+
+            /** The node service's {@code --max-awake-memory}, in MiB; 0 is no cap. */
+            OptionalInt maxAwakeMemoryMib();
+
+            /** The node service's {@code --admission-wait}, a Go duration. */
+            Optional<String> admissionWait();
+
+            /** The memory, in GiB, that kubelet reports for the node. Applies at the next node restart. */
+            OptionalInt reportedMemoryGib();
+
+            /** The CPUs that kubelet reports for the node. Applies at the next node restart. */
+            OptionalInt reportedCpus();
+
+            /** {@code RUST_LOG} of the node service and the shim. Applies at the next node restart. */
+            Optional<String> rustLog();
+        }
+    }
+
     interface NetworkConfig {
         SecurityGroupEnforcementConfig securityGroupEnforcement();
     }
@@ -1862,6 +1993,21 @@ public interface EmulatorConfig {
          *  Env: FLOCI_SERVICES_RDS_AURORA_RESUME_DELAY_MILLIS */
         @WithDefault("0")
         int auroraResumeDelayMillis();
+
+        /** The database containers as hibernating microVMs on a smolvm-pods node. */
+        RdsSmolvmConfig smolvm();
+
+        interface RdsSmolvmConfig {
+            /** Runs every database container on the smolvm-pods node ({@code floci.runtime.node}),
+             *  in a pod VM that sleeps when idle. Env: FLOCI_SERVICES_RDS_SMOLVM_ENABLED */
+            @WithDefault("false")
+            boolean enabled();
+
+            /** How long a database takes no traffic before it sleeps, a duration from 10s to
+             *  24h such as {@code 2m}. Empty takes the node's own idle timeout.
+             *  Env: FLOCI_SERVICES_RDS_SMOLVM_IDLE_TIMEOUT */
+            Optional<String> idleTimeout();
+        }
     }
 
     interface DsqlServiceConfig {
@@ -3645,8 +3791,15 @@ public interface EmulatorConfig {
         @WithDefault("0")
         int maxVcpus();
 
+        /**
+         * What new clusters run on: {@code k3s}, a k3s container, or {@code smolvm-pods}, the k3s
+         * of the smolvm-pods node that RDS and EKS share ({@code floci.runtime.node}), which holds
+         * one cluster.
+         */
         @WithDefault("k3s")
         String provider();
+
+        SmolvmConfig smolvm();
 
         @WithDefault("rancher/k3s:latest")
         String defaultImage();
@@ -3780,6 +3933,26 @@ public interface EmulatorConfig {
          */
         @WithDefault("true")
         boolean vpcRouteProgramming();
+
+        /**
+         * The smolvm-pods node VMs of clusters created with the {@code smolvm-pods} provider:
+         * {@code node-vm.sh} and its inputs, the size of each node, its Mac ports, and the node
+         * service settings that Floci writes into each node's seed. An empty node setting keeps
+         * the node's own default.
+         */
+        interface SmolvmConfig {
+            /** The version a cluster reports when CreateCluster names none, the node image's k3s minor. */
+            @WithDefault("1.35")
+            String kubernetesVersion();
+
+            /**
+             * Namespaces whose pods the pod admission webhook gives the {@code smolvm-pods}
+             * RuntimeClass when they name none, so that pods made by an operator that cannot set it
+             * run in VMs and sleep. {@code *} is every namespace except the {@code kube-} ones.
+             * Needs {@code floci.tls.enabled}. Env: FLOCI_SERVICES_EKS_SMOLVM_RUNTIME_NAMESPACES
+             */
+            Optional<List<String>> runtimeNamespaces();
+        }
     }
 
     /**

@@ -17,9 +17,20 @@ import java.util.stream.Collectors;
 /**
  * Thread-safe wrapper around a per-queue message list. All operations acquire a
  * {@link ReentrantLock} so that compound read-modify-write sequences (e.g., claim
- * visible messages) are atomic with respect to each other.
+ * visible messages) are atomic with respect to each other. Each change that succeeds is
+ * reported to the queue's {@link SqsQueueListener} after the lock is released.
  */
 class GuardedMessageQueue {
+
+    static final SqsQueueListener NO_LISTENER = new SqsQueueListener() {
+        @Override
+        public void messageAvailable(SqsQueueId queue, Instant at) {
+        }
+
+        @Override
+        public void messagesChanged(SqsQueueId queue) {
+        }
+    };
 
     private final ReentrantLock lock = new ReentrantLock();
     private final List<Message> messages;
@@ -27,6 +38,8 @@ class GuardedMessageQueue {
     private final String storageKey;
     private final String receiptHandleSecret;
     private final SqsQueueActivity activity = new SqsQueueActivity();
+    private final SqsQueueId id;
+    private final SqsQueueListener listener;
     private volatile boolean closed;
 
     @FunctionalInterface
@@ -50,10 +63,18 @@ class GuardedMessageQueue {
 
     GuardedMessageQueue(List<Message> initial, StorageBackend<String, List<Message>> messageStore, String storageKey,
                         String receiptHandleSecret) {
+        this(initial, messageStore, storageKey, receiptHandleSecret, NO_LISTENER);
+    }
+
+    /** @param listener hears each change when the storage key names a queue */
+    GuardedMessageQueue(List<Message> initial, StorageBackend<String, List<Message>> messageStore, String storageKey,
+                        String receiptHandleSecret, SqsQueueListener listener) {
         this.messages = new ArrayList<>(initial);
         this.messageStore = messageStore;
         this.storageKey = storageKey;
         this.receiptHandleSecret = receiptHandleSecret;
+        this.id = SqsQueueId.ofStorageKey(storageKey);
+        this.listener = listener;
     }
 
     record ClaimResult(List<Message> claimed, List<Message> dlqCandidates) {
@@ -70,6 +91,7 @@ class GuardedMessageQueue {
                 throw e;
             }
         }
+        available(List.of(message));
     }
 
     /** If persisting fails the in-memory add is rolled back and the exception propagates, so a
@@ -85,11 +107,13 @@ class GuardedMessageQueue {
                 throw e;
             }
         }
+        available(toAdd);
     }
 
     ClaimResult claimVisibleMessages(int maxMessages, int effectiveTimeout,
                                      boolean fifo, int maxReceiveCount,
                                      String deadLetterTargetArn) {
+        ClaimResult result;
         try (Guard _ = hold()) {
             List<Message> claimed = new ArrayList<>();
             List<Message> dlqCandidates = new ArrayList<>();
@@ -106,8 +130,12 @@ class GuardedMessageQueue {
                 persist();
             }
 
-            return new ClaimResult(claimed, dlqCandidates);
+            result = new ClaimResult(claimed, dlqCandidates);
         }
+        if (!result.claimed().isEmpty() || !result.dlqCandidates().isEmpty()) {
+            changed();
+        }
+        return result;
     }
 
     private boolean tryClaim(Message msg, int effectiveTimeout, int maxReceiveCount,
@@ -173,6 +201,7 @@ class GuardedMessageQueue {
     }
 
     Removal removeByReceiptHandle(ReceiptHandle handle, boolean fifo) {
+        Message removed;
         try (Guard _ = hold()) {
             Message msg = findByMessageId(handle.messageId());
             HandleResult result = checkHandle(msg, handle, fifo);
@@ -181,20 +210,26 @@ class GuardedMessageQueue {
             }
             messages.remove(msg);
             persist();
-            return new Removal(HandleResult.APPLIED, msg);
+            removed = msg;
         }
+        changed();
+        return new Removal(HandleResult.APPLIED, removed);
     }
 
     HandleResult changeVisibility(ReceiptHandle handle, int visibilityTimeout, boolean fifo) {
+        HandleResult result;
         try (Guard _ = hold()) {
             Message msg = findByMessageId(handle.messageId());
-            HandleResult result = checkHandle(msg, handle, fifo);
+            result = checkHandle(msg, handle, fifo);
             if (result == HandleResult.APPLIED) {
                 msg.setVisibleAt(Instant.now().plusSeconds(visibilityTimeout));
                 persist();
             }
-            return result;
         }
+        if (result == HandleResult.APPLIED) {
+            changed();
+        }
+        return result;
     }
 
     private Message findByMessageId(String messageId) {
@@ -225,13 +260,19 @@ class GuardedMessageQueue {
             messages.removeAll(toRemove);
             persist();
         }
+        changed();
     }
 
     void removeExpired(Instant cutoff) {
+        boolean removed;
         try (Guard _ = hold()) {
-            if (messages.removeIf(msg -> msg.isExpired(cutoff))) {
+            removed = messages.removeIf(msg -> msg.isExpired(cutoff));
+            if (removed) {
                 persist();
             }
+        }
+        if (removed) {
+            changed();
         }
     }
 
@@ -240,15 +281,18 @@ class GuardedMessageQueue {
             messages.clear();
             persist();
         }
+        changed();
     }
 
     List<Message> drainAll() {
+        List<Message> drained;
         try (Guard _ = hold()) {
-            List<Message> drained = new ArrayList<>(messages);
+            drained = new ArrayList<>(messages);
             messages.clear();
             persist();
-            return drained;
         }
+        changed();
+        return drained;
     }
 
     /** Remove and return the head message if {@code eligible} accepts it; otherwise leave the
@@ -256,14 +300,16 @@ class GuardedMessageQueue {
      *  hold so nothing can slip in between. Used by the message-move-task worker so the source
      *  queue stays observably populated for the duration of a rate-limited move. */
     Message drainFirstIf(Predicate<Message> eligible) {
+        Message head;
         try (Guard _ = hold()) {
             if (messages.isEmpty() || !eligible.test(messages.getFirst())) {
                 return null;
             }
-            Message head = messages.removeFirst();
+            head = messages.removeFirst();
             persist();
-            return head;
         }
+        changed();
+        return head;
     }
 
     /** Put a message that could not be delivered back at the head, preserving queue order. */
@@ -272,6 +318,7 @@ class GuardedMessageQueue {
             messages.addFirst(message);
             persist();
         }
+        available(List.of(message));
     }
 
     record MessageCounts(long visible, long inFlight, long delayed) {
@@ -339,6 +386,32 @@ class GuardedMessageQueue {
         return activity;
     }
 
+    /**
+     * The messages a consumer has to handle, in one pass that changes nothing: those visible and
+     * those in flight, and the earliest time a delayed one becomes visible. Messages sent before
+     * {@code cutoff} have expired and are skipped.
+     */
+    SqsService.QueueWork work(Instant cutoff) {
+        try (Guard _ = hold()) {
+            long visible = 0;
+            long inFlight = 0;
+            Instant nextVisible = null;
+            for (Message m : messages) {
+                if (m.isExpired(cutoff)) {
+                    continue;
+                }
+                if (m.isVisible()) {
+                    visible++;
+                } else if (m.getReceiptHandle() != null) {
+                    inFlight++;
+                } else if (nextVisible == null || m.getVisibleAt().isBefore(nextVisible)) {
+                    nextVisible = m.getVisibleAt();
+                }
+            }
+            return new SqsService.QueueWork(visible, inFlight, nextVisible);
+        }
+    }
+
     List<Message> peekAll() {
         try (Guard _ = hold()) {
             return new ArrayList<>(messages);
@@ -367,6 +440,36 @@ class GuardedMessageQueue {
 
     void close() {
         closed = true;
+    }
+
+    /** Whether the calling thread holds the queue's lock, for tests. */
+    boolean heldByCurrentThread() {
+        return lock.isHeldByCurrentThread();
+    }
+
+    /** Reports that messages of this queue changed. */
+    void changed() {
+        if (id != null) {
+            listener.messagesChanged(id);
+        }
+    }
+
+    /** Reports added messages, once, with the earliest time one of them can be received. */
+    private void available(List<Message> added) {
+        if (id == null || added.isEmpty()) {
+            return;
+        }
+        Instant at = null;
+        for (Message message : added) {
+            Instant from = message.getVisibleAt() != null ? message.getVisibleAt() : message.getSentTimestamp();
+            if (from == null) {
+                from = Instant.now();
+            }
+            if (at == null || from.isBefore(at)) {
+                at = from;
+            }
+        }
+        listener.messageAvailable(id, at);
     }
 
     private void persist() {

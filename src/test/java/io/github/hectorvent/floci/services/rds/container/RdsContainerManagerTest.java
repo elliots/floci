@@ -1,5 +1,6 @@
 package io.github.hectorvent.floci.services.rds.container;
 
+import com.fasterxml.jackson.databind.ObjectMapper;
 import com.github.dockerjava.api.DockerClient;
 import com.github.dockerjava.api.async.ResultCallback;
 import com.github.dockerjava.api.command.CopyArchiveToContainerCmd;
@@ -15,6 +16,7 @@ import com.github.dockerjava.api.command.PauseContainerCmd;
 import com.github.dockerjava.api.command.UnpauseContainerCmd;
 import com.github.dockerjava.api.model.Bind;
 import com.github.dockerjava.api.model.Frame;
+import com.github.dockerjava.api.model.Statistics;
 import com.github.dockerjava.api.model.StreamType;
 import io.github.hectorvent.floci.config.EmulatorConfig;
 import io.github.hectorvent.floci.core.common.RegionResolver;
@@ -59,6 +61,7 @@ import static org.junit.jupiter.api.Assertions.assertSame;
 import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 import static org.mockito.ArgumentMatchers.any;
+import static org.mockito.ArgumentMatchers.anyList;
 import static org.mockito.ArgumentMatchers.anyString;
 import static org.mockito.ArgumentMatchers.eq;
 import static org.mockito.Mockito.RETURNS_SELF;
@@ -554,9 +557,40 @@ class RdsContainerManagerTest {
         verify(lifecycleManager).create(spec.capture());
         assertEquals(dbPath.toString(), spec.getValue().binds().getFirst().getPath());
         assertEquals("floci-aws-rds-db1", spec.getValue().name());
-        verify(logStreamer).attachForAccount(
-                "222222222222", "container-id", "/aws/rds/instance/db1/error",
-                "log-stream", "us-west-2", "rds:" + runtimeId);
+        verify(logStreamer, never()).attachToDestinations(any(), any(), anyList(), any(), any(), any());
+    }
+
+    @Test
+    void exportLogsShipsFromTheStartThenFromNowAndOnlyWhenTheExportChanges() throws Exception {
+        EmulatorConfig config = config(tempDir.resolve("host-root"));
+        ContainerLifecycleManager lifecycleManager = mock(ContainerLifecycleManager.class);
+        stubStarts(lifecycleManager, new ContainerLifecycleManager.ContainerInfo(
+                "container-id", Map.of(3306, new ContainerLifecycleManager.EndpointInfo("db1", 3306))));
+        ContainerLogStreamer logStreamer = mock(ContainerLogStreamer.class);
+        Closeable first = mock(Closeable.class);
+        Closeable second = mock(Closeable.class);
+        when(logStreamer.attachToDestinations(any(), any(), anyList(), any(), any(), any())).thenReturn(first, second);
+        RdsContainerManager manager = new RdsContainerManager(
+                new ContainerBuilder(config, mock(DockerHostResolver.class), mock(EmbeddedDnsServer.class)),
+                lifecycleManager, logStreamer, mock(ContainerDetector.class), config,
+                new RegionResolver("us-east-1", "000000000000"), mock(ServiceConfigAccess.class));
+        String runtimeId = "arn:aws:rds:us-west-2:222222222222:db:db1";
+        manager.start(runtimeId, "db1", null, DatabaseEngine.MYSQL, "mysql:8.0", "root", "password", "db");
+        List<ContainerLogStreamer.LogDestination> errorLog =
+                List.of(new ContainerLogStreamer.LogDestination("/aws/rds/instance/db1/error", "db1"));
+
+        manager.exportLogs(runtimeId, new RdsLogExport("222222222222", "us-west-2", errorLog));
+        manager.exportLogs(runtimeId, new RdsLogExport("222222222222", "us-west-2", errorLog));
+        verify(logStreamer, times(1)).attachToDestinations(eq("222222222222"), eq("container-id"), eq(errorLog),
+                eq("us-west-2"), eq("rds:" + runtimeId), Mockito.isNull());
+
+        manager.exportLogs(runtimeId, new RdsLogExport("222222222222", "us-west-2", List.of()));
+        verify(first).close();
+        verify(logStreamer).attachToDestinations(eq("222222222222"), eq("container-id"), eq(List.of()),
+                eq("us-west-2"), eq("rds:" + runtimeId), Mockito.notNull());
+
+        manager.stop(manager.getActiveHandle(runtimeId));
+        verify(lifecycleManager).stopAndRemoveStrict("container-id", second);
     }
 
     @Test
@@ -1053,11 +1087,9 @@ class RdsContainerManagerTest {
                 new ContainerLifecycleManager.ContainerInfo(
                         "container-b", Map.of(3306,
                         new ContainerLifecycleManager.EndpointInfo("db1", 3307))));
+        doThrow(new IllegalStateException("start failed"))
+                .when(lifecycleManager).startCreated(eq("container-a"), any());
         ContainerLogStreamer logStreamer = mock(ContainerLogStreamer.class);
-        lenient().when(logStreamer.generateLogStreamName(any())).thenReturn("log-stream");
-        when(logStreamer.attachForAccount(any(), any(), any(), any(), any(), any()))
-                .thenThrow(new IllegalStateException("log attach failed"))
-                .thenReturn(null);
         RdsContainerManager manager = new RdsContainerManager(
                 new ContainerBuilder(config, mock(DockerHostResolver.class),
                         mock(EmbeddedDnsServer.class)),
@@ -1089,10 +1121,9 @@ class RdsContainerManagerTest {
                 new ContainerLifecycleManager.ContainerInfo(
                         "container-a", Map.of(3306,
                         new ContainerLifecycleManager.EndpointInfo("db1", 3306))));
+        doThrow(new IllegalStateException("start failed"))
+                .when(lifecycleManager).startCreated(eq("container-a"), any());
         ContainerLogStreamer logStreamer = mock(ContainerLogStreamer.class);
-        lenient().when(logStreamer.generateLogStreamName(any())).thenReturn("log-stream");
-        when(logStreamer.attachForAccount(any(), any(), any(), any(), any(), any()))
-                .thenThrow(new IllegalStateException("log attach failed"));
         doThrow(new IllegalStateException("Docker cleanup failed"))
                 .doNothing()
                 .when(lifecycleManager).stopAndRemoveStrict(any(), any());
@@ -1671,5 +1702,29 @@ class RdsContainerManagerTest {
             }
             return infos[infos.length - 1];
         });
+    }
+
+    @Test
+    void aSleepingDatabaseReportsNoCpu() throws Exception {
+        String json = """
+                {"cpu_stats":{"cpu_usage":{"total_usage":5000},"system_cpu_usage":900000,"online_cpus":2},
+                 "precpu_stats":{"cpu_usage":{"total_usage":5000},"system_cpu_usage":800000},
+                 "memory_stats":{"usage":0,"limit":2147483648}}""";
+
+        RdsContainerManager.ContainerUsage usage = RdsContainerManager.usageOf(new ObjectMapper().readValue(json, Statistics.class));
+
+        assertEquals(new RdsContainerManager.ContainerUsage(0, 0, 2147483648L), usage);
+    }
+
+    @Test
+    void cpuIsTheShareOfTheDaemonsCpuTimeAndMemoryLeavesOutThePageCache() throws Exception {
+        String json = """
+                {"cpu_stats":{"cpu_usage":{"total_usage":30000},"system_cpu_usage":1000000,"online_cpus":4},
+                 "precpu_stats":{"cpu_usage":{"total_usage":10000},"system_cpu_usage":800000},
+                 "memory_stats":{"usage":3000,"limit":10000,"stats":{"inactive_file":1000}}}""";
+
+        RdsContainerManager.ContainerUsage usage = RdsContainerManager.usageOf(new ObjectMapper().readValue(json, Statistics.class));
+
+        assertEquals(new RdsContainerManager.ContainerUsage(10.0, 2000, 10000), usage);
     }
 }

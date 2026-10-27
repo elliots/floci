@@ -22,6 +22,7 @@ import javax.net.ssl.TrustManager;
 import javax.net.ssl.X509TrustManager;
 import java.io.IOException;
 import java.io.Serializable;
+import java.net.URI;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.nio.file.Paths;
@@ -29,6 +30,7 @@ import java.security.cert.X509Certificate;
 import java.time.Duration;
 import java.util.Optional;
 import java.util.function.Function;
+import java.util.function.Supplier;
 
 /**
  * CDI producer for the DockerClient beans.
@@ -506,6 +508,59 @@ public class DockerClientProducer {
                 .responseTimeout(apiTimeout)
                 .connectionRequestTimeout(connectionRequestTimeout)
                 .build();
+    }
+
+    /**
+     * A DockerClient for a daemon that an HTTP API serves under a path, such as the dockerd of a
+     * smolvm-pods node behind its node service's {@code /docker} route. It is built as the CDI
+     * clients are, with the pool sizes and timeouts of {@code floci.docker.*}, and sends
+     * {@code authorization} as the {@code Authorization} header of every request.
+     *
+     * @param apiBaseUrl    the API's {@code http} or {@code https} URL, a host and a port
+     * @param pathPrefix    where the API serves the daemon, such as {@code /docker}
+     * @param authorization the header's value, read for each request
+     * @param streaming     a client for log follows ({@link StreamingDocker}), else one for short calls
+     */
+    public DockerClient remoteDockerClient(URI apiBaseUrl, String pathPrefix, Supplier<String> authorization,
+                                           boolean streaming) {
+        int port = apiBaseUrl.getPort() > 0 ? apiBaseUrl.getPort()
+                : "https".equalsIgnoreCase(apiBaseUrl.getScheme()) ? 443 : 80;
+        URI dockerHost = URI.create("tcp://" + apiBaseUrl.getHost() + ":" + port + pathPrefix);
+        DefaultDockerClientConfig clientConfig = new DefaultDockerClientConfig.Builder()
+                .withDockerHost(dockerHost.toString())
+                .build();
+        String role = streaming ? "streaming" : "control-plane";
+        int maxConnections = streaming
+                ? validateStreamingMaxConnections(config.docker().streamingMaxConnections())
+                : validateMaxConnections(config.docker().maxConnections());
+        LOG.infov("Creating {0} DockerClient pool (maxConnections={1}) for {2}{3}",
+                role, maxConnections, apiBaseUrl, pathPrefix);
+        FlociDockerHttpClient transport = new FlociDockerHttpClient.Builder()
+                .dockerHost(dockerHost)
+                .sslConfig("https".equalsIgnoreCase(apiBaseUrl.getScheme()) ? new DefaultTrustSslConfig() : null)
+                .maxConnections(maxConnections)
+                .connectionTimeout(Duration.ofSeconds(30))
+                .responseTimeout(Duration.ofSeconds(validateApiTimeoutSeconds(config.docker().apiTimeoutSeconds())))
+                .connectionRequestTimeout(Duration.ofSeconds(validateConnectionRequestTimeoutSeconds(
+                        config.docker().connectionRequestTimeoutSeconds())))
+                .authorization(authorization)
+                .build();
+        return DockerClientImpl.getInstance(clientConfig, wrapForRole(transport, role));
+    }
+
+    /** TLS that checks the server's certificate against the JVM's default trust. */
+    private static final class DefaultTrustSslConfig implements SSLConfig, Serializable {
+
+        private static final long serialVersionUID = 1L;
+
+        @Override
+        public SSLContext getSSLContext() {
+            try {
+                return SSLContext.getDefault();
+            } catch (Exception e) {
+                throw new DockerClientException(e.getMessage(), e);
+            }
+        }
     }
 
     /**

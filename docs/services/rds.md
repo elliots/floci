@@ -276,6 +276,8 @@ they belong to, as the model requires. An omitted `Enabled` activates the subscr
 | `FLOCI_SERVICES_RDS_PROXY_MAX_CONNECTIONS` | `100` | Max concurrent connections per proxy before new ones are refused |
 | `FLOCI_SERVICES_RDS_AURORA_AUTO_PAUSE_ENABLED` | `true` | Pause an Aurora Serverless v2 cluster whose `MinCapacity` is 0 after `SecondsUntilAutoPause` without connections; see [Automatic pause and resume](#automatic-pause-and-resume) |
 | `FLOCI_SERVICES_RDS_AURORA_RESUME_DELAY_MILLIS` | `0` | How long the first connection to a paused cluster is held while it resumes; Aurora takes about `15000` |
+| `FLOCI_SERVICES_RDS_SMOLVM_ENABLED` | `false` | Run every database container as a hibernating microVM on the Floci node, which Floci creates on first use when the runtime file lists none; see [Databases on a smolvm-pods node](#databases-on-a-smolvm-pods-node) |
+| `FLOCI_SERVICES_RDS_SMOLVM_IDLE_TIMEOUT` | _(empty)_ | How long a database has no traffic before it sleeps, a duration from `10s` to `24h` such as `2m`; empty takes the node's own idle timeout (`5m` by default) |
 
 ### Docker Compose
 
@@ -379,6 +381,88 @@ services:
     (`InvalidDBProxyEndpointStateFault`). Endpoint names are unique per account and Region, a proxy
     holds at most 20 endpoints (`DBProxyEndpointQuotaExceededFault`), and an endpoint with no
     `VpcSecurityGroupIds` gets its VPC's default security group.
+
+## Databases on a smolvm-pods node
+
+With `FLOCI_SERVICES_RDS_SMOLVM_ENABLED=true`, Floci runs every database container, of every
+engine and of instances and Aurora clusters alike, on a smolvm-pods node (`tools/smolvm-pods`)
+instead of its own Docker: each in a microVM of its own that sleeps when no client has used it for
+the idle timeout and wakes when one connects, its memory intact. The RDS API, the endpoints and
+the proxy are unchanged; only where the database runs moves.
+
+```bash
+export FLOCI_SERVICES_RDS_SMOLVM_ENABLED=true
+export FLOCI_SERVICES_RDS_SMOLVM_IDLE_TIMEOUT=2m
+# Either the runtime file declares the node,
+export FLOCI_RUNTIME_CONFIG_FILE=$HOME/.floci/runtime.yaml
+# or Floci creates it, natively on an Apple silicon Mac:
+export FLOCI_RUNTIME_NODE_NODE_VM_SCRIPT=$PWD/tools/smolvm-pods/scripts/node-vm.sh
+export FLOCI_RUNTIME_NODE_SMOLVM_SRC=$(cd .. && pwd)/smolvm
+export FLOCI_RUNTIME_NODE_IMAGE=$PWD/tools/smolvm-pods/target/node/node-image.tar
+export FLOCI_RUNTIME_NODE_IMAGE_SHA256=$(shasum -a 256 "$FLOCI_RUNTIME_NODE_IMAGE" | cut -d' ' -f1)
+```
+
+**The node.** The databases run on [the Floci node](../configuration/smolvm-runtime.md#the-floci-node),
+which RDS shares with EKS: the runtime file's node, or the one Floci creates. When there is none,
+the first `CreateDBInstance` or `CreateDBCluster` has Floci create it and answers at once: the
+instance or cluster is `creating` until the node and its dockerd are ready, and then its database
+starts and it becomes `available`: on an M4 Max, a PostgreSQL instance created first was
+`available` 30 seconds after the create, of which the node took 12. It becomes
+`failed` when the node fails. A `CreateDBInstance` into a cluster that is `creating` this way is
+accepted, as AWS accepts a member of a creating cluster: the member is `creating` too and starts
+with its cluster, so a CloudFormation or CDK stack with a `DBCluster` and its `DBInstance` completes
+on the node's first use. When Floci cannot create the node, because a setting is missing or it
+does not run natively on an Apple silicon Mac, `CreateDBInstance` fails with
+`InsufficientDBInstanceCapacity` and `CreateDBCluster` with `InsufficientDBClusterCapacityFault`,
+with a message that names each problem; nothing is created. The node stays when the last database
+goes. After a Floci restart with persistent storage, each instance and cluster keeps its endpoint
+port at once, and those that ran a database are `creating` until the node is adopted, started or
+created again and their database runs; a stopped one stays `stopped`. A database created meanwhile
+gets another port.
+
+**How Floci reaches it.** Floci calls the node's dockerd through the node service's Docker proxy
+and connects to each database through the node service's tunnels, both on the node's API with its
+bearer token, so the node publishes nothing else (`tools/smolvm-pods/docs/configuration.md`,
+"Docker and tunnels"). Each container is created with `HostConfig.Runtime`
+`io.containerd.smolvm-pods.v2` and the annotations `smolvm-pods.floci.io/hibernate: "true"` and,
+when set, `smolvm-pods.floci.io/idle-timeout`, on the node's default bridge, with no published
+port. The proxy behind each endpoint opens a tunnel to the database's address on that bridge for
+every client connection, so a connection to a sleeping database wakes it; the client waits for
+the wake, typically well under a second, and then authenticates as usual.
+
+**Images.** When the node's dockerd does not have an image, Floci makes sure its own Docker has it,
+pulling it as for any container (with `FLOCI_DOCKER_REGISTRY_CREDENTIALS` and
+`FLOCI_DOCKER_IMAGE_REGISTRY_BASE`), saves it there and loads it into the node's dockerd through the
+proxy, so the node needs no registry. The image must be for the node's architecture, arm64 on a
+Mac. When Floci's Docker cannot give the image, the node's dockerd pulls it itself.
+
+**Data.** Each database keeps its data in a named Docker volume on the node, removed or kept on
+delete as [Persistence](#persistence) says. `FLOCI_STORAGE_HOST_PERSISTENT_PATH` does not apply:
+Floci logs a warning once and uses named volumes on the node. The volumes go with the node: a
+deleted node takes its databases' data along.
+
+**Watching the databases.** The Docker CLI reaches the node's dockerd with
+`node-vm.sh docker-env`, for `docker ps`, `docker logs` and `docker exec` on the databases, and the
+node's admin UI and events show each one sleep and wake
+([Using the Floci node day to day](../configuration/smolvm-node.md)).
+
+**Sleep and liveness.** The node puts an idle database to sleep; Floci's Docker-pause auto-pause of
+Aurora Serverless v2 is off for databases on a node (the node's runtime has no `docker pause`), and
+`SecondsUntilAutoPause` does not apply there. A describe reads a database's state from the node's
+record of its microVM, which does not wake it: a sleeping database is `available`, and one whose
+microVM failed is `failed`.
+
+| Feature | On a smolvm-pods node |
+|---|---|
+| Connections through the endpoint, with password or IAM authentication, and TLS to the proxy | Work as without a node; the first connection to a sleeping database wakes it |
+| Snapshots, restores, point in time restores and read replicas of PostgreSQL | Work; Floci runs `pg_dumpall` and `psql` in the database's microVM, which wakes it. A restore writes the dump into the microVM through exec, in 64 KiB pieces, because Docker's archive upload does not reach a running microVM |
+| MySQL and MariaDB master users | Work; the grant script goes into the container before it starts, which the microVM sees |
+| `ModifyDBInstance` and `ModifyDBCluster` master password rotation | Works; it runs in the microVM, which wakes it |
+| Aurora clusters and their members | Work; members share the cluster's microVM. A Serverless v2 cluster sleeps on the node's idle timeout, not on `SecondsUntilAutoPause` |
+| Log files (`DescribeDBLogFiles`, `DownloadDBLogFilePortion`) and [CloudWatch Logs export](#cloudwatch-logs-export) | Work, from dockerd's log of the container, without waking it. A follow of that log that the node drops follows again from its last line |
+| [CloudWatch metrics](#cloudwatch-metrics) | Work without waking a database: the node answers `docker stats` from its last sample, and a sleeping database reports 0 CPU. No `FreeStorageSpace`: the microVM writes to its own copy of the volume |
+| RDS Data API (`rds-data`) | Works; each connection goes through the node service's tunnel, as the proxy's do, through a relay on Floci's loopback, so a statement to a sleeping database wakes it |
+| `FLOCI_SERVICES_RDS_DOCKER_NETWORK` | Does not apply: the databases are on the node's default bridge |
 
 ## Aurora Serverless v2 scaling
 
@@ -768,6 +852,46 @@ Control characters XML cannot carry (a terminal colour code) come back as U+FFFD
 An instance that is not available, or whose database container cannot be found or started, is
 `DBInstanceNotReady`, and an unknown file name `DBLogFileNotFoundFault`. Negative `FileSize`,
 `FileLastWritten` or `Marker` values are `InvalidParameterValue`. In mock RDS mode there is no container, so an instance has no log files.
+
+## CloudWatch Logs export
+
+`EnableCloudwatchLogsExports` on `CreateDBInstance` and `CreateDBCluster`, and
+`CloudwatchLogsExportConfiguration` on `ModifyDBInstance` and `ModifyDBCluster`, choose the log
+types a database ships to CloudWatch Logs, and `EnabledCloudwatchLogsExports` reports them. Floci
+ships the output of the database container, which is one log type:
+
+| Engine | Shipped | Accepted, not shipped |
+|---|---|---|
+| PostgreSQL, Aurora PostgreSQL | `postgresql` | `upgrade` |
+| MySQL, MariaDB, Aurora MySQL | `error` | `general`, `slowquery`, `audit` |
+| SQL Server | `error` | `agent` |
+
+As on AWS, a DB instance ships to the log group `/aws/rds/instance/ID/TYPE`, stream `ID`, and an
+Aurora cluster to `/aws/rds/cluster/CLUSTER/TYPE`, one stream per member instance, named by its
+id. The members share the cluster's database, so each stream gets the same lines. A database
+ships its output from its start, and a modify that turns a type on or off takes effect at once,
+for the lines written from then on. The groups and streams are in the account and region of the
+instance or cluster. Every line also goes to the Floci console. Mock RDS mode has no container,
+so it ships nothing.
+
+## CloudWatch metrics
+
+Each minute Floci sends CloudWatch the `AWS/RDS` metrics of every available DB instance, with the
+dimension `DBInstanceIdentifier`, and those of each Aurora cluster with `DBClusterIdentifier`:
+
+| Metric | Unit | From |
+|---|---|---|
+| `DatabaseConnections` | Count | The client connections the proxies of the instance's endpoint hold, and for the writer those of the cluster endpoint. A cluster sums its members |
+| `CPUUtilization` | Percent | One `docker stats` sample of the database container: its share of the daemon's CPU time |
+| `FreeableMemory` | Bytes | The same sample: the container's memory limit less what it uses, without the page cache |
+| `FreeStorageSpace` | Bytes | `AllocatedStorage` less the bytes in the database's Docker volume, from `docker system df`. Not for Aurora, not for a database whose data is a host directory rather than a volume, and not on a smolvm-pods node, where the database's microVM writes to its own copy of the volume, which `docker system df` does not see |
+
+A sample is stamped with the minute that ended, and datapoints older than 15 days are dropped.
+None of these wakes a database on a [smolvm-pods node](#databases-on-a-smolvm-pods-node): the
+node answers `docker stats` from its last sample of the microVM, and a sleeping database reports
+0 CPU. A paused Aurora Serverless v2 cluster also reports zero `ServerlessDatabaseCapacity`,
+`ACUUtilization` and `CPUUtilization` ([Automatic pause and resume](#automatic-pause-and-resume)).
+Mock RDS mode sends no metrics, and none are sent while CloudWatch Metrics is disabled.
 
 ## IAM role associations
 

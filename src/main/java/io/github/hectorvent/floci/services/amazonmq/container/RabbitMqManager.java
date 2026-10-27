@@ -1,12 +1,17 @@
 package io.github.hectorvent.floci.services.amazonmq.container;
 
+import com.fasterxml.jackson.core.JsonProcessingException;
+import com.fasterxml.jackson.databind.JsonNode;
+import com.fasterxml.jackson.databind.ObjectMapper;
 import io.github.hectorvent.floci.config.EmulatorConfig;
 import io.github.hectorvent.floci.core.common.AwsArnUtils;
 import io.github.hectorvent.floci.core.common.RegionResolver;
 import io.github.hectorvent.floci.core.common.docker.ContainerBuilder;
 import io.github.hectorvent.floci.core.common.docker.ContainerDetector;
+import io.github.hectorvent.floci.core.common.docker.ContainerExec;
 import io.github.hectorvent.floci.core.common.docker.ContainerLifecycleManager;
 import io.github.hectorvent.floci.core.common.docker.ContainerLifecycleManager.ContainerInfo;
+import io.github.hectorvent.floci.core.common.docker.ContainerLifecycleManager.ContainerPresence;
 import io.github.hectorvent.floci.core.common.docker.ContainerLifecycleManager.EndpointInfo;
 import io.github.hectorvent.floci.core.common.docker.ContainerLogStreamer;
 import io.github.hectorvent.floci.core.common.docker.ContainerSpec;
@@ -23,8 +28,12 @@ import java.io.Closeable;
 import java.net.HttpURLConnection;
 import java.net.URI;
 import java.util.ArrayList;
+import java.util.Collections;
+import java.util.LinkedHashMap;
+import java.util.LinkedHashSet;
 import java.util.List;
 import java.util.Map;
+import java.util.Set;
 import java.util.concurrent.ConcurrentHashMap;
 
 /**
@@ -47,6 +56,16 @@ public class RabbitMqManager {
     private static final Logger LOG = Logger.getLogger(RabbitMqManager.class);
     private static final int AMQP_PORT = 5672;
     private static final int MGMT_PORT = 15672;
+    private static final int COMMAND_TIMEOUT_SECONDS = 10;
+    private static final long EXIT_ALREADY_EXISTS = 70;
+    private static final long EXIT_NO_SUCH_VIRTUAL_HOST = 69;
+    /** Configure on its own server-named queues. */
+    private static final String WAKE_USER_CONFIGURE = "^amq\\.gen-.*";
+    /** Write on its own server-named queues, and on the default exchange that their dead letters go through. */
+    private static final String WAKE_USER_WRITE = "^(amq\\.gen-.*|amq\\.default)$";
+    /** Read on its own server-named queues and on the trace and event exchanges. */
+    private static final String WAKE_USER_READ = "^(amq\\.rabbitmq\\.(trace|event)|amq\\.gen-.*)$";
+    private static final ObjectMapper JSON = new ObjectMapper();
 
     private final ContainerBuilder containerBuilder;
     private final ContainerLifecycleManager lifecycleManager;
@@ -64,6 +83,24 @@ public class RabbitMqManager {
 
     /** The pair of host ports a broker's container is published on. */
     record HostPorts(int amqp, int console) {}
+
+    /** A virtual host of a broker, and whether the broker traces it to {@code amq.rabbitmq.trace}. */
+    public record VirtualHost(String name, boolean tracing) {}
+
+    /** A queue's messages that wait for a consumer, and those delivered and not yet acknowledged. */
+    public record QueueCounts(long ready, long unacknowledged) {}
+
+    /**
+     * The counts of a virtual host's queues, by name, and the names of the queues that have none,
+     * such as a crashed classic queue or a quorum queue with no leader.
+     */
+    public record VirtualHostQueues(Map<String, QueueCounts> counts, Set<String> down) {
+
+        public VirtualHostQueues {
+            counts = Collections.unmodifiableMap(new LinkedHashMap<>(counts));
+            down = Collections.unmodifiableSet(new LinkedHashSet<>(down));
+        }
+    }
 
     @Inject
     public RabbitMqManager(ContainerBuilder containerBuilder,
@@ -224,6 +261,141 @@ public class RabbitMqManager {
                 conn.disconnect();
             }
         }
+    }
+
+    /** Whether this Floci run started the broker's container and has not stopped it. */
+    public boolean running(String brokerId) {
+        return containerIds.containsKey(brokerId);
+    }
+
+    /**
+     * Where the broker's container stands: absent when Floci stopped it or Docker no longer has
+     * it, stopped when it exited or was stopped and is still there. One inspect.
+     */
+    public ContainerPresence containerPresence(String brokerId) {
+        String containerId = containerIds.get(brokerId);
+        return containerId == null ? ContainerPresence.ABSENT : lifecycleManager.presenceOf(containerId);
+    }
+
+    /** The broker's virtual hosts and their tracing, from {@code rabbitmqctl list_vhosts}. */
+    public List<VirtualHost> virtualHosts(String brokerId) {
+        ContainerExec.Result result = rabbitmqctl(brokerId, "list_vhosts", "--silent", "--formatter", "json",
+                "name", "tracing");
+        try {
+            JsonNode list = JSON.readTree(result.stdout());
+            if (list == null || !list.isArray()) {
+                throw new IllegalStateException("rabbitmqctl list_vhosts printed no list: " + result.summary());
+            }
+            List<VirtualHost> hosts = new ArrayList<>();
+            for (JsonNode host : list) {
+                hosts.add(new VirtualHost(host.path("name").asText(), host.path("tracing").asBoolean()));
+            }
+            return hosts;
+        } catch (JsonProcessingException e) {
+            throw new IllegalStateException("rabbitmqctl list_vhosts printed invalid JSON: " + result.summary(), e);
+        }
+    }
+
+    /**
+     * The counts of every queue of a virtual host from {@code rabbitmqctl list_queues}: the
+     * queues' own counts at this moment, unlike the management API's statistics, which lag them
+     * by up to two statistics intervals. Empty for a virtual host that does not exist.
+     */
+    public VirtualHostQueues queueCounts(String brokerId, String virtualHost) {
+        ContainerExec.Result result = rabbitmqctl(brokerId, "list_queues", "-p", virtualHost, "--silent",
+                "--formatter", "json", "name", "messages_ready", "messages_unacknowledged");
+        return virtualHostQueues(result.stdout(), result.summary());
+    }
+
+    /** Reads what {@code rabbitmqctl list_queues --formatter json} printed; {@code summary} names it in a failure. */
+    static VirtualHostQueues virtualHostQueues(String stdout, String summary) {
+        try {
+            JsonNode list = JSON.readTree(stdout);
+            if (list == null || !list.isArray()) {
+                throw new IllegalStateException("rabbitmqctl list_queues printed no list: " + summary);
+            }
+            Map<String, QueueCounts> counts = new LinkedHashMap<>();
+            Set<String> down = new LinkedHashSet<>();
+            for (JsonNode queue : list) {
+                String name = queue.path("name").asText();
+                JsonNode ready = queue.path("messages_ready");
+                JsonNode unacknowledged = queue.path("messages_unacknowledged");
+                if (ready.canConvertToLong() && unacknowledged.canConvertToLong()) {
+                    counts.put(name, new QueueCounts(ready.asLong(), unacknowledged.asLong()));
+                } else {
+                    down.add(name);
+                }
+            }
+            return new VirtualHostQueues(counts, down);
+        } catch (JsonProcessingException e) {
+            throw new IllegalStateException("rabbitmqctl list_queues printed invalid JSON: " + summary, e);
+        }
+    }
+
+    /** Turns the firehose on for a virtual host: the broker copies its publishes and deliveries to {@code amq.rabbitmq.trace}. */
+    public void traceOn(String brokerId, String virtualHost) {
+        rabbitmqctl(brokerId, "trace_on", "-p", virtualHost);
+    }
+
+    public void traceOff(String brokerId, String virtualHost) {
+        rabbitmqctl(brokerId, "trace_off", "-p", virtualHost);
+    }
+
+    /** Adds the user that wakes consumers, with no tags and this password, or sets the password of the user that is there. */
+    public void addWakeUser(String brokerId, String username, String password) {
+        ContainerExec.Result added = exec(brokerId, "rabbitmqctl", "add_user", username, password);
+        if (added.exitCode() == EXIT_ALREADY_EXISTS) {
+            rabbitmqctl(brokerId, "change_password", username, password);
+        } else {
+            check(added, "add_user");
+        }
+    }
+
+    /**
+     * Lets the user that wakes consumers declare and consume its own server-named queues in a
+     * virtual host, and bind them to the trace and event exchanges. Returns false when the
+     * virtual host does not exist.
+     */
+    public boolean grantWakeUser(String brokerId, String virtualHost, String username) {
+        ContainerExec.Result result = exec(brokerId, "rabbitmqctl", "set_permissions", "-p", virtualHost, username,
+                WAKE_USER_CONFIGURE, WAKE_USER_WRITE, WAKE_USER_READ);
+        if (result.exitCode() == EXIT_NO_SUCH_VIRTUAL_HOST) {
+            return false;
+        }
+        check(result, "set_permissions");
+        return true;
+    }
+
+    public void deleteWakeUser(String brokerId, String username) {
+        rabbitmqctl(brokerId, "delete_user", username);
+    }
+
+    /** Enables {@code rabbitmq_event_exchange}, which publishes the broker's events, such as {@code vhost.created}, to {@code amq.rabbitmq.event}. */
+    public void enableEventExchange(String brokerId) {
+        check(exec(brokerId, "rabbitmq-plugins", "enable", "rabbitmq_event_exchange"), "rabbitmq-plugins");
+    }
+
+    private ContainerExec.Result rabbitmqctl(String brokerId, String... args) {
+        String[] command = new String[args.length + 1];
+        command[0] = "rabbitmqctl";
+        System.arraycopy(args, 0, command, 1, args.length);
+        return check(exec(brokerId, command), args[0]);
+    }
+
+    private ContainerExec.Result exec(String brokerId, String... command) {
+        String containerId = containerIds.get(brokerId);
+        if (containerId == null) {
+            throw new IllegalStateException("Floci runs no container for broker " + brokerId);
+        }
+        return ContainerExec.run(lifecycleManager.getDockerClient(), containerId, command, COMMAND_TIMEOUT_SECONDS)
+                .throwIfTimedOut(containerId);
+    }
+
+    private static ContainerExec.Result check(ContainerExec.Result result, String command) {
+        if (result.exitCode() != 0) {
+            throw new IllegalStateException(command + " exited with " + result.exitCode() + ": " + result.summary());
+        }
+        return result;
     }
 
     public void stopContainer(Broker broker) {

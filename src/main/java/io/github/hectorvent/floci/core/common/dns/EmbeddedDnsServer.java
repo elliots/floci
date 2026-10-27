@@ -397,7 +397,7 @@ public class EmbeddedDnsServer {
      * today. A source that throws must not take the DNS server down with it: the query falls
      * through to the upstream resolvers, which is what happened before any source existed.
      */
-    private Optional<DnsAnswer> resolveFromRecordSources(String name, int type) {
+    Optional<DnsAnswer> resolveFromRecordSources(String name, int type) {
         return resolveFromRecordSources(name, type, false);
     }
 
@@ -830,7 +830,7 @@ public class EmbeddedDnsServer {
     }
 
     /** End offset of the query's single question (name, type, class), or -1 if it is malformed. */
-    private static int questionEnd(byte[] query) {
+    static int questionEnd(byte[] query) {
         int pos = 12;
         while (pos < query.length && query[pos] != 0) {
             pos += 1 + (query[pos] & 0xFF);
