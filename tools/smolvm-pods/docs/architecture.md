@@ -944,7 +944,11 @@ first bytes for a TLS server name or an HTTP `Host`, picks the route with an exa
 the wildcard with the longest domain, ends TLS with a leaf for the name that it signs with the
 profile's issuer, a name-constrained intermediate of Floci's CA, and splices to the route's
 backend, which it dials from the node address, so that a sleeping simulator wakes on the relay's
-SYN. The sinkhole (`network/sinkhole.rs`) accepts and resets each TCP connection and drops each
+SYN. It waits up to 30 s for a client's first bytes (a Node client in a starved pod can connect
+and send its ClientHello seconds later) and 2 s for the rest of the hello. A client that sends
+nothing, or stalls inside a TLS record, is closed without a word: a plain-text 502 on a TLS
+connection reads as `write EPROTO ... wrong version number`. Only a client that spoke HTTP gets
+the text answers. The sinkhole (`network/sinkhole.rs`) accepts and resets each TCP connection and drops each
 datagram; the original destination comes from `SO_ORIGINAL_DST` or conntrack, and the TLS server
 name or `Host` from a short peek. Blocked and relayed attempts are counted per pod, kind,
 destination, port and protocol over a minute in `.node/network-events.jsonl`, rotated at 8 MiB.
