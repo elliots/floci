@@ -197,8 +197,10 @@ setup_node_network() {
     printf 'nameserver %s\n' "$node_address" >"$pod_resolv"
     mkdir -p "${network_dropin%/*}"
     printf 'resolv-conf: %s\n' "$pod_resolv" >"$network_dropin"
+    # A valid image-owned symlink is preserved when smolvm prepares an
+    # interactive exec. A regular file would be reset to the guest gateway.
     rm -f /etc/resolv.conf
-    printf 'nameserver %s\n' "$node_address" >/etc/resolv.conf
+    ln -s "$pod_resolv" /etc/resolv.conf
     if ! smolvm-pods _network-boot; then
         log "warning: the node address and its table are not set up; pods have no DNS" \
             "until the node service starts its network"
