@@ -11,6 +11,8 @@ import io.github.hectorvent.floci.config.EmulatorConfig;
 import io.github.hectorvent.floci.config.TlsConfigSource;
 import io.github.hectorvent.floci.core.common.AwsException;
 import io.github.hectorvent.floci.core.common.docker.LaunchedContainerAwsEnv;
+import io.github.hectorvent.floci.services.ecr.registry.EcrRegistryManager;
+import io.github.hectorvent.floci.services.ecr.registry.NodeRegistryBackend.ImageMetadata;
 import io.github.hectorvent.floci.services.lambda.LambdaLayerFixtures;
 import io.github.hectorvent.floci.services.lambda.LambdaLayerService;
 import io.github.hectorvent.floci.services.lambda.launcher.ContainerHandle;
@@ -61,6 +63,7 @@ import static org.mockito.Mockito.mock;
 import static org.mockito.Mockito.never;
 import static org.mockito.Mockito.spy;
 import static org.mockito.Mockito.verify;
+import static org.mockito.Mockito.verifyNoInteractions;
 import static org.mockito.Mockito.when;
 
 /**
@@ -226,6 +229,52 @@ class KubernetesPodLauncherTest {
             pod.setStatus(new PodStatusBuilder().withPhase(phase).build());
             client.pods().inNamespace("default").resource(pod).updateStatus();
         });
+    }
+
+    @Test
+    void nodeRegistryImageCommandSuppliesTheImageHandler() {
+        EcrRegistryManager registry = mock(EcrRegistryManager.class);
+        String image = "localhost:4566/000000000000/us-east-1/function:1";
+        when(registry.nodeImageMetadata(image)).thenReturn(Optional.of(new ImageMetadata(List.of("app.handler"), "sha256:abc")));
+        KubernetesPodLauncher withRegistry = new KubernetesPodLauncher(apiClient, config, runtimeApiServerFactory,
+                imageResolver, addressResolver, awsEnv, layerService, new LambdaPodSpecFactory(config),
+                logStreamer, s3Service, presignGenerator, registry);
+        LambdaFunction fn = function();
+        fn.setPackageType("Image");
+        fn.setImageUri(image);
+        fn.setHandler(null);
+        markPodPhaseInBackground("floci-lambda-my-fn-", "Running");
+
+        ContainerHandle handle = withRegistry.launch(fn);
+
+        Pod pod = client.pods().inNamespace("default").withName(handle.getContainerId()).get();
+        assertThat(pod.getSpec().getContainers().getFirst().getImage())
+                .isEqualTo("localhost:4566/000000000000/us-east-1/function@sha256:abc");
+        assertThat(pod.getSpec().getContainers().getFirst().getEnv())
+                .filteredOn(variable -> "_HANDLER".equals(variable.getName()))
+                .extracting(EnvVar::getValue).containsExactly("app.handler");
+    }
+
+    @Test
+    void explicitImageCommandSuppliesHandlerWithoutInspectingRegistry() {
+        EcrRegistryManager registry = mock(EcrRegistryManager.class);
+        KubernetesPodLauncher withRegistry = new KubernetesPodLauncher(apiClient, config, runtimeApiServerFactory,
+                imageResolver, addressResolver, awsEnv, layerService, new LambdaPodSpecFactory(config),
+                logStreamer, s3Service, presignGenerator, registry);
+        LambdaFunction fn = function();
+        fn.setPackageType("Image");
+        fn.setImageUri("example.com/image:1");
+        fn.setHandler(null);
+        fn.setImageConfigCommand(List.of("override.handler"));
+        markPodPhaseInBackground("floci-lambda-my-fn-", "Running");
+
+        ContainerHandle handle = withRegistry.launch(fn);
+
+        Pod pod = client.pods().inNamespace("default").withName(handle.getContainerId()).get();
+        assertThat(pod.getSpec().getContainers().getFirst().getEnv())
+                .filteredOn(variable -> "_HANDLER".equals(variable.getName()))
+                .extracting(EnvVar::getValue).containsExactly("override.handler");
+        verifyNoInteractions(registry);
     }
 
     @ParameterizedTest

@@ -152,6 +152,9 @@ public class ElastiCacheSmolvmBackend {
 
     /** Host Docker supplies the archive; an isolated node cannot pull external images itself. */
     public void ensureImage(Target target, String image) {
+        if (config.services().ecr().smolvmEnabled() && image.startsWith("localhost:5000/")) {
+            return; // The node's dockerd pulls from its local registry during container creation.
+        }
         DockerClient docker = target.clients().control();
         Object lock = imageLocks.computeIfAbsent(target.node().name() + "|" + image, key -> new Object());
         synchronized (lock) {

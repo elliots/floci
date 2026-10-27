@@ -69,6 +69,11 @@ public class ContainerBuilder {
         return new Builder(resolveImage(image), config, dockerHostResolver, embeddedDnsServer, currentContainerNetworkResolver);
     }
 
+    /** Creates a spec for a reference already resolved to the target daemon's local registry. */
+    public Builder newContainerResolved(String image) {
+        return new Builder(image, config, dockerHostResolver, embeddedDnsServer, currentContainerNetworkResolver);
+    }
+
     /**
      * The Docker network a spec built with {@link Builder#withDockerNetwork} would land on: the
      * service's own setting, else the global default, else the network Floci itself is attached

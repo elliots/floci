@@ -60,7 +60,11 @@ public class DockerAvailabilityReport {
 
     void report() {
         Set<String> enabled = Set.copyOf(serviceRegistry.getEnabledServices());
-        List<String> metadataOnly = METADATA_ONLY.stream().filter(enabled::contains).toList();
+        List<String> metadataOnly = METADATA_ONLY.stream().filter(enabled::contains)
+                .filter(service -> !runsWithoutLocalDocker(service))
+                .map(service -> "elasticache".equals(service) && config.services().elasticache().smolvm().enabled()
+                        ? "elasticache (Memcached)" : service)
+                .toList();
         List<String> failOnUse = failOnUse(enabled);
         if (metadataOnly.isEmpty() && failOnUse.isEmpty()) {
             return;
@@ -87,7 +91,11 @@ public class DockerAvailabilityReport {
     /** A service whose container work goes somewhere other than the local daemon. */
     boolean runsWithoutLocalDocker(String service) {
         return switch (service) {
-            case "lambda" -> "kubernetes".equalsIgnoreCase(config.services().lambda().executor().trim());
+            case "lambda" -> "kubernetes".equalsIgnoreCase(config.services().lambda().executor().trim())
+                    || config.services().lambda().smolvm().enabled();
+            case "rds" -> config.services().rds().smolvm().enabled();
+            case "eks" -> "smolvm-pods".equalsIgnoreCase(config.services().eks().provider());
+            case "ecr" -> config.services().ecr().smolvmEnabled();
             case "athena" -> isSet(config.services().duck().url());
             case "verifiedpermissions" -> isSet(config.services().verifiedpermissions().cedarUrl());
             default -> false;

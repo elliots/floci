@@ -8,6 +8,8 @@ floci runs natively on a Mac. With these settings it runs one smolvm-pods node V
 FLOCI_SERVICES_EKS_PROVIDER=smolvm-pods
 FLOCI_SERVICES_RDS_SMOLVM_ENABLED=true
 FLOCI_SERVICES_LAMBDA_SMOLVM_ENABLED=true
+FLOCI_SERVICES_ELASTICACHE_SMOLVM_ENABLED=true
+FLOCI_SERVICES_ECR_SMOLVM_ENABLED=true
 ```
 
 The node is isolated (`--isolate`):
@@ -24,25 +26,25 @@ Users may fetch or build images on the Mac or another machine and transfer them 
 
 **Wanted:**
 
-- Support users importing images they prepared elsewhere into a registry on the node.
-- Have both dockerd and k3s pull from that registry. Their image stores remain separate.
-- Keep host Docker pulls and archive transfer as an optional convenience.
+- With `FLOCI_SERVICES_ECR_SMOLVM_ENABLED=true`, the emulated ECR registry and its data run on the node. The node image includes the registry image; Floci does not need a host daemon to start it.
+- Users push images prepared elsewhere through Floci's existing ECR endpoint. The node dockerd and k3s's separate containerd store can both pull them. A real-node test verifies both pulls while Floci's host Docker socket is unavailable.
+- Host Docker pulls and archive transfer remain an optional convenience. Switching an existing host-backed ECR to the node selects a separate image store; images must be pushed again.
 
 ## 2. The ECR "prefer local images" check includes the selected node
 
 - Fixed for Lambda: `EcrRegistryManager.rewriteImageUri` checks the selected node's dockerd first, then the Mac's daemon, under the resolved image reference.
-- If neither has the image, it starts the emulated registry on the Mac's Docker, which supplies the image for transfer into the node.
+- If neither has the image, Floci can use the emulated registry on the node when `FLOCI_SERVICES_ECR_SMOLVM_ENABLED=true`.
 
-Moving the emulated registry into the node is still needed for Floci's ECR-backed image path without a host daemon.
+The host-backed registry remains the default to preserve existing stores.
 
 ## 3. Lambda image CMD selection
 
 - Fixed for the Docker launcher: prepare the image on the selected daemon before reading its CMD. Node launches inspect the node's image, honoring the requested platform and any `ImageConfig.Command` override.
-- `KubernetesPodLauncher` (around `:194-196`) sets `_HANDLER` only from the function's Handler, never from the image's CMD.
+- For a Kubernetes Lambda whose image is in node-backed ECR, Floci reads the image CMD and pins the pod to its manifest digest. `ImageConfig.Command` and an explicit handler take precedence.
 
 **Wanted:**
 
-- Give `KubernetesPodLauncher` the same CMD fallback.
+- Other Kubernetes registry references still need an explicit handler or `ImageConfig.Command`; their image CMD is not yet inspected.
 
 ## 4. ElastiCache node backend
 

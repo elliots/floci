@@ -110,7 +110,12 @@ public class NodeSettings {
      * provider, each real.
      */
     public boolean wanted() {
-        return rdsWants() || eksWants() || lambdaWants() || elasticacheWants();
+        return rdsWants() || eksWants() || lambdaWants() || elasticacheWants() || ecrWants();
+    }
+
+    private boolean ecrWants() {
+        EmulatorConfig.EcrServiceConfig ecr = config.services().ecr();
+        return ecr != null && ecr.enabled() && ecr.smolvmEnabled();
     }
 
     private boolean elasticacheWants() {
@@ -146,6 +151,9 @@ public class NodeSettings {
         }
         if (elasticacheWants()) {
             users.add("ElastiCache");
+        }
+        if (ecrWants()) {
+            users.add("ECR");
         }
         return users.size() < 2 ? String.join("", users)
                 : String.join(", ", users.subList(0, users.size() - 1)) + " and " + users.getLast();

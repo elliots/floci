@@ -380,6 +380,7 @@ floci:
       enabled: true
     ecr:
       enabled: true
+      smolvm-enabled: ${FLOCI_SERVICES_ECR_SMOLVM_ENABLED:false}
       tls-uri: false
     ui:
       enabled: true

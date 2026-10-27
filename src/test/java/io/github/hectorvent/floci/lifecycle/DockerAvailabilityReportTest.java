@@ -95,4 +95,13 @@ class DockerAvailabilityReportTest {
     void pipesIsQualifiedToItsKafkaSources() {
         assertThat(report.failOnUse(Set.of("pipes")), contains("pipes (Kafka sources)"));
     }
+
+    @Test
+    void nodeBackedRegistryAndLambdaDoNotRequireHostDockerForPreloadedImages() {
+        when(config.services().lambda().executor()).thenReturn("docker");
+        when(config.services().lambda().smolvm().enabled()).thenReturn(true);
+        when(config.services().ecr().smolvmEnabled()).thenReturn(true);
+
+        assertThat(report.failOnUse(Set.of("lambda", "ecr", "ecs")), contains("ecs"));
+    }
 }

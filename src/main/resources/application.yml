@@ -791,6 +791,7 @@ floci:
       enabled: true
     ecr:
       enabled: true
+      smolvm-enabled: ${FLOCI_SERVICES_ECR_SMOLVM_ENABLED:false}
       registry-image: "registry:2"
       registry-container-name: floci-ecr-registry
       registry-base-port: 5100

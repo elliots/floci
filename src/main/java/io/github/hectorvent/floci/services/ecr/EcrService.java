@@ -130,6 +130,8 @@ public class EcrService implements ResourceProvider {
         this.config = config;
         this.regionResolver = regionResolver;
         this.registryManager.setReconcileHook(this::reconcileFromCatalog);
+        this.registryManager.setRepositoryNameResolver(
+                (account, region, repository) -> registryRepositoryName(repository, account, region));
     }
 
     public boolean isDisabled() {
