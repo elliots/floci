@@ -165,7 +165,55 @@ fn outbound_resets() {
     });
 }
 
+#[test]
+#[ignore = "needs a Mac with smolvm and Docker: SMOLVM_PODS_E2E=1 cargo test -- --ignored"]
+fn outbound_preserves_selected_peer() {
+    let mac = Pusher::start(
+        Duration::from_secs(PUSH_EVERY),
+        Duration::from_secs(PUSH_SECONDS),
+    );
+    with_suite_config("outbound-keep", Some(mac.port()), |suite| {
+        expect(suite.ensure_awake(FOLLOWER));
+        let stream = format!("/stream%3Fseconds%3D{PUSH_SECONDS}%26every%3D{PUSH_EVERY}");
+        let kept = format!("{}:{}", suite.node().gateway(), mac.port());
+        let reset = format!("{}:{PORT}", suite.ips[CLIENT]);
+        for (name, server) in [("kept", &kept), ("reset", &reset)] {
+            let path = format!("/follow?name={name}&url=http://{server}{stream}");
+            let response = expect(suite.client.get(&suite.url(FOLLOWER, &path), REQUEST));
+            assert_eq!(expect(response.value("follow")), "started");
+        }
+        thread::sleep(Duration::from_secs(PUSH_EVERY + 1));
+        for name in ["kept", "reset"] {
+            let path = suite.url(FOLLOWER, &format!("/followed?name={name}"));
+            let status = expect(suite.client.get(&path, REQUEST));
+            let lines: u64 = expect(status.value("lines")).parse().unwrap_or_default();
+            assert!(
+                lines > 0 && status.value("ended") == Ok("false"),
+                "{status}"
+            );
+        }
+        let cursor = suite.cursor();
+        expect(suite.sleeps_within(FOLLOWER, cursor, SLEEP_START));
+        thread::sleep(ASLEEP_WITH_PUSHES);
+        let reset_path = suite.service_url(FOLLOWER, "/followed?name=reset");
+        let mut reset_status = expect(suite.client.get(&reset_path, REQUEST));
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while reset_status.value("ended") == Ok("false") && Instant::now() < deadline {
+            thread::sleep(Duration::from_millis(20));
+            reset_status = expect(suite.client.get(&reset_path, REQUEST));
+        }
+        assert_eq!(reset_status.value("ended"), Ok("true"), "{reset_status}");
+        let kept_path = suite.url(FOLLOWER, "/followed?name=kept");
+        let kept_status = expect(suite.client.get(&kept_path, REQUEST));
+        assert_eq!(kept_status.value("ended"), Ok("false"), "{kept_status}");
+    });
+}
+
 fn with_suite(name: &str, check: impl FnOnce(&Suite<'_>)) {
+    with_suite_config(name, None, check);
+}
+
+fn with_suite_config(name: &str, keep_port: Option<u16>, check: impl FnOnce(&Suite<'_>)) {
     let cluster = Cluster::start_with_memory(name, Some(NODE_MEMORY_MIB));
     let testapp = cluster.node_path("testapp");
     cluster
@@ -174,7 +222,7 @@ fn with_suite(name: &str, check: impl FnOnce(&Suite<'_>)) {
     cluster.node.sh(&format!("chmod +x {testapp}"));
     let api = Api::connect(&cluster.node, &testapp, Duration::from_secs(60));
     let start = api.cursor().unwrap_or(0);
-    let pods = start_pods(&cluster);
+    let pods = start_pods(&cluster, keep_port);
     let suite = Suite::new(&cluster, api, testapp, pods, start);
     check(&suite);
 }
@@ -417,12 +465,25 @@ fn services(namespace: &str, node_port: u16) -> String {
 
 /// Creates the test's pods and Services, and waits until every pod but
 /// `unready` is Ready, and `unready` runs.
-fn start_pods(cluster: &Cluster) -> Vec<Pod<'_>> {
+fn start_pods(cluster: &Cluster, keep_port: Option<u16>) -> Vec<Pod<'_>> {
     step("creating the test pods and Services");
     let pods = test_pods();
     let manifests: Vec<String> = pods
         .iter()
-        .map(|p| p.manifest(&cluster.namespace, &cluster.image(p.arch)))
+        .map(|p| {
+            let manifest = p.manifest(&cluster.namespace, &cluster.image(p.arch));
+            if p.name == FOLLOWER {
+                if let Some(port) = keep_port {
+                    let annotations = format!(
+                        "annotations: {{\"smolvm-pods.floci.io/reset-on-pause\": \"false\", \
+                         \"smolvm-pods.floci.io/keep-tcp-on-pause\": \"{}:{port}\", ",
+                        cluster.node.gateway()
+                    );
+                    return manifest.replacen("annotations: {", &annotations, 1);
+                }
+            }
+            manifest
+        })
         .collect();
     cluster.apply("pods.yaml", &manifests.join("---\n"));
     cluster.apply(

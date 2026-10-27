@@ -79,14 +79,18 @@ class LambdaSmolvmBackendTest {
 
     @Test
     void everyEnvironmentHibernatesWithItsConnectionsAndTheConfiguredIdleTimeout() {
-        // reset-on-pause false: the runtime's wait on /runtime/invocation/next lasts through the pause.
+        when(config.services().lambda().runtimeApiBasePort()).thenReturn(12000);
+        when(config.services().lambda().runtimeApiMaxPort()).thenReturn(12499);
+        // The runtime's wait on /runtime/invocation/next lasts through the pause.
         assertEquals(new OciRuntime("io.containerd.smolvm-pods.v2", Map.of(
                         "smolvm-pods.floci.io/hibernate", "true",
-                        "smolvm-pods.floci.io/reset-on-pause", "false")),
+                        "smolvm-pods.floci.io/reset-on-pause", "false",
+                        "smolvm-pods.floci.io/keep-tcp-on-pause", "169.254.53.1:12000-12499")),
                 backend.runtime());
 
         when(config.services().lambda().smolvm().idleTimeout()).thenReturn(Optional.of(" 1m "));
         assertEquals(Map.of("smolvm-pods.floci.io/hibernate", "true", "smolvm-pods.floci.io/reset-on-pause", "false",
+                        "smolvm-pods.floci.io/keep-tcp-on-pause", "169.254.53.1:12000-12499",
                         "smolvm-pods.floci.io/idle-timeout", "1m"),
                 backend.runtime().annotations());
 

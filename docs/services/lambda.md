@@ -944,9 +944,9 @@ export FLOCI_RUNTIME_CONFIG_FILE=$HOME/.floci/runtime.yaml
   a lease on the node, so a long invocation does not sleep. A warm environment that sleeps is
   still warm: the next invocation wakes it in well under a second instead of a cold start. Floci's
   warm pool still stops an environment after `FLOCI_SERVICES_LAMBDA_CONTAINER_IDLE_TIMEOUT_SECONDS`.
-  An environment sleeps with its connections (`smolvm-pods.floci.io/reset-on-pause: "false"`), as
-  AWS freezes one: the runtime waits on `GET /runtime/invocation/next` through the sleep, and the
-  next event is the answer to that request. Its other connections can close while it sleeps.
+  The runtime waits on `GET /runtime/invocation/next` through the sleep, and the next event is the
+  answer to that request. Floci preserves connections to the Runtime API and resets other external
+  TCP connections as the environment sleeps. Older nodes preserve all connections instead.
 - **An environment that fails before it takes its event.** When an environment's runtime exits,
   or the environment fails, before the runtime has taken the event, the handler did not run, so
   Floci gives the event once to a new environment. An event that the runtime took is not run again.

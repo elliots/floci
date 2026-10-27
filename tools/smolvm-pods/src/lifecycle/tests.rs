@@ -1273,6 +1273,30 @@ async fn a_pod_that_keeps_its_connections_is_not_frozen_for_a_pause() {
 }
 
 #[tokio::test]
+async fn a_named_keep_list_takes_precedence_over_the_legacy_keep_all_flag() {
+    let h = Harness::new().await;
+    let mut identity = identity("pod");
+    identity.keep_connections = true;
+    identity.kept_tcp_peers = vec![smolvm_protocol::PreservedTcpPeer {
+        address: "169.254.53.1".parse().unwrap(),
+        first_port: 12000,
+        last_port: 12499,
+    }];
+    h.create_with(identity).await.unwrap();
+    h.clear();
+    h.hibernate("pod").await.unwrap();
+    assert!(
+        h.vm.calls()
+            .iter()
+            .any(|call| call.starts_with("freeze pod keep ")
+                && call.contains("169.254.53.1")
+                && call.contains("12000")),
+        "{:?}",
+        h.vm.calls()
+    );
+}
+
+#[tokio::test]
 async fn a_vm_exit_outside_a_pause_is_a_crash() {
     let h = Harness::awake("pod").await;
     let process = h.info("pod").vm.unwrap();

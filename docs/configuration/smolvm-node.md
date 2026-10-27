@@ -190,6 +190,16 @@ scrape_configs:
 
 ## What does not work
 
+On an arm64 node with Rosetta enabled, an ordinary amd64 Docker container can run when it
+bind-mounts the node's Rosetta runtime:
+
+```sh
+docker run --platform linux/amd64 --mount type=bind,src=/mnt/rosetta,dst=/mnt/rosetta,readonly IMAGE
+```
+
+The node does not add that mount automatically. In particular, Docker build steps do not get it;
+amd64 pod VMs use Rosetta without this Docker mount.
+
 - **A terminal or stdin in a microVM.** `docker exec -it` and `docker exec -i` into a database, and
   `kubectl exec -it`, `kubectl attach` and `kubectl cp` into a VM pod, are refused:
   `smolvm-pods does not give VM pod processes a terminal`. Connect `psql` or `mysql` to the

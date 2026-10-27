@@ -17,7 +17,7 @@ set -eu
 
 # The smolvm commit this crate builds against. node/Dockerfile pins the
 # guest agent (AGENT_SHA256) built from the same agent sources.
-smolvm_commit=6842995fa8de2e86fc48ed0b33f49dff2948fa21
+smolvm_commit=fbdbbd9502d3caa554bcecfa80b202bdd602662c
 
 here=$(cd "$(dirname "$0")/.." && pwd)
 smolvm=$(cd "${SMOLVM_SRC:-$here/../../../smolvm}" && pwd)

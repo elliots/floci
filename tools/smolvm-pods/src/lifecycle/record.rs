@@ -6,6 +6,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
+use smolvm_protocol::PreservedTcpPeer;
 
 use super::state::{PodState, Reason};
 use super::vm::VmProcess;
@@ -26,6 +27,9 @@ pub const ANN_WAKE_ON_TERMINATE: &str = "smolvm-pods.floci.io/wake-on-terminate"
 /// then the pod sleeps with them, as AWS freezes a Lambda environment, whose
 /// runtime waits on the Runtime API through the freeze.
 pub const ANN_RESET_ON_PAUSE: &str = "smolvm-pods.floci.io/reset-on-pause";
+
+/// Destination IP and port ranges to preserve while resetting other TCP connections.
+pub const ANN_KEEP_TCP_ON_PAUSE: &str = "smolvm-pods.floci.io/keep-tcp-on-pause";
 
 /// Pod annotation that sets how long the pod may be idle before it sleeps, as
 /// a Go duration such as `"30s"` or `"10m"`.
@@ -85,6 +89,35 @@ pub fn keeps_connections(spec: Option<&serde_json::Value>) -> Result<bool, Strin
             )),
         },
     }
+}
+
+/// Parses a comma-separated list of `IP:PORT` or `IP:FIRST-LAST` destinations.
+pub fn kept_tcp_peers(spec: Option<&serde_json::Value>) -> Result<Vec<PreservedTcpPeer>, String> {
+    let Some(value) = bundle::annotation(spec, ANN_KEEP_TCP_ON_PAUSE) else {
+        return Ok(Vec::new());
+    };
+    let mut peers = Vec::new();
+    for entry in value.split(',') {
+        let invalid = || format!("{ANN_KEEP_TCP_ON_PAUSE} has invalid destination {entry:?}");
+        let (address, ports) = entry.trim().rsplit_once(':').ok_or_else(invalid)?;
+        let address = address
+            .trim_start_matches('[')
+            .trim_end_matches(']')
+            .parse()
+            .map_err(|_| invalid())?;
+        let (first, last) = ports.split_once('-').unwrap_or((ports, ports));
+        let first_port = first.parse::<u16>().map_err(|_| invalid())?;
+        let last_port = last.parse::<u16>().map_err(|_| invalid())?;
+        if first_port == 0 || first_port > last_port || peers.len() >= 128 {
+            return Err(invalid());
+        }
+        peers.push(PreservedTcpPeer {
+            address,
+            first_port,
+            last_port,
+        });
+    }
+    Ok(peers)
 }
 
 /// The duration that the sandbox OCI spec sets with the annotation `key`, if
@@ -241,6 +274,9 @@ pub struct PodIdentity {
     /// reset its connections.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub keep_connections: bool,
+    /// Named TCP destinations that a pause preserves while resetting all others.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub kept_tcp_peers: Vec<PreservedTcpPeer>,
     /// Set by [`ANN_IDLE_TIMEOUT`]; without it the node's default applies.
     #[serde(default)]
     pub idle_timeout_ms: Option<u64>,
@@ -551,6 +587,26 @@ mod tests {
             !old.keep_connections,
             "a record from before keeps resetting"
         );
+    }
+
+    #[test]
+    fn only_valid_named_tcp_destinations_are_preserved() {
+        let selected = spec(
+            serde_json::json!({ ANN_KEEP_TCP_ON_PAUSE: "169.254.53.1:12000-12499,[::1]:443" }),
+        );
+        let peers = kept_tcp_peers(Some(&selected)).unwrap();
+        assert_eq!(peers.len(), 2);
+        assert_eq!(peers[0].address.to_string(), "169.254.53.1");
+        assert_eq!((peers[0].first_port, peers[0].last_port), (12000, 12499));
+        assert_eq!(peers[1].address.to_string(), "::1");
+        for value in ["", "host:443", "1.2.3.4:0", "1.2.3.4:4-3", "1.2.3.4:65536"] {
+            let invalid = spec(serde_json::json!({ ANN_KEEP_TCP_ON_PAUSE: value }));
+            assert!(kept_tcp_peers(Some(&invalid)).is_err(), "{value}");
+        }
+        assert!(kept_tcp_peers(None).unwrap().is_empty());
+        let old: PodIdentity =
+            serde_json::from_str(r#"{"sandbox_id":"pod","machine":"pod"}"#).unwrap();
+        assert!(old.kept_tcp_peers.is_empty());
     }
 
     #[test]

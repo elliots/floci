@@ -71,21 +71,11 @@ Port 443 and 1023 both returned permission denied to the unprivileged test proce
 
 **Cause and fix:** interactive exec prepares the persistent overlay again. The guest agent refreshes a regular `/etc/resolv.conf` during that preparation, even on an already running node. It preserves a valid image-owned symlink, so `floci-node` now links `/etc/resolv.conf` to `/etc/floci-node/pod-resolv.conf`. The saved upstream resolver remains separate. A real-node regression repeats interactive exec and checks both files.
 
-## 7. Keep only named connections through a pause (optional)
+## 7. Keep only named connections through a pause
 
-- A pause runs smolvm's `PodFreeze`, which resets every TCP connection that leaves the pod VM. The guest agent does this in `pod_freeze.rs` (around `:348-372`, `SOCK_DESTROY`).
-- The current fix is a pod-level annotation, `smolvm-pods.floci.io/reset-on-pause: "false"`, which skips the reset entirely. floci sets it on every Lambda environment, because the runtime's `GET /runtime/invocation/next` must survive the freeze.
-
-**Wanted:**
-
-- An option in the freeze request that names the connections to keep, by destination IP and port or by a port range.
-- With it, a Lambda environment keeps only its Runtime API connection and still drops all the others.
-
-This needs:
-
-- a change to the smolvm protocol and guest agent;
-- a new pinned smolvm commit;
-- a new `AGENT_SHA256`.
+- The freeze request can preserve named destination IPs and port ranges while resetting other external TCP connections.
+- Lambda preserves its Runtime API connection. Older nodes retain the compatibility annotation and preserve all connections.
+- A real-node test verifies that one named connection survives a pause while an unrelated connection is reset.
 
 ## 8. Allocator test fixed
 
@@ -97,11 +87,9 @@ This needs:
 
 ## 9. Smaller gaps on the node's dockerd
 
-- **amd64:** only pod VMs get Rosetta, and nothing registers binfmt on the node itself.
-  - amd64 runc containers probably fail.
-  - So do `RUN` steps in `docker build --platform linux/amd64`.
-
-  This is not checked yet.
+- **amd64:** pod VMs use Rosetta automatically. An ordinary Docker container can use Rosetta
+  with a read-only bind mount of `/mnt/rosetta`; a real-node check ran an amd64 binary this way.
+  The mount is not automatic, and amd64 Docker build steps still need a solution.
 - **Mac paths:** `FLOCI_RUNTIME_NODE_VOLUMES` passes directory shares when creating the node. Containers bind the resulting node path, not the original Mac path.
 - **stdin:** `docker exec -i` into a pod-VM container is refused (`refuse_input`). The node guide documents passing small input as an environment variable and piping it through `sh` in the container.
 
