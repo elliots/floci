@@ -50,7 +50,9 @@ The host-backed registry remains the default to preserve existing stores.
 
 - Redis and Valkey can run on the shared node with `FLOCI_SERVICES_ELASTICACHE_SMOLVM_ENABLED=true`. Their proxy, readiness checks and cluster formation connect through the node tunnel. Cache hostnames from the `floci:tls-hostnames` tag resolve through node DNS.
 - The real-node test verifies a cache's data survives a sleep and a tunnel connection wakes it. An AWS SDK test exercises provisioning and deletion against a fake node.
-- Memcached remains on host Docker.
+- Memcached also runs on the node. Its TCP relay shares ElastiCache's port reservations and
+  configured proxy range, so isolated workloads can reach the advertised endpoint. A real-node
+  test verifies coexistence with Valkey, access from a workload VM, and data retained across sleep/wake.
 
 ## 5. Extra port mappings for the node
 

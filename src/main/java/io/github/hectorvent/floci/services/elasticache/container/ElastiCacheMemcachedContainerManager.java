@@ -1,6 +1,7 @@
 package io.github.hectorvent.floci.services.elasticache.container;
 
 import io.github.hectorvent.floci.config.EmulatorConfig;
+import io.github.hectorvent.floci.core.common.AwsException;
 import io.github.hectorvent.floci.core.common.RegionResolver;
 import io.github.hectorvent.floci.core.common.docker.ContainerBuilder;
 import io.github.hectorvent.floci.core.common.docker.ContainerDetector;
@@ -10,6 +11,8 @@ import io.github.hectorvent.floci.core.common.docker.ContainerLifecycleManager.E
 import io.github.hectorvent.floci.core.common.docker.ContainerLogStreamer;
 import io.github.hectorvent.floci.core.common.docker.ContainerSpec;
 import io.github.hectorvent.floci.core.common.docker.ContainerStorageHelper;
+import io.github.hectorvent.floci.runtime.node.NodeTcpRelay;
+import io.github.hectorvent.floci.services.elasticache.ElastiCachePortReservations;
 import jakarta.enterprise.context.ApplicationScoped;
 import jakarta.inject.Inject;
 import org.jboss.logging.Logger;
@@ -18,6 +21,7 @@ import java.io.Closeable;
 import java.io.IOException;
 import java.io.InputStream;
 import java.io.OutputStream;
+import java.net.BindException;
 import java.net.InetSocketAddress;
 import java.net.Socket;
 import java.nio.charset.StandardCharsets;
@@ -48,8 +52,13 @@ public class ElastiCacheMemcachedContainerManager {
     private final ContainerDetector containerDetector;
     private final EmulatorConfig config;
     private final RegionResolver regionResolver;
+    private final ElastiCacheSmolvmBackend smolvm;
+    private final ElastiCachePortReservations ports;
     private final Map<String, ElastiCacheContainerHandle> activeContainers = new ConcurrentHashMap<>();
+    private final Map<String, NodeContainer> nodeContainers = new ConcurrentHashMap<>();
     private volatile boolean dockerUnavailableLogged;
+
+    private record NodeContainer(ContainerLifecycleManager lifecycle, NodeTcpRelay relay) {}
 
     @Inject
     public ElastiCacheMemcachedContainerManager(ContainerBuilder containerBuilder,
@@ -57,13 +66,35 @@ public class ElastiCacheMemcachedContainerManager {
                                                 ContainerLogStreamer logStreamer,
                                                 ContainerDetector containerDetector,
                                                 EmulatorConfig config,
-                                                RegionResolver regionResolver) {
+                                                RegionResolver regionResolver,
+                                                ElastiCacheSmolvmBackend smolvm,
+                                                ElastiCachePortReservations ports) {
         this.containerBuilder = containerBuilder;
         this.lifecycleManager = lifecycleManager;
         this.logStreamer = logStreamer;
         this.containerDetector = containerDetector;
         this.config = config;
         this.regionResolver = regionResolver;
+        this.smolvm = smolvm;
+        this.ports = ports;
+    }
+
+    ElastiCacheMemcachedContainerManager(ContainerBuilder containerBuilder,
+                                        ContainerLifecycleManager lifecycleManager,
+                                        ContainerLogStreamer logStreamer,
+                                        ContainerDetector containerDetector,
+                                        EmulatorConfig config,
+                                        RegionResolver regionResolver) {
+        this(containerBuilder, lifecycleManager, logStreamer, containerDetector, config, regionResolver,
+                null, new ElastiCachePortReservations());
+    }
+
+    public boolean onSmolvmNode() {
+        return smolvm != null && smolvm.enabled();
+    }
+
+    private ContainerLifecycleManager lifecycle() {
+        return onSmolvmNode() ? smolvm.target().lifecycle() : lifecycleManager;
     }
 
     /**
@@ -82,6 +113,9 @@ public class ElastiCacheMemcachedContainerManager {
             dockerUnavailableLogged = false;
             return handle;
         } catch (RuntimeException e) {
+            if (onSmolvmNode()) {
+                throw e;
+            }
             if (isDockerReachable()) {
                 throw e;
             }
@@ -121,44 +155,85 @@ public class ElastiCacheMemcachedContainerManager {
         LOG.infov("Starting Memcached container for cluster: {0}", clusterId);
 
         String containerName = ContainerStorageHelper.resourceName(config, "memcached", null, clusterId);
-        lifecycleManager.removeIfExists(containerName);
+        ElastiCacheSmolvmBackend.Target node = onSmolvmNode()
+                ? smolvm.target(regionResolver.getAccountId(), effectiveRegion) : null;
+        ContainerLifecycleManager lifecycle = node == null ? lifecycleManager : node.lifecycle();
+        ContainerLogStreamer logs = node == null ? logStreamer : node.logs();
+        lifecycle.removeIfExists(containerName);
 
         ContainerBuilder.Builder specBuilder = containerBuilder.newContainer(image)
                 .withName(containerName)
-                .withDockerNetwork(config.services().elasticache().dockerNetwork())
                 .withLogRotation()
                 .withLabels(ContainerStorageHelper.resourceIdentityLabels(
                         "elasticache", clusterId, regionResolver.getAccountId(), effectiveRegion));
 
-        if (!containerDetector.isRunningInContainer()) {
-            specBuilder.withDynamicPort(BACKEND_PORT);
-        } else {
+        if (node != null) {
             specBuilder.withExposedPort(BACKEND_PORT);
+        } else {
+            specBuilder.withDockerNetwork(config.services().elasticache().dockerNetwork());
+            if (!containerDetector.isRunningInContainer()) {
+                specBuilder.withDynamicPort(BACKEND_PORT);
+            } else {
+                specBuilder.withExposedPort(BACKEND_PORT);
+            }
         }
 
         ContainerSpec spec = specBuilder.build();
-        ContainerInfo info = lifecycleManager.createAndStart(spec);
-        EndpointInfo endpoint = info.getEndpoint(BACKEND_PORT);
+        if (node != null) {
+            smolvm.ensureImage(node, spec.image());
+        }
+        ContainerInfo info = lifecycle.createAndStart(spec);
+        try {
+            EndpointInfo endpoint;
+            if (node == null) {
+                endpoint = info.getEndpoint(BACKEND_PORT);
+            } else {
+                String ip = lifecycle.resolveContainerNetworkIp(info.containerId(), null);
+                try {
+                    NodeTcpRelay relay = openRelay(node, ip);
+                    nodeContainers.put(info.containerId(), new NodeContainer(lifecycle, relay));
+                    endpoint = new EndpointInfo("127.0.0.1", relay.port());
+                } catch (IOException e) {
+                    throw new IllegalStateException("Could not expose Memcached on the node", e);
+                }
+            }
 
-        LOG.infov("Memcached backend for cluster {0}: {1}", clusterId, endpoint);
+            LOG.infov("Memcached backend for cluster {0}: {1}", clusterId, endpoint);
 
-        ElastiCacheContainerHandle handle = new ElastiCacheContainerHandle(
-                info.containerId(), clusterId, endpoint.host(), endpoint.port());
-        activeContainers.put(clusterId, handle);
+            ElastiCacheContainerHandle handle = new ElastiCacheContainerHandle(
+                    info.containerId(), clusterId, endpoint.host(), endpoint.port());
+            activeContainers.put(clusterId, handle);
 
-        String shortId = info.containerId().length() >= 8
-                ? info.containerId().substring(0, 8)
-                : info.containerId();
-        String logGroup = "/aws/elasticache/cluster/" + clusterId + "/engine-log";
-        String logStream = logStreamer.generateLogStreamName(shortId);
+            String shortId = info.containerId().length() >= 8
+                    ? info.containerId().substring(0, 8)
+                    : info.containerId();
+            String logGroup = "/aws/elasticache/cluster/" + clusterId + "/engine-log";
+            String logStream = logs.generateLogStreamName(shortId);
 
-        Closeable logHandle = logStreamer.attach(
-                info.containerId(), logGroup, logStream, effectiveRegion, "elasticache-memcached:" + clusterId);
-        handle.setLogStream(logHandle);
+            Closeable logHandle = logs.attach(
+                    info.containerId(), logGroup, logStream, effectiveRegion, "elasticache-memcached:" + clusterId);
+            handle.setLogStream(logHandle);
 
-        waitForBackendReady(clusterId, endpoint.host(), endpoint.port());
+            waitForBackendReady(clusterId, endpoint.host(), endpoint.port());
 
-        return handle;
+            return handle;
+        } catch (RuntimeException e) {
+            if (node != null) {
+                ElastiCacheContainerHandle partial = activeContainers.get(clusterId);
+                Closeable logHandle = null;
+                if (partial != null && info.containerId().equals(partial.getContainerId())) {
+                    activeContainers.remove(clusterId, partial);
+                    logHandle = partial.getLogStream();
+                }
+                closeRelay(info.containerId());
+                try {
+                    lifecycle.stopAndRemove(info.containerId(), logHandle);
+                } catch (RuntimeException cleanupFailure) {
+                    e.addSuppressed(cleanupFailure);
+                }
+            }
+            throw e;
+        }
     }
 
     private static void waitForBackendReady(String clusterId, String host, int port) {
@@ -213,10 +288,49 @@ public class ElastiCacheMemcachedContainerManager {
         if (handle == null) {
             return;
         }
-        ElastiCacheContainerHandle existing = activeContainers.remove(handle.getGroupId());
+        ElastiCacheContainerHandle existing = activeContainers.get(handle.getGroupId());
+        if (existing != null && existing.getContainerId().equals(handle.getContainerId())) {
+            activeContainers.remove(handle.getGroupId(), existing);
+        } else {
+            existing = null;
+        }
         Closeable logStream = handle.getLogStream() != null ? handle.getLogStream()
                 : (existing != null ? existing.getLogStream() : null);
-        lifecycleManager.stopAndRemove(handle.getContainerId(), logStream);
+        NodeContainer node = closeRelay(handle.getContainerId());
+        ContainerLifecycleManager lifecycle = node == null ? lifecycle() : node.lifecycle();
+        lifecycle.stopAndRemove(handle.getContainerId(), logStream);
+    }
+
+    private NodeTcpRelay openRelay(ElastiCacheSmolvmBackend.Target node, String ip) throws IOException {
+        int base = config.services().elasticache().proxyBasePort();
+        int max = config.services().elasticache().proxyMaxPort();
+        for (int port = base; port <= max; port++) {
+            if (!ports.claim(port)) {
+                continue;
+            }
+            try {
+                return smolvm.relay(node, ip, BACKEND_PORT, port);
+            } catch (BindException e) {
+                ports.release(port);
+                LOG.debugv("Memcached relay port {0} is unavailable: {1}", port, e.getMessage());
+            } catch (IOException | RuntimeException e) {
+                ports.release(port);
+                throw e;
+            }
+        }
+        LOG.warnv("ElastiCache proxy port range {0}-{1} exhausted while starting Memcached", base, max);
+        throw new AwsException("InsufficientCacheClusterCapacity",
+                "The requested cache node type is not available in the specified Availability Zone.", 400);
+    }
+
+    private NodeContainer closeRelay(String containerId) {
+        NodeContainer node = nodeContainers.remove(containerId);
+        if (node != null) {
+            int port = node.relay().port();
+            node.relay().close();
+            ports.release(port);
+        }
+        return node;
     }
 
     public void stopAll() {

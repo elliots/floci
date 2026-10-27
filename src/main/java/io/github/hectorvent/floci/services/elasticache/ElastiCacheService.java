@@ -98,7 +98,7 @@ public class ElastiCacheService implements ResourceProvider {
     private final KmsService kmsService;
     private final Ec2Service ec2Service;
     private final RegionResolver regionResolver;
-    private final Set<Integer> usedPorts = ConcurrentHashMap.newKeySet();
+    private final ElastiCachePortReservations usedPorts;
     /**
      * Ids claimed by in-flight creates: replication groups, standalone cache clusters and the
      * Memcached clusters {@link ElastiCacheMemcachedService} creates, all claiming against the
@@ -157,7 +157,9 @@ public class ElastiCacheService implements ResourceProvider {
                               Ec2Service ec2Service,
                               RegionResolver regionResolver,
                               KmsService kmsService,
-                              ElastiCacheProvisioningIds provisioningIds) {
+                              ElastiCacheProvisioningIds provisioningIds,
+                              ElastiCachePortReservations usedPorts) {
+        this.usedPorts = usedPorts;
         this.kmsService = kmsService;
         this.provisioningIds = provisioningIds;
         this.containerManager = containerManager;
@@ -180,6 +182,19 @@ public class ElastiCacheService implements ResourceProvider {
                 new TypeReference<Map<String, CacheParameterGroup>>() {});
         this.subnetGroups = storageFactory.create("elasticache", "elasticache-subnet-groups.json",
                 new TypeReference<Map<String, CacheSubnetGroup>>() {});
+    }
+
+    public ElastiCacheService(ElastiCacheContainerManager containerManager,
+                             ElastiCacheProxyManager proxyManager,
+                             ValkeyClusterFormation clusterFormation,
+                             StorageFactory storageFactory,
+                             EmulatorConfig config,
+                             Ec2Service ec2Service,
+                             RegionResolver regionResolver,
+                             KmsService kmsService,
+                             ElastiCacheProvisioningIds provisioningIds) {
+        this(containerManager, proxyManager, clusterFormation, storageFactory, config, ec2Service,
+                regionResolver, kmsService, provisioningIds, new ElastiCachePortReservations());
     }
 
     /**
@@ -2615,7 +2630,7 @@ public class ElastiCacheService implements ResourceProvider {
                 throw new AwsException("InvalidParameterValue",
                         "Port must be between 1150 and 65535.", 400);
             }
-            if (requested >= base && requested <= max && usedPorts.add(requested)) {
+            if (requested >= base && requested <= max && usedPorts.claim(requested)) {
                 return requested;
             }
             int substitute = scanForFreePort(base, max);
@@ -2633,7 +2648,7 @@ public class ElastiCacheService implements ResourceProvider {
 
     private int scanForFreePort(int base, int max) {
         for (int port = base; port <= max; port++) {
-            if (usedPorts.add(port)) {
+            if (usedPorts.claim(port)) {
                 return port;
             }
         }
@@ -2648,11 +2663,11 @@ public class ElastiCacheService implements ResourceProvider {
     }
 
     private void releaseProxyPort(int port) {
-        usedPorts.remove(port);
+        usedPorts.release(port);
     }
 
     private int reserveOrAllocateProxyPort(int persistedPort) {
-        if (persistedPort > 0 && usedPorts.add(persistedPort)) {
+        if (persistedPort > 0 && usedPorts.claim(persistedPort)) {
             return persistedPort;
         }
         return allocateProxyPort();

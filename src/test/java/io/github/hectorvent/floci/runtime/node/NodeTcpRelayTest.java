@@ -21,7 +21,7 @@ import static org.mockito.ArgumentMatchers.anyString;
 import static org.mockito.Mockito.mock;
 import static org.mockito.Mockito.when;
 
-class NodeRegistryRelayTest {
+class NodeTcpRelayTest {
     @Test
     void concurrentClientsEachGetTheirOwnTunnelAndClosingTheRelayStopsIt() throws Exception {
         try (ServerSocket backend = new ServerSocket(0, 10, InetAddress.getLoopbackAddress())) {
@@ -40,7 +40,7 @@ class NodeRegistryRelayTest {
                     .thenAnswer(invocation -> new Socket(InetAddress.getLoopbackAddress(), backend.getLocalPort()));
             SmolvmNode node = new SmolvmNode("fake", URI.create("http://127.0.0.1:1"),
                     NodeToken.file(Path.of("token")), SmolvmNode.Kind.DECLARED, List.of());
-            NodeRegistryRelay relay = new NodeRegistryRelay(tunnel, node, "172.17.0.2", 5000);
+            NodeTcpRelay relay = new NodeTcpRelay(tunnel, node, "172.17.0.2", 5000);
             int port = relay.port();
             try (relay) {
                 CompletableFuture<String> first = CompletableFuture.supplyAsync(() -> exchange(port, "first"));
