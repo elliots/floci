@@ -113,6 +113,35 @@ class NodeSettingsServiceTest {
     }
 
     @Test
+    void extraPortsValidateShapeConflictsAndTheTotalMappingBudget() {
+        when(smolvm.extraPorts()).thenReturn(Optional.of(List.of("443:30443", "8080:30080")));
+        assertThat(settings.problems(), empty());
+        for (String invalid : List.of("0:80", "443:65536", "443", "*:443:30443", "443:30443/udp", "6501:80", "32080:80")) {
+            when(smolvm.extraPorts()).thenReturn(Optional.of(List.of(invalid)));
+            assertThat(invalid, settings.problems(), not(empty()));
+        }
+        when(smolvm.extraPorts()).thenReturn(Optional.of(List.of("443:30443", "443:30080")));
+        assertThat(settings.problems(), hasItem(containsString("overlaps")));
+        when(smolvm.extraPorts()).thenReturn(Optional.of(List.of("443:30443")));
+        when(smolvm.nodePorts()).thenReturn("32000-32061");
+        assertThat(settings.problems(), hasItem(containsString("64 mappings")));
+    }
+
+    @Test
+    void volumesRequireExistingHostDirectoriesAndDistinctGuestPaths() {
+        String host = dir.toString();
+        when(smolvm.volumes()).thenReturn(Optional.of(List.of(host + ":/workspace:ro")));
+        assertThat(settings.problems(), empty());
+        for (String invalid : List.of("relative:/workspace", host + ":/", host + ":relative",
+                host + ":/workspace:rw", host + ":/workspace/../etc", host + "/missing:/workspace")) {
+            when(smolvm.volumes()).thenReturn(Optional.of(List.of(invalid)));
+            assertThat(invalid, settings.problems(), not(empty()));
+        }
+        when(smolvm.volumes()).thenReturn(Optional.of(List.of(host + ":/workspace", host + ":/workspace:ro")));
+        assertThat(settings.problems(), hasItem(containsString("unique absolute directory")));
+    }
+
+    @Test
     void flociMustRunNativelyOnAnAppleSiliconMac() {
         inContainer.set(true);
         assertThat(settings.problems(), contains(

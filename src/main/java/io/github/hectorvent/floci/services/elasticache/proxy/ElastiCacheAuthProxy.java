@@ -30,25 +30,45 @@ public class ElastiCacheAuthProxy extends AbstractRedisAuthProxy {
     private final PasswordValidator passwordValidator;
     private final SigV4Validator sigV4Validator;
     private final Supplier<SSLContext> tlsContext;
+    private final BackendDialer backendDialer;
+
+    @FunctionalInterface
+    public interface BackendDialer {
+        Socket connect(String host, int port, int timeoutMillis) throws IOException;
+    }
+
     private final ElastiCacheBackendAcl backendAcl = new ElastiCacheBackendAcl();
 
     public ElastiCacheAuthProxy(String groupId, AuthMode authMode,
                                 String backendHost, int backendPort,
                                 PasswordValidator passwordValidator,
                                 SigV4Validator sigV4Validator) {
-        this(groupId, authMode, backendHost, backendPort, passwordValidator, sigV4Validator, null);
+        this(groupId, authMode, backendHost, backendPort, passwordValidator, sigV4Validator, null, null);
     }
 
     public ElastiCacheAuthProxy(String groupId, AuthMode authMode,
                                 String backendHost, int backendPort,
                                 PasswordValidator passwordValidator, SigV4Validator sigV4Validator,
                                 Supplier<SSLContext> tlsContext) {
+        this(groupId, authMode, backendHost, backendPort, passwordValidator, sigV4Validator, tlsContext, null);
+    }
+
+    public ElastiCacheAuthProxy(String groupId, AuthMode authMode,
+                                String backendHost, int backendPort,
+                                PasswordValidator passwordValidator, SigV4Validator sigV4Validator,
+                                Supplier<SSLContext> tlsContext, BackendDialer backendDialer) {
         super(LOG, "ElastiCache", "ec", groupId, backendHost, backendPort);
         this.groupId = groupId;
         this.authMode = authMode;
         this.passwordValidator = passwordValidator;
         this.sigV4Validator = sigV4Validator;
         this.tlsContext = tlsContext;
+        this.backendDialer = backendDialer;
+    }
+
+    @Override
+    protected Socket connectBackend(String host, int port) throws IOException {
+        return backendDialer == null ? super.connectBackend(host, port) : backendDialer.connect(host, port, 5_000);
     }
 
     @Override

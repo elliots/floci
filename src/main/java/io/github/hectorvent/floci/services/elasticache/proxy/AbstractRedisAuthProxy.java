@@ -343,7 +343,7 @@ public abstract class AbstractRedisAuthProxy {
     }
 
     private void bridgeCommand(Socket client, InputStream input, String[] command, String username) throws IOException {
-        Socket backend = new Socket(backendHost, backendPort);
+        Socket backend = connectBackend(backendHost, backendPort);
         try {
             backend.setTcpNoDelay(true);
             initializeBackend(backend, username);
@@ -359,6 +359,11 @@ public abstract class AbstractRedisAuthProxy {
             closeQuietly(backend);
             throw e;
         }
+    }
+
+    /** Subclasses may dial a node tunnel while keeping authentication and relaying unchanged. */
+    protected Socket connectBackend(String host, int port) throws IOException {
+        return new Socket(host, port);
     }
 
     private static void writeResponse(Socket client, byte[] response) throws IOException {

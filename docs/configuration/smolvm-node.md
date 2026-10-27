@@ -196,6 +196,9 @@ scrape_configs:
   database's RDS endpoint, `localhost` and its port from `describe-db-instances`, or run one
   command without `-i` and `-t`: `docker exec CONTAINER psql -U USER -d DB -c 'select 1'`.
   Containers in runc, without the runtime, take `-it`.
+  For a command that reads a small input from stdin, pass it in an environment variable and pipe
+  it inside the container instead, for example `docker exec -e INPUT='hello' CONTAINER sh -c
+  'printf %s "$INPUT" | your-command'`.
 - **`kubectl port-forward`** to a VM pod: use a NodePort Service.
 - **`docker pause`** of a microVM: the node puts it to sleep instead.
 - **Volumes, load balancers and ingress for pods.** The node has no default StorageClass, ServiceLB

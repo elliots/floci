@@ -15,24 +15,25 @@ The node is isolated (`--isolate`):
 - It reaches only the gateway to the Mac's loopback.
 - Routed names resolve only through floci's node DNS at the node address, `169.254.53.1`.
 
-Host Docker (Docker Desktop or OrbStack) is an accepted requirement for pulling and preparing images, as well as building the node image. Workload containers still run on the smolvm-pods node. A daemon-free registry client is no longer a goal. These are the remaining gaps, most important first.
+Users may fetch or build images on the Mac or another machine and transfer them into the node. Floci itself should not require a host Docker daemon once the node has its images. A daemon-free client for fetching external images is not required. These are the remaining gaps, most important first.
 
-## 1. Image supply uses the Mac's Docker by design
+## 1. Image supply and the node registry
 
 - `LambdaSmolvmBackend.ensureImage` and `RdsSmolvmBackend` (around `:225-253`) pull an image into the Mac's Docker. They then `saveImageCmd` it and `loadImageCmd` it into the node's dockerd.
 - Their fallback, "the node's dockerd pulls it", cannot reach external registries on an isolated node. The node has Floci DNS, but no external registry egress.
 
 **Wanted:**
 
-- Keep host Docker pulls and archive transfer into the node's dockerd.
-- Where k3s needs the image, floci also loads it into containerd's `k8s.io` namespace. The node dockerd's image store is separate from k3s's.
+- Support users importing images they prepared elsewhere into a registry on the node.
+- Have both dockerd and k3s pull from that registry. Their image stores remain separate.
+- Keep host Docker pulls and archive transfer as an optional convenience.
 
 ## 2. The ECR "prefer local images" check includes the selected node
 
 - Fixed for Lambda: `EcrRegistryManager.rewriteImageUri` checks the selected node's dockerd first, then the Mac's daemon, under the resolved image reference.
 - If neither has the image, it starts the emulated registry on the Mac's Docker, which supplies the image for transfer into the node.
 
-Host Docker remains available for image supply. Moving the emulated registry into the node is a separate feature, not a prerequisite for running the workload there.
+Moving the emulated registry into the node is still needed for Floci's ECR-backed image path without a host daemon.
 
 ## 3. Lambda image CMD selection
 
@@ -43,27 +44,19 @@ Host Docker remains available for image supply. Moving the emulated registry int
 
 - Give `KubernetesPodLauncher` the same CMD fallback.
 
-## 4. ElastiCache has no node backend
+## 4. ElastiCache node backend
 
-- `ElastiCacheContainerManager` runs Redis containers on the Mac's Docker.
-- Pods on the node cannot resolve or reach them, and get `getaddrinfo ENOTFOUND` for the cache endpoint.
-
-**Wanted:** an ElastiCache backend on the node's dockerd, like the RDS one:
-
-- pod-VM containers;
-- reached through the node tunnel;
-- endpoint names answered by the node DNS.
+- Redis and Valkey can run on the shared node with `FLOCI_SERVICES_ELASTICACHE_SMOLVM_ENABLED=true`. Their proxy, readiness checks and cluster formation connect through the node tunnel. Cache hostnames from the `floci:tls-hostnames` tag resolve through node DNS.
+- The real-node test verifies a cache's data survives a sleep and a tunnel connection wakes it. An AWS SDK test exercises provisioning and deletion against a fake node.
+- Memcached remains on host Docker.
 
 ## 5. Extra port mappings for the node
 
-- floci creates the node with fixed Mac port mappings: the API port, the service port and `--node-ports`.
+- `FLOCI_RUNTIME_NODE_EXTRA_PORTS` supplies extra TCP mappings when Floci creates a node, in addition to the API port, service port and `--node-ports`.
 - smolvm allows 64 mappings per machine. TCP mappings can be updated live; changes to UDP mappings require stopping the machine.
-- `node-vm.sh create` passes extra smolvm options after `--`, but floci never passes any.
+- Floci validates port ranges, overlaps and the total limit before passing the options to `node-vm.sh create`. Existing nodes must be recreated to change the mappings.
 
-**Wanted:**
-
-- A node setting for extra mappings, for example `443:30443`, so that a NodePort in the cluster can serve Mac port 443. Each mapping counts against the limit of 64.
-- Check that smolvm's port forwarder can bind a port below 1024 without root. macOS allows a process that is not root to bind such a port on all interfaces.
+Port 443 and 1023 both returned permission denied to the unprivileged test process on the tested Mac. An available higher port works without that privilege; a low port needs an appropriate host-level arrangement.
 
 ## 6. Node resolver overwrite fixed
 
@@ -107,8 +100,8 @@ This needs:
   - So do `RUN` steps in `docker build --platform linux/amd64`.
 
   This is not checked yet.
-- **Mac paths:** floci creates the node with no `--volume` shares, so `docker run -v <mac path>:…` on the node's dockerd cannot bind Mac paths. `node-vm.sh create --volume` exists, and floci could offer a setting for it.
-- **stdin:** `docker exec -i` into a pod-VM container is refused (`refuse_input`). Support stdin, or document a workaround: put the input in an environment variable and pipe it through `sh` in the container.
+- **Mac paths:** `FLOCI_RUNTIME_NODE_VOLUMES` passes directory shares when creating the node. Containers bind the resulting node path, not the original Mac path.
+- **stdin:** `docker exec -i` into a pod-VM container is refused (`refuse_input`). The node guide documents passing small input as an environment variable and piping it through `sh` in the container.
 
 ## Already fixed, for reference
 

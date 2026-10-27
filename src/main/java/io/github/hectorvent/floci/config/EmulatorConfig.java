@@ -213,6 +213,12 @@ public interface EmulatorConfig {
             @WithDefault("32080-32099")
             String nodePorts();
 
+            /** Extra TCP mappings HOST_PORT:GUEST_PORT, applied when creating the node. */
+            Optional<List<String>> extraPorts();
+
+            /** Mac directory shares HOST:GUEST[:ro], applied when creating the node. */
+            Optional<List<String>> volumes();
+
             /**
              * {@code HOST:PORT} where k3s and containerd in the node reach Floci: the token
              * webhook, the admission webhook and the ECR mirror. Empty means
@@ -1831,6 +1837,17 @@ public interface EmulatorConfig {
 
         @WithDefault("memcached:1.6")
         String defaultMemcachedImage();
+
+        /** Runs Redis and Valkey containers on the shared smolvm-pods node. */
+        ElastiCacheSmolvmConfig smolvm();
+
+        interface ElastiCacheSmolvmConfig {
+            @WithDefault("false")
+            boolean enabled();
+
+            /** Idle duration from 10s to 24h; empty uses the node's timeout. */
+            Optional<String> idleTimeout();
+        }
 
         /** Docker network to attach ElastiCache containers to. Empty = default bridge. */
         Optional<String> dockerNetwork();

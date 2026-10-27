@@ -51,6 +51,20 @@ class NodeDnsServerServiceTest {
         assertThat(server.answer(new byte[5]) == null, is(true));
     }
 
+    @Test
+    void serviceProxyNamesFollowRegistrationReplacementAndRemoval() {
+        server.update(new NodeDnsServer.Policy(Set.of(), Set.of(), true));
+        server.serviceNames("elasticache:a", Set.of("Cache.Example.test"));
+        server.serviceNames("elasticache:b", Set.of("cache.example.test"));
+        assertThat(address(server.answer(query("cache.example.test", A))), is(NodeDnsServer.NODE_ADDRESS));
+        assertThat(count(server.answer(query("cache.example.test", AAAA))), is(0));
+        server.serviceNames("elasticache:a", Set.of("replacement.example.test"));
+        assertThat(address(server.answer(query("replacement.example.test", A))), is(NodeDnsServer.NODE_ADDRESS));
+        server.serviceNames("elasticache:b", Set.of());
+        assertThat(rcode(server.answer(query("cache.example.test", A))), is(3));
+        assertThat(rcode(server.answer(query("unregistered.example.test", A))), is(3));
+    }
+
     private static byte[] query(String name, int type) {
         ByteArrayOutputStream out = new ByteArrayOutputStream();
         out.writeBytes(new byte[] {0x12, 0x34, 0x01, 0x00, 0, 1, 0, 0, 0, 0, 0, 0});

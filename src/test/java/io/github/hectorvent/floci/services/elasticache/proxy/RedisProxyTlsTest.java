@@ -30,9 +30,11 @@ import java.security.cert.X509Certificate;
 import java.util.HashSet;
 import java.util.List;
 import java.util.Set;
+import java.util.concurrent.atomic.AtomicInteger;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertThrows;
+import static org.junit.jupiter.api.Assertions.assertTrue;
 import static org.mockito.Mockito.mock;
 
 class RedisProxyTlsTest {
@@ -43,6 +45,8 @@ class RedisProxyTlsTest {
     Path tempDir;
 
     private volatile Set<String> hostnames = Set.of();
+    private volatile TransitEncryption encryption = TransitEncryption.PREFERRED;
+    private final AtomicInteger backendConnections = new AtomicInteger();
     private FlociCertificateAuthority authority;
     private ServerSocket backend;
     private ElastiCacheAuthProxy proxy;
@@ -82,7 +86,7 @@ class RedisProxyTlsTest {
         try (ServerSocket free = new ServerSocket(0)) {
             proxyPort = free.getLocalPort();
         }
-        proxy = new ElastiCacheAuthProxy("grp", AuthMode.NO_AUTH, "127.0.0.1", backend.getLocalPort(),
+        proxy = new ElastiCacheAuthProxy("grp", AuthMode.NO_AUTH, "node-cache.test", backend.getLocalPort(),
                 new ElastiCacheAuthProxy.PasswordValidator() {
                     @Override
                     public boolean validatePassword(String username, String password) {
@@ -91,10 +95,14 @@ class RedisProxyTlsTest {
 
                     @Override
                     public TransitEncryption transitEncryption() {
-                        return TransitEncryption.PREFERRED;
+                        return encryption;
                     }
                 }, mock(SigV4Validator.class),
-                () -> new RedisTlsContext(authority, List.of("cache.amazonaws.com"), "floci", () -> hostnames).context());
+                new RedisTlsContext(authority, List.of("cache.amazonaws.com"), "floci", () -> hostnames)::context,
+                (host, port, timeout) -> {
+                    backendConnections.incrementAndGet();
+                    return new Socket("127.0.0.1", port);
+                });
         proxy.start(proxyPort);
     }
 
@@ -185,4 +193,21 @@ class RedisProxyTlsTest {
             assertEquals("+PONG\r\n", ping(s));
         }
     }
+    @Test
+    void requiredEncryptionRejectsPlaintextBeforeDialingTheNode() throws Exception {
+        encryption = TransitEncryption.REQUIRED;
+        try (Socket client = new Socket("127.0.0.1", proxyPort)) {
+            client.setSoTimeout(5000);
+            client.getOutputStream().write(PING);
+            client.getOutputStream().flush();
+            int first = client.getInputStream().read();
+            assertTrue(first == -1 || first == 21, "expected EOF or a TLS alert");
+        }
+        assertEquals(0, backendConnections.get());
+        try (SSLSocket client = tlsClient(LONG_ENDPOINT)) {
+            assertEquals("+PONG\r\n", ping(client));
+        }
+        assertEquals(1, backendConnections.get());
+    }
+
 }

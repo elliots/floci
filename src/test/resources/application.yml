@@ -138,6 +138,8 @@ floci:
       image: ""
       image-sha256: ""
       data-path: ./target/runtime-node
+      extra-ports: ${FLOCI_RUNTIME_NODE_EXTRA_PORTS:}
+      volumes: ${FLOCI_RUNTIME_NODE_VOLUMES:}
 
   docker:
     log-max-size: "10m"
@@ -219,6 +221,9 @@ floci:
       proxy-max-port: 6399
       default-image: "valkey/valkey:8"
       default-memcached-image: "memcached:1.6"
+      smolvm:
+        enabled: ${FLOCI_SERVICES_ELASTICACHE_SMOLVM_ENABLED:false}
+        idle-timeout: ${FLOCI_SERVICES_ELASTICACHE_SMOLVM_IDLE_TIMEOUT:}
       tls-suffixes: ${FLOCI_SERVICES_ELASTICACHE_TLS_SUFFIXES:auto}
     memorydb:
       enabled: true

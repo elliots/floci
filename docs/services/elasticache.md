@@ -1,5 +1,16 @@
 # ElastiCache
 
+Redis and Valkey containers can run as hibernating microVMs on the shared smolvm-pods node.
+Set `FLOCI_SERVICES_ELASTICACHE_SMOLVM_ENABLED=true` and configure [the Floci node](../configuration/smolvm-runtime.md#the-floci-node).
+Preload the cache image into the node, or let host Docker supply it. Floci keeps the authentication proxies on the host and
+connects to the cache through the node's tunnel, waking it on traffic. Cluster formation uses
+the same tunnel; cache peers communicate on the node's Docker network.
+
+`FLOCI_SERVICES_ELASTICACHE_SMOLVM_IDLE_TIMEOUT` sets an idle duration such as `2m`; empty uses
+the node's default. Use a `FLOCI_HOSTNAME` that node clients can resolve, such as `localhost.floci.io`.
+Names supplied through the `floci:tls-hostnames` tag also resolve through node DNS to Floci's
+gateway and reach the same authenticated proxy. Memcached remains on host Docker.
+
 **Protocol:** Query (XML) for management API + Redis RESP protocol for data plane
 **Management Endpoint:** `POST http://localhost:4566/`
 **Data Endpoint:** `localhost:<proxy-port>` (TCP)

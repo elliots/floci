@@ -3,6 +3,8 @@ package io.github.hectorvent.floci.services.elasticache.proxy;
 import io.github.hectorvent.floci.config.EmulatorConfig;
 import io.github.hectorvent.floci.config.FlociCertificateAuthority;
 import io.github.hectorvent.floci.core.common.AwsPartitions;
+import io.github.hectorvent.floci.core.common.dns.NodeDnsServer;
+import io.github.hectorvent.floci.services.elasticache.container.ElastiCacheContainerManager;
 import io.github.hectorvent.floci.services.elasticache.model.AuthMode;
 import jakarta.enterprise.context.ApplicationScoped;
 import jakarta.inject.Inject;
@@ -30,17 +32,22 @@ public class ElastiCacheProxyManager {
     private final List<String> tlsSuffixes;
     private final String hostname;
     private final Set<String> endpointHostnames;
+    private final ElastiCacheContainerManager containers;
+    private final NodeDnsServer nodeDns;
     private final ConcurrentHashMap<String, ElastiCacheAuthProxy> proxies = new ConcurrentHashMap<>();
     private final ConcurrentHashMap<String, Set<String>> tlsHostnames = new ConcurrentHashMap<>();
 
     @Inject
     public ElastiCacheProxyManager(SigV4Validator sigV4Validator, FlociCertificateAuthority authority,
-                                   EmulatorConfig config, ElastiCacheTlsCertificates tlsCertificates) {
+                                   EmulatorConfig config, ElastiCacheContainerManager containers, NodeDnsServer nodeDns,
+                                   ElastiCacheTlsCertificates tlsCertificates) {
         this.sigV4Validator = sigV4Validator;
         this.authority = authority;
         this.tlsSuffixes = tlsSuffixes(config.services().elasticache().tlsSuffixes());
         this.hostname = config.hostname().orElse("localhost");
         this.endpointHostnames = tlsCertificates.hostnames();
+        this.containers = containers;
+        this.nodeDns = nodeDns;
     }
 
     /** For a manager that serves plain text only. */
@@ -50,6 +57,8 @@ public class ElastiCacheProxyManager {
         this.tlsSuffixes = List.of();
         this.hostname = "localhost";
         this.endpointHostnames = Set.of("localhost");
+        this.containers = null;
+        this.nodeDns = null;
     }
 
     /** The configured TLS domains, with {@code auto} replaced by the ElastiCache domain of every AWS partition. */
@@ -66,6 +75,9 @@ public class ElastiCacheProxyManager {
      * own configuration connects to. Takes effect on the next handshake, whether or not the proxy has started.
      */
     public void setTlsHostnames(String groupId, Set<String> names) {
+        if (nodeDns != null) {
+            nodeDns.serviceNames("elasticache:" + groupId, names);
+        }
         if (names.isEmpty()) {
             tlsHostnames.remove(groupId);
         } else {
@@ -102,7 +114,8 @@ public class ElastiCacheProxyManager {
         }).context();
         ElastiCacheAuthProxy proxy = new ElastiCacheAuthProxy(
                 authIdentity, authMode, backendHost, backendPort,
-                passwordValidator, sigV4Validator, tls == null ? null : () -> tls);
+                passwordValidator, sigV4Validator, tls == null ? null : () -> tls,
+                containers == null ? null : containers::connect);
         try {
             proxy.start(proxyPort);
             proxies.put(proxyId, proxy);
@@ -131,6 +144,10 @@ public class ElastiCacheProxyManager {
     public void stopAll() {
         proxies.values().forEach(ElastiCacheAuthProxy::stop);
         proxies.clear();
+        if (nodeDns != null) {
+            tlsHostnames.keySet().forEach(group -> nodeDns.serviceNames("elasticache:" + group, Set.of()));
+        }
+        tlsHostnames.clear();
         LOG.info("Stopped all ElastiCache proxies");
     }
 }
