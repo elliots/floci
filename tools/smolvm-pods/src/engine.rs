@@ -1248,6 +1248,7 @@ impl PodBackend for EnginePodBackend {
             } => Ok(Some(StatsSample {
                 cpu_usage_ns,
                 memory_bytes,
+                ..Default::default()
             })),
             AgentResponse::Error { message, .. } => Err(format!("PodStats: {message}")),
             other => Err(format!("PodStats: unexpected agent response {other:?}")),

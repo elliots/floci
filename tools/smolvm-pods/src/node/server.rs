@@ -930,14 +930,23 @@ impl Node {
             Op::Stats { pod, id } => {
                 let pod = self.pod(&pod)?;
                 pod.require_vm()?;
+                let memory_mib = self
+                    .inner
+                    .lifecycle
+                    .get(&PodRef::sandbox(&pod.id))
+                    .and_then(|info| info.identity.memory_mib)
+                    .unwrap_or(crate::engine::DEFAULT_SANDBOX_MEMORY_MIB);
                 // While the pod sleeps: memory 0, and the front shim keeps
                 // the CPU total, which never goes back.
-                if !self.is_awake(&pod.id) {
+                let mut sample = if !self.is_awake(&pod.id) {
                     let container = id != pod.id || pod.standalone;
-                    let sample = container.then_some(StatsSample::default());
-                    return Ok(Reply::Stats { sample });
+                    container.then_some(StatsSample::default())
+                } else {
+                    pod.backend.stats(&id).await.map_err(unknown)?
+                };
+                if let Some(sample) = &mut sample {
+                    sample.memory_limit_bytes = Some(u64::from(memory_mib) * 1024 * 1024);
                 }
-                let sample = pod.backend.stats(&id).await.map_err(unknown)?;
                 Ok(Reply::Stats { sample })
             }
             Op::DropSandbox { pod, netns } => self.drop_sandbox(&pod, netns).await,
