@@ -6,8 +6,11 @@ import io.restassured.RestAssured;
 import io.restassured.path.xml.XmlPath;
 import io.restassured.specification.RequestSpecification;
 import org.junit.jupiter.api.*;
+import org.junit.jupiter.params.ParameterizedTest;
+import org.junit.jupiter.params.provider.ValueSource;
 
 import java.net.Socket;
+import java.net.URI;
 import java.net.URLEncoder;
 import java.nio.charset.StandardCharsets;
 import java.util.LinkedHashMap;
@@ -849,22 +852,29 @@ class SqsIntegrationTest {
     }
 
 
-    @Test
-    void longPollOfAClosedConnectionTakesNoMessage() throws Exception {
+    @ParameterizedTest
+    @ValueSource(strings = {"query", "json-root", "json-queue"})
+    void longPollOfAClosedConnectionTakesNoMessage(String protocol) throws Exception {
         String goneQueueUrl = given()
             .contentType("application/x-www-form-urlencoded")
             .formParam("Action", "CreateQueue")
-            .formParam("QueueName", "query-gone-poller-queue")
+            .formParam("QueueName", protocol + "-gone-poller-queue")
         .when().post("/").then().statusCode(200)
             .extract().xmlPath().getString("CreateQueueResponse.CreateQueueResult.QueueUrl");
 
         try {
-            String form = "Action=ReceiveMessage&WaitTimeSeconds=10&QueueUrl="
-                    + URLEncoder.encode(goneQueueUrl, StandardCharsets.UTF_8);
+            boolean query = protocol.equals("query");
+            String body = query
+                    ? "Action=ReceiveMessage&WaitTimeSeconds=10&QueueUrl="
+                        + URLEncoder.encode(goneQueueUrl, StandardCharsets.UTF_8)
+                    : "{\"QueueUrl\":\"" + goneQueueUrl + "\",\"WaitTimeSeconds\":10}";
+            String path = protocol.equals("json-queue") ? URI.create(goneQueueUrl).getRawPath() : "/";
+            String headers = query
+                    ? "Content-Type: application/x-www-form-urlencoded\r\n"
+                    : "Content-Type: application/x-amz-json-1.0\r\nX-Amz-Target: AmazonSQS.ReceiveMessage\r\n";
             try (Socket socket = new Socket("127.0.0.1", RestAssured.port)) {
-                socket.getOutputStream().write(("POST / HTTP/1.1\r\nHost: localhost\r\n"
-                        + "Content-Type: application/x-www-form-urlencoded\r\n"
-                        + "Content-Length: " + form.length() + "\r\n\r\n" + form)
+                socket.getOutputStream().write(("POST " + path + " HTTP/1.1\r\nHost: localhost\r\n"
+                        + headers + "Content-Length: " + body.length() + "\r\n\r\n" + body)
                         .getBytes(StandardCharsets.US_ASCII));
                 Thread.sleep(500); // let the poll park inside its long-poll wait
                 socket.setSoLinger(true, 0); // close with a RST, as a reset connection does
