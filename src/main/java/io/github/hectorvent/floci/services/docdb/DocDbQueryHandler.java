@@ -340,10 +340,10 @@ public class DocDbQueryHandler {
            .start("DBClusterMembers");
         if (c.getDbClusterMembers() != null) {
             for (String memberId : c.getDbClusterMembers()) {
-                xml.start("member")
+                xml.start("DBClusterMember")
                    .elem("DBInstanceIdentifier", memberId)
                    .elem("IsClusterWriter", true)
-                   .end("member");
+                   .end("DBClusterMember");
             }
         }
         xml.end("DBClusterMembers");

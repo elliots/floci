@@ -4,14 +4,24 @@ import io.github.hectorvent.floci.services.ec2.Ec2Service;
 import io.github.hectorvent.floci.services.ec2.model.SecurityGroup;
 import io.github.hectorvent.floci.services.kms.KmsService;
 import io.github.hectorvent.floci.testing.RdsAndDocDbMockProfile;
+import io.quarkus.test.common.http.TestHTTPResource;
 import io.quarkus.test.junit.QuarkusTest;
 import io.quarkus.test.junit.TestProfile;
 import jakarta.inject.Inject;
 import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.Test;
+import software.amazon.awssdk.auth.credentials.AwsBasicCredentials;
+import software.amazon.awssdk.auth.credentials.StaticCredentialsProvider;
+import software.amazon.awssdk.regions.Region;
+import software.amazon.awssdk.services.rds.RdsClient;
+import software.amazon.awssdk.services.rds.model.DBClusterMember;
+
+import java.net.URI;
+import java.util.List;
 
 import static io.github.hectorvent.floci.testing.RdsRequests.rds;
 import static org.hamcrest.Matchers.containsString;
+import static org.junit.jupiter.api.Assertions.assertEquals;
 
 /**
  * The settings a DocumentDB cluster is created with come back from DescribeDBClusters, as on a
@@ -30,10 +40,42 @@ class DocDbClusterSettingsIntegrationTest {
     @Inject
     Ec2Service ec2Service;
 
+    @TestHTTPResource
+    URI endpoint;
+
     @AfterEach
     void cleanUp() {
         rds("DeleteDBInstance").formParam("DBInstanceIdentifier", ID + "-1").when().post("/");
         rds("DeleteDBCluster").formParam("DBClusterIdentifier", ID).formParam("SkipFinalSnapshot", "true").when().post("/");
+    }
+
+    @Test
+    void membersAreDbClusterMemberElements() {
+        rds("CreateDBCluster")
+                .formParam("DBClusterIdentifier", ID)
+                .formParam("Engine", "docdb")
+                .formParam("MasterUsername", "u")
+                .formParam("MasterUserPassword", "secret99password")
+                .when().post("/").then().statusCode(200);
+        rds("CreateDBInstance")
+                .formParam("DBInstanceIdentifier", ID + "-1")
+                .formParam("DBInstanceClass", "db.t3.medium")
+                .formParam("Engine", "docdb")
+                .formParam("DBClusterIdentifier", ID)
+                .when().post("/").then().statusCode(200);
+
+        rds("DescribeDBClusters").formParam("DBClusterIdentifier", ID)
+                .when().post("/").then().statusCode(200)
+                .body(containsString("<DBClusterMembers><DBClusterMember><DBInstanceIdentifier>" + ID
+                        + "-1</DBInstanceIdentifier><IsClusterWriter>true</IsClusterWriter></DBClusterMember>"
+                        + "</DBClusterMembers>"));
+        try (RdsClient client = RdsClient.builder().endpointOverride(endpoint).region(Region.US_EAST_1)
+                .credentialsProvider(StaticCredentialsProvider.create(AwsBasicCredentials.create("test", "test")))
+                .build()) {
+            List<DBClusterMember> members = client.describeDBClusters(request -> request.dbClusterIdentifier(ID))
+                    .dbClusters().getFirst().dbClusterMembers();
+            assertEquals(List.of(ID + "-1"), members.stream().map(DBClusterMember::dbInstanceIdentifier).toList());
+        }
     }
 
     /**
