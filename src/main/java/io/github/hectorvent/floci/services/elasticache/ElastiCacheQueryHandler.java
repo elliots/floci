@@ -31,6 +31,7 @@ import java.net.URLDecoder;
 import java.nio.charset.StandardCharsets;
 import java.util.ArrayList;
 import java.util.Collection;
+import java.util.Comparator;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
@@ -357,13 +358,8 @@ public class ElastiCacheQueryHandler {
 
     private Response handleDescribeUserGroups(MultivaluedMap<String, String> params) {
         try {
-            Collection<ElastiCacheUserGroup> userGroups = service.listUserGroups(params.getFirst("UserGroupId"));
-            XmlBuilder xml = new XmlBuilder().start("UserGroups");
-            for (ElastiCacheUserGroup userGroup : userGroups) {
-                xml.start("member").raw(userGroupXml(userGroup)).end("member");
-            }
-            xml.end("UserGroups");
-            return Response.ok(AwsQueryResponse.envelope("DescribeUserGroups", AwsNamespaces.EC, xml.build())).build();
+            return Response.ok(AwsQueryResponse.envelope("DescribeUserGroups", AwsNamespaces.EC,
+                    describeUserGroupsXml(params))).build();
         } catch (AwsException e) {
             return AwsQueryResponse.error(e.getErrorCode(), e.getMessage(), AwsNamespaces.EC, e.getHttpStatus());
         }
@@ -390,6 +386,37 @@ public class ElastiCacheQueryHandler {
         } catch (AwsException e) {
             return AwsQueryResponse.error(e.getErrorCode(), e.getMessage(), AwsNamespaces.EC, e.getHttpStatus());
         }
+    }
+
+    private String describeUserGroupsXml(MultivaluedMap<String, String> params) {
+        Integer requestedLimit = intParam(params, "MaxRecords");
+        int limit = requestedLimit == null ? 100 : requestedLimit;
+        if (limit < 1) {
+            throw new AwsException("InvalidParameterValue", "MaxRecords must be positive.", 400);
+        }
+        List<ElastiCacheUserGroup> groups = service.listUserGroups(params.getFirst("UserGroupId")).stream()
+                .sorted(Comparator.comparing(ElastiCacheUserGroup::getUserGroupId)).toList();
+        String marker = params.getFirst("Marker");
+        int start = 0;
+        if (marker != null) {
+            while (start < groups.size() && !groups.get(start).getUserGroupId().equals(marker)) {
+                start++;
+            }
+            if (start == groups.size()) {
+                throw new AwsException("InvalidParameterValue", "Invalid Marker.", 400);
+            }
+            start++;
+        }
+        int end = (int) Math.min((long) start + limit, groups.size());
+        XmlBuilder xml = new XmlBuilder().start("UserGroups");
+        for (ElastiCacheUserGroup group : groups.subList(start, end)) {
+            xml.start("member").raw(userGroupXml(group)).end("member");
+        }
+        xml.end("UserGroups");
+        if (end < groups.size()) {
+            xml.elem("Marker", groups.get(end - 1).getUserGroupId());
+        }
+        return xml.build();
     }
 
     private String userGroupXml(ElastiCacheUserGroup g) {

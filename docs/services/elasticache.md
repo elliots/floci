@@ -126,8 +126,9 @@ to one VPC. Names, settings, tags, owner account and runtime identity use the ex
 storage mode. Restart recovery reserves proxy ports and restores authentication and endpoints;
 the cache keyspace itself comes back empty, as for the other local cache runtimes.
 
-Tags on a serverless cache are set at creation and are not editable afterwards, because
-`AddTagsToResource` and `RemoveTagsFromResource` are not implemented for ElastiCache.
+`ListTagsForResource`, `AddTagsToResource`, and `RemoveTagsFromResource` persist tags on
+users, user groups, replication groups, standalone clusters, serverless caches, subnet groups,
+and parameter groups. User-group listing supports `MaxRecords` and `Marker`.
 
 Local serverless caches have fixed capacity and plaintext TCP endpoints. Usage limits, subnet and
 security-group placement, KMS encryption and snapshot schedules are metadata; they do not enable
