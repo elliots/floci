@@ -40,6 +40,15 @@ public final class ServerCertificateRenewal {
 
     /** A new leaf for {@code sans}. An expired CA signs nothing, so it fails rather than issue a dead leaf. */
     public Leaf issue(List<String> sans) throws GeneralSecurityException, IOException {
+        CertificateGenerator.GeneratedCertificate generated = issueCertificate("localhost", sans);
+        SSLContext context = authority.serverSslContext(Pem.parseCertificate(generated.certificatePem()),
+                Pem.parsePrivateKey(generated.privateKeyPem()));
+        return new Leaf(context, generated.notAfter());
+    }
+
+    /** Issues the same renewable leaf for a listener that selects its key and certificate through SNI. */
+    public CertificateGenerator.GeneratedCertificate issueCertificate(String commonName, List<String> sans)
+            throws GeneralSecurityException {
         Instant now = clock.instant();
         X509Certificate ca = authority.certificate();
         ca.checkValidity(Date.from(now));
@@ -48,12 +57,8 @@ public final class ServerCertificateRenewal {
         if (caNotAfter.isBefore(notAfter)) {
             notAfter = caNotAfter;
         }
-        CertificateGenerator.GeneratedCertificate generated = generator.generateIssuedCertificate(
-                "localhost", sans, KeyAlgorithm.RSA_2048, null, authority.issuer(),
+        return generator.generateIssuedCertificate(commonName, sans, KeyAlgorithm.RSA_2048, null, authority.issuer(),
                 CertificateGenerator.LeafUsage.SERVER, notAfter);
-        SSLContext context = authority.serverSslContext(Pem.parseCertificate(generated.certificatePem()),
-                Pem.parsePrivateKey(generated.privateKeyPem()));
-        return new Leaf(context, generated.notAfter());
     }
 
     /** True with no leaf yet, and once {@code leaf} is due. */

@@ -429,6 +429,7 @@ These services spawn Docker containers. They require access to the Docker socket
 | `FLOCI_SERVICES_ELASTICACHE_DEFAULT_IMAGE` | `valkey/valkey:8` | Default Docker image for cache clusters |
 | `FLOCI_SERVICES_ELASTICACHE_DOCKER_NETWORK` | _(none)_ | Docker network for ElastiCache containers (overrides `FLOCI_SERVICES_DOCKER_NETWORK`) |
 | `FLOCI_SERVICES_ELASTICACHE_CLUSTER_ANNOUNCE_HOSTNAME` | _(none)_ | Hostname cluster-mode nodes announce in `MOVED`/`ASK` redirects and topology responses, and report as the `ConfigurationEndpoint`. Set to a name every client resolves (e.g. `localhost.floci.io`) when `FLOCI_HOSTNAME` only resolves inside Floci's Docker network. Defaults to `FLOCI_HOSTNAME` |
+| `FLOCI_SERVICES_ELASTICACHE_TLS_SUFFIXES` | `auto` | Comma-separated domains whose names the Redis and Valkey proxies issue TLS certificates for; `auto` uses the ElastiCache domain of every AWS partition. See [ElastiCache TLS](../services/elasticache.md#local-tls-connections) |
 
 ### RDS
 

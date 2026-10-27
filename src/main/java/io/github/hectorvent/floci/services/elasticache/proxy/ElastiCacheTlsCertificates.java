@@ -56,6 +56,10 @@ public class ElastiCacheTlsCertificates {
         hosts.add(name.startsWith("[") && name.endsWith("]") ? name.substring(1, name.length() - 1) : name);
     }
 
+    Set<String> hostnames() {
+        return Set.copyOf(hosts);
+    }
+
     public SSLContext sslContext() {
         ServerCertificateRenewal.Leaf current = leaf;
         if (renewal.due(current)) {

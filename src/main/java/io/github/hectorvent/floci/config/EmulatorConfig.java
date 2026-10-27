@@ -1701,6 +1701,17 @@ public interface EmulatorConfig {
          * network. Empty = the main hostname.
          */
         Optional<String> clusterAnnounceHostname();
+
+        /**
+         * Domains whose names the proxy serves TLS for. A client that opens with a TLS handshake (a
+         * {@code rediss://} URL, as clients of a group with in-transit encryption use) is given a certificate from
+         * Floci's CA for the name it asked for, if that name is one of these domains or under one; any other name gets
+         * the certificate for the Floci hostname. A client that opens with a Redis command is served in plain text.
+         * The default, auto, derives cache domains from every AWS partition, so a client given an address from its own
+         * configuration can verify it. Env: {@code FLOCI_SERVICES_ELASTICACHE_TLS_SUFFIXES}
+         */
+        @WithDefault("auto")
+        List<String> tlsSuffixes();
     }
 
     interface MemoryDbServiceConfig {
