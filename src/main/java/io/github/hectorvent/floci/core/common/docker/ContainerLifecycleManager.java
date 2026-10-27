@@ -5,6 +5,7 @@ import com.github.dockerjava.api.DockerClient;
 import com.github.dockerjava.api.command.CreateContainerCmd;
 import com.github.dockerjava.api.command.CreateContainerResponse;
 import com.github.dockerjava.api.command.InspectContainerResponse;
+import com.github.dockerjava.api.command.InspectImageResponse;
 import com.github.dockerjava.api.command.InspectVolumeResponse;
 import com.github.dockerjava.api.command.ListVolumesResponse;
 import com.github.dockerjava.api.command.RemoveContainerCmd;
@@ -191,6 +192,14 @@ public class ContainerLifecycleManager {
      */
     public LaunchImage resolveImageForLaunch(String image, ImagePullBehavior behavior) {
         return imageCacheService.resolveForLaunch(image, behavior);
+    }
+
+    /** Reads the command from the image prepared on this daemon for the requested platform. */
+    public List<String> imageCommand(String image, String platform) {
+        String resolvedImage = imageCacheService.ensureImageExists(image, platform);
+        InspectImageResponse inspected = dockerClient.inspectImageCmd(resolvedImage).exec();
+        String[] command = inspected.getConfig() == null ? null : inspected.getConfig().getCmd();
+        return command == null ? List.of() : List.of(command);
     }
 
     /**

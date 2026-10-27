@@ -110,12 +110,12 @@ class ContainerLauncherTest {
 
         when(config.services()).thenReturn(services);
         when(services.lambda()).thenReturn(lambda);
-        when(lambda.dockerNetwork()).thenReturn(Optional.empty());
+        lenient().when(lambda.dockerNetwork()).thenReturn(Optional.empty());
         lenient().when(lambda.extraHosts()).thenReturn(Optional.empty());
         lenient().when(lambda.awsConfigPath()).thenReturn(Optional.empty());
         when(config.docker()).thenReturn(docker);
-        when(docker.logMaxSize()).thenReturn("10m");
-        when(docker.logMaxFile()).thenReturn("3");
+        lenient().when(docker.logMaxSize()).thenReturn("10m");
+        lenient().when(docker.logMaxFile()).thenReturn("3");
         lenient().when(config.baseUrl()).thenReturn("http://localhost:4566");
         lenient().when(config.port()).thenReturn(4566);
         lenient().when(config.tls()).thenReturn(mock(EmulatorConfig.TlsConfig.class));
@@ -133,7 +133,7 @@ class ContainerLauncherTest {
         lenient().when(efs.mountUser()).thenReturn(Optional.empty());
         lenient().when(efs.mountGroupAdd()).thenReturn(OptionalInt.empty());
 
-        when(embeddedDnsServer.getServerIp()).thenReturn(Optional.empty());
+        lenient().when(embeddedDnsServer.getServerIp()).thenReturn(Optional.empty());
         // Default: pass images through unchanged, matching the real EcrRegistryManager's
         // behavior for non-ECR-shaped images. Individual ECR-rewrite tests override this.
         lenient().when(ecrRegistryManager.rewriteImageUri(any()))
@@ -564,7 +564,7 @@ class ContainerLauncherTest {
 
     @Test
     void launchFunction_usesEmbeddedDnsEndpointWithoutExplicitResolvers() throws Exception {
-        when(embeddedDnsServer.getServerIp()).thenReturn(Optional.of("172.18.0.4"));
+        lenient().when(embeddedDnsServer.getServerIp()).thenReturn(Optional.of("172.18.0.4"));
         when(config.dns()).thenReturn(mock(EmulatorConfig.DnsConfig.class));
         Path codePath = Files.createDirectory(tempDir.resolve("embedded-dns-code"));
 
@@ -989,13 +989,7 @@ class ContainerLauncherTest {
     }
 
     private void stubImageCmd(String image, String... cmd) {
-        com.github.dockerjava.api.command.InspectImageCmd inspect = mock(com.github.dockerjava.api.command.InspectImageCmd.class);
-        com.github.dockerjava.api.command.InspectImageResponse response = mock(com.github.dockerjava.api.command.InspectImageResponse.class);
-        com.github.dockerjava.api.model.ContainerConfig containerConfig = mock(com.github.dockerjava.api.model.ContainerConfig.class);
-        lenient().when(dockerClient.inspectImageCmd(image)).thenReturn(inspect);
-        lenient().when(inspect.exec()).thenReturn(response);
-        lenient().when(response.getConfig()).thenReturn(containerConfig);
-        lenient().when(containerConfig.getCmd()).thenReturn(cmd);
+        lenient().when(lifecycleManager.imageCommand(eq(image), any())).thenReturn(List.of(cmd));
     }
 
     private static List<String> handlerEnv(ContainerSpec spec) {
@@ -1033,17 +1027,19 @@ class ContainerLauncherTest {
     }
 
     @Test
-    void launchImageFunction_setsNoHandlerWhenTheImageCannotBeRead() {
+    void launchImageFunction_failsBeforeCreatingWhenTheImageCannotBePrepared() {
         LambdaFunction fn = new LambdaFunction();
         fn.setFunctionName("image-no-handler-fn");
         fn.setPackageType("Image");
         fn.setImageUri("localhost:5001/missing:1");
         when(ecrRegistryManager.rewriteImageUri("localhost:5001/missing:1")).thenReturn("localhost:5001/missing:1");
-        lenient().when(dockerClient.inspectImageCmd("localhost:5001/missing:1")).thenThrow(new NotFoundException("no such image"));
+        when(lifecycleManager.imageCommand(eq("localhost:5001/missing:1"), any()))
+                .thenThrow(new NotFoundException("no such image"));
 
-        launcher.launch(fn);
+        assertThrows(NotFoundException.class, () -> launcher.launch(fn));
 
-        assertEquals(List.of(), handlerEnv(captureRealContainerSpec()));
+        verify(lifecycleManager, never()).create(any());
+        verify(runtimeApiServer).stop();
     }
 
     @Test

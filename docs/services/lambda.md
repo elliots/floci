@@ -1104,6 +1104,11 @@ When unset (default), Floci injects execution-role credentials for a known role.
 
 A container image function whose `ImageUri` names an image already present on the Docker daemon runs that image directly. This includes AWS-shaped `<account>.dkr.ecr.<region>.amazonaws.com/<repo>:<tag>` URIs, which are otherwise rewritten to [Floci's emulated ECR registry](ecr.md) at pull time: build the image under the exact URI the function declares (`docker build -t <ImageUri> .`) and no push is needed. With `FLOCI_DOCKER_IMAGE_REGISTRY_BASE` set, tag it as `<base>/<ImageUri>` instead, since that is the reference Floci launches. Set `FLOCI_SERVICES_ECR_PREFER_LOCAL_IMAGES=false` to always resolve AWS-shaped URIs through the emulated registry.
 
+For smolvm launches, Floci also checks the selected node's dockerd before rewriting an ECR
+image URI. An image already loaded there can run even if the host daemon no longer has it.
+The Docker executor prepares the image on the selected daemon before deriving `_HANDLER`
+from its CMD; an explicit `ImageConfig.Command` takes precedence.
+
 ### Private registry authentication
 
 Container image functions (`"PackageType": "Image"`) that pull from private registries need Docker credentials. See [Docker Configuration → Private Registry Authentication](../configuration/docker.md#private-registry-authentication) for the full guide.

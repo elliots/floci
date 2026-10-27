@@ -21,6 +21,7 @@ import io.github.hectorvent.floci.services.lambda.runtime.RuntimeApiServerFactor
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
 import org.mockito.ArgumentCaptor;
+import org.mockito.InOrder;
 
 import java.net.URI;
 import java.nio.file.Path;
@@ -44,6 +45,7 @@ import static org.mockito.ArgumentMatchers.anyString;
 import static org.mockito.ArgumentMatchers.eq;
 import static org.mockito.ArgumentMatchers.isNull;
 import static org.mockito.Mockito.RETURNS_DEEP_STUBS;
+import static org.mockito.Mockito.inOrder;
 import static org.mockito.Mockito.mock;
 import static org.mockito.Mockito.never;
 import static org.mockito.Mockito.verify;
@@ -85,7 +87,7 @@ class ContainerLauncherSmolvmTest {
         when(dns.getServerIp()).thenReturn(Optional.of("172.30.0.53"));
         ContainerReachableEndpoint endpoint = new ContainerReachableEndpoint(config, dockerHostResolver, dns, 4566);
         EcrRegistryManager ecr = mock(EcrRegistryManager.class);
-        when(ecr.rewriteImageUri(any())).thenAnswer(inv -> inv.getArgument(0));
+        when(ecr.rewriteImageUri(any(), any())).thenAnswer(inv -> inv.getArgument(0));
         LambdaExecutionRoleCredentials roles = mock(LambdaExecutionRoleCredentials.class);
         when(roles.forFunction(any())).thenReturn(Optional.empty());
 
@@ -118,6 +120,22 @@ class ContainerLauncherSmolvmTest {
         fn.setPackageType("Image");
         fn.setImageUri(IMAGE);
         return fn;
+    }
+
+    @Test
+    void imageHandlerComesFromThePreparedNodeImage() {
+        when(nodeLifecycle.imageCommand(IMAGE, null)).thenReturn(List.of("node.handler"));
+
+        launcher.launch(imageFunction());
+
+        ArgumentCaptor<ContainerSpec> spec = ArgumentCaptor.forClass(ContainerSpec.class);
+        verify(nodeLifecycle).create(spec.capture());
+        assertThat(spec.getValue().env(), hasItem("_HANDLER=node.handler"));
+        verify(localLifecycle, never()).imageCommand(any(), any());
+        InOrder order = inOrder(smolvm, nodeLifecycle);
+        order.verify(smolvm).ensureImage(target, IMAGE, null);
+        order.verify(nodeLifecycle).imageCommand(IMAGE, null);
+        order.verify(nodeLifecycle).create(any());
     }
 
     @Test

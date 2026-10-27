@@ -244,7 +244,8 @@ public class ContainerLauncher implements LambdaRuntimeLauncher {
                 : imageResolver.resolve(fn.getRuntime());
 
         // If this is an AWS-shaped ECR URI, rewrite it to Floci's loopback registry
-        image = ecrRegistryManager.rewriteImageUri(image);
+        image = node == null ? ecrRegistryManager.rewriteImageUri(image)
+                : ecrRegistryManager.rewriteImageUri(image, node.clients().control());
 
         // Determine host address reachable from container
         String hostAddress = node != null ? smolvm.runtimeApiHost() : dockerHostResolver.resolve();
@@ -262,6 +263,10 @@ public class ContainerLauncher implements LambdaRuntimeLauncher {
         String lambdaRegion = extractRegionFromArn(fn.getFunctionArn(), config.defaultRegion());
         String lambdaAccountId = AwsArnUtils.accountOrDefault(fn.getFunctionArn(), config.defaultAccountId());
         LambdaDockerFlags dockerFlags = configuredDockerFlags();
+        String platform = createPlatform(fn, dockerFlags);
+        if (node != null) {
+            smolvm.ensureImage(node, containerBuilder.resolveImage(image), platform);
+        }
 
         // Build env vars
         List<String> env = new ArrayList<>();
@@ -271,7 +276,7 @@ public class ContainerLauncher implements LambdaRuntimeLauncher {
         env.add("AWS_LAMBDA_FUNCTION_TIMEOUT=" + fn.getTimeout());
         env.add("AWS_LAMBDA_LOG_GROUP_NAME=" + cwLogGroup);
         env.add("AWS_LAMBDA_LOG_STREAM_NAME=" + cwLogStream);
-        String handler = handlerFor(fn, image);
+        String handler = handlerFor(fn, image, lifecycle, platform);
         if (handler != null) {
             env.add("_HANDLER=" + handler);
         }
@@ -425,7 +430,7 @@ public class ContainerLauncher implements LambdaRuntimeLauncher {
 
         // Create container without starting — provided.* runtimes exec
         // /var/runtime/bootstrap on start, so code must be copied first.
-        containerId = createContainer(lifecycle, node, spec, fn, dockerFlags);
+        containerId = createContainer(lifecycle, spec, platform);
         if (node != null) {
             nodeContainers.put(containerId, node);
         }
@@ -605,12 +610,7 @@ public class ContainerLauncher implements LambdaRuntimeLauncher {
         };
     }
 
-    private String createContainer(ContainerLifecycleManager lifecycle, LambdaSmolvmBackend.Target node,
-                                   ContainerSpec spec, LambdaFunction fn, LambdaDockerFlags dockerFlags) {
-        String platform = createPlatform(fn, dockerFlags);
-        if (node != null) {
-            smolvm.ensureImage(node, spec.image(), platform);
-        }
+    private String createContainer(ContainerLifecycleManager lifecycle, ContainerSpec spec, String platform) {
         return platform == null ? lifecycle.create(spec) : lifecycle.create(spec, platform);
     }
 
@@ -1090,7 +1090,8 @@ public class ContainerLauncher implements LambdaRuntimeLauncher {
         acquirePopulatePermit(fn.getFunctionName());
         String helperId = null;
         try {
-            helperId = createContainer(lifecycleManager, null, helperSpec, fn, LambdaDockerFlags.parse(null));
+            helperId = createContainer(lifecycleManager, helperSpec,
+                    createPlatform(fn, LambdaDockerFlags.parse(null)));
             lifecycleManager.startCreated(helperId, helperSpec);
             copyDirToContainerStrict(lifecycleManager.getDockerClient(), helperId,
                     Path.of(fn.getCodeLocalPath()), TASK_DIR, fn.getFunctionName());
@@ -1345,7 +1346,8 @@ public class ContainerLauncher implements LambdaRuntimeLauncher {
      * AWS sets it from the function's command, which is {@code ImageConfig.Command} when that is set and otherwise the
      * image's own CMD. A runtime interface client such as aws-lambda-ric stops at start when it is missing.
      */
-    String handlerFor(LambdaFunction fn, String image) {
+    private String handlerFor(LambdaFunction fn, String image, ContainerLifecycleManager lifecycle,
+                              String platform) {
         if (fn.getHandler() != null && !fn.getHandler().isBlank()) {
             return fn.getHandler();
         }
@@ -1354,24 +1356,13 @@ public class ContainerLauncher implements LambdaRuntimeLauncher {
         }
         List<String> command = fn.getImageConfigCommand();
         if (command == null || command.isEmpty()) {
-            command = imageCmd(image);
+            String resolvedImage = containerBuilder.resolveImage(image);
+            command = lifecycle.imageCommand(resolvedImage, platform);
         }
         if (command == null || command.isEmpty() || command.get(0) == null || command.get(0).isBlank()) {
             return null;
         }
         return command.get(0);
-    }
-
-    /** The CMD of a local image, or null when the image is not there or cannot be read. */
-    private List<String> imageCmd(String image) {
-        try {
-            var inspected = lifecycleManager.getDockerClient().inspectImageCmd(image).exec();
-            String[] cmd = inspected == null || inspected.getConfig() == null ? null : inspected.getConfig().getCmd();
-            return cmd == null ? null : List.of(cmd);
-        } catch (RuntimeException e) {
-            LOG.debugf("Could not read the CMD of image %s: %s", image, e.getMessage());
-            return null;
-        }
     }
 
     private void copyDirToContainer(DockerClient dockerClient, String containerId,
