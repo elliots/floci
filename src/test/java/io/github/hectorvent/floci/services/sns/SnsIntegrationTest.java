@@ -355,7 +355,24 @@ class SnsIntegrationTest {
         .when()
             .post("/")
         .then()
-            .statusCode(200);
+            .statusCode(200)
+            // the SDKs require the empty result element: without it the Go SDK fails with "TagResourceResult node not found"
+            .body(containsString("<TagResourceResult"));
+    }
+
+    @Test
+    @Order(11)
+    void untagResourceHasAnEmptyResult() {
+        given()
+            .contentType("application/x-www-form-urlencoded")
+            .formParam("Action", "UntagResource")
+            .formParam("ResourceArn", topicArn)
+            .formParam("TagKeys.member.1", "no-such-key")
+        .when()
+            .post("/")
+        .then()
+            .statusCode(200)
+            .body(containsString("<UntagResourceResult"));
     }
 
     @Test
