@@ -361,8 +361,42 @@ public class LambdaExecutorService implements Resettable {
                     buildErrorPayload(initFailureMessage(e, dockerExecutor), "Lambda.InitError"),
                     null, requestId);
         }
+        Attempt first = executeOn(handle, fn, payload, requestId, clientContext);
+        if (!first.undelivered()) {
+            return first.result();
+        }
+        // The environment failed before its runtime took the event, so the handler never ran: a fresh
+        // environment gets it once, instead of an error that would leave an SQS message invisible until its
+        // visibility timeout. A frozen environment whose runtime exits as it thaws fails this way.
+        LOG.infov("Function {0}: the environment failed before it took request {1}; starting a new one for it",
+                fn.getFunctionName(), requestId);
+        ContainerHandle fresh;
+        try {
+            fresh = warmPool.acquire(fn);
+        } catch (Exception e) {
+            LOG.warnv("Failed to acquire container for function {0}: {1}", fn.getFunctionName(), e.getMessage());
+            return new InvokeResult(200, "Unhandled",
+                    buildErrorPayload(initFailureMessage(e, dockerExecutor), "Lambda.InitError"),
+                    null, requestId);
+        }
+        return executeOn(fresh, fn, payload, requestId, clientContext).result();
+    }
+
+    /**
+     * One invocation on one environment. {@code undelivered} is true when the environment failed before
+     * its runtime took the event: the handler did not run, so the event may go to a new environment.
+     */
+    record Attempt(InvokeResult result, boolean undelivered) {
+        static Attempt done(InvokeResult result) {
+            return new Attempt(result, false);
+        }
+    }
+
+    private Attempt executeOn(ContainerHandle handle, LambdaFunction fn, byte[] payload, String requestId,
+                              String clientContext) {
         try {
             InvokeResult result;
+            boolean dispatched;
             try (LambdaRuntimeLauncher.Hold awake = warmPool.hold(handle)) {
                 long deadlineMs = System.currentTimeMillis() + (long) fn.getTimeout() * 1000;
                 PendingInvocation invocation = new PendingInvocation(
@@ -376,28 +410,30 @@ public class LambdaExecutorService implements Resettable {
                                 invocation.getDispatchedFuture(), invocation.getResultFuture())
                         .get(fn.getTimeout() + RUNTIME_DISPATCH_GRACE_SECONDS, TimeUnit.SECONDS);
                 result = invocation.getResultFuture().get();
+                dispatched = invocation.getDispatchedFuture().isDone();
             }
 
+            // release() retires a faulted environment rather than pooling it.
             warmPool.release(handle);
-            return result;
+            return new Attempt(result, !dispatched && handle.getRuntimeApiServer().isFaulted());
 
         } catch (InterruptedException e) {
             Thread.currentThread().interrupt();
             warmPool.destroyHandle(handle);
-            return new InvokeResult(200, "Unhandled", buildErrorPayload("Invocation interrupted", "Interrupted"), null, requestId);
+            return Attempt.done(new InvokeResult(200, "Unhandled", buildErrorPayload("Invocation interrupted", "Interrupted"), null, requestId));
         } catch (Exception e) {
             Throwable cause = e instanceof ExecutionException && e.getCause() != null ? e.getCause() : e;
             if (cause instanceof TimeoutException) {
                 LOG.warnv("Function {0} timed out after {1}s", fn.getFunctionName(), fn.getTimeout());
                 warmPool.destroyHandle(handle);
-                return new InvokeResult(200, "Unhandled",
+                return Attempt.done(new InvokeResult(200, "Unhandled",
                         buildErrorPayload("Task timed out after " + fn.getTimeout() + " seconds", "Function.TimedOut"),
-                        null, requestId);
+                        null, requestId));
             }
             LOG.warnv("Invocation error for function {0}: {1}", fn.getFunctionName(), cause.getMessage());
             warmPool.destroyHandle(handle);
-            return new InvokeResult(200, "Unhandled",
-                    buildErrorPayload(cause.getMessage(), "InvocationError"), null, requestId);
+            return Attempt.done(new InvokeResult(200, "Unhandled",
+                    buildErrorPayload(cause.getMessage(), "InvocationError"), null, requestId));
         }
     }
 

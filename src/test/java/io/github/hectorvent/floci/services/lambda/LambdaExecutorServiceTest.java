@@ -197,6 +197,64 @@ class LambdaExecutorServiceTest {
     }
 
     @Test
+    void anEnvironmentThatFailsBeforeItTakesTheEvent_givesItToANewEnvironmentOnce() {
+        // The runtime of a thawed environment exits before it takes the event: the handler never ran.
+        RuntimeApiServer failed = mock(RuntimeApiServer.class);
+        ContainerHandle failedHandle = new ContainerHandle("cid-failed", "test-fn", failed, ContainerState.WARM);
+        InvokeResult exitError = new InvokeResult(200, "Unhandled", "{\"errorType\":\"Runtime.ExitError\"}".getBytes(),
+                null, "req-1");
+        doAnswer(inv -> {
+            PendingInvocation pi = inv.getArgument(0);
+            pi.getResultFuture().complete(exitError);
+            return pi.getResultFuture();
+        }).when(failed).enqueue(any(PendingInvocation.class));
+        when(failed.isFaulted()).thenReturn(true);
+
+        RuntimeApiServer fresh = mock(RuntimeApiServer.class);
+        ContainerHandle freshHandle = new ContainerHandle("cid-fresh", "test-fn", fresh, ContainerState.WARM);
+        InvokeResult expected = new InvokeResult(200, null, "{\"ok\":true}".getBytes(), null, "req-1");
+        doAnswer(inv -> {
+            PendingInvocation pi = inv.getArgument(0);
+            pi.markDispatched();
+            pi.getResultFuture().complete(expected);
+            return pi.getResultFuture();
+        }).when(fresh).enqueue(any(PendingInvocation.class));
+
+        when(warmPool.acquire(any())).thenReturn(failedHandle, freshHandle);
+
+        InvokeResult result = executor.invoke(fn, "{}".getBytes(), InvocationType.RequestResponse);
+
+        assertNull(result.getFunctionError());
+        verify(failed).enqueue(any(PendingInvocation.class));
+        verify(fresh).enqueue(any(PendingInvocation.class));
+        verify(warmPool).release(failedHandle);
+        verify(warmPool).release(freshHandle);
+    }
+
+    @Test
+    void anEnvironmentThatFailsAfterItTookTheEvent_isNotRetried() {
+        // The handler may have run: a second run could repeat its side effects.
+        RuntimeApiServer rtas = mock(RuntimeApiServer.class);
+        ContainerHandle handle = new ContainerHandle("cid-3", "test-fn", rtas, ContainerState.WARM);
+        InvokeResult exitError = new InvokeResult(200, "Unhandled", "{\"errorType\":\"Runtime.ExitError\"}".getBytes(),
+                null, "req-1");
+        doAnswer(inv -> {
+            PendingInvocation pi = inv.getArgument(0);
+            pi.markDispatched();
+            pi.getResultFuture().complete(exitError);
+            return pi.getResultFuture();
+        }).when(rtas).enqueue(any(PendingInvocation.class));
+        when(rtas.isFaulted()).thenReturn(true);
+        when(warmPool.acquire(any())).thenReturn(handle);
+
+        InvokeResult result = executor.invoke(fn, "{}".getBytes(), InvocationType.RequestResponse);
+
+        assertEquals("Unhandled", result.getFunctionError());
+        verify(warmPool, times(1)).acquire(any());
+        verify(rtas, times(1)).enqueue(any(PendingInvocation.class));
+    }
+
+    @Test
     void successfulInvocation_releasesHandle_doesNotDestroy() {
         RuntimeApiServer rtas = mock(RuntimeApiServer.class);
         ContainerHandle handle = new ContainerHandle("cid-2", "test-fn", rtas, ContainerState.WARM);
