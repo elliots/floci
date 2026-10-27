@@ -270,6 +270,8 @@ public class S3Service implements Resettable, ResourceProvider {
     private final IamService iamService;
     private final boolean globalBucketNamespace;
     private final IamPolicyEvaluator policyEvaluator;
+    /** What a bucket gets when CreateBucket names no ownership (floci.services.s3.default-object-ownership). */
+    private String defaultObjectOwnership = "BucketOwnerEnforced";
 
     @Inject
     public S3Service(StorageFactory storageFactory, EmulatorConfig config,
@@ -302,6 +304,15 @@ public class S3Service implements Resettable, ResourceProvider {
                 config.services().s3().enforceAuth(), config.services().iam().enforcementEnabled(), iamService,
                 config.services().s3().globalBucketNamespace()
         );
+        setDefaultObjectOwnership(config.services().s3().defaultObjectOwnership());
+    }
+
+    void setDefaultObjectOwnership(String ownership) {
+        if (!OBJECT_OWNERSHIP_VALUES.contains(ownership)) {
+            throw new IllegalArgumentException("floci.services.s3.default-object-ownership (FLOCI_SERVICES_S3_DEFAULT_OBJECT_OWNERSHIP) "
+                    + "must be one of " + OBJECT_OWNERSHIP_VALUES + ", not " + ownership);
+        }
+        this.defaultObjectOwnership = ownership;
     }
 
     /**
@@ -492,7 +503,7 @@ public class S3Service implements Resettable, ResourceProvider {
                                 String grantFullControl, String grantReadAcp, String grantWriteAcp,
                                 boolean internal) {
         requirePathSafeBucketName(bucketName);
-        String ownership = requestedOwnership == null ? "BucketOwnerEnforced" : requestedOwnership;
+        String ownership = requestedOwnership == null ? defaultObjectOwnership : requestedOwnership;
         if (!OBJECT_OWNERSHIP_VALUES.contains(ownership)) {
             throw new AwsException("InvalidArgument", "Invalid x-amz-object-ownership value: " + ownership, 400);
         }

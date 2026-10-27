@@ -137,6 +137,24 @@ class S3ServiceTest {
     }
 
     @Test
+    void aNewBucketIsOwnerEnforcedUnlessTheDefaultIsChanged() {
+        s3Service.createBucket("modern", "us-east-1");
+        assertTrue(s3Service.getBucketOwnershipControls("modern").contains("BucketOwnerEnforced"));
+        AwsException rejected = assertThrows(AwsException.class,
+                () -> s3Service.putBucketAcl("modern", "", "private", null, null, null, null, null));
+        assertEquals("AccessControlListNotSupported", rejected.getErrorCode());
+
+        s3Service.setDefaultObjectOwnership("ObjectWriter");
+        s3Service.createBucket("legacy", "us-east-1");
+        assertTrue(s3Service.getBucketOwnershipControls("legacy").contains("ObjectWriter"));
+        s3Service.putBucketAcl("legacy", "", "private", null, null, null, null, null);
+        // a CreateBucket that names an ownership still wins
+        s3Service.createBucket("named", "us-east-1", "BucketOwnerEnforced", null, null, null, null, null, null);
+        assertTrue(s3Service.getBucketOwnershipControls("named").contains("BucketOwnerEnforced"));
+        assertThrows(IllegalArgumentException.class, () -> s3Service.setDefaultObjectOwnership("Anything"));
+    }
+
+    @Test
     void createBucketStoresRegion() {
         s3Service.createBucket("eu-bucket", "eu-central-1");
         assertEquals("eu-central-1", s3Service.getBucketRegion("eu-bucket"));
