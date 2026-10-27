@@ -39,6 +39,9 @@ pub struct Node {
     /// The node's ports that pods may reach under isolation besides DNS, the
     /// relay and the sinkhole: the API server and kubelet.
     pub node_ports: Vec<u16>,
+    /// The node's own IPv4 addresses on `iface`, at which pods reach
+    /// `node_ports`: kubelet's InternalIP, which metrics-server scrapes.
+    pub own: Vec<Ipv4Addr>,
 }
 
 fn set(out: &mut String, name: &str, kind: &str, elements: &[String]) {
@@ -161,6 +164,23 @@ pub fn render(node: &Node, profile: &Checked, isolation: bool) -> String {
     );
     if isolation {
         t.push_str("    ip daddr @cluster4 return\n");
+        // The node's own address is not in the cluster, and pods_input lets
+        // pods reach node_ports there: without this the sinkhole had them.
+        if !node.own.is_empty() && !node.node_ports.is_empty() {
+            let own = node
+                .own
+                .iter()
+                .map(Ipv4Addr::to_string)
+                .collect::<Vec<_>>()
+                .join(", ");
+            let list = node
+                .node_ports
+                .iter()
+                .map(u16::to_string)
+                .collect::<Vec<_>>()
+                .join(", ");
+            let _ = writeln!(t, "    ip daddr {{ {own} }} tcp dport {{ {list} }} return");
+        }
         if let Some(gw) = gateway {
             let _ = writeln!(t, "    ip daddr {gw} tcp dport @floci_ports return");
         }
@@ -375,7 +395,24 @@ mod tests {
                 Cidr::parse("10.100.0.0/16").unwrap(),
             ],
             node_ports: vec![6443, 10250],
+            own: vec!["100.96.0.2".parse().unwrap()],
         }
+    }
+
+    #[test]
+    fn isolated_pods_reach_kubelet_at_the_nodes_own_address() {
+        let t = render(&mac(), &checked(true), true);
+        let nat = &t[t.find("chain pods_nat").unwrap()..];
+        let nat = &nat[..nat.find("  }\n").unwrap()];
+        let own = nat
+            .find("    ip daddr { 100.96.0.2 } tcp dport { 6443, 10250 } return\n")
+            .unwrap_or_else(|| panic!("{nat}"));
+        let sink = nat
+            .rfind("    meta l4proto { tcp, udp } dnat ip to 169.254.53.1:7072\n")
+            .unwrap();
+        assert!(own < sink, "the sinkhole comes first:\n{nat}");
+        let open = render(&mac(), &checked(false), false);
+        assert!(!open.contains("ip daddr { 100.96.0.2 }"), "{open}");
     }
 
     #[test]

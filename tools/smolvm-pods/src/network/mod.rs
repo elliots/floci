@@ -281,13 +281,42 @@ pub fn node_of(env: &NodeEnv) -> Result<nft::Node, String> {
     };
     let mut cluster = env.cluster.clone();
     cluster.push(Cidr::parse(DOCKER_CIDR)?);
+    let own = iface_addresses(&iface);
     Ok(nft::Node {
         address: env.address,
         floci,
         iface,
         cluster,
         node_ports: NODE_PORTS.to_vec(),
+        own,
     })
+}
+
+/// The IPv4 addresses on `iface`, or none when `ip` cannot say: then pods do
+/// not reach node_ports at the node's own address, and nothing else changes.
+fn iface_addresses(iface: &str) -> Vec<Ipv4Addr> {
+    let out = crate::net::real_tool("ip").and_then(|tool| {
+        std::process::Command::new(tool)
+            .args(["-4", "-o", "addr", "show", "dev", iface])
+            .output()
+            .map_err(|e| e.to_string())
+    });
+    match out {
+        Ok(out) if out.status.success() => parse_addresses(&String::from_utf8_lossy(&out.stdout)),
+        _ => Vec::new(),
+    }
+}
+
+/// The addresses of `ip -4 -o addr show` lines, such as
+/// `2: eth0    inet 100.96.0.2/30 brd 100.96.0.3 scope global eth0`.
+fn parse_addresses(text: &str) -> Vec<Ipv4Addr> {
+    text.lines()
+        .filter_map(|line| {
+            let mut words = line.split_whitespace();
+            words.find(|w| *w == "inet")?;
+            words.next()?.split('/').next()?.parse().ok()
+        })
+        .collect()
 }
 
 /// Puts the node address on `floci0`, once.
@@ -437,5 +466,16 @@ mod tests {
             Some(("eth0".to_string(), Ipv4Addr::new(100, 96, 0, 1)))
         );
         assert_eq!(default_route("Iface\tDestination\tGateway\n"), None);
+    }
+
+    #[test]
+    fn the_interface_addresses_come_from_ip_addr_show() {
+        let text = "2: eth0    inet 100.96.0.2/30 brd 100.96.0.3 scope global eth0\\       valid_lft forever preferred_lft forever\n\
+                    2: eth0    inet 100.96.0.6/30 scope global secondary eth0\n";
+        assert_eq!(
+            parse_addresses(text),
+            vec![Ipv4Addr::new(100, 96, 0, 2), Ipv4Addr::new(100, 96, 0, 6)]
+        );
+        assert!(parse_addresses("").is_empty());
     }
 }
