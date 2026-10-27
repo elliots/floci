@@ -15,36 +15,32 @@ The node is isolated (`--isolate`):
 - It reaches only the gateway to the Mac's loopback.
 - Routed names resolve only through floci's node DNS at the node address, `169.254.53.1`.
 
-The goal is that a user of floci needs no Docker daemon on the Mac (Docker Desktop or OrbStack), apart from building the node image once. These are the remaining gaps, most important first.
+Host Docker (Docker Desktop or OrbStack) is an accepted requirement for pulling and preparing images, as well as building the node image. Workload containers still run on the smolvm-pods node. A daemon-free registry client is no longer a goal. These are the remaining gaps, most important first.
 
-## 1. Image supply still needs the Mac's Docker
-
-This is the main gap. Items 2 and 3 depend on it.
+## 1. Image supply uses the Mac's Docker by design
 
 - `LambdaSmolvmBackend.ensureImage` and `RdsSmolvmBackend` (around `:225-253`) pull an image into the Mac's Docker. They then `saveImageCmd` it and `loadImageCmd` it into the node's dockerd.
-- Their fallback, "the node's dockerd pulls it", cannot work: an isolated node has no egress and no DNS.
+- Their fallback, "the node's dockerd pulls it", cannot reach external registries on an isolated node. The node has Floci DNS, but no external registry egress.
 
 **Wanted:**
 
-- floci pulls images without a Docker daemon: a registry client writes a tar, with ECR and Docker Hub credentials.
-- floci loads the tar into the node's dockerd.
+- Keep host Docker pulls and archive transfer into the node's dockerd.
 - Where k3s needs the image, floci also loads it into containerd's `k8s.io` namespace. The node dockerd's image store is separate from k3s's.
 
-## 2. The ECR "prefer local images" check looks at the Mac's Docker
+## 2. The ECR "prefer local images" check includes the selected node
 
-- `EcrRegistryManager.rewriteImageUri` (around `:123-152`) asks the Mac's daemon whether an image is present (`isPresentOnDaemon`).
-- If the image is not there, it starts a `registry:2` container on the Mac's Docker.
+- Fixed for Lambda: `EcrRegistryManager.rewriteImageUri` checks the selected node's dockerd first, then the Mac's daemon, under the resolved image reference.
+- If neither has the image, it starts the emulated registry on the Mac's Docker, which supplies the image for transfer into the node.
 
-**Wanted:** when Lambda or RDS run on the node, this check looks at the node's dockerd. The registry runs on the node, or not at all.
+Host Docker remains available for image supply. Moving the emulated registry into the node is a separate feature, not a prerequisite for running the workload there.
 
-## 3. Lambda's image CMD comes from the Mac's Docker
+## 3. Lambda image CMD selection
 
-- For an Image-package function, `ContainerLauncher.handlerFor` and `imageCmd` set `_HANDLER` from `ImageConfig.Command`, or else from the image's CMD. They read the CMD from the Mac's daemon.
+- Fixed for the Docker launcher: prepare the image on the selected daemon before reading its CMD. Node launches inspect the node's image, honoring the requested platform and any `ImageConfig.Command` override.
 - `KubernetesPodLauncher` (around `:194-196`) sets `_HANDLER` only from the function's Handler, never from the image's CMD.
 
 **Wanted:**
 
-- For environments on the node, read the CMD from the node's dockerd, or from the image config that item 1 pulls.
 - Give `KubernetesPodLauncher` the same CMD fallback.
 
 ## 4. ElastiCache has no node backend
@@ -61,7 +57,7 @@ This is the main gap. Items 2 and 3 depend on it.
 ## 5. Extra port mappings for the node
 
 - floci creates the node with fixed Mac port mappings: the API port, the service port and `--node-ports`.
-- smolvm allows 64 mappings per machine, fixed when the machine is created.
+- smolvm allows 64 mappings per machine. TCP mappings can be updated live; changes to UDP mappings require stopping the machine.
 - `node-vm.sh create` passes extra smolvm options after `--`, but floci never passes any.
 
 **Wanted:**
@@ -69,7 +65,7 @@ This is the main gap. Items 2 and 3 depend on it.
 - A node setting for extra mappings, for example `443:30443`, so that a NodePort in the cluster can serve Mac port 443. Each mapping counts against the limit of 64.
 - Check that smolvm's port forwarder can bind a port below 1024 without root. macOS allows a process that is not root to bind such a port on all interfaces.
 
-## 6. Something rewrites the node's `/etc/resolv.conf`
+## 6. Node resolver overwrite fixed
 
 - At boot, `floci-node` does three things:
   - sets `/etc/resolv.conf` to the node address;
@@ -78,14 +74,7 @@ This is the main gap. Items 2 and 3 depend on it.
 - On a running node, `/etc/resolv.conf` was later found back at smolvm's resolver (`100.96.0.1`). This was 27 minutes after boot, with no reboot.
 - dockerd now runs with `--dns <node address>`, so containers no longer depend on that file. Processes on the node itself still use it, and smolvm's resolver answers no names on an isolated node.
 
-These are already ruled out as the writer:
-
-- `node-vm.sh`;
-- floci's node code;
-- the node service;
-- the guest agent's resolv.conf writer, which runs only at boot.
-
-**Wanted:** find what rewrites the file and stop it, or make `floci-node` restore the file.
+**Cause and fix:** interactive exec prepares the persistent overlay again. The guest agent refreshes a regular `/etc/resolv.conf` during that preparation, even on an already running node. It preserves a valid image-owned symlink, so `floci-node` now links `/etc/resolv.conf` to `/etc/floci-node/pod-resolv.conf`. The saved upstream resolver remains separate. A real-node regression repeats interactive exec and checks both files.
 
 ## 7. Keep only named connections through a pause (optional)
 
@@ -103,13 +92,13 @@ This needs:
 - a new pinned smolvm commit;
 - a new `AGENT_SHA256`.
 
-## 8. Flaky node test
+## 8. Allocator test fixed
 
 - `node::tests::a_freed_block_of_a_few_mib_leaves_no_resident_memory` failed with "the resident set grew by 1024 KiB", against a limit just under 1024 KiB.
 - It passed with the recent smolvm-pods changes set aside: the network table change and the `reset-on-pause` change.
-- It measures allocator memory and uses none of the changed code. The threshold probably depends on how the binary is laid out, but this is not proven.
+- It measured the approximate RSS counter in `/proc/self/statm`. This can differ from the precise resident mapping total around the 1024 KiB boundary.
 
-**Wanted:** make the test robust, or find the cause.
+**Fixed:** measure `/proc/self/smaps_rollup`, warm the measurement before allocating, and run a separate untuned allocator control. The tuned process must release the allocation; the untuned control must retain it. The threshold was not relaxed.
 
 ## 9. Smaller gaps on the node's dockerd
 
@@ -126,6 +115,7 @@ This needs:
 - dockerd runs with `--dns <node address>`.
 - Isolated pods can reach the API server and kubelet ports at the node's own addresses. metrics-server needs this.
 - Each pod VM is sized from its memory limit.
+- Container memory statistics now report that VM's actual memory limit, including after node recovery, instead of always reporting 1 GiB. Older node samples retain the 1 GiB fallback.
 - The relay waits up to 30 s for a client's first bytes.
 - Lambda environments keep their connections through a pause.
 - An event whose environment dies before taking it goes once to a new environment.

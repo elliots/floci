@@ -169,6 +169,11 @@ Floci has one smolvm-pods node for everything that runs on one: RDS's databases 
 and Lambda's environments with `FLOCI_SERVICES_LAMBDA_SMOLVM_ENABLED=true`
 ([Functions on a smolvm-pods node](../services/lambda.md#functions-on-a-smolvm-pods-node)).
 
+Keep a host Docker daemon available for image pulls. Lambda and RDS transfer missing images
+from that daemon into the node's dockerd; the workload containers then run on the node.
+An isolated node cannot pull from external registries itself. Kubernetes uses a separate
+containerd image store and pulls through [Floci's ECR](../services/eks.md#pods-floci-and-images).
+
 - **The runtime file's node.** When the runtime file lists nodes, the one that
   `FLOCI_RUNTIME_NODE_NAME` names, by its key, is the node, or the only one when the setting is
   empty. Floci neither creates nor deletes it. Several nodes and no name, or a name that the file
