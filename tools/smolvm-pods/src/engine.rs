@@ -102,9 +102,34 @@ const POD_SHARE_GUEST_MOUNT: &str = "/run/smolvm/virtiofs/podshare";
 /// vCPUs of every sandbox VM.
 const SANDBOX_CPUS: u8 = 2;
 
-/// Memory of every sandbox VM, in MiB, which admission also counts for each
-/// pod.
-pub(crate) const SANDBOX_MEMORY_MIB: u32 = 1024;
+/// Memory of a sandbox VM, in MiB, when the pod has no memory limit. A pod
+/// record from before the VMs were sized has no size of its own: its VM has
+/// this one.
+pub(crate) const DEFAULT_SANDBOX_MEMORY_MIB: u32 = 1024;
+
+/// What a sandbox VM needs besides the pod's memory limit, in MiB: the guest
+/// kernel, the smolvm agent, the container shims and the page cache.
+const SANDBOX_MEMORY_HEADROOM_MIB: u64 = 256;
+
+/// A sandbox VM's memory is a multiple of this, in MiB.
+const SANDBOX_MEMORY_STEP_MIB: u64 = 64;
+
+/// The least memory of a sandbox VM, in MiB: the size at which the VMs of
+/// the TSO canary and the boot check run.
+const SANDBOX_MEMORY_MIN_MIB: u32 = 512;
+
+/// The most memory of a sandbox VM, in MiB. A VM that is larger than the
+/// node does not start.
+const SANDBOX_MEMORY_MAX_MIB: u32 = 16384;
+
+/// containerd's annotation on a sandbox: the sum of the memory limits that
+/// the pod's containers have, in bytes. It is 0, or absent, when no container
+/// has a limit.
+const ANN_CRI_SANDBOX_MEMORY: &str = "io.kubernetes.cri.sandbox-memory";
+
+/// Pod annotation that sets the memory of the sandbox VM, in MiB. It wins
+/// over the pod's memory limit. It must be a whole number from 512 to 16384.
+const ANN_MEMORY_MIB: &str = "smolvm.io/memory-mib";
 
 /// Pod annotation opting the sandbox VM into a virtio-gpu device (Venus/Vulkan).
 ///
@@ -152,6 +177,71 @@ fn sandbox_gpu_request(spec: Option<&serde_json::Value>) -> GpuRequest {
         enabled: true,
         vram_mib,
     }
+}
+
+/// The memory of a sandbox's VM, and why a request for another size was not
+/// kept.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) struct SandboxMemory {
+    pub mib: u32,
+    pub warnings: Vec<String>,
+}
+
+/// The VM memory for pods whose containers have `bytes` of memory limit:
+/// the limit plus the headroom, up to a multiple of the step, and within the
+/// least and the most.
+fn memory_for_limit(bytes: u64) -> u32 {
+    let mib = bytes
+        .div_ceil(1024 * 1024)
+        .saturating_add(SANDBOX_MEMORY_HEADROOM_MIB)
+        .div_ceil(SANDBOX_MEMORY_STEP_MIB)
+        .saturating_mul(SANDBOX_MEMORY_STEP_MIB);
+    mib.clamp(SANDBOX_MEMORY_MIN_MIB.into(), SANDBOX_MEMORY_MAX_MIB.into()) as u32
+}
+
+/// Read the VM memory from a sandbox OCI spec.
+///
+/// [`ANN_MEMORY_MIB`] wins when it is valid. Else the memory limit that
+/// containerd sums over the pod's containers sets it (see
+/// [`memory_for_limit`]). With neither, the VM has
+/// [`DEFAULT_SANDBOX_MEMORY_MIB`]. A bad value does not fail the pod: it is
+/// ignored, and the warning says so.
+pub(crate) fn sandbox_memory(spec: Option<&serde_json::Value>) -> SandboxMemory {
+    let mut warnings = Vec::new();
+    if let Some(value) = bundle::annotation(spec, ANN_MEMORY_MIB) {
+        let valid = value
+            .trim()
+            .parse::<u32>()
+            .ok()
+            .filter(|mib| (SANDBOX_MEMORY_MIN_MIB..=SANDBOX_MEMORY_MAX_MIB).contains(mib));
+        match valid {
+            Some(mib) => return SandboxMemory { mib, warnings },
+            None => warnings.push(format!(
+                "{ANN_MEMORY_MIB} is not a whole number from {SANDBOX_MEMORY_MIN_MIB} to \
+                 {SANDBOX_MEMORY_MAX_MIB}; ignoring it"
+            )),
+        }
+    }
+    let mut mib = DEFAULT_SANDBOX_MEMORY_MIB;
+    if let Some(value) = bundle::annotation(spec, ANN_CRI_SANDBOX_MEMORY) {
+        match value.trim().parse::<u64>() {
+            Ok(0) => {}
+            Ok(bytes) => {
+                mib = memory_for_limit(bytes);
+                if mib == SANDBOX_MEMORY_MAX_MIB {
+                    warnings.push(format!(
+                        "the pod's memory limit is {bytes} bytes; the VM has at most \
+                         {SANDBOX_MEMORY_MAX_MIB} MiB"
+                    ));
+                }
+            }
+            Err(_) => warnings.push(format!(
+                "{ANN_CRI_SANDBOX_MEMORY} is not a number of bytes; using \
+                 {DEFAULT_SANDBOX_MEMORY_MIB} MiB"
+            )),
+        }
+    }
+    SandboxMemory { mib, warnings }
 }
 
 /// How long `start` waits for the agent's `Started` frame.
@@ -596,6 +686,8 @@ impl PodBackend for EnginePodBackend {
             let hostname = spec_hostname(sandbox_spec.as_ref());
             let sysctls = spec_sysctls(sandbox_spec.as_ref());
             let gpu = sandbox_gpu_request(sandbox_spec.as_ref());
+            let memory_mib = sandbox_memory(sandbox_spec.as_ref()).mib;
+            info!("sandbox {id_owned}: {memory_mib} MiB of guest RAM");
             if gpu.enabled {
                 info!(
                     "sandbox {id_owned}: GPU requested (vram_mib={})",
@@ -646,7 +738,7 @@ impl PodBackend for EnginePodBackend {
                 image: None,
                 resources: VmResources {
                     cpus: SANDBOX_CPUS,
-                    memory_mib: SANDBOX_MEMORY_MIB,
+                    memory_mib,
                     network: netns.is_some(),
                     // virtio-net gives the sandbox a real L2 NIC, which the pod
                     // network bridges into the pod's network namespace, so that
@@ -1588,6 +1680,102 @@ mod tests {
             ))),
             GpuRequest::default()
         );
+    }
+
+    fn memory_of(annotations: serde_json::Value) -> SandboxMemory {
+        sandbox_memory(Some(&spec_with(annotations)))
+    }
+
+    #[test]
+    fn a_pod_without_a_memory_limit_keeps_the_default_size() {
+        let default = SandboxMemory {
+            mib: 1024,
+            warnings: Vec::new(),
+        };
+        assert_eq!(sandbox_memory(None), default);
+        assert_eq!(memory_of(serde_json::json!({})), default);
+        assert_eq!(
+            memory_of(serde_json::json!({ ANN_CRI_SANDBOX_MEMORY: "0" })),
+            default
+        );
+    }
+
+    #[test]
+    fn a_memory_limit_gets_the_headroom_and_a_multiple_of_the_step() {
+        let mib = 1024 * 1024;
+        for (limit, expected) in [
+            (256 * mib, 512),
+            (512 * mib, 768),
+            (1024 * mib, 1280),
+            (1000 * mib, 1280),
+            (1000 * mib + 1, 1280),
+            (1025 * mib, 1344),
+            // Below the least, which is also what the headroom gives for 256.
+            (64 * mib, 512),
+            (1, 512),
+        ] {
+            assert_eq!(
+                memory_of(serde_json::json!({ ANN_CRI_SANDBOX_MEMORY: limit.to_string() })),
+                SandboxMemory {
+                    mib: expected,
+                    warnings: Vec::new()
+                },
+                "expected a limit of {limit} bytes to give {expected} MiB"
+            );
+        }
+    }
+
+    #[test]
+    fn a_huge_memory_limit_is_held_to_the_most_with_a_warning() {
+        for limit in ["17179869184", "1099511627776", "18446744073709551615"] {
+            let memory = memory_of(serde_json::json!({ ANN_CRI_SANDBOX_MEMORY: limit }));
+            assert_eq!(memory.mib, 16384, "limit {limit}");
+            assert_eq!(memory.warnings.len(), 1, "limit {limit}");
+        }
+    }
+
+    #[test]
+    fn a_bad_memory_limit_annotation_keeps_the_default_size_with_a_warning() {
+        for v in ["lots", "-1", "", "1.5Gi"] {
+            let memory = memory_of(serde_json::json!({ ANN_CRI_SANDBOX_MEMORY: v }));
+            assert_eq!(memory.mib, 1024, "value {v:?}");
+            assert_eq!(memory.warnings.len(), 1, "value {v:?}");
+        }
+    }
+
+    #[test]
+    fn the_override_wins_over_the_memory_limit() {
+        assert_eq!(
+            memory_of(serde_json::json!({
+                ANN_MEMORY_MIB: "2048",
+                ANN_CRI_SANDBOX_MEMORY: "268435456"
+            })),
+            SandboxMemory {
+                mib: 2048,
+                warnings: Vec::new()
+            }
+        );
+        for v in ["512", " 640 ", "16384"] {
+            let memory = memory_of(serde_json::json!({ ANN_MEMORY_MIB: v }));
+            assert_eq!(memory.mib, v.trim().parse::<u32>().unwrap());
+            assert!(memory.warnings.is_empty());
+        }
+    }
+
+    #[test]
+    fn a_bad_override_is_ignored_with_a_warning() {
+        for v in ["0", "-1", "lots", "", "511", "16385", "1.5", "4294967296"] {
+            let without = memory_of(serde_json::json!({ ANN_CRI_SANDBOX_MEMORY: "536870912" }));
+            let memory = memory_of(
+                serde_json::json!({ ANN_MEMORY_MIB: v, ANN_CRI_SANDBOX_MEMORY: "536870912" }),
+            );
+            assert_eq!(memory.mib, without.mib, "value {v:?}");
+            assert_eq!(memory.mib, 768, "value {v:?}");
+            assert_eq!(memory.warnings.len(), 1, "value {v:?}");
+        }
+        let memory = memory_of(serde_json::json!({ ANN_MEMORY_MIB: "lots" }));
+        assert_eq!(memory.mib, 1024);
+        assert_eq!(memory.warnings.len(), 1);
     }
 
     #[test]

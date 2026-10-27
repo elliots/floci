@@ -27,7 +27,7 @@ use tokio::task::JoinHandle;
 use super::admission::{Admission, Holder};
 use super::settings::Settings;
 use crate::activity::{self, Candidate, ConntrackLookup, Flow, Monitor, Protocol, Tuple, Verdict};
-use crate::engine::SANDBOX_MEMORY_MIB;
+use crate::engine::DEFAULT_SANDBOX_MEMORY_MIB;
 use crate::kube::events::Reporter;
 use crate::lifecycle::{
     Blocker, Clock, HibernateRequest, Lifecycle, LifecycleError, PodIdentity, PodInfo, PodRef,
@@ -41,6 +41,14 @@ use crate::sync::lock;
 
 /// The shortest time between two polls of the idle loop.
 const POLL_GAP: Duration = Duration::from_secs(1);
+
+/// The guest RAM of the pod's VM, in MiB, which admission counts for it.
+fn vm_memory_mib(identity: &PodIdentity) -> u64 {
+    identity
+        .memory_mib
+        .unwrap_or(DEFAULT_SANDBOX_MEMORY_MIB)
+        .into()
+}
 
 /// Names the pod at an IP, as `NAMESPACE/NAME`.
 pub type Names = Arc<dyn Fn(Ipv4Addr) -> Option<String> + Send + Sync>;
@@ -188,9 +196,10 @@ impl Sleep {
     /// pod's own connections.
     pub fn may_wake(&self, info: &PodInfo, waiting: &dyn Fn(&str)) -> Result<(), String> {
         let id = &info.identity.sandbox_id;
-        let admitted =
-            self.admission
-                .admit(id, SANDBOX_MEMORY_MIB.into(), || self.holders(), waiting);
+        let memory_mib = vm_memory_mib(&info.identity);
+        let admitted = self
+            .admission
+            .admit(id, memory_mib, || self.holders(), waiting);
         let net = self.net(info).and_then(Result::ok);
         if let Err(reason) = admitted {
             if let Some(net) = &net {
@@ -219,7 +228,7 @@ impl Sleep {
                     PodState::Creating | PodState::Awake | PodState::Pausing | PodState::Waking
                 )
             })
-            .map(|p| (p.identity.sandbox_id, SANDBOX_MEMORY_MIB.into()))
+            .map(|p| (p.identity.sandbox_id.clone(), vm_memory_mib(&p.identity)))
             .collect()
     }
 
@@ -800,6 +809,22 @@ mod tests {
                 .unwrap()
         }
 
+        async fn pod_with_memory(
+            &self,
+            id: &str,
+            ip: Ipv4Addr,
+            memory_mib: Option<u32>,
+        ) -> PodInfo {
+            let identity = PodIdentity {
+                memory_mib,
+                ..identity(id, id, ip)
+            };
+            self.life
+                .create(identity, async { Ok(None) })
+                .await
+                .unwrap()
+        }
+
         /// Runs a hook on a blocking thread, as the lifecycle does.
         async fn hook<T: Send + 'static>(&self, f: impl FnOnce(&Sleep) -> T + Send + 'static) -> T {
             let sleep = self.sleep.clone();
@@ -911,6 +936,47 @@ mod tests {
         let refused = f.hook(move |s| s.may_wake(&i, &|_| {})).await;
         assert_eq!(refused, Err("awake pods 1/1".into()));
         assert_eq!(f.catchers.calls(), ["refuse pod"]);
+    }
+
+    fn memory_cap(max_awake_memory_mib: u64) -> Settings {
+        Settings {
+            max_awake_memory_mib,
+            admission_wait: Duration::from_millis(100),
+            ..Settings::default()
+        }
+    }
+
+    #[tokio::test]
+    async fn admission_counts_the_vm_memory_of_each_pod() {
+        let f = Fixture::new(memory_cap(1536)).await;
+        f.pod_with_memory("small", Ipv4Addr::new(10, 42, 0, 8), Some(512))
+            .await;
+        let info = f.pod_with_memory("pod", POD_IP, Some(1024)).await;
+        let i = info.clone();
+        f.hook(move |s| s.may_wake(&i, &|_| {})).await.unwrap();
+
+        let big = Fixture::new(memory_cap(1536)).await;
+        big.pod_with_memory("big", Ipv4Addr::new(10, 42, 0, 8), Some(1344))
+            .await;
+        let info = big.pod_with_memory("pod", POD_IP, Some(512)).await;
+        let i = info.clone();
+        let refused = big.hook(move |s| s.may_wake(&i, &|_| {})).await;
+        assert_eq!(refused, Err("memory 1.8/1.5 GiB".into()));
+    }
+
+    #[tokio::test]
+    async fn a_pod_from_before_the_vms_were_sized_counts_the_default() {
+        let f = Fixture::new(memory_cap(1536)).await;
+        f.pod_with_memory("old", Ipv4Addr::new(10, 42, 0, 8), None)
+            .await;
+        let info = f.pod_with_memory("pod", POD_IP, Some(512)).await;
+        let i = info.clone();
+        f.hook(move |s| s.may_wake(&i, &|_| {})).await.unwrap();
+        let info = f
+            .pod_with_memory("late", Ipv4Addr::new(10, 42, 0, 9), Some(1024))
+            .await;
+        let refused = f.hook(move |s| s.may_wake(&info, &|_| {})).await;
+        assert_eq!(refused, Err("memory 2.5/1.5 GiB".into()));
     }
 
     #[tokio::test]

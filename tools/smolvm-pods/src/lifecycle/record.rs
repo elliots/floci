@@ -206,6 +206,11 @@ pub struct PodIdentity {
     pub netns: Option<String>,
     #[serde(default)]
     pub rosetta: bool,
+    /// The guest RAM of the pod's VM, in MiB, as the VM was created with it.
+    /// A record from before the VMs were sized has none: its VM has the
+    /// default size.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub memory_mib: Option<u32>,
     /// Set by [`ANN_HIBERNATE`].
     #[serde(default)]
     pub hibernate_disabled: bool,
@@ -443,6 +448,24 @@ mod tests {
 
     fn spec(annotations: serde_json::Value) -> serde_json::Value {
         serde_json::json!({ "annotations": annotations })
+    }
+
+    #[test]
+    fn the_vm_memory_is_kept_and_an_old_record_has_none() {
+        let identity = PodIdentity {
+            sandbox_id: "pod".into(),
+            machine: "pod".into(),
+            memory_mib: Some(768),
+            ..Default::default()
+        };
+        let text = serde_json::to_string(&identity).unwrap();
+        let back: PodIdentity = serde_json::from_str(&text).unwrap();
+        assert_eq!(back.memory_mib, Some(768));
+        let old = r#"{"sandbox_id": "pod", "machine": "pod"}"#;
+        let old: PodIdentity = serde_json::from_str(old).unwrap();
+        assert_eq!(old.memory_mib, None);
+        let text = serde_json::to_string(&old).unwrap();
+        assert!(!text.contains("memory_mib"), "{text}");
     }
 
     #[test]

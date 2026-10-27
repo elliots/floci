@@ -85,7 +85,7 @@ for a trial with several apps.
   smolvm's copy of the tar in `~/Library/Caches`;
 - each node VM's disks. They are sparse files that grow as the node uses them, up to 40 GiB for
   the storage disk and 8 GiB for the overlay by default. Each sleeping pod has a checkpoint on
-  the storage disk: up to about 1.3 GB for a pod that uses all of its 1 GiB of RAM. Every
+  the storage disk: up to about 1.3 GB for a pod that uses all of its 1 GiB of RAM; a pod VM with less or more RAM, from its memory limit, has a checkpoint of that size. Every
   container also has a full copy of its image's root file system in its pod share, on the storage
   disk, for as long as it exists. For many or large images, give the node a larger storage disk
   with `node-vm.sh create --storage GIB`. The end-to-end suites create nodes of their own.
@@ -452,7 +452,9 @@ scripts/node-vm.sh exec -- smolvm-pods ctl get default/web
   others, such as `smolvm-pods.floci.io/hibernate: "false"`, which keeps a pod from sleeping.
 - The readiness probe shows that kubelet's probes do not keep a pod awake: while it sleeps, the
   node service answers them with the app's last result.
-- Every pod VM has 2 vCPUs and 1024 MiB of RAM, whatever the pod requests. On an Apple silicon
+- Every pod VM has 2 vCPUs. Its RAM is the pod's memory limit plus 256 MiB (at least 512 MiB), or
+  1024 MiB when the pod has no limit; `smolvm.io/memory-mib` sets it
+  ([the size of a pod VM](architecture.md#the-size-of-a-pod-vm)). On an Apple silicon
   node every pod VM gets Rosetta by default (`"rosetta": true`), once the node's TSO canary has
   passed ([amd64 pods](architecture.md#amd64-pods)).
 - The first VM pod after a node starts waits for the node to expand smolvm's disk templates,
@@ -588,7 +590,7 @@ works while it sleeps.
   service account token volumes do not update. Every file of a copy is readable by all users, so
   a Secret's `defaultMode` is not kept, and programs that refuse a loosely permissioned key, such
   as PostgreSQL's `ssl_key_file` or OpenSSH, fail ([Known limits](architecture.md#known-limits)).
-- Size the node for the pods that are awake at the same time. An awake pod can take about 1.1 GiB
+- Size the node for the pods that are awake at the same time. An awake pod with no memory limit can take about 1.1 GiB
   of the node's memory, up to 1 GiB of guest RAM and about 100 MiB for its VM process, and a pod
   that wakes has all the memory it used resident at once. The default node has 6 GiB, about
   5.2 GiB of it free, so more than four memory-heavy pods awake at once start the node's OOM

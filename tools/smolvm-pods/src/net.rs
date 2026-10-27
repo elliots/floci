@@ -959,7 +959,7 @@ mod tests {
             "rootfs_path": "/r",
             "startup_error_log": dir.join("startup-error.log"),
             "pod_netns": pod_netns,
-            "resources": {"cpus": 2, "memory_mib": 1024, "network": true},
+            "resources": {"cpus": 2, "memory_mib": 768, "network": true},
         });
         std::fs::write(&config, value.to_string()).unwrap();
         config
@@ -991,7 +991,7 @@ mod tests {
         );
         let resumed = read_config(&config);
         assert_eq!(resumed["pod_netns"], ns);
-        assert_eq!(resumed["resources"]["memory_mib"], 1024);
+        assert_eq!(resumed["resources"]["memory_mib"], 768);
         assert_eq!(resumed["rootfs_path"], "/r");
     }
 

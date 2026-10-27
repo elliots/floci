@@ -44,6 +44,7 @@ use super::Backends;
 use crate::activity::Flow;
 use crate::backend::{now_ns, Adopted, AgentStats, PodBackend, ProcessSpec};
 use crate::bundle;
+use crate::engine::sandbox_memory;
 use crate::lifecycle::{
     cpu_threshold, cpu_window, hibernation_disabled, idle_timeout, wakes_on_terminate, Activity,
     AwakeCause, Config, ExecRecord, ExecStatus, Hooks, KillOutcome, KillRequest, Lifecycle,
@@ -2083,6 +2084,10 @@ fn pod_identity(
         warn!("pod sandbox {id} gets the node's CPU window: {e}");
         None
     });
+    let memory = sandbox_memory(spec.as_ref());
+    for warning in &memory.warnings {
+        warn!("pod sandbox {id}: {warning}");
+    }
     PodIdentity {
         sandbox_id: id.to_string(),
         namespace: annotation(ANN_POD_NAMESPACE),
@@ -2090,6 +2095,7 @@ fn pod_identity(
         uid: annotation(ANN_POD_UID),
         machine: id.to_string(),
         netns,
+        memory_mib: Some(memory.mib),
         hibernate_disabled: hibernation_disabled(spec.as_ref(), standalone),
         wake_on_terminate: wakes_on_terminate(spec.as_ref()),
         idle_timeout_ms: idle.map(|t| t.as_millis() as u64),

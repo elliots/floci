@@ -223,8 +223,8 @@ kubelet sees far more memory than the node has ([Capacity](#capacity)), so
 nothing in Kubernetes keeps awake pods within the node's real memory. The node
 service's wake admission does, once a cap is set; its caps are off by default.
 Three settings in `/etc/floci-node/env` set them: `FLOCI_NODE_MAX_AWAKE_PODS`,
-`FLOCI_NODE_MAX_AWAKE_MEMORY`, in MiB of guest RAM with every pod VM counted
-as 1024 MiB, and `FLOCI_NODE_ADMISSION_WAIT`, how long a wake waits for room
+`FLOCI_NODE_MAX_AWAKE_MEMORY`, in MiB of guest RAM with each pod VM counted
+as its own size ([the size of a pod VM](../docs/architecture.md#the-size-of-a-pod-vm)), and `FLOCI_NODE_ADMISSION_WAIT`, how long a wake waits for room
 before it is refused ([the node's settings](../docs/configuration.md#the-nodes-settings)).
 `floci-node` passes them to the node service each time it starts it, so after
 a change, kill the node service and it starts again with them. Creates are

@@ -449,8 +449,9 @@ fn state_to_api(s: ProcState) -> api::Status {
 /// Build a cgroups v1 `Metrics` message (the format containerd's CRI decodes for
 /// `ContainerStats`) from a guest usage sample. crun runs cgroup-less in the
 /// guest, so only CPU total and memory usage are populated, which is what the
-/// CRI cpu/memory stats surface, and the memory limit is the pod VM's memory,
-/// which `docker stats` reports. The CPU throttling is there, empty, because
+/// CRI cpu/memory stats surface, and the memory limit, which `docker stats`
+/// reports, is the default size of a pod VM: the front does not know the
+/// size of this one. The CPU throttling is there, empty, because
 /// dockerd reads it without a check.
 fn cgroup_metrics(sample: StatsSample) -> containerd_shim_protos::cgroups::metrics::Metrics {
     use containerd_shim_protos::cgroups::metrics::{
@@ -470,7 +471,7 @@ fn cgroup_metrics(sample: StatsSample) -> containerd_shim_protos::cgroups::metri
         memory: MessageField::some(MemoryStat {
             usage: MessageField::some(MemoryEntry {
                 usage: sample.memory_bytes,
-                limit: u64::from(crate::engine::SANDBOX_MEMORY_MIB) * 1024 * 1024,
+                limit: u64::from(crate::engine::DEFAULT_SANDBOX_MEMORY_MIB) * 1024 * 1024,
                 ..Default::default()
             }),
             ..Default::default()

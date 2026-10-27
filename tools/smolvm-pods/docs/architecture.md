@@ -207,6 +207,35 @@ place. After the checkpoint is durable, the wake resumes the pod once the VM pro
 **Incarnations.** Each record has a random incarnation. An API call may name it, and a call that
 names an older incarnation of a recreated pod is refused.
 
+### The size of a pod VM
+
+A pod VM has 2 vCPUs. Its guest RAM comes from the pod's memory limit. containerd sets the
+annotation `io.kubernetes.cri.sandbox-memory` on the sandbox's OCI spec: the sum of the memory
+limits that kubelet found in the pod's containers, in bytes. It is `0`, or absent, when no
+container has a limit. The shim sizes the VM when it creates the sandbox:
+
+| Pod | Guest RAM |
+| --- | --- |
+| `smolvm.io/memory-mib` is a whole number from 512 to 16384 | That number |
+| A memory limit, `L` MiB | `L` plus 256 MiB, up to a multiple of 64 MiB, and not below 512 MiB or above 16384 MiB |
+| No memory limit | 1024 MiB |
+
+The 256 MiB is for the guest kernel, the smolvm agent, the container shims and the page cache. It is
+a safe margin and not a measured one. 512 MiB is the least: the VM of the TSO canary and of the boot
+check boots and runs with it. A guest with less than the limit would meet its own OOM killer before the
+container's cgroup does. The most is 16384 MiB, because a VM that is larger than the node does not
+start. A value of `smolvm.io/memory-mib` that is not valid is ignored, with a warning in the node
+service's log, and the memory limit sets the size.
+
+kubelet adds up only the containers that have a limit. A pod with a limit on one container and none
+on another gets a VM that fits the first: set `smolvm.io/memory-mib` for such a pod.
+
+The size goes in the pod's record (`memory_mib` of the identity) when the pod is created, and
+smolvm's machine record has it too. A resume uses the machine record, so a pod keeps its size
+through every sleep. A record from before the VMs were sized has no size, and its pod counts as
+1024 MiB, the size its VM was created with. A pod VM never changes size: a change of the pod's
+limit makes a new pod, with a new VM.
+
 ### Durable state and recovery
 
 The records are in `/var/lib/containerd-shim-smolvm-pods/.node/`, which the leading dot keeps out
@@ -688,7 +717,8 @@ The caps on awake pods and on their guest RAM are off by default; `FLOCI_NODE_MA
 `FLOCI_NODE_MAX_AWAKE_MEMORY` in `/etc/floci-node/env` set them
 ([node/README.md](../node/README.md#wake-admission)). A pod holds room from its create, or from
 the admission of its wake, until it is asleep, failed or deleted: every pod that is creating,
-awake, pausing or waking, with 1024 MiB of guest RAM, the size of every pod VM. A wake that does
+awake, pausing or waking, with the guest RAM of its own VM ([the size of a pod
+VM](#the-size-of-a-pod-vm)). A wake that does
 not fit waits, first come first served, for at most the admission wait (10 s), after an event
 from `asleep` to `asleep` with `waiting` set to why, and is then refused. Its refusal goes from
 `asleep` to `asleep` with the error `wake refused: awake pods 2/2`
@@ -1163,7 +1193,7 @@ On an Apple M4 Max:
   6.8 to 8.5 s. In the pods test, arm64 pods were Ready in 19 to 27 s and amd64 pods under Rosetta
   in 42 to 45 s.
 - A pod VM process uses about 100 to 120 MiB on the node; an idle awake pod with 1 GiB of guest
-  RAM about 105 MiB.
+  RAM about 105 MiB. The guest RAM of a pod is resident only when the pod uses it.
 - The node service's USS grows 136 to 156 KiB for each pod that sleeps (40 pods in the wake test,
   which allows 200 KiB).
 - 100 MiB TCP streams ran at 654 to 820 MiB/s into a VM pod and 322 MiB/s out.
@@ -1211,8 +1241,9 @@ the token on its own requests.
 
 ## Known limits
 
-- A pod VM always has 2 vCPUs and 1024 MiB of RAM; the pod's requests and limits do not size it,
-  and admission counts every pod as 1024 MiB.
+- A pod VM always has 2 vCPUs, and the pod's CPU requests and limits do not size it. Its RAM comes
+  from the pod's memory limit ([the size of a pod VM](#the-size-of-a-pod-vm)) and does not change
+  while the VM exists.
 - A container resource update, such as an in-place resize, succeeds and changes nothing.
 - IPv4 only, with the CNI interface `eth0`; smolvm reads only its first IPv4 address. UDP never
   wakes a pod.
