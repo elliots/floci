@@ -9,6 +9,7 @@ import io.github.hectorvent.floci.core.common.docker.ContainerLogStreamer;
 import io.github.hectorvent.floci.core.common.docker.OciRuntime;
 import io.github.hectorvent.floci.runtime.flocinode.FlociNode;
 import io.github.hectorvent.floci.runtime.node.NodeDocker;
+import io.github.hectorvent.floci.runtime.node.NodeTcpRelay;
 import io.github.hectorvent.floci.runtime.node.NodeTunnel;
 import io.github.hectorvent.floci.runtime.node.SmolvmNode;
 import io.github.hectorvent.floci.services.cloudwatch.logs.CloudWatchLogsService;
@@ -29,7 +30,7 @@ import java.util.concurrent.TimeUnit;
 import java.util.concurrent.TimeoutException;
 import java.util.regex.Pattern;
 
-/** Redis and Valkey containers on the shared node, reached through its wake-on-connect tunnel. */
+/** Cache containers on the shared node, reached through its wake-on-connect tunnel. */
 @ApplicationScoped
 public class ElastiCacheSmolvmBackend {
 
@@ -179,5 +180,10 @@ public class ElastiCacheSmolvmBackend {
         } catch (IllegalStateException e) {
             throw new IOException(e.getMessage(), e);
         }
+    }
+
+    /** Exposes a node container through a local multi-connection relay. */
+    public NodeTcpRelay relay(Target target, String host, int port, int listenPort) throws IOException {
+        return new NodeTcpRelay(tunnel, target.node(), host, port, listenPort);
     }
 }

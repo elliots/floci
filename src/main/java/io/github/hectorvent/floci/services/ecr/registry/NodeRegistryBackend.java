@@ -15,7 +15,7 @@ import io.github.hectorvent.floci.core.common.docker.ContainerSpec;
 import io.github.hectorvent.floci.core.common.docker.ContainerStorageHelper;
 import io.github.hectorvent.floci.runtime.flocinode.FlociNode;
 import io.github.hectorvent.floci.runtime.node.NodeDocker;
-import io.github.hectorvent.floci.runtime.node.NodeRegistryRelay;
+import io.github.hectorvent.floci.runtime.node.NodeTcpRelay;
 import io.github.hectorvent.floci.runtime.node.NodeTunnel;
 import io.github.hectorvent.floci.runtime.node.SmolvmNode;
 import io.github.hectorvent.floci.services.lambda.launcher.ImageCacheService;
@@ -47,7 +47,7 @@ public class NodeRegistryBackend {
     private final RegionResolver region;
     private ContainerLifecycleManager lifecycle;
     private String containerId;
-    private NodeRegistryRelay relay;
+    private NodeTcpRelay relay;
 
     @Inject
     public NodeRegistryBackend(EmulatorConfig config, FlociNode flociNode, NodeDocker nodeDocker,
@@ -107,7 +107,7 @@ public class NodeRegistryBackend {
         containerId = info.containerId();
         String ip = lifecycle.resolveContainerNetworkIp(containerId, null);
         try {
-            relay = new NodeRegistryRelay(tunnel, node, ip, REGISTRY_PORT);
+            relay = new NodeTcpRelay(tunnel, node, ip, REGISTRY_PORT);
         } catch (IOException e) {
             throw new IllegalStateException("Cannot open the node registry relay", e);
         }

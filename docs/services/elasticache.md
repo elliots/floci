@@ -1,6 +1,6 @@
 # ElastiCache
 
-Redis and Valkey containers can run as hibernating microVMs on the shared smolvm-pods node.
+Redis, Valkey and Memcached containers can run as hibernating microVMs on the shared smolvm-pods node.
 Set `FLOCI_SERVICES_ELASTICACHE_SMOLVM_ENABLED=true` and configure [the Floci node](../configuration/smolvm-runtime.md#the-floci-node).
 Preload the cache image into the node, or let host Docker supply it. Floci keeps the authentication proxies on the host and
 connects to the cache through the node's tunnel, waking it on traffic. Cluster formation uses
@@ -9,7 +9,10 @@ the same tunnel; cache peers communicate on the node's Docker network.
 `FLOCI_SERVICES_ELASTICACHE_SMOLVM_IDLE_TIMEOUT` sets an idle duration such as `2m`; empty uses
 the node's default. Use a `FLOCI_HOSTNAME` that node clients can resolve, such as `localhost.floci.io`.
 Names supplied through the `floci:tls-hostnames` tag also resolve through node DNS to Floci's
-gateway and reach the same authenticated proxy. Memcached remains on host Docker.
+gateway and reach the same authenticated proxy. Memcached uses a plain TCP relay through the
+node tunnel. Its relay shares the configured ElastiCache proxy port range and reservations with
+Redis and Valkey, so the advertised endpoint is reachable from isolated workload VMs as well as
+the Mac. No additional port mapping is needed.
 
 **Protocol:** Query (XML) for management API + Redis RESP protocol for data plane
 **Management Endpoint:** `POST http://localhost:4566/`
@@ -275,7 +278,9 @@ take: the old endpoint then reaches an unrelated cache rather than failing clean
 
 A Memcached cluster's endpoint follows its new container. Outside Docker, Floci publishes the
 backend on a host port Docker picks per run, so a restored cluster's `ConfigurationEndpoint` port
-can differ from the one it had before the restart. Replication groups and standalone cache
+can differ from the one it had before the restart. With the smolvm backend, the relay instead
+gets a free port from the ElastiCache proxy range; that port can also change on restore.
+Replication groups and standalone cache
 clusters keep their port: it is a proxy port Floci owns and re-reserves.
 
 A delete that arrives while a record is still `creating` wins. The restore takes the same
@@ -370,6 +375,9 @@ Memcached uses the separate `floci.services.elasticache.default-memcached-image`
 | `FLOCI_SERVICES_ELASTICACHE_PROXY_BASE_PORT` | `6379` | First host port in the ElastiCache proxy range |
 | `FLOCI_SERVICES_ELASTICACHE_PROXY_MAX_PORT` | `6399` | Last host port in the ElastiCache proxy range |
 | `FLOCI_SERVICES_ELASTICACHE_DEFAULT_IMAGE` | `valkey/valkey:8` | Docker image for Redis/Valkey containers |
+| `FLOCI_SERVICES_ELASTICACHE_DEFAULT_MEMCACHED_IMAGE` | `memcached:1.6` | Docker image for Memcached containers |
+| `FLOCI_SERVICES_ELASTICACHE_SMOLVM_ENABLED` | `false` | Run Redis, Valkey and Memcached on the shared node |
+| `FLOCI_SERVICES_ELASTICACHE_SMOLVM_IDLE_TIMEOUT` | _(empty)_ | Cache VM idle duration, or the node's default when empty |
 | `FLOCI_SERVICES_ELASTICACHE_TLS_SUFFIXES` | `auto` | Comma-separated domains whose names the Redis and Valkey proxies issue TLS certificates for; see [Local TLS connections](#local-tls-connections) |
 
 ### Docker Compose

@@ -4,6 +4,7 @@ import com.fasterxml.jackson.core.type.TypeReference;
 import io.github.hectorvent.floci.config.EmulatorConfig;
 import io.github.hectorvent.floci.core.common.AwsException;
 import io.github.hectorvent.floci.core.common.RegionResolver;
+import io.github.hectorvent.floci.core.common.dns.EmbeddedDnsServer;
 import io.github.hectorvent.floci.core.storage.AccountAwareStorageBackend;
 import io.github.hectorvent.floci.core.storage.StorageBackend;
 import io.github.hectorvent.floci.core.storage.StorageFactory;
@@ -396,6 +397,9 @@ public class ElastiCacheMemcachedService {
     }
 
     private String resolveEndpointHost(ElastiCacheContainerHandle handle) {
+        if (containerManager.onSmolvmNode()) {
+            return config.hostname().orElse(EmbeddedDnsServer.DEFAULT_SUFFIX);
+        }
         return config.hostname().orElse(handle != null ? handle.getHost() : "localhost");
     }
 

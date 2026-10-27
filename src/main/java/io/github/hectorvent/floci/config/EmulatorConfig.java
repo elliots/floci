@@ -1838,7 +1838,7 @@ public interface EmulatorConfig {
         @WithDefault("memcached:1.6")
         String defaultMemcachedImage();
 
-        /** Runs Redis and Valkey containers on the shared smolvm-pods node. */
+        /** Runs Redis, Valkey and Memcached containers on the shared smolvm-pods node. */
         ElastiCacheSmolvmConfig smolvm();
 
         interface ElastiCacheSmolvmConfig {

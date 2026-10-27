@@ -11,9 +11,9 @@ import java.time.Duration;
 import java.util.Set;
 import java.util.concurrent.ConcurrentHashMap;
 
-/** Loopback-only, multi-connection relay from Floci's registry clients to a node container. */
-public final class NodeRegistryRelay implements AutoCloseable {
-    private static final Logger LOG = Logger.getLogger(NodeRegistryRelay.class);
+/** Loopback-only, multi-connection relay from Floci to a node container. */
+public final class NodeTcpRelay implements AutoCloseable {
+    private static final Logger LOG = Logger.getLogger(NodeTcpRelay.class);
     private final ServerSocket listener;
     private final NodeTunnel tunnel;
     private final SmolvmNode node;
@@ -21,14 +21,23 @@ public final class NodeRegistryRelay implements AutoCloseable {
     private final int port;
     private final Set<Socket> sockets = ConcurrentHashMap.newKeySet();
 
-    public NodeRegistryRelay(NodeTunnel tunnel, SmolvmNode node, String host, int port) throws IOException {
+    public NodeTcpRelay(NodeTunnel tunnel, SmolvmNode node, String host, int port) throws IOException {
+        this(tunnel, node, host, port, 0);
+    }
+
+    public NodeTcpRelay(NodeTunnel tunnel, SmolvmNode node, String host, int port, int listenPort) throws IOException {
         this.tunnel = tunnel;
         this.node = node;
         this.host = host;
         this.port = port;
         listener = new ServerSocket();
-        listener.bind(new InetSocketAddress(InetAddress.getByName("127.0.0.1"), 0));
-        Thread.ofVirtual().name("node-registry-accept").start(this::accept);
+        try {
+            listener.bind(new InetSocketAddress(InetAddress.getByName("127.0.0.1"), listenPort));
+        } catch (IOException e) {
+            listener.close();
+            throw e;
+        }
+        Thread.ofVirtual().name("node-relay-accept").start(this::accept);
     }
 
     public int port() {
@@ -40,10 +49,10 @@ public final class NodeRegistryRelay implements AutoCloseable {
             try {
                 Socket client = listener.accept();
                 sockets.add(client);
-                Thread.ofVirtual().name("node-registry-connection").start(() -> relay(client));
+                Thread.ofVirtual().name("node-relay-connection").start(() -> relay(client));
             } catch (IOException e) {
                 if (!listener.isClosed()) {
-                    LOG.warnv("Node registry relay could not accept a connection: {0}", e.getMessage());
+                    LOG.warnv("Node relay could not accept a connection: {0}", e.getMessage());
                 }
             }
         }
@@ -59,7 +68,7 @@ public final class NodeRegistryRelay implements AutoCloseable {
             copy(far, client);
             sender.join();
         } catch (IOException e) {
-            LOG.debugv("Node registry connection ended: {0}", e.getMessage());
+            LOG.debugv("Node relay connection ended: {0}", e.getMessage());
         } catch (InterruptedException e) {
             Thread.currentThread().interrupt();
         } finally {
@@ -69,7 +78,7 @@ public final class NodeRegistryRelay implements AutoCloseable {
                 try {
                     upstream.close();
                 } catch (IOException e) {
-                    LOG.debugv("Closing node registry upstream failed: {0}", e.getMessage());
+                    LOG.debugv("Closing node relay upstream failed: {0}", e.getMessage());
                 }
             }
         }
@@ -82,14 +91,14 @@ public final class NodeRegistryRelay implements AutoCloseable {
                 to.shutdownOutput();
             } catch (UnsupportedOperationException expected) {
                 // TLS sockets cannot half-close; their other direction ends the relay.
-                LOG.trace("A TLS node registry socket does not support half-close");
+                LOG.trace("A TLS node relay socket does not support half-close");
             }
         } catch (IOException e) {
             try {
                 from.close();
                 to.close();
             } catch (IOException closeFailure) {
-                LOG.debugv("Closing a node registry connection failed: {0}", closeFailure.getMessage());
+                LOG.debugv("Closing a node relay connection failed: {0}", closeFailure.getMessage());
             }
         }
     }
@@ -99,13 +108,13 @@ public final class NodeRegistryRelay implements AutoCloseable {
         try {
             listener.close();
         } catch (IOException e) {
-            LOG.debugv("Closing node registry listener failed: {0}", e.getMessage());
+            LOG.debugv("Closing node relay listener failed: {0}", e.getMessage());
         }
         for (Socket socket : sockets) {
             try {
                 socket.close();
             } catch (IOException e) {
-                LOG.debugv("Closing node registry socket failed: {0}", e.getMessage());
+                LOG.debugv("Closing node relay socket failed: {0}", e.getMessage());
             }
         }
         sockets.clear();

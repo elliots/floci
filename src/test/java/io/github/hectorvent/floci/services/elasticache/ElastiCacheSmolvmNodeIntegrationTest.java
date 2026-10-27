@@ -15,6 +15,7 @@ import software.amazon.awssdk.auth.credentials.StaticCredentialsProvider;
 import software.amazon.awssdk.http.urlconnection.UrlConnectionHttpClient;
 import software.amazon.awssdk.regions.Region;
 import software.amazon.awssdk.services.elasticache.ElastiCacheClient;
+import software.amazon.awssdk.services.elasticache.model.CacheCluster;
 import software.amazon.awssdk.services.elasticache.model.ReplicationGroup;
 import software.amazon.awssdk.services.elasticache.model.Tag;
 
@@ -41,6 +42,7 @@ import java.util.concurrent.TimeUnit;
 
 import static org.awaitility.Awaitility.await;
 import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertNotEquals;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
 /** Real node: SDK provisioning, tunneled Redis, DNS and a sleep/wake round trip. */
@@ -75,7 +77,8 @@ class ElastiCacheSmolvmNodeIntegrationTest {
         int servicePort = freePort();
         nodeCreated = true;
         nodeVm("create", "--name", nodeName, "--image", image.toString(), "--service-port",
-                String.valueOf(servicePort), "--api-port", String.valueOf(freePort()), "--node-ports", "none");
+                String.valueOf(servicePort), "--api-port", String.valueOf(freePort()), "--node-ports", "none",
+                "--isolate");
         nodeVm("start", "--name", nodeName);
         nodeApi = URI.create("http://127.0.0.1:" + servicePort);
         token = nodeVm("token", "--name", nodeName).strip();
@@ -107,6 +110,8 @@ class ElastiCacheSmolvmNodeIntegrationTest {
     void cleanup() {
         if (caches != null) {
             tolerate(() -> caches.deleteReplicationGroup(request -> request.replicationGroupId("node-cache")));
+            tolerate(() -> caches.deleteReplicationGroup(request -> request.replicationGroupId("memcached-peer")));
+            tolerate(() -> caches.deleteCacheCluster(request -> request.cacheClusterId("node-memcached")));
             caches.close();
         }
         if (floci != null) {
@@ -114,6 +119,47 @@ class ElastiCacheSmolvmNodeIntegrationTest {
         }
         if (nodeCreated) {
             tolerate(() -> nodeVm("delete", "--name", nodeName));
+        }
+    }
+
+    @Test
+    void memcachedRunsOnNodeAndItsRelaySurvivesSleep() throws IOException {
+        CacheCluster cluster = caches.createCacheCluster(request -> request.cacheClusterId("node-memcached")
+                .engine("memcached").cacheNodeType("cache.t3.micro").numCacheNodes(1)).cacheCluster();
+        try {
+            int port = cluster.configurationEndpoint().port();
+            ReplicationGroup peer = caches.createReplicationGroup(request -> request.replicationGroupId("memcached-peer")
+                    .replicationGroupDescription("Shares the Memcached port pool").engine("valkey")
+                    .cacheNodeType("cache.t3.micro").numCacheClusters(1)).replicationGroup();
+            int peerPort = peer.nodeGroups().getFirst().primaryEndpoint().port();
+            assertNotEquals(port, peerPort, "Memcached and Valkey must share port reservations");
+            assertEquals("+PONG\r\n", command(peerPort, "PING", 7));
+            try (Socket socket = new Socket("127.0.0.1", port)) {
+                socket.setSoTimeout(45_000);
+                socket.getOutputStream().write("set marker 0 0 8\r\nretained\r\n".getBytes(StandardCharsets.US_ASCII));
+                assertEquals("STORED\r\n", new String(socket.getInputStream().readNBytes(8), StandardCharsets.US_ASCII));
+            }
+            String selectedPod = nodeVm("exec", "--name", nodeName, "--", "docker", "ps", "--no-trunc",
+                    "--quiet", "--filter", "label=io.floci.resource-id=node-memcached").strip();
+            assertTrue(!selectedPod.isBlank());
+            String fromPod = nodeVm("exec", "--name", nodeName, "--", "timeout", "20s", "docker", "exec",
+                    selectedPod, "bash", "-ec", "exec 3<>/dev/tcp/localhost.floci.io/$1; "
+                            + "printf 'version\\r\\n' >&3; IFS= read -r line <&3; printf '%s' \"$line\"",
+                    "bash", String.valueOf(port));
+            assertTrue(fromPod.startsWith("VERSION "), fromPod);
+            await().atMost(Duration.ofMinutes(3)).pollInterval(Duration.ofSeconds(2))
+                    .until(() -> "asleep".equals(get("/v1/pods/" + selectedPod).path("state").asText()));
+            try (Socket socket = new Socket("127.0.0.1", port)) {
+                socket.setSoTimeout(45_000);
+                socket.getOutputStream().write("get marker\r\n".getBytes(StandardCharsets.US_ASCII));
+                assertEquals("VALUE marker 0 8\r\nretained\r\nEND\r\n",
+                        new String(socket.getInputStream().readNBytes(33), StandardCharsets.US_ASCII));
+            }
+            caches.deleteCacheCluster(request -> request.cacheClusterId("node-memcached"));
+            assertEquals("+PONG\r\n", command(peerPort, "PING", 7), "deleting Memcached must leave Valkey reachable");
+        } finally {
+            tolerate(() -> caches.deleteCacheCluster(request -> request.cacheClusterId("node-memcached")));
+            tolerate(() -> caches.deleteReplicationGroup(request -> request.replicationGroupId("memcached-peer")));
         }
     }
 
