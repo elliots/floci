@@ -7,6 +7,7 @@ import io.github.hectorvent.floci.core.common.AwsArnUtils;
 import io.github.hectorvent.floci.core.common.AwsException;
 import io.github.hectorvent.floci.core.common.Resettable;
 import io.github.hectorvent.floci.services.lambda.launcher.ContainerHandle;
+import io.github.hectorvent.floci.services.lambda.launcher.LambdaRuntimeLauncher;
 import io.github.hectorvent.floci.services.lambda.model.FunctionEventInvokeConfig;
 import io.github.hectorvent.floci.services.lambda.model.InvocationType;
 import io.github.hectorvent.floci.services.lambda.model.InvokeResult;
@@ -361,18 +362,21 @@ public class LambdaExecutorService implements Resettable {
                     null, requestId);
         }
         try {
-            long deadlineMs = System.currentTimeMillis() + (long) fn.getTimeout() * 1000;
-            PendingInvocation invocation = new PendingInvocation(
-                    requestId, payload, deadlineMs, fn.getFunctionArn(),
-                    new CompletableFuture<>());
-            invocation.setClientContext(clientContext);
+            InvokeResult result;
+            try (LambdaRuntimeLauncher.Hold awake = warmPool.hold(handle)) {
+                long deadlineMs = System.currentTimeMillis() + (long) fn.getTimeout() * 1000;
+                PendingInvocation invocation = new PendingInvocation(
+                        requestId, payload, deadlineMs, fn.getFunctionArn(),
+                        new CompletableFuture<>());
+                invocation.setClientContext(clientContext);
 
-            handle.getRuntimeApiServer().enqueue(invocation);
+                handle.getRuntimeApiServer().enqueue(invocation);
 
-            CompletableFuture.anyOf(
-                            invocation.getDispatchedFuture(), invocation.getResultFuture())
-                    .get(fn.getTimeout() + RUNTIME_DISPATCH_GRACE_SECONDS, TimeUnit.SECONDS);
-            InvokeResult result = invocation.getResultFuture().get();
+                CompletableFuture.anyOf(
+                                invocation.getDispatchedFuture(), invocation.getResultFuture())
+                        .get(fn.getTimeout() + RUNTIME_DISPATCH_GRACE_SECONDS, TimeUnit.SECONDS);
+                result = invocation.getResultFuture().get();
+            }
 
             warmPool.release(handle);
             return result;

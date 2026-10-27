@@ -1,6 +1,7 @@
 # Using the Floci node day to day
 
-The Floci node is the smolvm-pods node VM that runs RDS's databases and the EKS cluster
+The Floci node is the smolvm-pods node VM that runs RDS's databases, Lambda's environments and the
+EKS cluster
 ([The Floci node](smolvm-runtime.md#the-floci-node)). This page is about using it from the Mac:
 finding it, kubectl, the Docker CLI, watching pods and databases sleep and wake, metrics, logs, and
 what to do when something goes wrong. Commands run from `tools/smolvm-pods` in the floci
@@ -120,6 +121,14 @@ docker inspect CONTAINER
 
 `docker ps` shows a sleeping database `Up`. Change databases through the RDS API, not with
 `docker stop` or `docker rm`: Floci owns these containers.
+
+Lambda's environments are labelled `io.floci.service=lambda` and `io.floci.resource-id=<the
+function name>`, each in a microVM that sleeps between invocations:
+
+```sh
+docker ps --filter label=io.floci.service=lambda
+docker logs -f CONTAINER                   # the function's output, without waking it
+```
 
 ## Watching sleep and wake
 

@@ -1,7 +1,7 @@
 # smolvm Runtime
 
 smolvm-pods runs each Kubernetes pod in its own microVM and puts idle pods to sleep
-(`tools/smolvm-pods`). Floci has one smolvm-pods node, which RDS and EKS share
+(`tools/smolvm-pods`). Floci has one smolvm-pods node, which RDS, EKS and Lambda share
 ([The Floci node](#the-floci-node)): the runtime file's, or one that Floci creates. Floci calls the
 node service of its nodes over their API. The runtime file tells Floci about the nodes it did not
 create, the message consumers it wakes when messages arrive for them, and the nodes' network:
@@ -136,6 +136,19 @@ as hibernating microVMs, through the node service's Docker proxy and tunnels.
 | `FLOCI_SERVICES_RDS_SMOLVM_ENABLED` | `floci.services.rds.smolvm.enabled` | `false` |
 | `FLOCI_SERVICES_RDS_SMOLVM_IDLE_TIMEOUT` | `floci.services.rds.smolvm.idle-timeout` | _(empty)_: the node's `--idle-timeout` |
 
+### Lambda functions on a node
+
+With `FLOCI_SERVICES_LAMBDA_SMOLVM_ENABLED=true`, Lambda runs its environments on the Floci node,
+each a microVM on dockerd's default bridge with the network of the node's pods, which sleeps
+between invocations. `FLOCI_SERVICES_LAMBDA_SMOLVM_IDLE_TIMEOUT` sets how long an environment has
+no invocation before it sleeps. See
+[Functions on a smolvm-pods node](../services/lambda.md#functions-on-a-smolvm-pods-node).
+
+| Variable | Key | Default |
+|---|---|---|
+| `FLOCI_SERVICES_LAMBDA_SMOLVM_ENABLED` | `floci.services.lambda.smolvm.enabled` | `false` |
+| `FLOCI_SERVICES_LAMBDA_SMOLVM_IDLE_TIMEOUT` | `floci.services.lambda.smolvm.idle-timeout` | _(empty)_: the node's `--idle-timeout` |
+
 ### Errors
 
 | Message | Fix |
@@ -151,8 +164,10 @@ as hibernating microVMs, through the node service's Docker proxy and tunnels.
 ## The Floci node
 
 Floci has one smolvm-pods node for everything that runs on one: RDS's databases with
-`FLOCI_SERVICES_RDS_SMOLVM_ENABLED=true`, and the one EKS cluster with
-`FLOCI_SERVICES_EKS_PROVIDER=smolvm-pods` ([smolvm-pods nodes](../services/eks.md#smolvm-pods-nodes)).
+`FLOCI_SERVICES_RDS_SMOLVM_ENABLED=true`, the one EKS cluster with
+`FLOCI_SERVICES_EKS_PROVIDER=smolvm-pods` ([smolvm-pods nodes](../services/eks.md#smolvm-pods-nodes)),
+and Lambda's environments with `FLOCI_SERVICES_LAMBDA_SMOLVM_ENABLED=true`
+([Functions on a smolvm-pods node](../services/lambda.md#functions-on-a-smolvm-pods-node)).
 
 - **The runtime file's node.** When the runtime file lists nodes, the one that
   `FLOCI_RUNTIME_NODE_NAME` names, by its key, is the node, or the only one when the setting is
@@ -160,9 +175,10 @@ Floci has one smolvm-pods node for everything that runs on one: RDS's databases 
   does not list, is an error that names the nodes, which a create in RDS reports. An EKS cluster
   needs a node whose k3s Floci configures, so `CreateCluster` fails on the runtime file's node.
 - **The node Floci creates.** Otherwise Floci creates a node with `node-vm.sh` on the first use,
-  whichever comes first: an RDS create, of an instance or a cluster, or an EKS `CreateCluster`.
-  Uses that come at once create one node. The use answers at once: an RDS instance or cluster is
-  `creating` and an EKS cluster `CREATING` until the node is ready, which took 12 seconds on an
+  whichever comes first: an RDS create, of an instance or a cluster, an EKS `CreateCluster`, or a
+  Lambda cold start. Uses that come at once create one node. An RDS or EKS use answers at once: an
+  RDS instance or cluster is `creating` and an EKS cluster `CREATING` until the node is ready, and
+  a Lambda cold start waits for it, which took 12 seconds on an
   M4 Max. A use that comes later takes the node as it is.
 
 The node outlives its users: deleting the EKS cluster or the last database keeps it, since
@@ -602,7 +618,9 @@ network:
 
 ### What pods reach
 
-Each node owns the address `169.254.53.1`, which its pods reach through their default route:
+Each node owns the address `169.254.53.1`, which its pods reach through their default route.
+Containers of the node's dockerd on its default bridge, such as RDS's databases and Lambda's
+environments, get the same network as pods, and count as part of the cluster:
 
 | Port on `169.254.53.1` | Goes to |
 |---|---|
@@ -614,7 +632,8 @@ Each node owns the address `169.254.53.1`, which its pods reach through their de
 Floci's ports are its AWS endpoint, `FLOCI_PORT`, and the listeners its services publish for
 clients: Amazon MQ's AMQP and console ports, IoT's MQTT ports, the proxies of ElastiCache,
 MemoryDB, RDS, Redshift, Neptune, OpenSearch and MWAA, MSK's Kafka ports, ECR's registries and
-Timestream for InfluxDB's ports, each over its configured range, plus `floci.extra-ports`.
+Timestream for InfluxDB's ports, each over its configured range, plus `floci.extra-ports`, and the
+Lambda Runtime API's range while Lambda runs on the node.
 
 Floci answers the nodes' DNS at `FLOCI_RUNTIME_DNS_LISTEN`:
 

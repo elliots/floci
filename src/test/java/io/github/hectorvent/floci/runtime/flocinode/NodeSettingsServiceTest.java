@@ -35,6 +35,7 @@ import static org.hamcrest.Matchers.not;
 import static org.junit.jupiter.api.Assertions.assertDoesNotThrow;
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertThrows;
+import static org.mockito.Mockito.RETURNS_DEEP_STUBS;
 import static org.mockito.Mockito.mock;
 import static org.mockito.Mockito.when;
 
@@ -52,6 +53,8 @@ class NodeSettingsServiceTest {
     private Path image;
     private NodeSettings settings;
 
+    private EmulatorConfig.LambdaServiceConfig lambda;
+
     @BeforeEach
     void setUp() throws IOException {
         config = mock(EmulatorConfig.class);
@@ -67,6 +70,8 @@ class NodeSettingsServiceTest {
         when(config.port()).thenReturn(4566);
         when(services.eks()).thenReturn(eks);
         when(services.rds()).thenReturn(rds);
+        lambda = mock(EmulatorConfig.LambdaServiceConfig.class, RETURNS_DEEP_STUBS);
+        when(services.lambda()).thenReturn(lambda);
         when(rds.smolvm()).thenReturn(rdsSmolvm);
         when(rds.enabled()).thenReturn(true);
         when(eks.enabled()).thenReturn(true);
@@ -162,6 +167,22 @@ class NodeSettingsServiceTest {
         when(eks.provider()).thenReturn("smolvm-pods");
         refused = assertThrows(IllegalStateException.class, settings::requireValid);
         assertThat(refused.getMessage(), containsString("that RDS and EKS use: "));
+    }
+
+    @Test
+    void lambdaOnTheNodeChecksTheSettingsToo() {
+        inContainer.set(true);
+        when(eks.provider()).thenReturn("k3s");
+        when(lambda.enabled()).thenReturn(true);
+        when(lambda.smolvm().enabled()).thenReturn(true);
+
+        IllegalStateException refused = assertThrows(IllegalStateException.class, settings::requireValid);
+        assertThat(refused.getMessage(), containsString("the smolvm-pods node that Lambda use: "));
+
+        when(rdsSmolvm.enabled()).thenReturn(true);
+        when(eks.provider()).thenReturn("smolvm-pods");
+        refused = assertThrows(IllegalStateException.class, settings::requireValid);
+        assertThat(refused.getMessage(), containsString("that RDS, EKS and Lambda use: "));
     }
 
     @Test

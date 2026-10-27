@@ -3359,6 +3359,22 @@ public interface EmulatorConfig {
             String initImage();
         }
 
+        /** Lambda environments as hibernating microVMs on a smolvm-pods node. */
+        LambdaSmolvmConfig smolvm();
+
+        interface LambdaSmolvmConfig {
+            /** Runs every Lambda environment on the smolvm-pods node ({@code floci.runtime.node}),
+             *  in a pod VM that sleeps between invocations. Needs the docker executor.
+             *  Env: FLOCI_SERVICES_LAMBDA_SMOLVM_ENABLED */
+            @WithDefault("false")
+            boolean enabled();
+
+            /** How long an environment has no invocation before it sleeps, a duration from 10s
+             *  to 24h such as {@code 1m}. Empty takes the node's own idle timeout.
+             *  Env: FLOCI_SERVICES_LAMBDA_SMOLVM_IDLE_TIMEOUT */
+            Optional<String> idleTimeout();
+        }
+
         HotReload hotReload();
 
         interface HotReload {

@@ -58,6 +58,10 @@ public class LambdaRuntimeLauncherProducer {
                     "Unknown floci.services.lambda.executor '" + executor
                             + "'. Valid values: docker, kubernetes");
         }
+        if (executor.equals("kubernetes") && config.services().lambda().smolvm().enabled()) {
+            throw new IllegalArgumentException("floci.services.lambda.smolvm.enabled runs Lambda environments "
+                    + "with the docker executor, not kubernetes");
+        }
         return executor;
     }
 }

@@ -20,7 +20,22 @@ public interface LambdaRuntimeLauncher {
         throw new UnsupportedOperationException("Provisioned concurrency is not supported by this Lambda executor");
     }
 
+    /**
+     * Keeps the environment awake for one invocation, until the returned hold closes. An
+     * environment that sleeps between invocations is woken first.
+     */
+    default Hold hold(ContainerHandle handle) {
+        return () -> { };
+    }
+
     void stop(ContainerHandle handle);
 
     boolean isAlive(ContainerHandle handle);
+
+    /** What {@link #hold} returns. */
+    interface Hold extends AutoCloseable {
+
+        @Override
+        void close();
+    }
 }

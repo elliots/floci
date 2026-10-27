@@ -12,7 +12,7 @@ import java.util.Optional;
 /**
  * Floci's ports that pods of a smolvm-pods node reach at the node address: the AWS endpoint and
  * the listeners that Floci's services publish for their clients, such as brokers and database
- * proxies. Floci's own containers, the nodes' APIs and NodePorts, and ports that a route owns are
+ * proxies, and the Lambda Runtime API when Lambda runs on the node. Floci's own containers, the nodes' APIs and NodePorts, and ports that a route owns are
  * not in the set; {@link #EXCLUDED} names each with its reason.
  */
 @ApplicationScoped
@@ -31,9 +31,13 @@ public class FlociPortInventory {
         }
     }
 
-    /** The settings in the set, by their application.yml key below {@code floci.}. */
+    /**
+     * The settings in the set, by their application.yml key below {@code floci.}; the Runtime API's
+     * only with {@code services.lambda.smolvm.enabled}.
+     */
     static final List<String> INCLUDED = List.of(
             "port",
+            "services.lambda.runtime-api-base-port", "services.lambda.runtime-api-max-port",
             "services.amazonmq.amqp-host-port-base", "services.amazonmq.amqp-host-port-max",
             "services.amazonmq.console-host-port-base", "services.amazonmq.console-host-port-max",
             "services.iot.mqtt.port", "services.iot.mqtt.tls-port",
@@ -52,8 +56,6 @@ public class FlociPortInventory {
     /** The settings that hold a port and are not in the set, and why. */
     static final Map<String, String> EXCLUDED = Map.ofEntries(
             Map.entry("tls.aws-https-port", "routed origins own 443"),
-            Map.entry("services.lambda.runtime-api-base-port", "Floci's own Lambda containers"),
-            Map.entry("services.lambda.runtime-api-max-port", "Floci's own Lambda containers"),
             Map.entry("services.pipes.kafka-rest-bridge.host-port-base", "Floci's own Pipes containers"),
             Map.entry("services.pipes.kafka-rest-bridge.host-port-max", "Floci's own Pipes containers"),
             Map.entry("services.redshift.default-port", "a database port inside a cluster, not on the Floci host"),
@@ -95,6 +97,10 @@ public class FlociPortInventory {
         EmulatorConfig.ServicesConfig s = config.services();
         List<PortRange> ranges = new ArrayList<>();
         ranges.add(new PortRange(config.port(), config.port(), "port"));
+        if (s.lambda().enabled() && s.lambda().smolvm().enabled()) {
+            ranges.add(new PortRange(s.lambda().runtimeApiBasePort(), s.lambda().runtimeApiMaxPort(),
+                    "services.lambda.runtime-api-base-port"));
+        }
         ranges.add(new PortRange(s.amazonmq().amqpHostPortBase(), s.amazonmq().amqpHostPortMax(),
                 "services.amazonmq.amqp-host-port-base"));
         ranges.add(new PortRange(s.amazonmq().consoleHostPortBase(), s.amazonmq().consoleHostPortMax(),

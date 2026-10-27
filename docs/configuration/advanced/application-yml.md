@@ -119,7 +119,7 @@ floci:
   runtime:
     config-file: ""                          # FLOCI_RUNTIME_CONFIG_FILE: the smolvm runtime file (see smolvm-runtime.md)
     dns-listen: ""                           # FLOCI_RUNTIME_DNS_LISTEN: HOST:PORT of the smolvm-pods nodes' DNS; empty is 127.0.0.1:15353, or 0.0.0.0:15353 in a container
-    node:                                    # the one smolvm-pods node of RDS and EKS (smolvm-runtime.md, "The Floci node")
+    node:                                    # the one smolvm-pods node of RDS, EKS and Lambda (smolvm-runtime.md, "The Floci node")
       name: ""                               # the runtime file's node, by its key; empty takes the only one
       node-vm-script: ""                     # absolute path of tools/smolvm-pods/scripts/node-vm.sh, to create one
       smolvm-src: ""                         # the smolvm checkout that node-vm.sh runs
@@ -193,6 +193,9 @@ floci:
       poll-interval-ms: 1000
       async-retry-delay-seconds: 60           # Wait before the first retry of a failed Event invocation; the second waits twice this
       container-idle-timeout-seconds: 300     # Remove idle containers after this
+      smolvm:                                 # environments as microVMs on the smolvm-pods node (runtime.node)
+        enabled: false                        # FLOCI_SERVICES_LAMBDA_SMOLVM_ENABLED
+        idle-timeout: ""                      # how long an environment has no invocation before it sleeps; empty = the node's
       # warm-pool-max-per-function:           # Idle containers kept per function (default max(4, cpus))
       warm-pool-max-total: 0                  # Idle containers kept across all functions; 0 = unbounded
       region-concurrency-limit: 1000          # Concurrent executions ceiling per region

@@ -103,9 +103,12 @@ public class NodeSettings {
         }
     }
 
-    /** Whether a service runs on the node: RDS with smolvm on, or EKS with the smolvm-pods provider, both real. */
+    /**
+     * Whether a service runs on the node: RDS or Lambda with smolvm on, or EKS with the smolvm-pods
+     * provider, each real.
+     */
     public boolean wanted() {
-        return rdsWants() || eksWants();
+        return rdsWants() || eksWants() || lambdaWants();
     }
 
     private boolean rdsWants() {
@@ -118,11 +121,24 @@ public class NodeSettings {
         return eks.enabled() && !eks.mock() && "smolvm-pods".equals(eks.provider());
     }
 
+    private boolean lambdaWants() {
+        EmulatorConfig.LambdaServiceConfig lambda = config.services().lambda();
+        return lambda.enabled() && lambda.smolvm().enabled();
+    }
+
     private String users() {
-        if (rdsWants() && eksWants()) {
-            return "RDS and EKS";
+        List<String> users = new ArrayList<>();
+        if (rdsWants()) {
+            users.add("RDS");
         }
-        return rdsWants() ? "RDS" : "EKS";
+        if (eksWants()) {
+            users.add("EKS");
+        }
+        if (lambdaWants()) {
+            users.add("Lambda");
+        }
+        return users.size() < 2 ? String.join("", users)
+                : String.join(", ", users.subList(0, users.size() - 1)) + " and " + users.getLast();
     }
 
     /**
