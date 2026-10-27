@@ -271,8 +271,9 @@ public class ContainerLauncher implements LambdaRuntimeLauncher {
         env.add("AWS_LAMBDA_FUNCTION_TIMEOUT=" + fn.getTimeout());
         env.add("AWS_LAMBDA_LOG_GROUP_NAME=" + cwLogGroup);
         env.add("AWS_LAMBDA_LOG_STREAM_NAME=" + cwLogStream);
-        if (fn.getHandler() != null && !fn.getHandler().isBlank()) {
-            env.add("_HANDLER=" + fn.getHandler());
+        String handler = handlerFor(fn, image);
+        if (handler != null) {
+            env.add("_HANDLER=" + handler);
         }
         // Region, credentials and the Floci endpoint the SDK should target: the same baseline
         // Floci gives every launched container. When the host ~/.aws is mounted (awsConfigPath),
@@ -1338,6 +1339,40 @@ public class ContainerLauncher implements LambdaRuntimeLauncher {
      */
     static final int COPY_MAX_ATTEMPTS = 6;
     static final long COPY_RETRY_BACKOFF_MS = 500L;
+
+    /**
+     * The handler that the runtime reads from {@code _HANDLER}. A Zip function names it. An Image function names none:
+     * AWS sets it from the function's command, which is {@code ImageConfig.Command} when that is set and otherwise the
+     * image's own CMD. A runtime interface client such as aws-lambda-ric stops at start when it is missing.
+     */
+    String handlerFor(LambdaFunction fn, String image) {
+        if (fn.getHandler() != null && !fn.getHandler().isBlank()) {
+            return fn.getHandler();
+        }
+        if (!"Image".equals(fn.getPackageType())) {
+            return null;
+        }
+        List<String> command = fn.getImageConfigCommand();
+        if (command == null || command.isEmpty()) {
+            command = imageCmd(image);
+        }
+        if (command == null || command.isEmpty() || command.get(0) == null || command.get(0).isBlank()) {
+            return null;
+        }
+        return command.get(0);
+    }
+
+    /** The CMD of a local image, or null when the image is not there or cannot be read. */
+    private List<String> imageCmd(String image) {
+        try {
+            var inspected = lifecycleManager.getDockerClient().inspectImageCmd(image).exec();
+            String[] cmd = inspected == null || inspected.getConfig() == null ? null : inspected.getConfig().getCmd();
+            return cmd == null ? null : List.of(cmd);
+        } catch (RuntimeException e) {
+            LOG.debugf("Could not read the CMD of image %s: %s", image, e.getMessage());
+            return null;
+        }
+    }
 
     private void copyDirToContainer(DockerClient dockerClient, String containerId,
                                     Path sourceDir, String remotePath, String functionName) {

@@ -988,6 +988,64 @@ class ContainerLauncherTest {
                 "execution-role session token should appear exactly once");
     }
 
+    private void stubImageCmd(String image, String... cmd) {
+        com.github.dockerjava.api.command.InspectImageCmd inspect = mock(com.github.dockerjava.api.command.InspectImageCmd.class);
+        com.github.dockerjava.api.command.InspectImageResponse response = mock(com.github.dockerjava.api.command.InspectImageResponse.class);
+        com.github.dockerjava.api.model.ContainerConfig containerConfig = mock(com.github.dockerjava.api.model.ContainerConfig.class);
+        lenient().when(dockerClient.inspectImageCmd(image)).thenReturn(inspect);
+        lenient().when(inspect.exec()).thenReturn(response);
+        lenient().when(response.getConfig()).thenReturn(containerConfig);
+        lenient().when(containerConfig.getCmd()).thenReturn(cmd);
+    }
+
+    private static List<String> handlerEnv(ContainerSpec spec) {
+        return spec.env().stream().filter(value -> value.startsWith("_HANDLER=")).toList();
+    }
+
+    // AWS sets _HANDLER for a container image function from its command; aws-lambda-ric stops at start without it.
+    @Test
+    void launchImageFunction_setsTheHandlerFromTheImageCmd() {
+        LambdaFunction fn = new LambdaFunction();
+        fn.setFunctionName("image-handler-fn");
+        fn.setPackageType("Image");
+        fn.setImageUri("localhost:5001/dispatch:1");
+        when(ecrRegistryManager.rewriteImageUri("localhost:5001/dispatch:1")).thenReturn("localhost:5001/dispatch:1");
+        stubImageCmd("localhost:5001/dispatch:1", "index.handler");
+
+        launcher.launch(fn);
+
+        assertEquals(List.of("_HANDLER=index.handler"), handlerEnv(captureRealContainerSpec()));
+    }
+
+    @Test
+    void launchImageFunction_setsTheHandlerFromImageConfigCommandBeforeTheImageCmd() {
+        LambdaFunction fn = new LambdaFunction();
+        fn.setFunctionName("image-config-handler-fn");
+        fn.setPackageType("Image");
+        fn.setImageUri("localhost:5001/dispatch:1");
+        fn.setImageConfigCommand(List.of("app.handler"));
+        when(ecrRegistryManager.rewriteImageUri("localhost:5001/dispatch:1")).thenReturn("localhost:5001/dispatch:1");
+        stubImageCmd("localhost:5001/dispatch:1", "index.handler");
+
+        launcher.launch(fn);
+
+        assertEquals(List.of("_HANDLER=app.handler"), handlerEnv(captureRealContainerSpec()));
+    }
+
+    @Test
+    void launchImageFunction_setsNoHandlerWhenTheImageCannotBeRead() {
+        LambdaFunction fn = new LambdaFunction();
+        fn.setFunctionName("image-no-handler-fn");
+        fn.setPackageType("Image");
+        fn.setImageUri("localhost:5001/missing:1");
+        when(ecrRegistryManager.rewriteImageUri("localhost:5001/missing:1")).thenReturn("localhost:5001/missing:1");
+        lenient().when(dockerClient.inspectImageCmd("localhost:5001/missing:1")).thenThrow(new NotFoundException("no such image"));
+
+        launcher.launch(fn);
+
+        assertEquals(List.of(), handlerEnv(captureRealContainerSpec()));
+    }
+
     @Test
     void launchImageFunction_rewritesAwsEcrUriUsingRegistryManagerHostnameStyle() {
         LambdaFunction fn = new LambdaFunction();
