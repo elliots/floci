@@ -1084,7 +1084,7 @@ does not:
 - `docker pause` and `unpause`: the task API's Pause is not implemented;
 - Docker's embedded DNS on user networks, at `127.0.0.11` in the container's network namespace,
   which the guest cannot reach: names of other containers do not resolve in a VM container. On
-  the default bridge, the node's resolver applies, which is the node address
+  the default bridge, dockerd's `--dns` applies, which is the node address
   ([The node address](#the-node-address));
 - `docker network connect` and a second network: the VM has the one NIC of its first boot;
 - `docker cp`, which reads and writes Docker's copy of the image on the node, not the VM's copy;

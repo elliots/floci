@@ -885,7 +885,10 @@ supervise_node_service() {
 # after it exits. It waits for containerd's socket, which k3s makes, and keeps
 # its data on the storage disk. Its default runtime is runc; a container runs
 # in a pod VM only when it names the runtime io.containerd.smolvm-pods.v2
-# (node/README.md, "Docker").
+# (node/README.md, "Docker"). Its containers resolve through the node address,
+# as pods do: dockerd would otherwise copy the node's /etc/resolv.conf into
+# each container when it creates it, and that file can name smolvm's resolver,
+# which answers no name on an isolated node.
 supervise_dockerd() {
     local pid='' stopping=0 status
     trap 'stopping=1; if [ -n "$pid" ]; then kill -TERM "$pid" 2>/dev/null || true; fi' TERM
@@ -899,7 +902,8 @@ supervise_dockerd() {
         fi
         log "starting dockerd on $containerd_socket, logging to $docker_log"
         dockerd --containerd="$containerd_socket" --data-root "$docker_data" \
-            --bip "$docker_bridge" --host "unix://$docker_socket" >>"$docker_log" 2>&1 &
+            --bip "$docker_bridge" --dns "$node_address" \
+            --host "unix://$docker_socket" >>"$docker_log" 2>&1 &
         pid=$!
         while :; do
             if wait "$pid"; then status=0; else status=$?; fi

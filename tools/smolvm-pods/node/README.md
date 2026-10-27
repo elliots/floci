@@ -157,12 +157,14 @@ socket is there, and starts it again 5 seconds after it exits:
 
 ```sh
 dockerd --containerd=/run/k3s/containerd/containerd.sock --data-root /var/lib/smolvm/docker \
-    --bip 172.17.0.1/16 --host unix:///run/docker.sock
+    --bip 172.17.0.1/16 --dns 169.254.53.1 --host unix:///run/docker.sock
 ```
 
 Containers on the default bridge get the network of pods ([Network](#network)):
 the node's DNS, Floci's ports and routed hosts at the node address, and
-isolation.
+isolation. `--dns` names the node address, so that a container does not take the
+node's `/etc/resolv.conf`, which can name smolvm's resolver: on an isolated node
+that resolver answers no name.
 
 dockerd keeps its containers in containerd's namespace `moby`, its images and
 volumes on the storage disk, and its log in `/var/log/dockerd.log`. The image
