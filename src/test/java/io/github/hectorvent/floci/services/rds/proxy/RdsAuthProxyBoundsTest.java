@@ -15,6 +15,8 @@ import java.net.ServerSocket;
 import java.net.Socket;
 import java.net.SocketTimeoutException;
 import java.nio.file.Path;
+import java.time.Clock;
+import java.util.List;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.Semaphore;
 import java.util.concurrent.TimeUnit;
@@ -163,6 +165,6 @@ class RdsAuthProxyBoundsTest {
 
     private RdsProxyTlsCertificates realTls() {
         return new RdsProxyTlsCertificates(FlociCertificateAuthority.loadOrCreate(tempDir.resolve("tls")),
-                new CertificateGenerator());
+                new CertificateGenerator(), List.of(), Clock.systemUTC());
     }
 }

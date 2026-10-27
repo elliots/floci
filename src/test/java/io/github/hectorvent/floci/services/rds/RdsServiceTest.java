@@ -48,6 +48,7 @@ import io.github.hectorvent.floci.services.rds.model.OptionGroupOption;
 import io.github.hectorvent.floci.services.rds.model.PointInTimeRestoreRequest;
 import io.github.hectorvent.floci.services.rds.model.RdsEvent;
 import io.github.hectorvent.floci.services.rds.model.ReadReplicaRequest;
+import io.github.hectorvent.floci.services.rds.proxy.AuroraMySqlEmulation;
 import io.github.hectorvent.floci.services.rds.proxy.RdsAuthProxy;
 import io.github.hectorvent.floci.services.rds.proxy.RdsProxyBinding;
 import io.github.hectorvent.floci.services.rds.proxy.RdsProxyManager;
@@ -89,6 +90,7 @@ import java.util.concurrent.Future;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicReference;
+import java.util.function.Supplier;
 import java.util.logging.LogRecord;
 import java.util.stream.Collectors;
 
@@ -298,6 +300,34 @@ class RdsServiceTest {
         assertEquals(new RdsProxyBinding(instance.getEndpoint().address(), instance.getProxyPort(),
                         "us-east-1", "123456789012", instance.getDbiResourceId(), true),
                 binding.getValue());
+    }
+
+    @Test
+    void onlyAnAuroraMySqlClusterEndpointAnswersAuroraDiscoveryWithItsWriter() {
+        DbCluster aurora = rdsService.createDbCluster("aurora-my", "aurora-mysql", "8.0.mysql_aurora.3.05.2",
+                "admin", "password", "appdb", false, null);
+        DbCluster postgres = rdsService.createDbCluster("aurora-pg", "aurora-postgresql", "16.3",
+                "admin", "password", "appdb", false, null);
+        DbCluster multiAz = rdsService.createDbCluster("multi-az-my", "mysql", "8.0.36",
+                "admin", "password", "appdb", false, null);
+        ArgumentCaptor<String> relays = ArgumentCaptor.forClass(String.class);
+        ArgumentCaptor<RdsProxyBinding> bindings = ArgumentCaptor.forClass(RdsProxyBinding.class);
+        verify(proxyManager, times(3)).startProxy(relays.capture(), any(), any(), anyBoolean(), anyInt(), any(),
+                anyInt(), any(), any(), any(), any(), any(), bindings.capture());
+        Map<String, RdsProxyBinding> byRelay = new HashMap<>();
+        for (int i = 0; i < relays.getAllValues().size(); i++) {
+            byRelay.put(relays.getAllValues().get(i), bindings.getAllValues().get(i));
+        }
+
+        Supplier<AuroraMySqlEmulation.Server> discovery =
+                byRelay.get("rds-resource:" + aurora.getDbClusterArn()).auroraMySql();
+        assertNotNull(discovery);
+        assertNull(discovery.get(), "a cluster with no instance has no writer to report");
+        rdsService.createDbInstance("aurora-my-1", "aurora-mysql", null, null, null, "appdb", "db.r6g.large",
+                0, false, null, null, "aurora-my");
+        assertEquals(new AuroraMySqlEmulation.Server("aurora-my-1", "3.05.2"), discovery.get());
+        assertNull(byRelay.get("rds-resource:" + postgres.getDbClusterArn()).auroraMySql());
+        assertNull(byRelay.get("rds-resource:" + multiAz.getDbClusterArn()).auroraMySql());
     }
 
     @ParameterizedTest
@@ -1082,7 +1112,7 @@ class RdsServiceTest {
 
     @Test
     void createDbInstanceRemovesVisibleRecordWhenProxyStartupFails() {
-        doThrow(new IllegalStateException("proxy down"))
+        doThrow(new IllegalStateException("proxy down")).doNothing()
                 .when(proxyManager).startProxy(any(), any(), any(), anyBoolean(), anyInt(), any(), anyInt(),
                         any(), any(), any(), any(), any(), any());
 
@@ -1091,6 +1121,30 @@ class RdsServiceTest {
                 "admin", "secret123", null, "db.t3.micro",
                 20, false, null, null, null, null, false));
         assertThrows(AwsException.class, () -> rdsService.getDbInstance("mypostgres"));
+
+        // The container started for it is removed with its storage, and the port is free again.
+        verify(containerManager).stop(any());
+        verify(containerManager).removeVolume(eq("arn:aws:rds:us-east-1:123456789012:db:mypostgres"), any(), any());
+        assertEquals(7000, rdsService.createDbInstance("retried", "postgres", "13",
+                "admin", "secret123", null, "db.t3.micro",
+                20, false, null, null, null, null, false).getProxyPort());
+    }
+
+    @Test
+    void createDbClusterReleasesItsPortAndContainerWhenProxyStartupFails() {
+        doThrow(new IllegalStateException("proxy down")).doNothing()
+                .when(proxyManager).startProxy(any(), any(), any(), anyBoolean(), anyInt(), any(), anyInt(),
+                        any(), any(), any(), any(), any(), any());
+
+        assertThrows(IllegalStateException.class, () -> rdsService.createDbCluster("failed-cluster",
+                "aurora-postgresql", "16.3", "admin", "password", "appdb", false, null));
+        assertThrows(AwsException.class, () -> rdsService.getDbCluster("failed-cluster"));
+
+        verify(containerManager).stop(any());
+        verify(containerManager).removeVolume(
+                eq("arn:aws:rds:us-east-1:123456789012:cluster:failed-cluster"), any(), any());
+        assertEquals(7000, rdsService.createDbCluster("retried-cluster", "aurora-postgresql", "16.3",
+                "admin", "password", "appdb", false, null).getProxyPort());
     }
 
     @Test

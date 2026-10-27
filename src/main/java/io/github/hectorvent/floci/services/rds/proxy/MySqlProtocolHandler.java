@@ -264,7 +264,7 @@ public class MySqlProtocolHandler {
         // Authenticated: clear the handshake deadline so a long-lived idle session is never killed.
         client.setSoTimeout(0);
         backend.setSoTimeout(0);
-        bridge(client, backend);
+        bridge(client, backend, binding);
     }
 
     /**
@@ -404,7 +404,7 @@ public class MySqlProtocolHandler {
             closeQuietly(backend);
             return;
         }
-        bridge(client, backend);
+        bridge(client, backend, binding);
     }
 
     /** mysql_clear_password sends the password NUL-terminated. */
@@ -865,7 +865,7 @@ public class MySqlProtocolHandler {
 
     // ── Bridge ────────────────────────────────────────────────────────────────
 
-    private static void bridge(Socket client, Socket backend) {
+    private static void bridge(Socket client, Socket backend, RdsProxyBinding binding) {
         InputStream clientIn, backendIn;
         OutputStream clientOut, backendOut;
         try {
@@ -880,7 +880,7 @@ public class MySqlProtocolHandler {
         }
 
         Thread t1 = Thread.ofVirtual().name("rds-mysql-c2b")
-                .start(() -> relayClientCommands(clientIn, backendOut));
+                .start(() -> relayClientCommands(clientIn, backendOut, binding));
         Thread t2 = Thread.ofVirtual().name("rds-mysql-b2c")
                 .start(() -> relay(backendIn, clientOut));
         try {
@@ -894,15 +894,21 @@ public class MySqlProtocolHandler {
         }
     }
 
-    private static void relayClientCommands(InputStream from, OutputStream to) {
+    private static void relayClientCommands(InputStream from, OutputStream to, RdsProxyBinding binding) {
         try {
             byte[] raw;
             while ((raw = readMysqlPacketRaw(from)) != null) {
                 int length = (raw[0] & 0xFF) | ((raw[1] & 0xFF) << 8) | ((raw[2] & 0xFF) << 16);
-                byte[] rewritten = length == MAX_PACKET_PAYLOAD || raw.length < 5
-                        || (raw[4] & 0xFF) != COM_QUERY
-                        ? null
-                        : rewriteIamAuthPlugin(Arrays.copyOfRange(raw, 4, raw.length));
+                byte[] rewritten = null;
+                if (length != MAX_PACKET_PAYLOAD && raw.length >= 5 && (raw[4] & 0xFF) == COM_QUERY) {
+                    byte[] payload = Arrays.copyOfRange(raw, 4, raw.length);
+                    // An Aurora MySQL cluster answers a few statements its backend does not know (see AuroraMySqlEmulation).
+                    rewritten = binding == null || binding.auroraMySql() == null ? null
+                            : AuroraMySqlEmulation.rewrite(payload, binding.auroraMySql());
+                    if (rewritten == null) {
+                        rewritten = rewriteIamAuthPlugin(payload);
+                    }
+                }
                 if (rewritten == null) {
                     to.write(raw);
                 } else {

@@ -1,5 +1,6 @@
 package io.github.hectorvent.floci.services.rds.proxy;
 
+import io.github.hectorvent.floci.config.EmulatorConfig;
 import io.github.hectorvent.floci.config.FlociCertificateAuthority;
 import io.github.hectorvent.floci.core.common.Pem;
 import io.github.hectorvent.floci.services.acm.CertificateGenerator;
@@ -11,15 +12,25 @@ import org.junit.jupiter.params.provider.NullSource;
 import org.junit.jupiter.params.provider.ValueSource;
 
 import javax.net.ssl.SSLContext;
+import javax.net.ssl.SSLHandshakeException;
+import javax.net.ssl.SSLParameters;
+import javax.net.ssl.SSLServerSocket;
+import javax.net.ssl.SSLSocket;
+import javax.net.ssl.TrustManagerFactory;
+import java.io.IOException;
+import java.net.Socket;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.nio.file.attribute.PosixFilePermission;
 import java.nio.file.attribute.PosixFilePermissions;
+import java.security.KeyStore;
 import java.security.cert.CertificateExpiredException;
 import java.security.cert.X509Certificate;
 import java.time.Clock;
 import java.time.Instant;
 import java.time.temporal.ChronoUnit;
+import java.util.List;
+import java.util.Optional;
 import java.util.Set;
 import java.util.stream.Stream;
 
@@ -284,12 +295,77 @@ class RdsProxyTlsCertificatesTest {
         assertEquals(ca.certificatePem(), Files.readString(certFile));
     }
 
+    @Test
+    void configuredHostnamesAreServedAndKeptAcrossRestarts() throws Exception {
+        Path certFile = tempDir.resolve("tls").resolve(FlociCertificateAuthority.CA_CERT_NAME);
+        verifyFull(configuredCertificates("Database.Example.Test").sslContext(), "database.example.test");
+        String trustedCa = Files.readString(certFile);
+
+        SSLContext restarted = configuredCertificates("reader.example.test").sslContext();
+
+        verifyFull(restarted, "reader.example.test");
+        verifyFull(restarted, "database.example.test");
+        assertThrows(SSLHandshakeException.class, () -> verifyFull(restarted, "other.example.test"));
+        assertEquals(trustedCa, Files.readString(certFile));
+    }
+
+    @ParameterizedTest
+    @ValueSource(strings = {"https://db.example.test", "db.example.test:5432", "db..example.test", "*.example.test"})
+    void malformedConfiguredHostnamesFailBeforeAnythingIsWritten(String hostname) {
+        assertThrows(IllegalArgumentException.class, () -> configuredCertificates("db.example.test", hostname));
+        assertFalse(Files.exists(tempDir.resolve("tls/rds-ca.crt")));
+        assertFalse(Files.exists(tempDir.resolve("tls/rds-ca.metadata.json")));
+    }
+
     private RdsProxyTlsCertificates newCertificates() {
         return newCertificates(Clock.systemUTC());
     }
 
     private RdsProxyTlsCertificates newCertificates(Clock clock) {
         return new RdsProxyTlsCertificates(FlociCertificateAuthority.loadOrCreate(tempDir.resolve("tls")),
-                new CertificateGenerator(), clock);
+                new CertificateGenerator(), List.of(), clock);
+    }
+
+    /** Built as CDI builds it, with {@code services.rds.tls-hostnames} set. */
+    private RdsProxyTlsCertificates configuredCertificates(String... tlsHostnames) {
+        EmulatorConfig config = mock(EmulatorConfig.class);
+        EmulatorConfig.ServicesConfig services = mock(EmulatorConfig.ServicesConfig.class);
+        EmulatorConfig.RdsServiceConfig rds = mock(EmulatorConfig.RdsServiceConfig.class);
+        when(config.services()).thenReturn(services);
+        when(services.rds()).thenReturn(rds);
+        when(rds.tlsHostnames()).thenReturn(Optional.of(List.of(tlsHostnames)));
+        return new RdsProxyTlsCertificates(FlociCertificateAuthority.loadOrCreate(tempDir.resolve("tls")),
+                new CertificateGenerator(), config);
+    }
+
+    /** A handshake that trusts only the shared CA and checks the server certificate names {@code host}, as verify-full does. */
+    private void verifyFull(SSLContext server, String host) throws Exception {
+        KeyStore trustStore = KeyStore.getInstance(KeyStore.getDefaultType());
+        trustStore.load(null, null);
+        trustStore.setCertificateEntry("floci-root-ca",
+                FlociCertificateAuthority.loadOrCreate(tempDir.resolve("tls")).certificate());
+        TrustManagerFactory trust = TrustManagerFactory.getInstance(TrustManagerFactory.getDefaultAlgorithm());
+        trust.init(trustStore);
+        SSLContext client = SSLContext.getInstance("TLS");
+        client.init(null, trust.getTrustManagers(), null);
+        try (SSLServerSocket listener = (SSLServerSocket) server.getServerSocketFactory().createServerSocket(0)) {
+            Thread acceptor = Thread.ofVirtual().start(() -> {
+                try (SSLSocket accepted = (SSLSocket) listener.accept()) {
+                    accepted.startHandshake();
+                } catch (IOException expected) {
+                    // A client that rejects the certificate aborts the handshake.
+                }
+            });
+            try (Socket plain = new Socket("localhost", listener.getLocalPort());
+                 SSLSocket socket = (SSLSocket) client.getSocketFactory()
+                         .createSocket(plain, host, listener.getLocalPort(), true)) {
+                SSLParameters parameters = socket.getSSLParameters();
+                parameters.setEndpointIdentificationAlgorithm("HTTPS");
+                socket.setSSLParameters(parameters);
+                socket.startHandshake();
+            } finally {
+                acceptor.join(5_000);
+            }
+        }
     }
 }

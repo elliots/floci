@@ -175,6 +175,17 @@ usual default, a 30-minute window starting where the given one ends); a window g
 checked against the instance's other window. Modifications apply immediately —
 `PendingModifiedValues` is not modeled.
 
+`CreateDBCluster` checks and resolves `KmsKeyId` in the same way, also for an `AWS::RDS::DBCluster`
+created through CloudFormation, and returns `InvalidParameterCombination` for a key without
+`StorageEncrypted`. A member of a global cluster is checked against the encryption it gets from the
+global cluster, and an encrypted secondary cluster in an unencrypted global cluster is refused.
+`DescribeDBClusters` returns the key ARN as `KmsKeyId`. A cluster snapshot and its copies keep the cluster's key, and `RestoreDBClusterFromSnapshot` and
+`RestoreDBClusterToPointInTime` give the new cluster the key of its snapshot or source cluster. A
+`KmsKeyId` in `CopyDBClusterSnapshot` or in either restore encrypts the result with that key, so an
+unencrypted snapshot can be restored to an encrypted cluster. As in AWS, a copy of an unencrypted
+cluster snapshot and a point-in-time restore of an unencrypted cluster refuse a `KmsKeyId` with
+`InvalidParameterCombination`.
+
 !!! note "Stopping and starting"
 
     `StopDBInstance` and `StopDBCluster` follow the user guide: the response reports `stopping`
@@ -254,6 +265,7 @@ they belong to, as the model requires. An omitted `Enabled` activates the subscr
 | `FLOCI_SERVICES_RDS_PROXY_BASE_PORT` | `7001` | First host port in the RDS proxy range |
 | `FLOCI_SERVICES_RDS_PROXY_MAX_PORT` | `7099` | Last host port in the RDS proxy range |
 | `FLOCI_SERVICES_RDS_ENDPOINT_HOST` | _(auto-detected)_ | Hostname advertised in RDS endpoints; when set in Docker, Floci advertises each proxy's published host port |
+| `FLOCI_SERVICES_RDS_TLS_HOSTNAMES` | _(empty)_ | Additional DNS names in the database proxy's server certificate, comma-separated; see [TLS / SSL](#tls-ssl) |
 | `FLOCI_SERVICES_RDS_IAM_TOKEN_ENDPOINT_BINDING` | `true` | Refuse a PostgreSQL IAM auth token generated for another hostname, port or region than the endpoint publishes, as RDS does; set `false` to accept such tokens. MySQL and MariaDB always refuse them |
 | `FLOCI_SERVICES_RDS_DEFAULT_POSTGRES_IMAGE` | `postgres:16-alpine` | Docker image for PostgreSQL instances |
 | `FLOCI_SERVICES_RDS_DEFAULT_MYSQL_IMAGE` | `mysql:8.0` | Docker image for MySQL instances |
@@ -556,6 +568,16 @@ mysql -h 127.0.0.1 -P 7002 -u root -psecret123
 Override the image per-instance with the `--engine-version` flag or globally via environment variables.
 Aurora MySQL versions such as `8.0.mysql_aurora.3.08.0` use the MySQL version in front, so that example runs `mysql:8.0`.
 
+An Aurora MySQL cluster endpoint also answers the Aurora metadata statements that drivers such as the
+AWS Advanced JDBC Wrapper send: `SELECT @@aurora_server_id` (wrapper 2.x),
+`SELECT @@aurora_server_id, @@aurora_server_id` (wrapper 3.0 and later),
+`SHOW VARIABLES LIKE 'aurora_version'`, `SELECT AURORA_VERSION()`, and the wrapper's writer check and
+topology query on `information_schema.replica_host_status`. The answers describe a cluster with one
+instance, its writer.
+Only those complete statements, sent as text queries, are answered. Other SQL, including other queries
+on `information_schema.replica_host_status` and server-side prepared statements, goes to MySQL
+unchanged. Replication and failover are not emulated.
+
 ## Parameter groups
 
 A MySQL or MariaDB database runs with its parameter group: an Aurora MySQL cluster with its DB
@@ -682,7 +704,9 @@ stores as asked: the current size, and from the smallest real increase up to the
 GiB for SQL Server, 65536 GiB otherwise). Storage only grows, and for PostgreSQL, MySQL and MariaDB an
 increase under 10% is rounded up to 10%, so at 40 GiB the second range starts at 44. An Aurora instance
 has no storage of its own to modify, so its list is empty. `DescribeOrderableDBInstanceOptions` matches
-`EngineVersion` exactly or as a major version prefix, so `8.0` finds the MySQL `8.0.36` rows.
+`EngineVersion` exactly or as a major version prefix, so `8.0` finds the MySQL `8.0.36` rows. Its
+Aurora rows report `StorageType` as `aurora`, which Terraform's `aws_rds_orderable_db_instance`
+filters on.
 
 ## Cluster endpoints
 
@@ -1067,6 +1091,20 @@ The proxy also writes the shared root certificate to `tls/rds-ca.crt`, preservin
 initializes, even if the old RDS certificate is expired or corrupt. The unused `rds-ca.key`
 is removed; the shared CA key and existing `rds-ca.metadata.json` SAN list are retained.
 The shared certificate is also available from `GET /_floci/ca.pem`.
+
+To verify a host name that Floci does not advertise, such as an application's production endpoint
+name, list it in `FLOCI_SERVICES_RDS_TLS_HOSTNAMES` before Floci starts:
+
+```bash
+FLOCI_SERVICES_RDS_TLS_HOSTNAMES=writer.example.test,reader.example.test
+```
+
+Give DNS names without a scheme or port. Floci refuses to start when a name is malformed. The names
+are added to the server certificate that the RDS and Redshift proxies share, alongside the advertised
+hosts, and recorded with the other SANs in `rds-ca.metadata.json`, so a
+name stays in the certificate after it is removed from the setting. Restart Floci after changing
+it. The setting changes only the certificate: the names must still resolve to Floci, and IAM auth
+tokens generated for them follow `FLOCI_SERVICES_RDS_IAM_TOKEN_ENDPOINT_BINDING`.
 
 The proxy logs the shared certificate path when it first issues a server certificate:
 

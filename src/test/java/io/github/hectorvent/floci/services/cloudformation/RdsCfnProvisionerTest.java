@@ -242,7 +242,7 @@ class RdsCfnProvisionerTest {
         when(cluster.getDbClusterResourceId()).thenReturn("cluster-ABCDEFGHIJKLMNOP");
         when(rdsService.createDbCluster(any(), any(), any(), any(), any(), any(), anyBoolean(), any(),
                 any(), any(), anyBoolean(), any(), any(), any(), any(), anyBoolean(), any(), any(),
-                anyBoolean()))
+                anyBoolean(), any(), any()))
                 .thenReturn(cluster);
 
         StackResource r = provision("Cluster", "AWS::RDS::DBCluster", """
@@ -261,7 +261,7 @@ class RdsCfnProvisionerTest {
         assertEquals("cluster-ABCDEFGHIJKLMNOP", r.getAttributes().get("DBClusterResourceId"));
         verify(rdsService).createDbCluster("mycluster", "aurora-postgresql", "16.3",
                 "admin", "secret", "appdb", false, null, null, null, false, "us-east-1",
-                null, null, null, false, null, null, false);
+                null, null, null, false, null, null, false, null, null);
     }
 
     @Test
@@ -316,7 +316,23 @@ class RdsCfnProvisionerTest {
         assertEquals("CREATE_FAILED", r.getStatus());
         assertTrue(r.getStatusReason().contains("Aurora"), r.getStatusReason());
         verify(rdsService, never()).createDbCluster(any(), any(), any(), any(), any(), any(), anyBoolean(), any(),
-                any(), any(), anyBoolean(), any(), any(), any(), any(), anyBoolean(), any(), any(), anyBoolean());
+                any(), any(), anyBoolean(), any(), any(), any(), any(), anyBoolean(), any(), any(), anyBoolean(),
+                any(), any());
+    }
+
+    @Test
+    void dbClusterKmsKeyIdGoesToTheServiceToBeCheckedAndRecorded() {
+        createDbClusterEchoesRequestedId();
+
+        StackResource r = provision("Cluster", "AWS::RDS::DBCluster", """
+                {"DBClusterIdentifier":"mycluster","Engine":"aurora-postgresql","StorageEncrypted":true,
+                 "KmsKeyId":"alias/app"}
+                """);
+
+        assertEquals("CREATE_COMPLETE", r.getStatus(), r.getStatusReason());
+        verify(rdsService).createDbCluster(eq("mycluster"), eq("aurora-postgresql"), any(), any(), any(), any(),
+                anyBoolean(), any(), any(), any(), anyBoolean(), any(), any(), any(), any(), anyBoolean(), any(),
+                any(), eq(true), isNull(), eq("alias/app"));
     }
 
     @Test
@@ -325,7 +341,7 @@ class RdsCfnProvisionerTest {
         when(cluster.getDbClusterIdentifier()).thenReturn("mycluster");
         when(rdsService.createDbCluster(any(), any(), any(), any(), any(), any(), anyBoolean(), any(),
                 any(), any(), anyBoolean(), any(), any(), any(), any(), anyBoolean(), any(), any(),
-                anyBoolean()))
+                anyBoolean(), any(), any()))
                 .thenReturn(cluster);
 
         provision("Cluster", "AWS::RDS::DBCluster", """
@@ -334,7 +350,7 @@ class RdsCfnProvisionerTest {
 
         verify(rdsService).createDbCluster("mycluster", "aurora-postgresql", null,
                 null, null, null, false, null, null, null, false, "us-west-2",
-                null, null, null, false, null, null, false);
+                null, null, null, false, null, null, false, null, null);
     }
 
     @Test
@@ -343,7 +359,7 @@ class RdsCfnProvisionerTest {
         when(cluster.getDbClusterIdentifier()).thenReturn("mycluster");
         when(rdsService.createDbCluster(any(), any(), any(), any(), any(), any(), anyBoolean(), any(),
                 any(), any(), anyBoolean(), any(), any(), any(), any(), anyBoolean(), any(), any(),
-                anyBoolean()))
+                anyBoolean(), any(), any()))
                 .thenReturn(cluster);
 
         provision("Cluster", "AWS::RDS::DBCluster", """
@@ -354,7 +370,7 @@ class RdsCfnProvisionerTest {
 
         verify(rdsService).createDbCluster("mycluster", "aurora-postgresql", null,
                 null, null, null, false, null, null, null, false, "us-east-1",
-                0.0, 16.0, 600, false, null, null, false);
+                0.0, 16.0, 600, false, null, null, false, null, null);
     }
 
     @Test
@@ -363,7 +379,7 @@ class RdsCfnProvisionerTest {
         when(cluster.getDbClusterIdentifier()).thenReturn("mycluster");
         when(rdsService.createDbCluster(any(), any(), any(), any(), any(), any(), anyBoolean(), any(),
                 any(), any(), anyBoolean(), any(), any(), any(), any(), anyBoolean(), any(), any(),
-                anyBoolean()))
+                anyBoolean(), any(), any()))
                 .thenReturn(cluster);
 
         provision("Cluster", "AWS::RDS::DBCluster", """
@@ -373,7 +389,7 @@ class RdsCfnProvisionerTest {
 
         verify(rdsService).createDbCluster("mycluster", "aurora-postgresql", null,
                 null, null, null, false, null, null, null, false, "us-east-1",
-                null, null, null, false, null, "serverless", true);
+                null, null, null, false, null, "serverless", true, null, null);
     }
 
     @Test
@@ -412,7 +428,7 @@ class RdsCfnProvisionerTest {
         when(cluster.getEndpoint()).thenReturn(new DbEndpoint("mycluster.local", 5432));
         when(rdsService.createDbCluster(any(), any(), any(), any(), any(), any(), anyBoolean(), any(),
                 any(), any(), anyBoolean(), any(), any(), any(), any(), anyBoolean(), any(), any(),
-                anyBoolean()))
+                anyBoolean(), any(), any()))
                 .thenReturn(cluster);
 
         provision("Cluster", "AWS::RDS::DBCluster", """
@@ -425,7 +441,7 @@ class RdsCfnProvisionerTest {
         verify(rdsService).createDbCluster(eq("mycluster"), eq("aurora-postgresql"), eq("16.3"),
                 eq("resolved-user"), eq("resolved-secret"), eq("appdb"), anyBoolean(), any(),
                 any(), any(), anyBoolean(), any(),
-                any(), any(), any(), anyBoolean(), any(), any(), anyBoolean());
+                any(), any(), any(), anyBoolean(), any(), any(), anyBoolean(), any(), any());
         verify(secretsManagerService, times(2))
                 .getSecretValue("my-secret", null, null, "us-west-2");
     }
@@ -466,7 +482,7 @@ class RdsCfnProvisionerTest {
         when(cluster.getDbClusterIdentifier()).thenReturn("mycluster");
         when(rdsService.createDbCluster(any(), any(), any(), any(), any(), any(), anyBoolean(), any(),
                 any(), any(), anyBoolean(), any(), any(), any(), any(), anyBoolean(), any(), any(),
-                anyBoolean()))
+                anyBoolean(), any(), any()))
                 .thenReturn(cluster);
 
         provision("Cluster", "AWS::RDS::DBCluster", """
@@ -479,7 +495,7 @@ class RdsCfnProvisionerTest {
                 eq("mycluster"), eq("aurora-postgresql"), any(), eq("admin"),
                 eq("resolved-secret"), any(), anyBoolean(), any(), any(), any(),
                 anyBoolean(), eq("us-east-1"),
-                any(), any(), any(), anyBoolean(), any(), any(), anyBoolean());
+                any(), any(), any(), anyBoolean(), any(), any(), anyBoolean(), any(), any());
         verify(secretsManagerService)
                 .getSecretValue("my-secret", null, null, "us-east-1");
     }
@@ -494,7 +510,7 @@ class RdsCfnProvisionerTest {
         when(cluster.getDbClusterIdentifier()).thenReturn("mycluster");
         when(rdsService.createDbCluster(any(), any(), any(), any(), any(), any(), anyBoolean(), any(),
                 any(), any(), anyBoolean(), any(), any(), any(), any(), anyBoolean(), any(), any(),
-                anyBoolean()))
+                anyBoolean(), any(), any()))
                 .thenReturn(cluster);
 
         String secretArn =
@@ -509,7 +525,7 @@ class RdsCfnProvisionerTest {
                 eq("mycluster"), eq("aurora-postgresql"), any(), eq("admin"),
                 eq("resolved-secret"), any(), anyBoolean(), any(), any(), any(),
                 anyBoolean(), eq("us-east-1"),
-                any(), any(), any(), anyBoolean(), any(), any(), anyBoolean());
+                any(), any(), any(), anyBoolean(), any(), any(), anyBoolean(), any(), any());
         verify(secretsManagerService)
                 .getSecretValue(secretArn, null, null, "us-west-2");
     }
@@ -524,7 +540,7 @@ class RdsCfnProvisionerTest {
         when(cluster.getDbClusterIdentifier()).thenReturn("mycluster");
         when(rdsService.createDbCluster(any(), any(), any(), any(), any(), any(), anyBoolean(), any(),
                 any(), any(), anyBoolean(), any(), any(), any(), any(), anyBoolean(), any(), any(),
-                anyBoolean()))
+                anyBoolean(), any(), any()))
                 .thenReturn(cluster);
 
         String secretArn =
@@ -539,7 +555,7 @@ class RdsCfnProvisionerTest {
                 eq("mycluster"), eq("aurora-postgresql"), any(), eq("admin"),
                 eq("resolved-secret"), any(), anyBoolean(), any(), any(), any(),
                 anyBoolean(), eq("us-east-1"),
-                any(), any(), any(), anyBoolean(), any(), any(), anyBoolean());
+                any(), any(), any(), anyBoolean(), any(), any(), anyBoolean(), any(), any());
         verify(secretsManagerService)
                 .getSecretValue(secretArn, null, null, "us-west-2");
     }
@@ -554,7 +570,7 @@ class RdsCfnProvisionerTest {
         when(cluster.getDbClusterIdentifier()).thenReturn("mycluster");
         when(rdsService.createDbCluster(any(), any(), any(), any(), any(), any(), anyBoolean(), any(),
                 any(), any(), anyBoolean(), any(), any(), any(), any(), anyBoolean(), any(), any(),
-                anyBoolean()))
+                anyBoolean(), any(), any()))
                 .thenReturn(cluster);
 
         String secretArn =
@@ -569,7 +585,7 @@ class RdsCfnProvisionerTest {
                 eq("mycluster"), eq("aurora-postgresql"), any(), eq("admin"),
                 eq("resolved-secret"), any(), anyBoolean(), any(), any(), any(),
                 anyBoolean(), eq("us-east-1"),
-                any(), any(), any(), anyBoolean(), any(), any(), anyBoolean());
+                any(), any(), any(), anyBoolean(), any(), any(), anyBoolean(), any(), any());
         verify(secretsManagerService)
                 .getSecretValue(secretArn, null, null, "us-west-2");
     }
@@ -650,7 +666,7 @@ class RdsCfnProvisionerTest {
         when(cluster.getEndpoint()).thenReturn(new DbEndpoint("mycluster.local", 5432));
         when(rdsService.createDbCluster(any(), any(), any(), any(), any(), any(), anyBoolean(), any(),
                 any(), any(), anyBoolean(), any(), any(), any(), any(), anyBoolean(), any(), any(),
-                anyBoolean()))
+                anyBoolean(), any(), any()))
                 .thenReturn(cluster);
 
         provision("Cluster", "AWS::RDS::DBCluster", """
@@ -664,7 +680,7 @@ class RdsCfnProvisionerTest {
         verify(rdsService).createDbCluster(eq("mycluster"), eq("aurora-postgresql"), eq("16.3"),
                 eq("admin"), eq("resolved-ssm"), eq("appdb"), anyBoolean(), any(),
                 any(), any(), anyBoolean(), any(),
-                any(), any(), any(), anyBoolean(), any(), any(), anyBoolean());
+                any(), any(), any(), anyBoolean(), any(), any(), anyBoolean(), any(), any());
     }
 
     @Test
@@ -676,7 +692,7 @@ class RdsCfnProvisionerTest {
         when(cluster.getDbClusterIdentifier()).thenReturn("mycluster");
         when(rdsService.createDbCluster(any(), any(), any(), any(), any(), any(), anyBoolean(), any(),
                 any(), any(), anyBoolean(), any(), any(), any(), any(), anyBoolean(), any(), any(),
-                anyBoolean()))
+                anyBoolean(), any(), any()))
                 .thenReturn(cluster);
 
         StackResource resource = provision("Cluster", "AWS::RDS::DBCluster", """
@@ -689,7 +705,7 @@ class RdsCfnProvisionerTest {
         verify(rdsService).createDbCluster(eq("mycluster"), eq("aurora-postgresql"), any(),
                 eq("resolved-user"), eq("secret"), any(), anyBoolean(), any(),
                 any(), any(), anyBoolean(), eq("us-east-1"),
-                any(), any(), any(), anyBoolean(), any(), any(), anyBoolean());
+                any(), any(), any(), anyBoolean(), any(), any(), anyBoolean(), any(), any());
     }
 
     @Test
@@ -701,7 +717,7 @@ class RdsCfnProvisionerTest {
         when(cluster.getDbClusterIdentifier()).thenReturn("mycluster");
         when(rdsService.createDbCluster(any(), any(), any(), any(), any(), any(), anyBoolean(), any(),
                 any(), any(), anyBoolean(), any(), any(), any(), any(), anyBoolean(), any(), any(),
-                anyBoolean()))
+                anyBoolean(), any(), any()))
                 .thenReturn(cluster);
 
         StackResource resource = provision("Cluster", "AWS::RDS::DBCluster", """
@@ -714,7 +730,7 @@ class RdsCfnProvisionerTest {
         verify(rdsService).createDbCluster(eq("mycluster"), eq("aurora-postgresql"), any(),
                 eq("admin"), eq("first,second"), any(), anyBoolean(), any(),
                 any(), any(), anyBoolean(), eq("us-east-1"),
-                any(), any(), any(), anyBoolean(), any(), any(), anyBoolean());
+                any(), any(), any(), anyBoolean(), any(), any(), anyBoolean(), any(), any());
     }
 
     @Test
@@ -806,7 +822,7 @@ class RdsCfnProvisionerTest {
         when(cluster.getDbClusterIdentifier()).thenReturn("mycluster");
         when(rdsService.createDbCluster(any(), any(), any(), any(), any(), any(), anyBoolean(), any(),
                 any(), any(), anyBoolean(), any(), any(), any(), any(), anyBoolean(), any(), any(),
-                anyBoolean()))
+                anyBoolean(), any(), any()))
                 .thenReturn(cluster);
 
         StackResource resource = provision("Cluster", "AWS::RDS::DBCluster", """
@@ -819,7 +835,7 @@ class RdsCfnProvisionerTest {
         verify(rdsService).createDbCluster(eq("mycluster"), eq("aurora-postgresql"), any(),
                 eq("admin"), eq("first-password"), any(), anyBoolean(), any(),
                 any(), any(), anyBoolean(), eq("us-west-2"),
-                any(), any(), any(), anyBoolean(), any(), any(), anyBoolean());
+                any(), any(), any(), anyBoolean(), any(), any(), anyBoolean(), any(), any());
         verify(ssmService, never()).getParameter(any(), any());
     }
 
@@ -836,7 +852,7 @@ class RdsCfnProvisionerTest {
         when(cluster.getDbClusterIdentifier()).thenReturn("mycluster");
         when(rdsService.createDbCluster(any(), any(), any(), any(), any(), any(), anyBoolean(), any(),
                 any(), any(), anyBoolean(), any(), any(), any(), any(), anyBoolean(), any(), any(),
-                anyBoolean()))
+                anyBoolean(), any(), any()))
                 .thenReturn(cluster);
 
         StackResource resource = provision("Cluster", "AWS::RDS::DBCluster", """
@@ -849,7 +865,7 @@ class RdsCfnProvisionerTest {
         verify(rdsService).createDbCluster(eq("mycluster"), eq("aurora-postgresql"), any(),
                 eq("admin"), eq("first-password"), any(), anyBoolean(), any(),
                 any(), any(), anyBoolean(), eq("us-west-2"),
-                any(), any(), any(), anyBoolean(), any(), any(), anyBoolean());
+                any(), any(), any(), anyBoolean(), any(), any(), anyBoolean(), any(), any());
         verify(ssmService, never()).getParameter(any(), any());
     }
 
@@ -1463,7 +1479,7 @@ class RdsCfnProvisionerTest {
         assertEquals("mycluster", r.getPhysicalId());
         verify(rdsService, never()).createDbCluster(any(), any(), any(), any(), any(), any(),
                 anyBoolean(), any(), any(), any(), anyBoolean(), any(), any(), any(), any(),
-                anyBoolean(), any(), any(), anyBoolean());
+                anyBoolean(), any(), any(), anyBoolean(), any(), any());
         verify(rdsService).modifyDbCluster("mycluster", "secret", false,
                 null, null, null, "us-east-1");
     }
@@ -1479,7 +1495,7 @@ class RdsCfnProvisionerTest {
         };
         when(rdsService.createDbCluster(any(), any(), any(), any(), any(), any(), anyBoolean(), any(),
                 any(), any(), anyBoolean(), any(), any(), any(), any(), anyBoolean(), any(), any(),
-                anyBoolean())).thenAnswer(echo);
+                anyBoolean(), any(), any())).thenAnswer(echo);
     }
 
     /** The unnamed cluster a previous CreateStack left on file under a generated physical id. */
@@ -1516,7 +1532,7 @@ class RdsCfnProvisionerTest {
         assertEquals(replacement, r.getAttributes().get("DBClusterIdentifier"));
         verify(rdsService).createDbCluster(replacement, "aurora-postgresql", null,
                 "admin", "secret", null, false, null, null, null, false, "us-east-1",
-                null, null, null, false, null, "serverless", false);
+                null, null, null, false, null, "serverless", false, null, null);
         verify(rdsService, never()).modifyDbCluster(any(), any(), any(), any(), any(), any(), any());
         verify(rdsService, never()).deleteDbCluster(any(), any());
 
@@ -1529,7 +1545,7 @@ class RdsCfnProvisionerTest {
         InOrder inOrder = inOrder(rdsService);
         inOrder.verify(rdsService).createDbCluster(eq(replacement), any(), any(), any(), any(), any(),
                 anyBoolean(), any(), any(), any(), anyBoolean(), any(), any(), any(), any(),
-                anyBoolean(), any(), any(), anyBoolean());
+                anyBoolean(), any(), any(), anyBoolean(), any(), any());
         inOrder.verify(rdsService).deleteDbCluster(PRIOR_CLUSTER, "us-east-1");
         verify(rdsService, never()).deleteDbCluster(replacement, "us-east-1");
         provisioner.clearUpdate(r);
@@ -1550,7 +1566,7 @@ class RdsCfnProvisionerTest {
         assertNotEquals(PRIOR_CLUSTER, replacement);
         verify(rdsService).createDbCluster(replacement, "aurora-postgresql", null,
                 null, null, null, false, null, null, null, false, "us-east-1",
-                null, null, null, false, null, null, true);
+                null, null, null, false, null, null, true, null, null);
         verify(rdsService, never()).modifyDbCluster(any(), any(), any(), any(), any(), any(), any());
         assertEquals(PRIOR_CLUSTER, provisioner.updateCleanupPhysicalId(r));
         verify(rdsService, never()).deleteDbCluster(any(), any());
@@ -1564,7 +1580,7 @@ class RdsCfnProvisionerTest {
         priorUnnamedCluster("provisioned", false);
         when(rdsService.createDbCluster(any(), any(), any(), any(), any(), any(), anyBoolean(), any(),
                 any(), any(), anyBoolean(), any(), any(), any(), any(), anyBoolean(), any(), any(),
-                anyBoolean()))
+                anyBoolean(), any(), any()))
                 .thenThrow(new AwsException("InvalidParameterCombination",
                         "The engine mode serverless is not supported for aurora-postgresql 16.3.", 400));
 
@@ -1745,7 +1761,7 @@ class RdsCfnProvisionerTest {
         verify(rdsService, never()).modifyDbCluster(any(), any(), any(), any(), any(), any(), any());
         verify(rdsService, never()).createDbCluster(any(), any(), any(), any(), any(), any(),
                 anyBoolean(), any(), any(), any(), anyBoolean(), any(), any(), any(), any(),
-                anyBoolean(), any(), any(), anyBoolean());
+                anyBoolean(), any(), any(), anyBoolean(), any(), any());
     }
 
     @Test
@@ -1788,7 +1804,7 @@ class RdsCfnProvisionerTest {
         verify(rdsService, never()).deleteDbCluster(any(), any());
         verify(rdsService, never()).createDbCluster(any(), any(), any(), any(), any(), any(),
                 anyBoolean(), any(), any(), any(), anyBoolean(), any(), any(), any(), any(),
-                anyBoolean(), any(), any(), anyBoolean());
+                anyBoolean(), any(), any(), anyBoolean(), any(), any());
         verify(rdsService).modifyDbCluster("mycluster", "rotated", false,
                 null, null, null, "us-east-1");
     }
@@ -1865,7 +1881,7 @@ class RdsCfnProvisionerTest {
         assertNotEquals(PRIOR_CLUSTER, replacement);
         verify(rdsService).createDbCluster(replacement, "aurora-postgresql", null, null, null,
                 "reports", false, null, null, null, false, "us-east-1",
-                null, null, null, false, null, null, false);
+                null, null, null, false, null, null, false, null, null);
         verify(rdsService, never()).modifyDbCluster(any(), any(), any(), any(), any(), any(), any());
         verify(rdsService, never()).deleteDbCluster(any(), any());
         assertEquals(PRIOR_CLUSTER, provisioner.updateCleanupPhysicalId(r));
@@ -1934,7 +1950,7 @@ class RdsCfnProvisionerTest {
                 null, null, null, "us-east-1");
         verify(rdsService, times(1)).createDbCluster(any(), any(), any(), any(), any(), any(),
                 anyBoolean(), any(), any(), any(), anyBoolean(), any(), any(), any(), any(),
-                anyBoolean(), any(), any(), anyBoolean());
+                anyBoolean(), any(), any(), anyBoolean(), any(), any());
         assertEquals(record, r.getAttributes().get(CREATE_ONLY_ATTR));
         assertFalse(r.getAttributes().containsKey(CREATE_ONLY_PRIOR_ATTR));
         assertFalse(provisioner.hasReplacementUpdate(r));
@@ -2034,7 +2050,7 @@ class RdsCfnProvisionerTest {
         verify(rdsService).modifyDbCluster(prior, null, false, null, null, null, "us-east-1");
         verify(rdsService, times(2)).createDbCluster(any(), any(), any(), any(), any(), any(),
                 anyBoolean(), any(), any(), any(), anyBoolean(), any(), any(), any(), any(),
-                anyBoolean(), any(), any(), anyBoolean());
+                anyBoolean(), any(), any(), anyBoolean(), any(), any());
     }
 
     @Test

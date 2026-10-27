@@ -1,7 +1,10 @@
 package io.github.hectorvent.floci.services.rds;
 
+import io.github.hectorvent.floci.services.kms.KmsService;
+import io.github.hectorvent.floci.services.kms.model.KmsKey;
 import io.quarkus.test.junit.QuarkusTest;
 import io.restassured.specification.RequestSpecification;
+import jakarta.inject.Inject;
 import org.junit.jupiter.api.MethodOrderer;
 import org.junit.jupiter.api.Order;
 import org.junit.jupiter.api.Test;
@@ -26,6 +29,9 @@ class RdsGlobalClusterIntegrationTest {
     private static final String SECONDARY = "gdb-test-secondary";
     private static final String PRIMARY_ARN = "arn:aws:rds:us-east-1:000000000000:cluster:" + PRIMARY;
     private static final String SECONDARY_ARN = "arn:aws:rds:eu-west-1:000000000000:cluster:" + SECONDARY;
+
+    @Inject
+    KmsService kms;
 
     private static RequestSpecification query(String action, String region) {
         return given().header("Authorization",
@@ -119,6 +125,19 @@ class RdsGlobalClusterIntegrationTest {
         .when().post("/").then().statusCode(400)
             .body(containsString("<Code>InvalidParameterCombination</Code>"))
             .body(containsString("Cannot specify user name"));
+
+        // The primary is not encrypted, so a secondary cannot be either, whatever key it names.
+        KmsKey key = kms.createKey("secondary key", "ap-south-1");
+        query("CreateDBCluster", "ap-south-1")
+                .formParam("DBClusterIdentifier", "gdb-test-third")
+                .formParam("Engine", "aurora-postgresql")
+                .formParam("GlobalClusterIdentifier", GLOBAL)
+                .formParam("StorageEncrypted", "true")
+                .formParam("KmsKeyId", key.getArn())
+        .when().post("/").then().statusCode(400)
+            .body(containsString("<Code>InvalidParameterCombination</Code>"))
+            .body(containsString("unencrypted global cluster"));
+        kms.scheduleKeyDeletion(key.getKeyId(), 7, "ap-south-1");
     }
 
     @Test
@@ -286,5 +305,41 @@ class RdsGlobalClusterIntegrationTest {
                 .when().post("/").then().statusCode(200);
         query("DeleteDBCluster", "eu-west-1").formParam("DBClusterIdentifier", SECONDARY)
                 .when().post("/").then().statusCode(200);
+    }
+
+    @Test
+    @Order(7)
+    void aMemberOfAnEncryptedGlobalClusterTakesAKmsKeyWithoutStorageEncrypted() {
+        String global = "gdb-encrypted";
+        String primary = "gdb-encrypted-primary";
+        KmsKey key = kms.createKey("global member key", "us-east-1");
+        query("CreateGlobalCluster")
+                .formParam("GlobalClusterIdentifier", global)
+                .formParam("Engine", "aurora-postgresql")
+                .formParam("StorageEncrypted", "true")
+        .when().post("/").then().statusCode(200);
+        try {
+            query("CreateDBCluster")
+                    .formParam("DBClusterIdentifier", primary)
+                    .formParam("Engine", "aurora-postgresql")
+                    .formParam("MasterUsername", "admin")
+                    .formParam("MasterUserPassword", "password123")
+                    .formParam("GlobalClusterIdentifier", global)
+                    .formParam("KmsKeyId", key.getKeyId())
+            .when().post("/")
+            .then()
+                .statusCode(200)
+                .body(containsString("<StorageEncrypted>true</StorageEncrypted>"))
+                .body(containsString("<KmsKeyId>" + key.getArn() + "</KmsKeyId>"));
+        } finally {
+            query("RemoveFromGlobalCluster")
+                    .formParam("GlobalClusterIdentifier", global)
+                    .formParam("DbClusterIdentifier", "arn:aws:rds:us-east-1:000000000000:cluster:" + primary)
+                    .when().post("/");
+            query("DeleteDBCluster").formParam("DBClusterIdentifier", primary)
+                    .formParam("SkipFinalSnapshot", "true").when().post("/");
+            query("DeleteGlobalCluster").formParam("GlobalClusterIdentifier", global).when().post("/");
+            kms.scheduleKeyDeletion(key.getKeyId(), 7, "us-east-1");
+        }
     }
 }

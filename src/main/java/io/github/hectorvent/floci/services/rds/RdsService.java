@@ -62,6 +62,7 @@ import io.github.hectorvent.floci.services.rds.model.OptionGroupOption;
 import io.github.hectorvent.floci.services.rds.model.PointInTimeRestoreRequest;
 import io.github.hectorvent.floci.services.rds.model.RdsEvent;
 import io.github.hectorvent.floci.services.rds.model.ReadReplicaRequest;
+import io.github.hectorvent.floci.services.rds.proxy.AuroraMySqlEmulation;
 import io.github.hectorvent.floci.services.rds.proxy.RdsAuthProxy;
 import io.github.hectorvent.floci.services.rds.proxy.RdsProxyBinding;
 import io.github.hectorvent.floci.services.rds.proxy.RdsProxyManager;
@@ -936,6 +937,12 @@ public class RdsService implements Resettable, ResourceProvider {
                         deleteInstanceForScope(accountId, effectiveRegion, id);
                     } catch (RuntimeException rollbackFailure) {
                         e.addSuppressed(rollbackFailure);
+                    }
+                    releaseProxyPort(proxyPort);
+                    if (publicationCluster == null) {
+                        // A member uses its cluster's container; a standalone instance's was started here.
+                        discardStartedBackend(buildHandle(instance), resolvedInstanceStorageResourceId(instance),
+                                resolvedInstanceDockerVolumeName(instance), e);
                     }
                     throw e;
                 }
@@ -1988,8 +1995,15 @@ public class RdsService implements Resettable, ResourceProvider {
         return copyDbClusterSnapshot(sourceSnapshotId, targetSnapshotId, copyTags, tags, regionResolver.getDefaultRegion());
     }
 
+    public DbClusterSnapshot copyDbClusterSnapshot(String sourceSnapshotId, String targetSnapshotId,
+                                                   boolean copyTags, Map<String, String> tags, String region) {
+        return copyDbClusterSnapshot(sourceSnapshotId, targetSnapshotId, copyTags, tags, null, region);
+    }
+
+    /** A KmsKeyId encrypts the copy with that key, which AWS allows only for an encrypted snapshot. */
     public synchronized DbClusterSnapshot copyDbClusterSnapshot(String sourceSnapshotId, String targetSnapshotId,
-                                                                boolean copyTags, Map<String, String> tags, String region) {
+                                                                boolean copyTags, Map<String, String> tags,
+                                                                String kmsKeyId, String region) {
         String effectiveRegion = effectiveRegion(region);
         String accountId = currentAccountId();
         String sourceId = clusterSnapshotIdentifierFromArnOrName(sourceSnapshotId, effectiveRegion);
@@ -2002,7 +2016,15 @@ public class RdsService implements Resettable, ResourceProvider {
             throw new AwsException("DBClusterSnapshotAlreadyExistsFault",
                     "DB cluster snapshot " + targetSnapshotId + " already exists.", 400);
         }
+        if (hasText(kmsKeyId) && !source.isStorageEncrypted()) {
+            throw new AwsException("InvalidParameterCombination",
+                    "KmsKeyId can be specified only when copying an encrypted DB cluster snapshot.", 400);
+        }
+        String kmsKeyArn = resolveKmsKeyArn(kmsKeyId, effectiveRegion);
         DbClusterSnapshot copy = copyOfClusterSnapshot(source, targetSnapshotId, effectiveRegion);
+        if (kmsKeyArn != null) {
+            copy.setKmsKeyId(kmsKeyArn);
+        }
         copy.setSourceDbClusterSnapshotArn(source.getDbClusterSnapshotArn());
         Map<String, String> copiedTags = new LinkedHashMap<>();
         if (copyTags) {
@@ -2056,6 +2078,16 @@ public class RdsService implements Resettable, ResourceProvider {
                                                   String dbSubnetGroupName, String parameterGroupName,
                                                   String availabilityZone, Boolean iamEnabled, String engineMode,
                                                   Map<String, String> tags, String region) {
+        return restoreDbClusterFromSnapshot(clusterId, snapshotId, engine, engineVersion, port, databaseName,
+                dbSubnetGroupName, parameterGroupName, availabilityZone, iamEnabled, engineMode, tags, null, region);
+    }
+
+    /** A KmsKeyId encrypts the new cluster with that key, even when the snapshot is not encrypted. */
+    public DbCluster restoreDbClusterFromSnapshot(String clusterId, String snapshotId, String engine,
+                                                  String engineVersion, Integer port, String databaseName,
+                                                  String dbSubnetGroupName, String parameterGroupName,
+                                                  String availabilityZone, Boolean iamEnabled, String engineMode,
+                                                  Map<String, String> tags, String kmsKeyId, String region) {
         String effectiveRegion = effectiveRegion(region);
         String accountId = currentAccountId();
         // SnapshotIdentifier takes the snapshot's name or its ARN (API reference).
@@ -2081,7 +2113,11 @@ public class RdsService implements Resettable, ResourceProvider {
                 parameterGroupName, dbSubnetGroupName, availabilityZone, false, effectiveRegion,
                 null, null, null, false, null,
                 engineMode != null && !engineMode.isBlank() ? engineMode : snapshot.getEngineMode(),
-                snapshot.isStorageEncrypted(), port);
+                snapshot.isStorageEncrypted() || hasText(kmsKeyId), port, kmsKeyId);
+        if (!hasText(kmsKeyId)) {
+            cluster.setKmsKeyId(snapshot.getKmsKeyId());
+            putClusterForScope(accountId, effectiveRegion, clusterId, cluster);
+        }
         if (tags != null && !tags.isEmpty()) {
             cluster.getTags().putAll(tags);
             putClusterForScope(accountId, effectiveRegion, clusterId, cluster);
@@ -2117,6 +2153,18 @@ public class RdsService implements Resettable, ResourceProvider {
                                                    Integer port, String dbSubnetGroupName, String parameterGroupName,
                                                    Boolean iamEnabled, String engineMode,
                                                    Map<String, String> tags, String region) {
+        return restoreDbClusterToPointInTime(clusterId, sourceClusterRef, sourceClusterResourceId, restoreType,
+                restoreToTime, useLatestRestorableTime, port, dbSubnetGroupName, parameterGroupName, iamEnabled,
+                engineMode, tags, null, region);
+    }
+
+    /** A KmsKeyId encrypts the new cluster with that key, which AWS allows only for an encrypted source. */
+    public DbCluster restoreDbClusterToPointInTime(String clusterId, String sourceClusterRef,
+                                                   String sourceClusterResourceId, String restoreType,
+                                                   Instant restoreToTime, Boolean useLatestRestorableTime,
+                                                   Integer port, String dbSubnetGroupName, String parameterGroupName,
+                                                   Boolean iamEnabled, String engineMode,
+                                                   Map<String, String> tags, String kmsKeyId, String region) {
         String effectiveRegion = effectiveRegion(region);
         String accountId = currentAccountId();
         if (isBlank(clusterId)) {
@@ -2151,6 +2199,10 @@ public class RdsService implements Resettable, ResourceProvider {
                     "Operation RestoreDBClusterToPointInTime is not supported for engine "
                     + source.getEngine() + ".", 400);
         }
+        if (hasText(kmsKeyId) && !source.isStorageEncrypted()) {
+            throw new AwsException("InvalidParameterCombination",
+                    "KmsKeyId can be specified only when the source DB cluster " + sourceId + " is encrypted.", 400);
+        }
 
         String engineParam = source.getEngineIdentifier() != null
                 ? source.getEngineIdentifier() : source.getEngine().name().toLowerCase(Locale.ROOT);
@@ -2160,7 +2212,11 @@ public class RdsService implements Resettable, ResourceProvider {
                 parameterGroupName, dbSubnetGroupName, null, false, effectiveRegion,
                 null, null, null, false, null,
                 !isBlank(engineMode) ? engineMode : source.getEngineMode(),
-                source.isStorageEncrypted(), port);
+                source.isStorageEncrypted(), port, kmsKeyId);
+        if (!hasText(kmsKeyId)) {
+            cluster.setKmsKeyId(source.getKmsKeyId());
+            putClusterForScope(accountId, effectiveRegion, clusterId, cluster);
+        }
         if (tags != null && !tags.isEmpty()) {
             cluster.getTags().putAll(tags);
             putClusterForScope(accountId, effectiveRegion, clusterId, cluster);
@@ -2217,6 +2273,7 @@ public class RdsService implements Resettable, ResourceProvider {
         snapshot.setDatabaseName(cluster.getDatabaseName());
         snapshot.setLicenseModel("postgresql-license");
         snapshot.setStorageEncrypted(cluster.isStorageEncrypted());
+        snapshot.setKmsKeyId(cluster.getKmsKeyId());
         snapshot.setIamDatabaseAuthenticationEnabled(cluster.isIamDatabaseAuthenticationEnabled());
         snapshot.setDbClusterResourceId(cluster.getDbClusterResourceId());
         return snapshot;
@@ -3375,8 +3432,12 @@ public class RdsService implements Resettable, ResourceProvider {
         List<Map<String, String>> options = new ArrayList<>();
         for (RdsEngineCatalog.EngineVersion version : RdsEngineCatalog.VERSIONS) {
             for (String instanceClass : version.instanceClasses()) {
-                options.add(Map.of("engine", version.engine(), "engineVersion", version.version(),
-                        "dbInstanceClass", instanceClass));
+                Map<String, String> option = new LinkedHashMap<>(Map.of("engine", version.engine(),
+                        "engineVersion", version.version(), "dbInstanceClass", instanceClass));
+                if (isAuroraEngine(version.engine())) {
+                    option.put("storageType", "aurora");
+                }
+                options.add(option);
             }
         }
         return options.stream()
@@ -3850,8 +3911,8 @@ public class RdsService implements Resettable, ResourceProvider {
                     cluster.getMasterUsername() != null ? cluster.getMasterUsername() : "root",
                     cluster.getMasterPassword(), cluster.getDatabaseName(),
                     (user, pw) -> validateDbClusterPasswordForScope(accountId, clusterRegion, id, user, pw),
-                    proxyBinding(cluster.getEngine(), cluster.getEndpoint().address(), cluster.getEndpoint().port(),
-                            clusterRegion, accountId, cluster.getDbClusterResourceId()));
+                    clusterProxyBinding(cluster, cluster.getEndpoint().address(), cluster.getEndpoint().port(),
+                            clusterRegion, accountId));
             applyAutoPause(cluster);
         }
     }
@@ -4028,6 +4089,27 @@ public class RdsService implements Resettable, ResourceProvider {
                 || config.services().rds().iamTokenEndpointBinding();
         return new RdsProxyBinding(advertisedHost, publishedPort, region, accountId, resourceId,
                 tokensBoundToEndpoint);
+    }
+
+    /**
+     * The binding of an Aurora cluster's endpoint. For Aurora MySQL it also carries what the cluster answers that its plain
+     * MySQL backend does not (which instance a client reached, the topology, the Aurora version): the writer is looked up
+     * when a statement arrives, since the cluster is created before its instances.
+     */
+    private RdsProxyBinding clusterProxyBinding(DbCluster cluster, String advertisedHost, int publishedPort,
+                                                String region, String accountId) {
+        RdsProxyBinding binding = proxyBinding(cluster.getEngine(), advertisedHost, publishedPort, region, accountId,
+                cluster.getDbClusterResourceId());
+        if (cluster.getEngine() != DatabaseEngine.MYSQL || !isAuroraEngine(cluster.getEngineIdentifier())) {
+            return binding;
+        }
+        String clusterId = cluster.getDbClusterIdentifier();
+        return binding.withAuroraMySql(() -> {
+            DbCluster current = findClusterForScope(accountId, region, clusterId);
+            String writer = current == null ? null : current.resolveWriterIdentifier();
+            return writer == null ? null
+                    : new AuroraMySqlEmulation.Server(writer, AuroraMySqlEmulation.auroraVersion(current.getEngineVersion()));
+        });
     }
 
     private static boolean hasBackend(String host, int port) {
@@ -4220,8 +4302,8 @@ public class RdsService implements Resettable, ResourceProvider {
                     effectiveMasterUser, cluster.getMasterPassword(), cluster.getDatabaseName(),
                     (user, pw) -> validateDbClusterPasswordForScope(
                             accountId, clusterRegion, id, user, pw),
-                    proxyBinding(cluster.getEngine(), relayEndpoint.address(),
-                            relayEndpoint.port(), clusterRegion, accountId, cluster.getDbClusterResourceId()));
+                    clusterProxyBinding(cluster, relayEndpoint.address(),
+                            relayEndpoint.port(), clusterRegion, accountId));
         } catch (RuntimeException e) {
             if (allocatedRelayPort) {
                 releaseProxyPort(relayPort);
@@ -4305,7 +4387,7 @@ public class RdsService implements Resettable, ResourceProvider {
         }
     }
 
-    private void stopStartedBackend(RdsContainerHandle started, RuntimeException proxyFailure) {
+    private void stopStartedBackend(RdsContainerHandle started, Throwable proxyFailure) {
         if (started == null) {
             return;
         }
@@ -4315,6 +4397,22 @@ public class RdsService implements Resettable, ResourceProvider {
             proxyFailure.addSuppressed(stopFailure);
             LOG.warnv(stopFailure, "Failed to stop container {0} after its auth proxy did not start",
                     started.getContainerId());
+        }
+    }
+
+    /**
+     * Removes the container and storage that a create started for a resource it does not keep,
+     * because the resource's auth proxy did not start, so that a retry does not leak them.
+     */
+    private void discardStartedBackend(RdsContainerHandle started, String storageResourceId,
+                                       String dockerVolumeName, Throwable proxyFailure) {
+        stopStartedBackend(started, proxyFailure);
+        try {
+            containerManager.removeVolume(started.getRuntimeId(), storageResourceId, dockerVolumeName);
+        } catch (RuntimeException | Error removeFailure) {
+            proxyFailure.addSuppressed(removeFailure);
+            LOG.warnv(removeFailure, "Failed to remove the storage of {0} after its auth proxy did not start",
+                    started.getRuntimeId());
         }
     }
 
@@ -4521,7 +4619,7 @@ public class RdsService implements Resettable, ResourceProvider {
                 databaseName, iamEnabled, paramGroupName, dbSubnetGroupName, availabilityZone,
                 multiAz, region, serverlessV2MinCapacity, serverlessV2MaxCapacity,
                 serverlessV2SecondsUntilAutoPause, manageMasterUserPassword, masterUserSecretKmsKeyId,
-                engineMode, storageEncrypted, null);
+                engineMode, storageEncrypted, null, null);
     }
 
     public DbCluster createDbCluster(String id, String engineParam, String engineVersion,
@@ -4532,12 +4630,13 @@ public class RdsService implements Resettable, ResourceProvider {
                                      Double serverlessV2MinCapacity, Double serverlessV2MaxCapacity,
                                      Integer serverlessV2SecondsUntilAutoPause,
                                      boolean manageMasterUserPassword, String masterUserSecretKmsKeyId,
-                                     String engineMode, boolean storageEncrypted, Integer requestedPort) {
+                                     String engineMode, boolean storageEncrypted, Integer requestedPort,
+                                     String kmsKeyId) {
         return createDbClusterWithPort(id, engineParam, engineVersion, masterUsername, masterPassword,
                 databaseName, iamEnabled, paramGroupName, dbSubnetGroupName, availabilityZone,
                 multiAz, region, serverlessV2MinCapacity, serverlessV2MaxCapacity,
                 serverlessV2SecondsUntilAutoPause, manageMasterUserPassword, masterUserSecretKmsKeyId,
-                engineMode, storageEncrypted, requestedPort);
+                engineMode, storageEncrypted, requestedPort, kmsKeyId);
     }
 
     private DbCluster createDbClusterWithPort(String id, String engineParam, String engineVersion,
@@ -4548,7 +4647,8 @@ public class RdsService implements Resettable, ResourceProvider {
                                               Double serverlessV2MinCapacity, Double serverlessV2MaxCapacity,
                                               Integer serverlessV2SecondsUntilAutoPause,
                                               boolean manageMasterUserPassword, String masterUserSecretKmsKeyId,
-                                              String engineMode, boolean storageEncrypted, Integer requestedPort) {
+                                              String engineMode, boolean storageEncrypted, Integer requestedPort,
+                                              String kmsKeyId) {
         String provisioningKey = "cluster:" + currentAccountId() + ":"
                 + dbResourceKey(effectiveRegion(region), id);
         if (!provisioningIds.add(provisioningKey)) {
@@ -4560,7 +4660,7 @@ public class RdsService implements Resettable, ResourceProvider {
                     databaseName, iamEnabled, paramGroupName, dbSubnetGroupName, availabilityZone,
                     multiAz, region, serverlessV2MinCapacity, serverlessV2MaxCapacity,
                     serverlessV2SecondsUntilAutoPause, manageMasterUserPassword, masterUserSecretKmsKeyId,
-                    engineMode, storageEncrypted, requestedPort);
+                    engineMode, storageEncrypted, requestedPort, kmsKeyId);
         } finally {
             provisioningIds.remove(provisioningKey);
         }
@@ -4574,7 +4674,8 @@ public class RdsService implements Resettable, ResourceProvider {
                                         Double serverlessV2MinCapacity, Double serverlessV2MaxCapacity,
                                         Integer serverlessV2SecondsUntilAutoPause,
                                         boolean manageMasterUserPassword, String masterUserSecretKmsKeyId,
-                                        String engineMode, boolean storageEncrypted, Integer requestedPort) {
+                                        String engineMode, boolean storageEncrypted, Integer requestedPort,
+                                        String kmsKeyId) {
         String effectiveRegion = effectiveRegion(region);
         String clusterResourceId = "cluster-" + UUID.randomUUID().toString()
                 .replace("-", "").substring(0, 24).toUpperCase();
@@ -4593,6 +4694,7 @@ public class RdsService implements Resettable, ResourceProvider {
         validateClusterParameterGroup(
                 paramGroupName, engineParam, engineVersion, effectiveRegion);
         PlacementResolution placement = resolvePlacement(dbSubnetGroupName, availabilityZone, multiAz, effectiveRegion);
+        String kmsKeyArn = resolveClusterKmsKey(kmsKeyId, effectiveRegion, storageEncrypted);
 
         boolean mock = config.services().rds().mock();
         String effectiveSecretKmsKeyId = manageMasterUserPassword
@@ -4610,6 +4712,7 @@ public class RdsService implements Resettable, ResourceProvider {
         cluster.setEngineIdentifier(effectiveEngineName(engineParam).toLowerCase(Locale.ROOT));
         cluster.setEngineMode(engineMode != null && !engineMode.isBlank() ? engineMode : "provisioned");
         cluster.setStorageEncrypted(storageEncrypted);
+        cluster.setKmsKeyId(kmsKeyArn);
         cluster.setContainerStorageResourceId(clusterResourceId);
         if (!mock) {
             String image = imageForEngine(engine, engineVersion);
@@ -4651,16 +4754,22 @@ public class RdsService implements Resettable, ResourceProvider {
                 String effectiveMasterUser = masterUsername != null ? masterUsername : "root";
                 final String accountId = accountIdFromArn(cluster.getDbClusterArn());
                 final String clusterRegion = regionFromArn(cluster.getDbClusterArn());
-                proxyManager.startProxy(rdsResourceRelayKey(cluster.getDbClusterArn(), id),
-                    cluster.getDbClusterArn(),
-                        engine, iamEnabled, proxyPort,
-                        cluster.getContainerHost(), cluster.getContainerPort(),
-                        cluster.getEndpoint().address(),
-                        effectiveMasterUser, masterPassword, databaseName,
-                        (user, pw) -> validateDbClusterPasswordForScope(
-                                accountId, clusterRegion, id, user, pw),
-                        proxyBinding(engine, cluster.getEndpoint().address(), cluster.getEndpoint().port(),
-                                clusterRegion, accountId, cluster.getDbClusterResourceId()));
+                try {
+                    proxyManager.startProxy(rdsResourceRelayKey(cluster.getDbClusterArn(), id),
+                            cluster.getDbClusterArn(), engine, iamEnabled, proxyPort,
+                            cluster.getContainerHost(), cluster.getContainerPort(),
+                            cluster.getEndpoint().address(),
+                            effectiveMasterUser, masterPassword, databaseName,
+                            (user, pw) -> validateDbClusterPasswordForScope(
+                                    accountId, clusterRegion, id, user, pw),
+                            clusterProxyBinding(cluster, cluster.getEndpoint().address(),
+                                    cluster.getEndpoint().port(), clusterRegion, accountId));
+                } catch (RuntimeException e) {
+                    releaseProxyPort(proxyPort);
+                    discardStartedBackend(buildClusterHandle(cluster), resolvedClusterStorageResourceId(cluster),
+                            resolvedClusterDockerVolumeName(cluster), e);
+                    throw e;
+                }
             }
 
             cluster.setServerlessV2MinCapacity(serverlessV2MinCapacity);
@@ -4952,6 +5061,17 @@ public class RdsService implements Resettable, ResourceProvider {
                 .orElseThrow(() ->
                 new AwsException("DBClusterNotFoundFault",
                         "DB cluster " + id + " not found.", 404));
+    }
+
+    /**
+     * Checks a new cluster's KmsKeyId against the encryption the cluster gets, and returns the key's ARN, or
+     * {@code null} when no key is given.
+     */
+    private String resolveClusterKmsKey(String kmsKeyId, String region, boolean storageEncrypted) {
+        if (hasText(kmsKeyId) && !storageEncrypted) {
+            throw new AwsException("InvalidParameterCombination", "KmsKeyId requires StorageEncrypted.", 400);
+        }
+        return resolveKmsKeyArn(kmsKeyId, region);
     }
 
     public Collection<DbCluster> listDbClusters(String filterId) {
@@ -5322,8 +5442,8 @@ public class RdsService implements Resettable, ResourceProvider {
      * CreateDBCluster with GlobalClusterIdentifier: the first cluster becomes the primary, every
      * later one a secondary in a Region that has neither the primary nor another secondary. A
      * secondary takes credentials, database name, version and encryption from the primary and
-     * may not be given its own, and its database is initialised from a dump of the primary the
-     * way a read replica is.
+     * may not be given its own; only the KMS key of an encrypted secondary is its own. Its
+     * database is initialised from a dump of the primary the way a read replica is.
      */
     public DbCluster createDbClusterInGlobalCluster(String globalClusterIdentifier, String id,
                                                     String engineParam, String engineVersion,
@@ -5339,7 +5459,7 @@ public class RdsService implements Resettable, ResourceProvider {
                 masterUsername, masterPassword, databaseName, iamEnabled, paramGroupName,
                 dbSubnetGroupName, availabilityZone, multiAz, region, serverlessV2MinCapacity,
                 serverlessV2MaxCapacity, serverlessV2SecondsUntilAutoPause, manageMasterUserPassword,
-                masterUserSecretKmsKeyId, engineMode, storageEncrypted, null);
+                masterUserSecretKmsKeyId, engineMode, storageEncrypted, null, null);
     }
 
     public DbCluster createDbClusterInGlobalCluster(String globalClusterIdentifier, String id,
@@ -5351,7 +5471,8 @@ public class RdsService implements Resettable, ResourceProvider {
                                                     Double serverlessV2MinCapacity, Double serverlessV2MaxCapacity,
                                                     Integer serverlessV2SecondsUntilAutoPause,
                                                     boolean manageMasterUserPassword, String masterUserSecretKmsKeyId,
-                                                    String engineMode, boolean storageEncrypted, Integer requestedPort) {
+                                                    String engineMode, boolean storageEncrypted, Integer requestedPort,
+                                                    String kmsKeyId) {
         String effectiveRegion = effectiveRegion(region);
         String accountId = currentAccountId();
         GlobalCluster global = requireGlobalCluster(accountId, globalClusterIdentifier);
@@ -5372,7 +5493,7 @@ public class RdsService implements Resettable, ResourceProvider {
                     paramGroupName, dbSubnetGroupName, availabilityZone, multiAz, effectiveRegion,
                     serverlessV2MinCapacity, serverlessV2MaxCapacity, serverlessV2SecondsUntilAutoPause,
                     manageMasterUserPassword, masterUserSecretKmsKeyId, engineMode,
-                    storageEncrypted || global.isStorageEncrypted(), requestedPort);
+                    storageEncrypted || global.isStorageEncrypted(), requestedPort, kmsKeyId);
         } else {
             if (hasText(masterUsername) || hasText(masterPassword) || manageMasterUserPassword) {
                 throw new AwsException("InvalidParameterCombination",
@@ -5402,12 +5523,17 @@ public class RdsService implements Resettable, ResourceProvider {
                         "Adding a secondary cluster is not supported for engine "
                         + primary.getEngineIdentifier() + ".", 400);
             }
+            if (!primary.isStorageEncrypted() && (storageEncrypted || hasText(kmsKeyId))) {
+                throw new AwsException("InvalidParameterCombination",
+                        "Cannot create an encrypted secondary cluster in the unencrypted global cluster "
+                        + global.getGlobalClusterIdentifier() + ".", 400);
+            }
             cluster = createDbCluster(id, engineName, primary.getEngineVersion(),
                     primary.getMasterUsername(), primary.getMasterPassword(),
                     primary.getDatabaseName(), iamEnabled, paramGroupName, dbSubnetGroupName,
                     availabilityZone, multiAz, effectiveRegion, serverlessV2MinCapacity,
                     serverlessV2MaxCapacity, serverlessV2SecondsUntilAutoPause, false, null,
-                    engineMode, primary.isStorageEncrypted(), requestedPort);
+                    engineMode, primary.isStorageEncrypted(), requestedPort, kmsKeyId);
         }
         try {
             attachToGlobalCluster(accountId, global.getGlobalClusterIdentifier(), cluster, primary == null);
@@ -8665,8 +8791,8 @@ public class RdsService implements Resettable, ResourceProvider {
                             (user, pw) -> validateDbClusterPasswordForScope(
                                     accountId, clusterRegion,
                                     cluster.getDbClusterIdentifier(), user, pw),
-                            proxyBinding(cluster.getEngine(), cluster.getEndpoint().address(), cluster.getEndpoint().port(),
-                                    clusterRegion, accountId, cluster.getDbClusterResourceId()));
+                            clusterProxyBinding(cluster, cluster.getEndpoint().address(), cluster.getEndpoint().port(),
+                                    clusterRegion, accountId));
                 }
                 cluster.setStatus(DbInstanceStatus.AVAILABLE);
                 putClusterForScope(accountId, clusterRegion,
