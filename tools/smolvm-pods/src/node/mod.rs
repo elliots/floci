@@ -216,7 +216,11 @@ impl VmOps for MockVms {
         })
     }
 
-    fn freeze(&self, _machine: &str) -> Result<u32, String> {
+    fn freeze(
+        &self,
+        _machine: &str,
+        _keep: &[smolvm_protocol::PreservedTcpPeer],
+    ) -> Result<u32, String> {
         Ok(0)
     }
 

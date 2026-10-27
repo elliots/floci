@@ -1428,14 +1428,14 @@ async fn pause(
         }
         // A pod that keeps its connections (ANN_RESET_ON_PAUSE) sleeps with
         // them, so it is not frozen first.
-        if info.identity.keep_connections {
+        if info.identity.keep_connections && info.identity.kept_tcp_peers.is_empty() {
             debug!(
                 "pod sandbox {}: keeps its connections over the pause",
                 info.identity.sandbox_id
             );
         } else {
             let started = Instant::now();
-            match vm.freeze(&info.identity.machine) {
+            match vm.freeze(&info.identity.machine, &info.identity.kept_tcp_peers) {
                 Ok(reset) => debug!(
                     "pod sandbox {}: froze it and reset {reset} connections",
                     info.identity.sandbox_id

@@ -47,9 +47,9 @@ use crate::bundle;
 use crate::engine::sandbox_memory;
 use crate::lifecycle::{
     cpu_threshold, cpu_window, hibernation_disabled, idle_timeout, keeps_connections,
-    wakes_on_terminate, Activity, AwakeCause, Config, ExecRecord, ExecStatus, Hooks, KillOutcome,
-    KillRequest, Lifecycle, LifecycleError, PodIdentity, PodInfo, PodRef, PodState, Reason,
-    StdioPaths, TaskKind, TaskRecord, VmExit, VmProcess,
+    kept_tcp_peers, wakes_on_terminate, Activity, AwakeCause, Config, ExecRecord, ExecStatus,
+    Hooks, KillOutcome, KillRequest, Lifecycle, LifecycleError, PodIdentity, PodInfo, PodRef,
+    PodState, Reason, StdioPaths, TaskKind, TaskRecord, VmExit, VmProcess,
 };
 use crate::metrics::Text;
 use crate::probe::{self, CachedAnswer, ExecCommand, OutputCapture, ProbeExec};
@@ -2101,6 +2101,10 @@ fn pod_identity(
         warn!("pod sandbox {id} resets its connections at a pause: {e}");
         false
     });
+    let kept_tcp_peers = kept_tcp_peers(spec.as_ref()).unwrap_or_else(|e| {
+        warn!("pod sandbox {id} ignores its invalid TCP keep list: {e}");
+        Vec::new()
+    });
     PodIdentity {
         sandbox_id: id.to_string(),
         namespace: annotation(ANN_POD_NAMESPACE),
@@ -2112,6 +2116,7 @@ fn pod_identity(
         hibernate_disabled: hibernation_disabled(spec.as_ref(), standalone),
         wake_on_terminate: wakes_on_terminate(spec.as_ref()),
         keep_connections,
+        kept_tcp_peers,
         idle_timeout_ms: idle.map(|t| t.as_millis() as u64),
         cpu_threshold_milli: cpu_threshold,
         cpu_window_ms: cpu_window.map(|t| t.as_millis() as u64),

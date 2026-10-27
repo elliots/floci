@@ -231,8 +231,19 @@ impl VmOps for SmolvmOps {
         })
     }
 
-    fn freeze(&self, machine: &str) -> Result<u32, String> {
-        match pod_request(&agent_socket(machine), &AgentRequest::PodFreeze)? {
+    fn freeze(
+        &self,
+        machine: &str,
+        keep: &[smolvm_protocol::PreservedTcpPeer],
+    ) -> Result<u32, String> {
+        let request = if keep.is_empty() {
+            AgentRequest::PodFreeze
+        } else {
+            AgentRequest::PodFreezeExcept {
+                keep: keep.to_vec(),
+            }
+        };
+        match pod_request(&agent_socket(machine), &request)? {
             AgentResponse::Ok { data } => {
                 let reply: PodFreezeReply = data
                     .map(serde_json::from_value)

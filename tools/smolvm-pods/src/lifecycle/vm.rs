@@ -244,7 +244,11 @@ pub trait VmOps: Send + Sync + 'static {
     /// The agent's `PodFreeze`, before a pause: the pod's containers freeze,
     /// and each TCP connection that leaves the guest is reset. Returns how
     /// many it reset.
-    fn freeze(&self, machine: &str) -> Result<u32, String>;
+    fn freeze(
+        &self,
+        machine: &str,
+        keep: &[smolvm_protocol::PreservedTcpPeer],
+    ) -> Result<u32, String>;
 
     /// The agent's `PodThaw`: the containers that [`VmOps::freeze`] froze
     /// thaw.

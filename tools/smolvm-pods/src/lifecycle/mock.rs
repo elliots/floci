@@ -413,8 +413,16 @@ impl VmOps for MockVm {
         })
     }
 
-    fn freeze(&self, machine: &str) -> Result<u32, String> {
-        self.call(format!("freeze {machine}"));
+    fn freeze(
+        &self,
+        machine: &str,
+        keep: &[smolvm_protocol::PreservedTcpPeer],
+    ) -> Result<u32, String> {
+        if keep.is_empty() {
+            self.call(format!("freeze {machine}"));
+        } else {
+            self.call(format!("freeze {machine} keep {keep:?}"));
+        }
         Ok(0)
     }
 
@@ -581,7 +589,7 @@ impl VmOps for RunningVms {
         })
     }
 
-    fn freeze(&self, _: &str) -> Result<u32, String> {
+    fn freeze(&self, _: &str, _: &[smolvm_protocol::PreservedTcpPeer]) -> Result<u32, String> {
         Ok(0)
     }
 

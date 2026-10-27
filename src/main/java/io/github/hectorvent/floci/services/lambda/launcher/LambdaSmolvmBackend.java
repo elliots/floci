@@ -61,10 +61,11 @@ public class LambdaSmolvmBackend {
     static final String HIBERNATE_ANNOTATION = "smolvm-pods.floci.io/hibernate";
     static final String IDLE_TIMEOUT_ANNOTATION = "smolvm-pods.floci.io/idle-timeout";
     /**
-     * Keeps an environment's connections over a pause. The runtime waits on
+     * Keeps the Runtime API connection over a pause. The runtime waits on
      * {@code GET /runtime/invocation/next} while the environment sleeps, as on AWS, and a reset at the
      * pause would fail that request at the wake, which the runtime takes as fatal.
      */
+    static final String KEEP_TCP_ON_PAUSE_ANNOTATION = "smolvm-pods.floci.io/keep-tcp-on-pause";
     static final String RESET_ON_PAUSE_ANNOTATION = "smolvm-pods.floci.io/reset-on-pause";
 
     /** A lease's time to live; it is renewed every {@link #LEASE_RENEW} while an invocation runs. */
@@ -226,7 +227,10 @@ public class LambdaSmolvmBackend {
     OciRuntime runtime() {
         Map<String, String> annotations = new LinkedHashMap<>();
         annotations.put(HIBERNATE_ANNOTATION, "true");
+        // Older nodes preserve all connections; new nodes honor the narrower keep list.
         annotations.put(RESET_ON_PAUSE_ANNOTATION, "false");
+        annotations.put(KEEP_TCP_ON_PAUSE_ANNOTATION, runtimeApiHost() + ":"
+                + config.services().lambda().runtimeApiBasePort() + "-" + config.services().lambda().runtimeApiMaxPort());
         Optional<String> idleTimeout = config.services().lambda().smolvm().idleTimeout()
                 .map(String::strip).filter(value -> !value.isEmpty());
         if (idleTimeout.isPresent()) {
