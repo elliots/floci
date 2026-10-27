@@ -1,0 +1,30 @@
+{
+  "generation": "4b7f0c2e9a1d3f5b6c8e0a2c4e6f8a0b1c3d5e7f9a1b3c5d7e9f1a3b5c7d9e1f",
+  "isolation": true,
+  "floci": {"dns_port": 15353, "ports": ["4566", "5672-5699", "1883", "8883", "6379-6399"]},
+  "endpoints": [{"address": "169.254.170.23", "port": 80, "target_port": 4566}],
+  "routes": [
+    {
+      "name": "payments",
+      "origins": ["https://api.vendor.test:443", "https://*.vendor.test:443"],
+      "backend": "payments-simulator.simulators.svc.cluster.local:8080",
+      "protocol": "http1"
+    }
+  ],
+  "allow": [{"cidr": "203.0.113.10/32", "protocol": "tcp", "ports": [443]}],
+  "issuer": {
+    "certificate": "-----BEGIN CERTIFICATE-----\nMIIB\n-----END CERTIFICATE-----\n",
+    "key": "-----BEGIN PRIVATE KEY-----\nMIGH\n-----END PRIVATE KEY-----\n",
+    "subject": "Floci route CA",
+    "key_id": "0a1b2c3d4e5f60718293a4b5c6d7e8f901234567",
+    "not_after": "2027-01-18T00:00:00Z"
+  },
+  "trust": {
+    "mode": "system",
+    "ca": "-----BEGIN CERTIFICATE-----\nMIIC\n-----END CERTIFICATE-----\n",
+    "ca_sha256": "9f86d081884c7d659a2feaa0c55ad015a3bf4f1b2b0b822cd15d6c15b0f00a08",
+    "bundle": "-----BEGIN CERTIFICATE-----\nMIIC\n-----END CERTIFICATE-----\n",
+    "pkcs12": "MIIK",
+    "jks": "/u3+7Q=="
+  }
+}

@@ -1,0 +1,25 @@
+[package]
+name = "smolvm-pods-resume-harness"
+version = "0.1.0"
+edition = "2021"
+description = "Drives smolvm machines through smolvm::embedded, as the smolvm-pods runtime does, for the resume check"
+license = "Apache-2.0"
+publish = false
+
+# Built with ../../../scripts/build.sh against the pinned smolvm checkout.
+[workspace]
+
+[[bin]]
+name = "resume-harness"
+path = "src/main.rs"
+
+[dependencies]
+smolvm = { path = "../../../../../../smolvm" }
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+tracing = "0.1"
+
+# The release profile of the smolvm CLI and of the shim.
+[profile.release]
+lto = true
+codegen-units = 1
+strip = true
