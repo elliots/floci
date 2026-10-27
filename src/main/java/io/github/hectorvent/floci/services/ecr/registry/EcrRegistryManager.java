@@ -67,6 +67,8 @@ public class EcrRegistryManager {
      */
     private static final Pattern AWS_ECR_URI = Pattern.compile(
             "^([0-9]{12})\\.dkr\\.ecr\\.([a-z0-9-]+)\\." + AwsPartitions.dnsSuffixRegex() + "/(.+)$");
+    private static final Pattern FLOCI_HOSTNAME_URI = Pattern.compile(
+            "^([0-9]{12})\\.dkr\\.ecr\\.([a-z0-9-]+)\\.localhost(?:\\.floci\\.io)?:(\\d+)/(.+)$");
 
     /**
      * The container name actually in use. Differs from {@link #registryContainerName()} only when
@@ -82,6 +84,7 @@ public class EcrRegistryManager {
     private final PortAllocator portAllocator;
     private final EmulatorConfig config;
     private final RegionResolver regionResolver;
+    private final NodeRegistryBackend nodeRegistry;
 
     private volatile boolean started;
     private volatile boolean reconciled;
@@ -90,6 +93,40 @@ public class EcrRegistryManager {
     private volatile String containerId;
     private volatile Closeable logStream;
     private volatile Consumer<List<String>> reconcileHook;
+    private volatile RepositoryNameResolver repositoryNameResolver;
+
+    @FunctionalInterface
+    public interface RepositoryNameResolver {
+        String resolve(String account, String region, String repository);
+    }
+
+    public void setRepositoryNameResolver(RepositoryNameResolver resolver) {
+        this.repositoryNameResolver = resolver;
+    }
+
+    private String storedImageName(String account, String region, String repositoryAndReference) {
+        int slash = repositoryAndReference.lastIndexOf('/');
+        int colon = repositoryAndReference.lastIndexOf(':');
+        int at = repositoryAndReference.lastIndexOf('@');
+        int split = at > slash ? at : colon > slash ? colon : repositoryAndReference.length();
+        String repository = repositoryAndReference.substring(0, split);
+        RepositoryNameResolver resolver = repositoryNameResolver;
+        String stored = resolver == null ? internalRepoName(account, region, repository)
+                : resolver.resolve(account, region, repository);
+        return stored + repositoryAndReference.substring(split);
+    }
+
+    public EcrRegistryManager(ContainerBuilder containerBuilder,
+                              ContainerLifecycleManager lifecycleManager,
+                              ContainerLogStreamer logStreamer,
+                              ContainerDetector containerDetector,
+                              CurrentContainerNetworkResolver currentContainerNetworkResolver,
+                              PortAllocator portAllocator,
+                              EmulatorConfig config,
+                              RegionResolver regionResolver) {
+        this(containerBuilder, lifecycleManager, logStreamer, containerDetector, currentContainerNetworkResolver,
+                portAllocator, config, regionResolver, null);
+    }
 
     @Inject
     public EcrRegistryManager(ContainerBuilder containerBuilder,
@@ -99,7 +136,8 @@ public class EcrRegistryManager {
                               CurrentContainerNetworkResolver currentContainerNetworkResolver,
                               PortAllocator portAllocator,
                               EmulatorConfig config,
-                              RegionResolver regionResolver) {
+                              RegionResolver regionResolver,
+                              NodeRegistryBackend nodeRegistry) {
         this.containerBuilder = containerBuilder;
         this.lifecycleManager = lifecycleManager;
         this.logStreamer = logStreamer;
@@ -108,6 +146,7 @@ public class EcrRegistryManager {
         this.portAllocator = portAllocator;
         this.config = config;
         this.regionResolver = regionResolver;
+        this.nodeRegistry = nodeRegistry;
         this.hostPort = config.services().ecr().registryBasePort();
     }
 
@@ -138,6 +177,31 @@ public class EcrRegistryManager {
         }
         Matcher m = AWS_ECR_URI.matcher(image);
         if (!m.matches()) {
+            if (workloadDocker != null && onNodeRegistry()) {
+                Matcher hostname = FLOCI_HOSTNAME_URI.matcher(image);
+                if (hostname.matches() && Integer.parseInt(hostname.group(3)) == advertisedPort()) {
+                    if (config.services().ecr().preferLocalImages()
+                            && isPresentOnDaemon(workloadDocker, containerBuilder.resolveImage(image))) {
+                        return image;
+                    }
+                    ensureStarted();
+                    return nodeRegistryImage(storedImageName(hostname.group(1), hostname.group(2), hostname.group(4)));
+                }
+                for (String host : List.of("localhost", "localhost.floci.io")) {
+                    String prefix = host + ":" + advertisedPort() + "/";
+                    if (image.startsWith(prefix)) {
+                        String[] parts = image.substring(prefix.length()).split("/", 3);
+                        if (parts.length == 3 && parts[0].matches("[0-9]{12}") && !parts[1].isBlank()) {
+                            if (config.services().ecr().preferLocalImages()
+                                    && isPresentOnDaemon(workloadDocker, containerBuilder.resolveImage(image))) {
+                                return image;
+                            }
+                            ensureStarted();
+                            return nodeRegistryImage(storedImageName(parts[0], parts[1], parts[2]));
+                        }
+                    }
+                }
+            }
             return image;
         }
         if (config.services().ecr().preferLocalImages()) {
@@ -157,9 +221,51 @@ public class EcrRegistryManager {
         // 127.0.0.1 over plain HTTP and takes every other name, *.localhost included, for an
         // HTTPS registry: Floci's plain port cannot answer that, and its TLS port cannot prove
         // itself to a daemon that does not trust Floci's CA.
-        String rewritten = "localhost:" + advertisedPort() + "/" + internalRepoName(account, region, repoAndTag);
+        int port = workloadDocker != null && onNodeRegistry() ? NodeRegistryBackend.REGISTRY_PORT : advertisedPort();
+        String name = workloadDocker != null && onNodeRegistry() ? storedImageName(account, region, repoAndTag)
+                : internalRepoName(account, region, repoAndTag);
+        String rewritten = "localhost:" + port + "/" + name;
         LOG.infov("Rewriting ECR image URI {0} -> {1}", image, rewritten);
         return rewritten;
+    }
+
+    private static String nodeRegistryImage(String name) {
+        return "localhost:" + NodeRegistryBackend.REGISTRY_PORT + "/" + name;
+    }
+
+    /** Whether this is the node-only registry reference returned for a node workload. */
+    public boolean isNodeRegistryImage(String image) {
+        return onNodeRegistry() && image != null && image.startsWith("localhost:" + NodeRegistryBackend.REGISTRY_PORT + "/");
+    }
+
+    /** Image CMD for a Lambda pod whose image is in Floci's node registry, when recognized. */
+    public Optional<NodeRegistryBackend.ImageMetadata> nodeImageMetadata(String image) {
+        if (!onNodeRegistry() || image == null) {
+            return Optional.empty();
+        }
+        Matcher aws = AWS_ECR_URI.matcher(image);
+        if (aws.matches()) {
+            ensureStarted();
+            return Optional.of(nodeRegistry.imageMetadata(nodeRegistryImage(
+                    storedImageName(aws.group(1), aws.group(2), aws.group(3)))));
+        }
+        Matcher hostname = FLOCI_HOSTNAME_URI.matcher(image);
+        if (hostname.matches() && Integer.parseInt(hostname.group(3)) == advertisedPort()) {
+            ensureStarted();
+            return Optional.of(nodeRegistry.imageMetadata(nodeRegistryImage(
+                    storedImageName(hostname.group(1), hostname.group(2), hostname.group(4)))));
+        }
+        for (String host : List.of("localhost", "localhost.floci.io")) {
+            String prefix = host + ":" + advertisedPort() + "/";
+            if (image.startsWith(prefix)) {
+                String[] parts = image.substring(prefix.length()).split("/", 3);
+                if (parts.length == 3 && parts[0].matches("[0-9]{12}") && !parts[1].isBlank()) {
+                    ensureStarted();
+                    return Optional.of(nodeRegistry.imageMetadata(nodeRegistryImage(storedImageName(parts[0], parts[1], parts[2]))));
+                }
+            }
+        }
+        return Optional.empty();
     }
 
     private boolean isPresentOnDaemon(DockerClient docker, String image) {
@@ -260,6 +366,9 @@ public class EcrRegistryManager {
 
     /** Returns a {@link RegistryHttpClient} bound to the current registry endpoint. */
     public RegistryHttpClient httpClient() {
+        if (onNodeRegistry()) {
+            return nodeRegistry.httpClient();
+        }
         if (containerDetector.isRunningInContainer()) {
             return new RegistryHttpClient(internalEndpoint());
         }
@@ -312,6 +421,13 @@ public class EcrRegistryManager {
     public synchronized void ensureStarted() {
         if (!config.services().ecr().enabled()) {
             throw new IllegalStateException("ECR is disabled, the backing registry is not started");
+        }
+        if (onNodeRegistry()) {
+            nodeRegistry.ensureStarted();
+            containerId = nodeRegistry.containerId();
+            started = true;
+            runReconcileOnce();
+            return;
         }
         if (started) {
             ContainerPresence presence = lifecycleManager.presenceOf(containerId);
@@ -515,7 +631,7 @@ public class EcrRegistryManager {
         long startMs = System.currentTimeMillis();
         StringBuilder output = new StringBuilder();
 
-        DockerClient dockerClient = lifecycleManager.getDockerClient();
+        DockerClient dockerClient = registryDocker();
 
         ExecCreateCmdResponse exec = dockerClient
                 .execCreateCmd(containerId)
@@ -575,7 +691,7 @@ public class EcrRegistryManager {
         }
         String path = repositoryStoragePath(internalRepoName);
         StringBuilder output = new StringBuilder();
-        DockerClient dockerClient = lifecycleManager.getDockerClient();
+        DockerClient dockerClient = registryDocker();
         ExecCreateCmdResponse exec = dockerClient
                 .execCreateCmd(containerId)
                 .withCmd("timeout", "-k", String.valueOf(REPOSITORY_DELETION_KILL_GRACE_SECONDS),
@@ -609,6 +725,14 @@ public class EcrRegistryManager {
 
     /** Stops the container if {@code keepRunningOnShutdown=false}. Called from EmulatorLifecycle hooks. */
     public synchronized void shutdown() {
+        if (onNodeRegistry()) {
+            boolean remove = !config.services().ecr().keepRunningOnShutdown();
+            nodeRegistry.close(remove, remove && shouldPruneStorage());
+            started = false;
+            containerId = null;
+            reconciled = false;
+            return;
+        }
         if (config.services().ecr().keepRunningOnShutdown()) {
             if (started && containerId != null) {
                 LOG.infov("Leaving ECR backing registry container {0} running for next start-up", containerId);
@@ -622,6 +746,13 @@ public class EcrRegistryManager {
     /** Removes the shared registry storage after the final ECR repository is deleted. */
     public synchronized void pruneStorage() {
         if (!shouldPruneStorage()) {
+            return;
+        }
+        if (onNodeRegistry()) {
+            nodeRegistry.close(true, true);
+            started = false;
+            containerId = null;
+            reconciled = false;
             return;
         }
         stopRegistry();
@@ -650,6 +781,14 @@ public class EcrRegistryManager {
 
     private boolean shouldPruneStorage() {
         return "memory".equals(config.storage().mode()) || config.storage().pruneVolumesOnDelete();
+    }
+
+    private boolean onNodeRegistry() {
+        return nodeRegistry != null && config.services().ecr().smolvmEnabled();
+    }
+
+    private DockerClient registryDocker() {
+        return onNodeRegistry() ? nodeRegistry.docker() : lifecycleManager.getDockerClient();
     }
 
     private static String repositoryStoragePath(String repository) {
@@ -687,7 +826,7 @@ public class EcrRegistryManager {
         }
     }
 
-    private static boolean hasLoopbackBinding(Container container) {
+    static boolean hasLoopbackBinding(Container container) {
         ContainerPort[] ports = container.getPorts();
         if (ports == null) {
             return false;

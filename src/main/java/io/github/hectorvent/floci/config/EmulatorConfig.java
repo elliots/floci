@@ -3148,6 +3148,10 @@ public interface EmulatorConfig {
         @WithDefault("true")
         boolean enabled();
 
+        /** Run the backing registry and its image storage on the shared smolvm-pods node. */
+        @WithDefault("false")
+        boolean smolvmEnabled();
+
         @WithDefault("registry:2")
         String registryImage();
 

@@ -25,6 +25,7 @@ workloads_dir=$pods_dir/tests/e2e/workloads
 go_image=$(cat "$workloads_dir/go-image")
 # The images k3s runs at startup. The node imports them, so it needs no registry.
 system_images=(
+    registry:2@sha256:a3d8aaa63ed8681a604f1dea0aa03f100d5895b6a58ace528858a7b332415373
     rancher/mirrored-pause:3.6@sha256:74c4244427b7312c5b901fe0f67cbc53683d06f4f24c6faee65d4182bf0fa893
     rancher/mirrored-coredns-coredns:1.13.1@sha256:9b9128672209474da07c91439bf15ed704ae05ad918dd6454e5b6ae14e35fee6
     rancher/mirrored-metrics-server:v0.8.0@sha256:89258156d0e9af60403eafd44da9676fd66f600c7934d468ccc17e42b199aee2

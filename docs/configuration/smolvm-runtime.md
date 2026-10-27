@@ -172,6 +172,8 @@ Redis and Valkey caches join the same node with `FLOCI_SERVICES_ELASTICACHE_SMOL
 Their auth proxies stay in Floci and use node tunnels, so connecting wakes a sleeping cache.
 `FLOCI_SERVICES_ELASTICACHE_SMOLVM_IDLE_TIMEOUT` overrides the node's idle timeout for caches.
 Memcached continues to use host Docker.
+Set `FLOCI_SERVICES_ECR_SMOLVM_ENABLED=true` to keep the ECR backing registry and its image data
+on the node ([ECR registry on the node](../services/ecr.md#registry-on-the-smolvm-pods-node)).
 
 Images can be fetched or built on another machine and transferred into the node. A host Docker
 daemon is an optional image source, not a requirement once the node has the images it needs.

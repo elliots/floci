@@ -8,6 +8,8 @@ import io.github.hectorvent.floci.config.EmulatorConfig;
 import io.github.hectorvent.floci.core.common.AwsArnUtils;
 import io.github.hectorvent.floci.core.common.AwsException;
 import io.github.hectorvent.floci.core.common.docker.LaunchedContainerAwsEnv;
+import io.github.hectorvent.floci.services.ecr.registry.EcrRegistryManager;
+import io.github.hectorvent.floci.services.ecr.registry.NodeRegistryBackend.ImageMetadata;
 import io.github.hectorvent.floci.services.lambda.LambdaLayerService;
 import io.github.hectorvent.floci.services.lambda.LambdaLogDestinations;
 import io.github.hectorvent.floci.services.lambda.LambdaService;
@@ -96,6 +98,7 @@ public class KubernetesPodLauncher implements LambdaRuntimeLauncher {
     private final KubernetesPodLogStreamer logStreamer;
     private final S3Service s3Service;
     private final PreSignedUrlGenerator presignGenerator;
+    private final EcrRegistryManager registry;
 
     private final Object orphanSweepLock = new Object();
     private volatile boolean orphansSwept = false;
@@ -103,6 +106,21 @@ public class KubernetesPodLauncher implements LambdaRuntimeLauncher {
     private final Set<String> ownPodNames = ConcurrentHashMap.newKeySet();
     private final AtomicBoolean caConfigMapApplied = new AtomicBoolean(false);
     private final AtomicBoolean awsConfigPathWarned = new AtomicBoolean(false);
+
+    public KubernetesPodLauncher(KubernetesApiClient client,
+                                 EmulatorConfig config,
+                                 RuntimeApiServerFactory runtimeApiServerFactory,
+                                 ImageResolver imageResolver,
+                                 KubernetesFlociAddressResolver addressResolver,
+                                 LaunchedContainerAwsEnv awsEnv,
+                                 LambdaLayerService layerService,
+                                 LambdaPodSpecFactory podSpecFactory,
+                                 KubernetesPodLogStreamer logStreamer,
+                                 S3Service s3Service,
+                                 PreSignedUrlGenerator presignGenerator) {
+        this(client, config, runtimeApiServerFactory, imageResolver, addressResolver, awsEnv, layerService,
+                podSpecFactory, logStreamer, s3Service, presignGenerator, null);
+    }
 
     @Inject
     public KubernetesPodLauncher(KubernetesApiClient client,
@@ -115,7 +133,8 @@ public class KubernetesPodLauncher implements LambdaRuntimeLauncher {
                                  LambdaPodSpecFactory podSpecFactory,
                                  KubernetesPodLogStreamer logStreamer,
                                  S3Service s3Service,
-                                 PreSignedUrlGenerator presignGenerator) {
+                                 PreSignedUrlGenerator presignGenerator,
+                                 EcrRegistryManager registry) {
         this.client = client;
         this.config = config;
         this.runtimeApiServerFactory = runtimeApiServerFactory;
@@ -127,6 +146,7 @@ public class KubernetesPodLauncher implements LambdaRuntimeLauncher {
         this.logStreamer = logStreamer;
         this.s3Service = s3Service;
         this.presignGenerator = presignGenerator;
+        this.registry = registry;
     }
 
     /**
@@ -191,8 +211,10 @@ public class KubernetesPodLauncher implements LambdaRuntimeLauncher {
             env.add("AWS_LAMBDA_FUNCTION_TIMEOUT=" + fn.getTimeout());
             env.add("AWS_LAMBDA_LOG_GROUP_NAME=" + cwLogGroup);
             env.add("AWS_LAMBDA_LOG_STREAM_NAME=" + cwLogStream);
-            if (fn.getHandler() != null && !fn.getHandler().isBlank()) {
-                env.add("_HANDLER=" + fn.getHandler());
+            ImageHandler imageHandler = handlerFor(fn, imagePackage, image);
+            String handler = imageHandler.handler();
+            if (handler != null) {
+                env.add("_HANDLER=" + handler);
             }
             env.addAll(awsEnv.sdkBaselineEnv(region, Optional.empty(), addressResolver.flociBaseUrl(),
                     Optional.empty(), AwsArnUtils.accountOrDefault(fn.getFunctionArn(), config.defaultAccountId())));
@@ -220,7 +242,7 @@ public class KubernetesPodLauncher implements LambdaRuntimeLauncher {
 
             // After the function's own variables, so a value it sets wins, as in the docker launcher.
             List<String> podEnv = caConfigMap.isPresent() ? ContainerCaBundle.appendEnv(env) : env;
-            ObjectNode pod = podSpecFactory.buildPod(podName, fn.getFunctionName(), image, podEnv,
+            ObjectNode pod = podSpecFactory.buildPod(podName, fn.getFunctionName(), imageHandler.image(), podEnv,
                     codeDownloadUrl, layerUrls, isProvidedRuntime(fn.getRuntime()),
                     imagePackage ? null : fn.getHandler(), imageConfig, fn.getMemorySize(), caConfigMap);
 
@@ -573,5 +595,35 @@ public class KubernetesPodLauncher implements LambdaRuntimeLauncher {
 
     private static boolean isProvidedRuntime(String runtime) {
         return runtime != null && runtime.startsWith("provided");
+    }
+
+    private record ImageHandler(String handler, String image) {}
+
+    private ImageHandler handlerFor(LambdaFunction fn, boolean imagePackage, String image) {
+        if (fn.getHandler() != null && !fn.getHandler().isBlank()) {
+            return new ImageHandler(fn.getHandler(), image);
+        }
+        if (!imagePackage) {
+            return new ImageHandler(null, image);
+        }
+        List<String> command = fn.getImageConfigCommand();
+        if ((command == null || command.isEmpty()) && registry != null) {
+            Optional<ImageMetadata> metadata = registry.nodeImageMetadata(image);
+            if (metadata.isPresent()) {
+                command = metadata.get().command();
+                image = withDigest(image, metadata.get().manifestDigest());
+            }
+        }
+        String handler = command == null || command.isEmpty() || command.getFirst() == null || command.getFirst().isBlank()
+                ? null : command.getFirst();
+        return new ImageHandler(handler, image);
+    }
+
+    private static String withDigest(String image, String digest) {
+        int at = image.indexOf('@');
+        int slash = image.lastIndexOf('/');
+        int colon = image.lastIndexOf(':');
+        int end = at >= 0 ? at : colon > slash ? colon : image.length();
+        return image.substring(0, end) + "@" + digest;
     }
 }

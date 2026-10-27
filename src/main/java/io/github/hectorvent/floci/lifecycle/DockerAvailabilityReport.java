@@ -81,6 +81,7 @@ public class DockerAvailabilityReport {
         return METADATA_ONLY.stream()
                 .filter(enabled::contains)
                 .filter(service -> !needsDockerWhenConfigured(service))
+                .filter(service -> !runsWithoutLocalDocker(service))
                 .toList();
     }
 
@@ -103,7 +104,12 @@ public class DockerAvailabilityReport {
     /** A service whose container work goes somewhere other than the local daemon. */
     boolean runsWithoutLocalDocker(String service) {
         return switch (service) {
-            case "lambda" -> "kubernetes".equalsIgnoreCase(config.services().lambda().executor().trim());
+            case "lambda" -> "kubernetes".equalsIgnoreCase(config.services().lambda().executor().trim())
+                    || config.services().lambda().smolvm().enabled();
+            case "elasticache" -> config.services().elasticache().smolvm().enabled();
+            case "rds" -> config.services().rds().smolvm().enabled();
+            case "eks" -> "smolvm-pods".equalsIgnoreCase(config.services().eks().provider());
+            case "ecr" -> config.services().ecr().smolvmEnabled();
             case "athena" -> isSet(config.services().duck().url());
             case "verifiedpermissions" -> isSet(config.services().verifiedpermissions().cedarUrl());
             default -> false;

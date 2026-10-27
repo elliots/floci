@@ -111,4 +111,22 @@ class DockerAvailabilityReportTest {
     void pipesIsQualifiedToItsKafkaSources() {
         assertThat(report.failOnUse(Set.of("pipes")), contains("pipes (Kafka sources)"));
     }
+
+    @Test
+    void nodeBackedRegistryAndLambdaDoNotRequireHostDockerForPreloadedImages() {
+        when(config.services().lambda().executor()).thenReturn("docker");
+        when(config.services().lambda().smolvm().enabled()).thenReturn(true);
+        when(config.services().ecr().smolvmEnabled()).thenReturn(true);
+
+        assertThat(report.failOnUse(Set.of("lambda", "ecr", "ecs")), contains("ecs"));
+    }
+    @Test
+    void nodeBackedCachesAndDatabasesDoNotRequireHostDocker() {
+        when(config.services().elasticache().smolvm().enabled()).thenReturn(true);
+        when(config.services().rds().smolvm().enabled()).thenReturn(true);
+        when(config.services().eks().provider()).thenReturn("smolvm-pods");
+
+        assertThat(report.metadataOnly(Set.of("elasticache", "rds", "eks", "docdb")), contains("docdb"));
+    }
+
 }

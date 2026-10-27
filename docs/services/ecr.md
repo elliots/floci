@@ -4,6 +4,29 @@
 **Data plane:** OCI Distribution Spec v2 (`/v2/...`), proxied by Floci to a real `registry:2` container.
 **Endpoint:** `POST http://localhost:4566/` (or `https://...`) for the control plane; `<account>.dkr.ecr.<region>.localhost:4566/<repo>` (HTTP) or `<account>.dkr.ecr.<region>.localhost.floci.io:4566/<repo>` (TLS) for `docker push` / `docker pull`.
 
+### Registry on the smolvm-pods node
+
+Set `FLOCI_SERVICES_ECR_SMOLVM_ENABLED=true` to run ECR's backing registry on the shared
+[smolvm-pods node](../configuration/smolvm-runtime.md#the-floci-node). The node image includes
+the registry image; Floci can start and use it without a host Docker daemon. The registry's
+data is in a named Docker volume on the node. Enabling this setting selects a separate store;
+it does not copy images from a host-backed registry. Push the images again when switching stores.
+
+The existing ECR repository URI and Docker Registry API remain the entry point. A user may build
+or pull images with a tool on any machine that can reach Floci, then push to the repository URI.
+For example, with `FLOCI_SERVICES_ECR_URI_STYLE=path`:
+
+```sh
+aws --endpoint-url http://localhost:4566 ecr create-repository --repository-name app
+docker tag app:dev localhost:4566/000000000000/us-east-1/app:dev
+docker push localhost:4566/000000000000/us-east-1/app:dev
+```
+
+The node's dockerd can pull the stored image at `localhost:5000/000000000000/us-east-1/app:dev`.
+Kubernetes pulls through the existing Floci ECR mirror into its separate containerd image store.
+The node's registry binds only to its loopback; Floci reaches it through the authenticated node
+service tunnel. Port 5000 must be free on the node.
+
 ## Supported Actions
 
 | Action | Description |

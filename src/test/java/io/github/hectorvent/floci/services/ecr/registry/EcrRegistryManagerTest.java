@@ -642,6 +642,40 @@ class EcrRegistryManagerTest {
     }
 
     @Test
+    void nodeRegistryServesAwsAndFlociUrisWithTheStoredRepositoryName() {
+        NodeRegistryBackend nodeRegistry = Mockito.mock(NodeRegistryBackend.class);
+        DockerClient node = Mockito.mock(DockerClient.class);
+        when(ecr.smolvmEnabled()).thenReturn(true);
+        when(ecr.preferLocalImages()).thenReturn(false);
+        EcrRegistryManager onNode = new EcrRegistryManager(containerBuilder, lifecycleManager, logStreamer,
+                containerDetector, currentContainerNetworkResolver, portAllocator, config, regionResolver, nodeRegistry);
+        onNode.setRepositoryNameResolver((account, region, repository) -> "legacy/" + repository);
+
+        assertEquals("localhost:5000/legacy/backend-user:1", onNode.rewriteImageUri(AWS_ECR_IMAGE, node));
+        assertEquals("localhost:5000/legacy/backend-user:1", onNode.rewriteImageUri(
+                "localhost:4566/123456789012/us-east-1/backend-user:1", node));
+        assertEquals("localhost:5000/legacy/backend-user:1", onNode.rewriteImageUri(
+                "123456789012.dkr.ecr.us-east-1.localhost:4566/backend-user:1", node));
+        verify(nodeRegistry, times(3)).ensureStarted();
+        verify(lifecycleManager, never()).createAndStart(any());
+    }
+
+    @Test
+    void nodeRegistryCanInspectTheCommandWithoutHostDocker() {
+        NodeRegistryBackend nodeRegistry = Mockito.mock(NodeRegistryBackend.class);
+        when(ecr.smolvmEnabled()).thenReturn(true);
+        NodeRegistryBackend.ImageMetadata metadata = new NodeRegistryBackend.ImageMetadata(List.of("app.handler"), "sha256:abc");
+        when(nodeRegistry.imageMetadata("localhost:5000/123456789012/us-east-1/backend-user:1"))
+                .thenReturn(metadata);
+        EcrRegistryManager onNode = new EcrRegistryManager(containerBuilder, lifecycleManager, logStreamer,
+                containerDetector, currentContainerNetworkResolver, portAllocator, config, regionResolver, nodeRegistry);
+
+        assertEquals(Optional.of(metadata), onNode.nodeImageMetadata(AWS_ECR_IMAGE));
+        assertEquals(Optional.empty(), onNode.nodeImageMetadata("other.example/image:1"));
+        verify(dockerClient, never()).inspectImageCmd(anyString());
+    }
+
+    @Test
     void rewriteImageUri_imagePresentOnDaemon_preferLocalImagesOff_rewritesWithoutInspecting() {
         when(ecr.preferLocalImages()).thenReturn(false);
         Mockito.doReturn(new InspectImageResponse()).when(inspectImage).exec();

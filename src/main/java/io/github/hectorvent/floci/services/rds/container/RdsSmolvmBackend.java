@@ -228,6 +228,9 @@ public class RdsSmolvmBackend {
      * container is created.
      */
     public void ensureImage(Target target, String image) {
+        if (config.services().ecr().smolvmEnabled() && image.startsWith("localhost:5000/")) {
+            return; // The node's dockerd pulls from its local registry during container creation.
+        }
         DockerClient node = target.clients().control();
         if (hasImage(node, image)) {
             return;

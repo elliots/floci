@@ -272,8 +272,10 @@ public class ContainerLauncher implements LambdaRuntimeLauncher {
         String lambdaAccountId = AwsArnUtils.accountOrDefault(fn.getFunctionArn(), config.defaultAccountId());
         LambdaDockerFlags dockerFlags = configuredDockerFlags();
         String platform = createPlatform(fn, dockerFlags);
+        boolean nodeRegistryImage = node != null && ecrRegistryManager.isNodeRegistryImage(image);
+        String preparedImage = nodeRegistryImage ? image : containerBuilder.resolveImage(image);
         if (node != null) {
-            smolvm.ensureImage(node, containerBuilder.resolveImage(image), platform);
+            smolvm.ensureImage(node, preparedImage, platform);
         }
 
         // Build env vars
@@ -284,7 +286,7 @@ public class ContainerLauncher implements LambdaRuntimeLauncher {
         env.add("AWS_LAMBDA_FUNCTION_TIMEOUT=" + fn.getTimeout());
         env.add("AWS_LAMBDA_LOG_GROUP_NAME=" + cwLogGroup);
         env.add("AWS_LAMBDA_LOG_STREAM_NAME=" + cwLogStream);
-        String handler = handlerFor(fn, image, lifecycle, platform);
+        String handler = handlerFor(fn, preparedImage, lifecycle, platform);
         if (handler != null) {
             env.add("_HANDLER=" + handler);
         }
@@ -332,7 +334,8 @@ public class ContainerLauncher implements LambdaRuntimeLauncher {
             env.add("AWS_LAMBDA_INITIALIZATION_TYPE=provisioned-concurrency");
         }
 
-        ContainerBuilder.Builder specBuilder = containerBuilder.newContainer(image)
+        ContainerBuilder.Builder specBuilder = (nodeRegistryImage
+                ? containerBuilder.newContainerResolved(image) : containerBuilder.newContainer(image))
                 .withName(containerName)
                 .withEnv(env)
                 .withMemoryMb(fn.getMemorySize())
@@ -1365,8 +1368,7 @@ public class ContainerLauncher implements LambdaRuntimeLauncher {
         }
         List<String> command = fn.getImageConfigCommand();
         if (command == null || command.isEmpty()) {
-            String resolvedImage = containerBuilder.resolveImage(image);
-            command = lifecycle.imageCommand(resolvedImage, platform);
+            command = lifecycle.imageCommand(image, platform);
         }
         if (command == null || command.isEmpty() || command.get(0) == null || command.get(0).isBlank()) {
             return null;

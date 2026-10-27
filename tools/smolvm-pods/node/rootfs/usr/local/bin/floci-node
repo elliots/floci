@@ -907,6 +907,19 @@ supervise_dockerd() {
             --bip "$docker_bridge" --dns "$node_address" \
             --host "unix://$docker_socket" >>"$docker_log" 2>&1 &
         pid=$!
+        # The registry is included in the node image, so it can start without host Docker.
+        (
+            for attempt in {1..60}; do
+                if docker --host "unix://$docker_socket" info >/dev/null 2>&1; then
+                    if ! docker --host "unix://$docker_socket" image inspect registry:2 >/dev/null 2>&1; then
+                        docker --host "unix://$docker_socket" load -i /opt/floci-node/images/registry-2.tar \
+                            >>"$docker_log" 2>&1 || log "could not load the bundled registry image"
+                    fi
+                    break
+                fi
+                sleep 1
+            done
+        ) &
         while :; do
             if wait "$pid"; then status=0; else status=$?; fi
             # A signal also ends wait, while dockerd may still be running.

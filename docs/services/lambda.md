@@ -1171,6 +1171,10 @@ For smolvm launches, Floci also checks the selected node's dockerd before rewrit
 image URI. An image already loaded there can run even if the host daemon no longer has it.
 The Docker executor prepares the image on the selected daemon before deriving `_HANDLER`
 from its CMD; an explicit `ImageConfig.Command` takes precedence.
+For the Kubernetes executor with node-backed ECR enabled, Floci can also read the command from
+the node registry. It pins the pod image to the inspected manifest digest so a tag change cannot
+give the handler and pod different image versions. Other Kubernetes registry references continue
+to use the function's explicit handler or `ImageConfig.Command`.
 
 ### Private registry authentication
 

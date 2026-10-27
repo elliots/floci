@@ -258,6 +258,9 @@ public class LambdaSmolvmBackend {
      * @param platform such as {@code linux/arm64}, or null for the daemon's own
      */
     public void ensureImage(Target target, String image, String platform) {
+        if (config.services().ecr().smolvmEnabled() && image.startsWith("localhost:5000/")) {
+            return; // The node's dockerd pulls from its local registry during container creation.
+        }
         DockerClient node = target.clients().control();
         if (hasImage(node, image)) {
             return;

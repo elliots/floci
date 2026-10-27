@@ -287,6 +287,7 @@ docker pull "$(sed -n 's/^k3s_image=//p' scripts/node-vm.sh)"
 docker pull rancher/mirrored-pause:3.6
 docker pull rancher/mirrored-coredns-coredns:1.13.1
 docker pull rancher/mirrored-metrics-server:v0.8.0
+docker pull registry:2
 docker pull "$(cat tests/e2e/workloads/go-image)"
 ```
 

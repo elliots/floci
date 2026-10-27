@@ -387,12 +387,6 @@
         </dependency>
         <dependency>
             <groupId>software.amazon.awssdk</groupId>
-            <artifactId>ecr</artifactId>
-            <version>${aws.sdk.version}</version>
-            <scope>test</scope>
-        </dependency>
-        <dependency>
-            <groupId>software.amazon.awssdk</groupId>
             <artifactId>amp</artifactId>
             <version>${aws.sdk.version}</version>
             <scope>test</scope>
@@ -478,6 +472,12 @@
         <dependency>
             <groupId>software.amazon.awssdk</groupId>
             <artifactId>elasticache</artifactId>
+            <version>${aws.sdk.version}</version>
+            <scope>test</scope>
+        </dependency>
+        <dependency>
+            <groupId>software.amazon.awssdk</groupId>
+            <artifactId>ecr</artifactId>
             <version>${aws.sdk.version}</version>
             <scope>test</scope>
         </dependency>
