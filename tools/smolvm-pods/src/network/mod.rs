@@ -38,6 +38,11 @@ pub const SINK_PORT: u16 = 7072;
 
 const IFACE: &str = "floci0";
 
+/// dockerd's default bridge, which `floci-node` gives dockerd with `--bip`. Its
+/// containers get the network that pods get, and the table counts it as part
+/// of the cluster.
+const DOCKER_CIDR: &str = "172.17.0.0/16";
+
 /// The node's own ports that pods reach: the API server and kubelet.
 const NODE_PORTS: [u16; 2] = [6443, 10250];
 
@@ -274,11 +279,13 @@ pub fn node_of(env: &NodeEnv) -> Result<nft::Node, String> {
         Ok("loopback") => nft::FlociHost::Loopback,
         _ => nft::FlociHost::Gateway(gateway),
     };
+    let mut cluster = env.cluster.clone();
+    cluster.push(Cidr::parse(DOCKER_CIDR)?);
     Ok(nft::Node {
         address: env.address,
         floci,
         iface,
-        cluster: env.cluster.clone(),
+        cluster,
         node_ports: NODE_PORTS.to_vec(),
     })
 }

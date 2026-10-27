@@ -894,7 +894,9 @@ kernel has nf_tables with `reject`, `ct` and counters, but no `log`, NFLOG or NF
 ### The node address
 
 The node service owns `169.254.53.1` on `floci0` (`src/network`), and its table `inet floci`
-sorts what pods send there by port. Floci publishes a network profile with `PUT /v1/network`; the
+sorts what pods send there by port. The table treats what comes from `docker0`, dockerd's default
+bridge, which `floci-node` pins to `172.17.0.1/16`, as it treats `cni0`, and counts that bridge as
+part of the cluster, so that Docker containers get the network of pods. Floci publishes a network profile with `PUT /v1/network`; the
 node service checks it, writes the whole table with `nft -f` in one transaction, keeps the profile
 in `.node/network.json` (0600) and applies it again when it starts.
 
@@ -919,7 +921,7 @@ name or `Host` from a short peek. Blocked and relayed attempts are counted per p
 destination, port and protocol over a minute in `.node/network-events.jsonl`, rotated at 8 MiB.
 
 A node is isolated when it was created with `FLOCI_NODE_ISOLATION=1` or its profile says so. Then
-the table sends every connection from `cni0` that is not to the cluster, Floci's ports at the
+the table sends every connection from `cni0` or `docker0` that is not to the cluster, Floci's ports at the
 gateway, an endpoint or the allow list to the sinkhole, drops what else pods forward and all
 IPv6, drops pods' traffic to the node itself but DNS, the relay, the sinkhole, the API server and
 kubelet, and limits node processes to the cluster, the gateway's Floci and DNS ports and the
@@ -1019,7 +1021,8 @@ does not:
 - `docker pause` and `unpause`: the task API's Pause is not implemented;
 - Docker's embedded DNS on user networks, at `127.0.0.11` in the container's network namespace,
   which the guest cannot reach: names of other containers do not resolve in a VM container. On
-  the default bridge, the node's resolver applies;
+  the default bridge, the node's resolver applies, which is the node address
+  ([The node address](#the-node-address));
 - `docker network connect` and a second network: the VM has the one NIC of its first boot;
 - `docker cp`, which reads and writes Docker's copy of the image on the node, not the VM's copy;
 - `docker top`, which lists host processes by pid, and the container's pid in `docker inspect`,

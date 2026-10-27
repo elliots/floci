@@ -41,6 +41,9 @@ containerd_socket=/run/k3s/containerd/containerd.sock
 docker_data=/var/lib/smolvm/docker
 docker_socket=/run/docker.sock
 docker_log=/var/log/dockerd.log
+# dockerd's default bridge, whose containers the node service's table treats as
+# pods (src/network/mod.rs, DOCKER_CIDR).
+docker_bridge=172.17.0.1/16
 # The cgroup of the node service and the pod VMs, beside kubelet's kubepods.
 runtime_cgroup=/sys/fs/cgroup/smolvm-pods
 # The files of the capacity view that k3s's namespace binds over the real ones.
@@ -896,7 +899,7 @@ supervise_dockerd() {
         fi
         log "starting dockerd on $containerd_socket, logging to $docker_log"
         dockerd --containerd="$containerd_socket" --data-root "$docker_data" \
-            --host "unix://$docker_socket" >>"$docker_log" 2>&1 &
+            --bip "$docker_bridge" --host "unix://$docker_socket" >>"$docker_log" 2>&1 &
         pid=$!
         while :; do
             if wait "$pid"; then status=0; else status=$?; fi
