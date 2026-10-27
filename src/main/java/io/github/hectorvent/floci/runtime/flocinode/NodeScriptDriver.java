@@ -223,11 +223,19 @@ public class NodeScriptDriver implements NodeDriver {
         if (!smolvm.rosetta()) {
             args.add("--no-rosetta");
         }
+        for (String volume : smolvm.volumes().orElse(List.of())) {
+            args.add("--volume");
+            args.add(volume);
+        }
         Map<String, String> labels = ownerLabels();
         args.add("--");
         for (Map.Entry<String, String> label : labels.entrySet()) {
             args.add("--label");
             args.add(label.getKey() + "=" + label.getValue());
+        }
+        for (String mapping : smolvm.extraPorts().orElse(List.of())) {
+            args.add("--port");
+            args.add(mapping);
         }
         return args;
     }

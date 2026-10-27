@@ -376,6 +376,8 @@ floci:
       node-service-base-port: 6600     # the node service's API, on a Mac port in this range
       node-service-max-port: 6699
       node-ports: 32080-32099          # NodePorts on the same Mac ports: FIRST-LAST, PORT or none
+      extra-ports: ${FLOCI_RUNTIME_NODE_EXTRA_PORTS:} # comma-separated HOST_PORT:GUEST_PORT TCP mappings
+      volumes: ${FLOCI_RUNTIME_NODE_VOLUMES:}        # comma-separated HOST:GUEST[:ro] directory shares
       floci-endpoint: ""               # where k3s and containerd in the node reach Floci; empty: host.docker.internal:<port>
       keep-running-on-shutdown: true   # leave the node running when Floci stops, with persistent storage
       ready-timeout-seconds: 600       # how long a created, started or adopted node may take to be ready
@@ -550,6 +552,9 @@ floci:
       proxy-max-port: 6399
       default-image: "valkey/valkey:8"
       default-memcached-image: "memcached:1.6"
+      smolvm:
+        enabled: ${FLOCI_SERVICES_ELASTICACHE_SMOLVM_ENABLED:false}
+        idle-timeout: ${FLOCI_SERVICES_ELASTICACHE_SMOLVM_IDLE_TIMEOUT:}
       tls-suffixes: ${FLOCI_SERVICES_ELASTICACHE_TLS_SUFFIXES:auto}
     memorydb:
       enabled: true

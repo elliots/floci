@@ -185,6 +185,22 @@ class NodeScriptDriverServiceTest {
     }
 
     @Test
+    void extraPortsAndDirectorySharesArePassedAsSeparateCreateArguments() throws IOException {
+        when(smolvm.extraPorts()).thenReturn(Optional.of(List.of("443:30443", "8080:30080")));
+        String volume = dir.resolve("my project") + ":/workspace:ro";
+        when(smolvm.volumes()).thenReturn(Optional.of(List.of(volume)));
+
+        driver.createAndStart(node(false, List.of()), seed, NO_REALLOCATION);
+
+        List<String> create = calls().getFirst();
+        assertEquals(volume, create.get(create.indexOf("--volume") + 1));
+        assertTrue(create.indexOf("--volume") < create.indexOf("--"));
+        assertTrue(create.indexOf("--port") > create.indexOf("--"));
+        assertEquals(List.of("--port", "443:30443", "--port", "8080:30080"),
+                create.subList(create.size() - 4, create.size()));
+    }
+
+    @Test
     void createAndStart_isolated_passesIsolateAndTheAllowList() throws IOException {
         when(docker.resourceNamespace()).thenReturn(Optional.of("team-a"));
         when(smolvm.rosetta()).thenReturn(false);

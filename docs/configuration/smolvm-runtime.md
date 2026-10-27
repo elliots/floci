@@ -168,9 +168,13 @@ Floci has one smolvm-pods node for everything that runs on one: RDS's databases 
 `FLOCI_SERVICES_EKS_PROVIDER=smolvm-pods` ([smolvm-pods nodes](../services/eks.md#smolvm-pods-nodes)),
 and Lambda's environments with `FLOCI_SERVICES_LAMBDA_SMOLVM_ENABLED=true`
 ([Functions on a smolvm-pods node](../services/lambda.md#functions-on-a-smolvm-pods-node)).
+Redis and Valkey caches join the same node with `FLOCI_SERVICES_ELASTICACHE_SMOLVM_ENABLED=true`.
+Their auth proxies stay in Floci and use node tunnels, so connecting wakes a sleeping cache.
+`FLOCI_SERVICES_ELASTICACHE_SMOLVM_IDLE_TIMEOUT` overrides the node's idle timeout for caches.
+Memcached continues to use host Docker.
 
-Keep a host Docker daemon available for image pulls. Lambda and RDS transfer missing images
-from that daemon into the node's dockerd; the workload containers then run on the node.
+Images can be fetched or built on another machine and transferred into the node. A host Docker
+daemon is an optional image source, not a requirement once the node has the images it needs.
 An isolated node cannot pull from external registries itself. Kubernetes uses a separate
 containerd image store and pulls through [Floci's ECR](../services/eks.md#pods-floci-and-images).
 
@@ -196,6 +200,22 @@ finding the node, kubectl, Docker, watching its pods and databases sleep and wak
 logs, and troubleshooting.
 
 ### Creating the node
+
+`FLOCI_RUNTIME_NODE_EXTRA_PORTS` adds comma-separated TCP mappings such as `443:30443,8080:30080`.
+The host ports must be distinct from the node's API allocation ranges and NodePorts. The two API
+ports, NodePorts and extra mappings together may use at most 64 mappings. The host ports must be
+free when the node starts.
+Binding ports below 1024 depends on the host's privileges and policy. On the tested macOS
+machine, an unprivileged process was denied access to port 443; use an available higher host
+port or arrange an appropriate host-level forward.
+
+`FLOCI_RUNTIME_NODE_VOLUMES` adds comma-separated directory shares, for example
+`/Users/me/project:/workspace:ro`. Both paths must be absolute; the host directory must exist.
+Omit `:ro` for a writable share. A container on the node can then bind `/workspace`.
+
+These settings apply when Floci creates a node. Changing them does not modify an existing node;
+recreate the node to apply them. Existing workload data on that node must be backed up before
+recreating it.
 
 Floci creates the node only natively on an Apple silicon Mac of M3 or later, as a JVM or the
 native binary, not in a container, with `node-vm.sh`, the smolvm checkout and the node image of

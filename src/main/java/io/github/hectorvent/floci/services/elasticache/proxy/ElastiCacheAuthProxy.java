@@ -19,16 +19,34 @@ public class ElastiCacheAuthProxy extends AbstractRedisAuthProxy {
     private final AuthMode authMode;
     private final PasswordValidator passwordValidator;
     private final SigV4Validator sigV4Validator;
+    private final BackendDialer backendDialer;
+
+    @FunctionalInterface
+    public interface BackendDialer {
+        Socket connect(String host, int port, int timeoutMillis) throws IOException;
+    }
 
     public ElastiCacheAuthProxy(String groupId, AuthMode authMode,
                                 String backendHost, int backendPort,
                                 PasswordValidator passwordValidator,
                                 SigV4Validator sigV4Validator) {
+        this(groupId, authMode, backendHost, backendPort, passwordValidator, sigV4Validator, null);
+    }
+
+    public ElastiCacheAuthProxy(String groupId, AuthMode authMode,
+                               String backendHost, int backendPort, PasswordValidator passwordValidator,
+                               SigV4Validator sigV4Validator, BackendDialer backendDialer) {
         super(LOG, "ElastiCache", "ec", groupId, backendHost, backendPort);
         this.groupId = groupId;
         this.authMode = authMode;
         this.passwordValidator = passwordValidator;
         this.sigV4Validator = sigV4Validator;
+        this.backendDialer = backendDialer;
+    }
+
+    @Override
+    protected Socket connectBackend(String host, int port) throws IOException {
+        return backendDialer == null ? super.connectBackend(host, port) : backendDialer.connect(host, port, 5_000);
     }
 
     @Override

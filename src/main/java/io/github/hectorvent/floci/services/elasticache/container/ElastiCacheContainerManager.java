@@ -51,6 +51,7 @@ public class ElastiCacheContainerManager {
     private final ContainerDetector containerDetector;
     private final EmulatorConfig config;
     private final RegionResolver regionResolver;
+    private final ElastiCacheSmolvmBackend smolvm;
     private final Map<String, ElastiCacheContainerHandle> activeContainers = new ConcurrentHashMap<>();
     private volatile boolean dockerUnavailableLogged;
 
@@ -60,13 +61,44 @@ public class ElastiCacheContainerManager {
                                        ContainerLogStreamer logStreamer,
                                        ContainerDetector containerDetector,
                                        EmulatorConfig config,
-                                       RegionResolver regionResolver) {
+                                       RegionResolver regionResolver,
+                                       ElastiCacheSmolvmBackend smolvm) {
         this.containerBuilder = containerBuilder;
         this.lifecycleManager = lifecycleManager;
         this.logStreamer = logStreamer;
         this.containerDetector = containerDetector;
         this.config = config;
         this.regionResolver = regionResolver;
+        this.smolvm = smolvm;
+    }
+
+    ElastiCacheContainerManager(ContainerBuilder containerBuilder, ContainerLifecycleManager lifecycleManager,
+                               ContainerLogStreamer logStreamer, ContainerDetector detector,
+                               EmulatorConfig config, RegionResolver regionResolver) {
+        this(containerBuilder, lifecycleManager, logStreamer, detector, config, regionResolver, null);
+    }
+
+    public boolean onSmolvmNode() {
+        return smolvm != null && smolvm.enabled();
+    }
+
+    private ContainerLifecycleManager lifecycle() {
+        return onSmolvmNode() ? smolvm.target().lifecycle() : lifecycleManager;
+    }
+
+    /** The same connection path is used by readiness, cluster formation and the auth proxy. */
+    public Socket connect(String host, int port, int timeoutMillis) throws IOException {
+        if (onSmolvmNode()) {
+            return smolvm.connect(host, port, timeoutMillis);
+        }
+        Socket socket = new Socket();
+        try {
+            socket.connect(new InetSocketAddress(host, port), timeoutMillis);
+            return socket;
+        } catch (IOException e) {
+            socket.close();
+            throw e;
+        }
     }
 
     /**
@@ -85,6 +117,9 @@ public class ElastiCacheContainerManager {
             dockerUnavailableLogged = false;
             return handle;
         } catch (RuntimeException e) {
+            if (onSmolvmNode()) {
+                throw e;
+            }
             if (isDockerReachable()) {
                 throw e;
             }
@@ -110,7 +145,7 @@ public class ElastiCacheContainerManager {
      */
     public boolean isDockerReachable() {
         try {
-            lifecycleManager.getDockerClient().pingCmd().exec();
+            lifecycle().getDockerClient().pingCmd().exec();
             return true;
         } catch (Exception e) {
             LOG.debugv("Docker daemon is not reachable: {0}", e.getMessage());
@@ -131,10 +166,15 @@ public class ElastiCacheContainerManager {
                                             String region) {
         LOG.infov("Starting ElastiCache backend container for group: {0}", groupId);
 
+        ElastiCacheSmolvmBackend.Target node = onSmolvmNode()
+                ? smolvm.target(regionResolver.getAccountId(), region) : null;
+        ContainerLifecycleManager lifecycle = node == null ? lifecycleManager : node.lifecycle();
+        ContainerLogStreamer logs = node == null ? logStreamer : node.logs();
+
         String containerName = containerName(groupId);
 
         // Remove any stale container with the same name
-        lifecycleManager.removeIfExists(containerName);
+        lifecycle.removeIfExists(containerName);
 
         StringBuilder serverFlags = new StringBuilder("--loglevel verbose");
         for (String flag : extraServerFlags) {
@@ -147,30 +187,38 @@ public class ElastiCacheContainerManager {
         ContainerBuilder.Builder specBuilder = containerBuilder.newContainer(image)
                 .withName(containerName)
                 .withEnv("VALKEY_EXTRA_FLAGS", serverFlags.toString())
-                .withDockerNetwork(config.services().elasticache().dockerNetwork())
                 .withLogRotation()
                 .withLabels(ContainerStorageHelper.resourceIdentityLabels(
                         "elasticache", groupId, regionResolver.getAccountId(), region));
 
-        if (!containerDetector.isRunningInContainer()) {
-            specBuilder.withDynamicPort(BACKEND_PORT);
-        } else {
+        if (node != null) {
             specBuilder.withExposedPort(BACKEND_PORT);
+        } else {
+            specBuilder.withDockerNetwork(config.services().elasticache().dockerNetwork());
+            if (!containerDetector.isRunningInContainer()) {
+                specBuilder.withDynamicPort(BACKEND_PORT);
+            } else {
+                specBuilder.withExposedPort(BACKEND_PORT);
+            }
         }
 
         ContainerSpec spec = specBuilder.build();
+        if (node != null) {
+            smolvm.ensureImage(node, spec.image());
+        }
 
         // Create and start container
-        ContainerInfo info = lifecycleManager.createAndStart(spec);
-        EndpointInfo endpoint = info.getEndpoint(BACKEND_PORT);
+        ContainerInfo info = lifecycle.createAndStart(spec);
+        EndpointInfo endpoint = node == null ? info.getEndpoint(BACKEND_PORT)
+                : new EndpointInfo(lifecycle.resolveContainerNetworkIp(info.containerId(), null), BACKEND_PORT);
 
         LOG.infov("ElastiCache backend for group {0}: {1}", groupId, endpoint);
 
         ElastiCacheContainerHandle handle = new ElastiCacheContainerHandle(
                 info.containerId(), groupId, endpoint.host(), endpoint.port());
         try {
-            handle.setNetworkIp(lifecycleManager.resolveContainerNetworkIp(
-                    info.containerId(), config.services().elasticache().dockerNetwork().orElse(null)));
+            handle.setNetworkIp(lifecycle.resolveContainerNetworkIp(info.containerId(),
+                    node == null ? config.services().elasticache().dockerNetwork().orElse(null) : null));
         } catch (RuntimeException e) {
             LOG.warnv("Could not resolve network IP for ElastiCache container {0}: {1}",
                     info.containerId(), e.getMessage());
@@ -182,9 +230,9 @@ public class ElastiCacheContainerManager {
                 ? info.containerId().substring(0, 8)
                 : info.containerId();
         String logGroup = "/aws/elasticache/cluster/" + groupId + "/engine-log";
-        String logStream = logStreamer.generateLogStreamName(shortId);
+        String logStream = logs.generateLogStreamName(shortId);
 
-        Closeable logHandle = logStreamer.attach(
+        Closeable logHandle = logs.attach(
                 info.containerId(), logGroup, logStream, region, "elasticache:" + groupId);
         handle.setLogStream(logHandle);
 
@@ -193,13 +241,12 @@ public class ElastiCacheContainerManager {
         return handle;
     }
 
-    private static void waitForBackendReady(String groupId, String host, int port) {
+    private void waitForBackendReady(String groupId, String host, int port) {
         long deadline = System.currentTimeMillis() + BACKEND_READY_DEADLINE_MS;
         int attempt = 0;
         while (System.currentTimeMillis() < deadline) {
             attempt++;
-            try (Socket s = new Socket()) {
-                s.connect(new InetSocketAddress(host, port), BACKEND_PROBE_CONNECT_MS);
+            try (Socket s = connect(host, port, BACKEND_PROBE_CONNECT_MS)) {
                 s.setTcpNoDelay(true);
                 s.setSoTimeout(BACKEND_PROBE_CONNECT_MS);
                 OutputStream out = s.getOutputStream();
@@ -239,7 +286,7 @@ public class ElastiCacheContainerManager {
         ElastiCacheContainerHandle existing = activeContainers.remove(handle.getGroupId());
         Closeable logStream = handle.getLogStream() != null ? handle.getLogStream()
                 : (existing != null ? existing.getLogStream() : null);
-        lifecycleManager.stopAndRemove(handle.getContainerId(), logStream);
+        lifecycle().stopAndRemove(handle.getContainerId(), logStream);
     }
 
     /**
@@ -257,7 +304,7 @@ public class ElastiCacheContainerManager {
             stop(handle);
             return;
         }
-        lifecycleManager.removeIfExists(containerName(groupId));
+        lifecycle().removeIfExists(containerName(groupId));
     }
 
     private String containerName(String groupId) {

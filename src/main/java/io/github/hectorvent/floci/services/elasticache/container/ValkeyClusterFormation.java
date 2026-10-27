@@ -1,6 +1,7 @@
 package io.github.hectorvent.floci.services.elasticache.container;
 
 import jakarta.enterprise.context.ApplicationScoped;
+import jakarta.inject.Inject;
 import org.jboss.logging.Logger;
 
 import java.io.Closeable;
@@ -34,6 +35,16 @@ public class ValkeyClusterFormation {
     private static final int READ_TIMEOUT_MS = 10_000;
     private static final long FORMATION_DEADLINE_MS = 60_000;
     private static final long RETRY_SLEEP_MS = 200;
+    private final ElastiCacheContainerManager containers;
+
+    @Inject
+    public ValkeyClusterFormation(ElastiCacheContainerManager containers) {
+        this.containers = containers;
+    }
+
+    ValkeyClusterFormation() {
+        this.containers = null;
+    }
 
     /**
      * One node to join into the cluster.
@@ -52,7 +63,8 @@ public class ValkeyClusterFormation {
         List<RespClient> clients = new ArrayList<>(nodes.size());
         try {
             for (Node node : nodes) {
-                clients.add(new RespClient(node.endpointHost(), node.endpointPort()));
+                clients.add(containers == null ? new RespClient(node.endpointHost(), node.endpointPort())
+                        : new RespClient(containers.connect(node.endpointHost(), node.endpointPort(), CONNECT_TIMEOUT_MS)));
             }
 
             List<String> nodeIds = new ArrayList<>(nodes.size());
@@ -205,8 +217,17 @@ public class ValkeyClusterFormation {
         private final OutputStream out;
 
         RespClient(String host, int port) throws IOException {
-            socket = new Socket();
+            this(direct(host, port));
+        }
+
+        private static Socket direct(String host, int port) throws IOException {
+            Socket socket = new Socket();
             socket.connect(new InetSocketAddress(host, port), CONNECT_TIMEOUT_MS);
+            return socket;
+        }
+
+        RespClient(Socket socket) throws IOException {
+            this.socket = socket;
             socket.setTcpNoDelay(true);
             socket.setSoTimeout(READ_TIMEOUT_MS);
             in = socket.getInputStream();

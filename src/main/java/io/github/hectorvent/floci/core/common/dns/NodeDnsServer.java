@@ -55,6 +55,7 @@ public class NodeDnsServer {
     private final EmbeddedDnsServer answers;
     private final SequencedSet<String> flociSuffixes = new LinkedHashSet<>();
     private final Map<String, Long> denialsLogged = new ConcurrentHashMap<>();
+    private final Map<String, Set<String>> serviceNames = new ConcurrentHashMap<>();
     private volatile Policy policy = new Policy(Set.of(), Set.of(), false);
     private volatile List<String> upstreams = List.of();
     private volatile DatagramSocket udp;
@@ -104,6 +105,15 @@ public class NodeDnsServer {
     /** Applies the runtime file's routed hosts and isolation. */
     public void update(Policy policy) {
         this.policy = policy;
+    }
+
+    /** Names served by a host proxy, resolved by node clients to the Floci gateway. */
+    public void serviceNames(String owner, Set<String> names) {
+        if (names.isEmpty()) {
+            serviceNames.remove(owner);
+        } else {
+            serviceNames.put(owner, Set.copyOf(names.stream().map(name -> name.toLowerCase(Locale.ROOT)).toList()));
+        }
     }
 
     /** The port it listens on, once started; the configured one before. */
@@ -249,6 +259,9 @@ public class NodeDnsServer {
 
     /** Whether {@code name} is Floci's: one of its suffixes, or below one. */
     boolean isFlociName(String name) {
+        if (serviceNames.values().stream().anyMatch(names -> names.contains(name))) {
+            return true;
+        }
         for (String suffix : flociSuffixes) {
             if (name.equals(suffix) || name.endsWith("." + suffix)) {
                 return true;

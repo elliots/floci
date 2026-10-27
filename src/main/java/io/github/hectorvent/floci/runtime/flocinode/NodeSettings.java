@@ -23,6 +23,7 @@ import java.security.DigestInputStream;
 import java.security.MessageDigest;
 import java.security.NoSuchAlgorithmException;
 import java.util.ArrayList;
+import java.util.HashSet;
 import java.util.HexFormat;
 import java.util.LinkedHashMap;
 import java.util.List;
@@ -30,6 +31,7 @@ import java.util.Locale;
 import java.util.Map;
 import java.util.Optional;
 import java.util.OptionalInt;
+import java.util.Set;
 import java.util.function.BooleanSupplier;
 import java.util.regex.Matcher;
 import java.util.regex.Pattern;
@@ -108,7 +110,12 @@ public class NodeSettings {
      * provider, each real.
      */
     public boolean wanted() {
-        return rdsWants() || eksWants() || lambdaWants();
+        return rdsWants() || eksWants() || lambdaWants() || elasticacheWants();
+    }
+
+    private boolean elasticacheWants() {
+        EmulatorConfig.ElastiCacheServiceConfig cache = config.services().elasticache();
+        return cache != null && cache.enabled() && cache.smolvm().enabled();
     }
 
     private boolean rdsWants() {
@@ -136,6 +143,9 @@ public class NodeSettings {
         }
         if (lambdaWants()) {
             users.add("Lambda");
+        }
+        if (elasticacheWants()) {
+            users.add("ElastiCache");
         }
         return users.size() < 2 ? String.join("", users)
                 : String.join(", ", users.subList(0, users.size() - 1)) + " and " + users.getLast();
@@ -171,6 +181,7 @@ public class NodeSettings {
         positive(problems, "overlay-gib", node.overlayGib());
         positive(problems, "ready-timeout-seconds", node.readyTimeoutSeconds());
         checkPorts(problems, node);
+        checkVolumes(problems, node.volumes().orElse(List.of()));
         checkFlociEndpoint(problems, text(node.flociEndpoint()));
         duration(problems, "idle-timeout", text(node.idleTimeout()));
         duration(problems, "cpu-window", text(node.cpuWindow()));
@@ -381,6 +392,60 @@ public class NodeSettings {
         if (nodePorts.filter(ports -> ports.overlaps(api) || ports.overlaps(service)).isPresent()) {
             problems.add(key("node-ports") + " " + node.nodePorts()
                     + " overlaps the Kubernetes API or node service ports");
+        }
+        int mappings = 2 + nodePorts.map(ports -> ports.last() - ports.first() + 1).orElse(0);
+        Set<Integer> hosts = new HashSet<>();
+        for (String mapping : node.extraPorts().orElse(List.of())) {
+            String[] ports = mapping.split(":", -1);
+            int host;
+            int guest;
+            try {
+                if (ports.length != 2 || !ports[0].matches("[0-9]{1,5}") || !ports[1].matches("[0-9]{1,5}")) {
+                    throw new IllegalArgumentException();
+                }
+                host = Integer.parseInt(ports[0]);
+                guest = Integer.parseInt(ports[1]);
+                if (host < 1 || host > 65535 || guest < 1 || guest > 65535) {
+                    throw new IllegalArgumentException();
+                }
+            } catch (IllegalArgumentException e) {
+                problems.add(key("extra-ports") + " must contain HOST_PORT:GUEST_PORT with ports from 1 to 65535: " + mapping);
+                continue;
+            }
+            PortRange extra = new PortRange(host, host);
+            if (!hosts.add(host) || extra.overlaps(api) || extra.overlaps(service)
+                    || nodePorts.filter(extra::overlaps).isPresent()) {
+                problems.add(key("extra-ports") + " host port overlaps another node mapping or API allocation range: " + host);
+            }
+            mappings++;
+        }
+        if (mappings > 64) {
+            problems.add(key("extra-ports") + " and " + key("node-ports")
+                    + " exceed smolvm's 64 mappings, including the two API ports: " + mappings);
+        }
+    }
+
+    private static void checkVolumes(List<String> problems, List<String> volumes) {
+        Set<String> targets = new HashSet<>();
+        for (String volume : volumes) {
+            String[] parts = volume.split(":", -1);
+            if (parts.length < 2 || parts.length > 3 || (parts.length == 3 && !parts[2].equals("ro"))) {
+                problems.add(key("volumes") + " must contain HOST:GUEST[:ro]: " + volume);
+                continue;
+            }
+            try {
+                Path host = Path.of(parts[0]);
+                Path guest = Path.of(parts[1]);
+                if (!host.isAbsolute() || !Files.isDirectory(host)) {
+                    problems.add(key("volumes") + " host must be an existing absolute directory: " + parts[0]);
+                }
+                if (!guest.isAbsolute() || guest.normalize().getNameCount() == 0
+                        || !guest.equals(guest.normalize()) || !targets.add(guest.toString())) {
+                    problems.add(key("volumes") + " guest must be a unique absolute directory other than /: " + parts[1]);
+                }
+            } catch (IllegalArgumentException e) {
+                problems.add(key("volumes") + " contains an invalid path: " + volume);
+            }
         }
     }
 
