@@ -12,8 +12,6 @@ use super::{PodProbes, ProbeAction};
 
 /// The most of a request that is read.
 pub const REQUEST_MAX: usize = 4096;
-/// The most headers a request may have.
-const MAX_HEADERS: usize = 32;
 /// How long a request may take to arrive.
 pub const REQUEST_WAIT: Duration = Duration::from_secs(1);
 /// Kubelet's `User-Agent` starts with this, unless the probe sets its own.
@@ -72,7 +70,8 @@ impl RequestReader {
         if !head.ends_with(b"\r\n\r\n") {
             head.extend_from_slice(b"\r\n");
         }
-        let mut headers = [httparse::EMPTY_HEADER; MAX_HEADERS];
+        let mut headers =
+            vec![httparse::EMPTY_HEADER; head.iter().filter(|&&b| b == b'\n').count()];
         let mut request = httparse::Request::new(&mut headers);
         if !request.parse(&head).ok()?.is_complete() {
             return None;
@@ -236,6 +235,32 @@ User-Agent: kube-probe/1.35\r\nAccept: */*\r\nConnection: close\r\n\r\n";
                 user_agent: Some("kube-probe/1.35".into()),
             })
         );
+    }
+
+    #[test]
+    fn many_short_headers_still_get_the_recorded_probe_answer() {
+        let probes = PodProbes {
+            probes: vec![http_probe(
+                8080,
+                "/healthz",
+                false,
+                Some(result(true, Some(204))),
+            )],
+            ..Default::default()
+        };
+        for count in [32, 33, 256] {
+            let request = format!(
+                "GET /healthz HTTP/1.1\r\n{}User-Agent: kube-probe/1.35\r\n\r\n",
+                "X: a\r\n".repeat(count - 1)
+            );
+            assert!(request.len() < REQUEST_MAX);
+            let reader = read(request.as_bytes());
+            assert!(reader.is_done());
+            assert_eq!(
+                answer(reader.request().as_ref(), &probes, 8080),
+                Answer::Status(204)
+            );
+        }
     }
 
     #[test]

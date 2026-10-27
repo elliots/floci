@@ -81,7 +81,7 @@ fn tls(data: &[u8]) -> Hello {
 }
 
 fn http(data: &[u8]) -> Hello {
-    let mut headers = [httparse::EMPTY_HEADER; 64];
+    let mut headers = vec![httparse::EMPTY_HEADER; data.iter().filter(|&&b| b == b'\n').count()];
     let mut request = httparse::Request::new(&mut headers);
     match request.parse(data) {
         Ok(status) if status.is_complete() => {}
@@ -167,5 +167,21 @@ mod tests {
         assert_eq!(sniff(b"PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n\0\0"), Hello::H2c);
         assert_eq!(sniff(b"PRI * HT"), Hello::More);
         assert_eq!(sniff(b"\x00\x01binary"), Hello::Other);
+    }
+
+    #[test]
+    fn many_short_headers_do_not_hide_the_host() {
+        for count in [64, 65, 256] {
+            let request = format!(
+                "GET / HTTP/1.1\r\n{}Host: api.vendor.test\r\n\r\n",
+                "X: a\r\n".repeat(count - 1)
+            );
+            assert!(request.len() < 16 * 1024);
+            assert_eq!(
+                sniff(request.as_bytes()),
+                Hello::Http(Some("api.vendor.test".into()))
+            );
+            assert_eq!(sniff(&request.as_bytes()[..request.len() - 2]), Hello::More);
+        }
     }
 }
