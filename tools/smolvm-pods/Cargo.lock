@@ -3471,6 +3471,7 @@ dependencies = [
  "containerd-shim-protos",
  "futures-util",
  "http-body-util",
+ "httparse",
  "hyper",
  "hyper-util",
  "libc",
@@ -3491,6 +3492,7 @@ dependencies = [
  "tokio",
  "tokio-rustls",
  "url",
+ "x509-parser",
 ]
 
 [[package]]

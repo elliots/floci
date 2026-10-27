@@ -124,6 +124,25 @@ public class ContainerLauncher implements LambdaRuntimeLauncher {
     private final LambdaLayerService layerService;
     private final LaunchedContainerAwsEnv awsEnv;
     private final LambdaExecutionRoleCredentials executionRoleCredentials;
+    private final LambdaSmolvmBackend smolvm;
+    /** The node of each environment that runs on the smolvm-pods node, by container id. */
+    private final Map<String, LambdaSmolvmBackend.Target> nodeContainers = new ConcurrentHashMap<>();
+
+    /** A launcher that runs every environment in Floci's own Docker. */
+    public ContainerLauncher(ContainerBuilder containerBuilder,
+                             ContainerLifecycleManager lifecycleManager,
+                             ContainerLogStreamer logStreamer,
+                             ImageResolver imageResolver,
+                             RuntimeApiServerFactory runtimeApiServerFactory,
+                             DockerHostResolver dockerHostResolver,
+                             EmulatorConfig config,
+                             EcrRegistryManager ecrRegistryManager,
+                             LambdaLayerService layerService,
+                             LaunchedContainerAwsEnv awsEnv,
+                             LambdaExecutionRoleCredentials executionRoleCredentials) {
+        this(containerBuilder, lifecycleManager, logStreamer, imageResolver, runtimeApiServerFactory,
+                dockerHostResolver, config, ecrRegistryManager, layerService, awsEnv, executionRoleCredentials, null);
+    }
 
     @Inject
     public ContainerLauncher(ContainerBuilder containerBuilder,
@@ -136,7 +155,8 @@ public class ContainerLauncher implements LambdaRuntimeLauncher {
                              EcrRegistryManager ecrRegistryManager,
                              LambdaLayerService layerService,
                              LaunchedContainerAwsEnv awsEnv,
-                             LambdaExecutionRoleCredentials executionRoleCredentials) {
+                             LambdaExecutionRoleCredentials executionRoleCredentials,
+                             LambdaSmolvmBackend smolvm) {
         this.containerBuilder = containerBuilder;
         this.lifecycleManager = lifecycleManager;
         this.logStreamer = logStreamer;
@@ -148,6 +168,7 @@ public class ContainerLauncher implements LambdaRuntimeLauncher {
         this.layerService = layerService;
         this.awsEnv = awsEnv;
         this.executionRoleCredentials = executionRoleCredentials;
+        this.smolvm = smolvm;
         this.populateSemaphore = new Semaphore(resolvePopulateConcurrency(config));
     }
 
@@ -202,6 +223,10 @@ public class ContainerLauncher implements LambdaRuntimeLauncher {
             }
         }
 
+        LambdaSmolvmBackend.Target node = nodeFor(fn);
+        ContainerLifecycleManager lifecycle = node != null ? node.lifecycle() : lifecycleManager;
+        ContainerLogStreamer logs = node != null ? node.logs() : logStreamer;
+
         // Start Runtime API server first so container can connect on boot
         RuntimeApiServer runtimeApiServer = runtimeApiServerFactory.create();
         runtimeApiServer.setFunctionMetadata(fn.getFunctionName(), fn.getVersion(), fn.getHandler(),
@@ -227,10 +252,11 @@ public class ContainerLauncher implements LambdaRuntimeLauncher {
                 : imageResolver.resolve(fn.getRuntime());
 
         // If this is an AWS-shaped ECR URI, rewrite it to Floci's loopback registry
-        image = ecrRegistryManager.rewriteImageUri(image);
+        image = node == null ? ecrRegistryManager.rewriteImageUri(image)
+                : ecrRegistryManager.rewriteImageUri(image, node.clients().control());
 
         // Determine host address reachable from container
-        String hostAddress = dockerHostResolver.resolve();
+        String hostAddress = node != null ? smolvm.runtimeApiHost() : dockerHostResolver.resolve();
         String runtimeApiEndpoint = hostAddress + ":" + runtimeApiServer.getPort();
 
         // Give the container a human-readable name (needed for log stream name below)
@@ -245,6 +271,10 @@ public class ContainerLauncher implements LambdaRuntimeLauncher {
         String lambdaRegion = extractRegionFromArn(fn.getFunctionArn(), config.defaultRegion());
         String lambdaAccountId = AwsArnUtils.accountOrDefault(fn.getFunctionArn(), config.defaultAccountId());
         LambdaDockerFlags dockerFlags = configuredDockerFlags();
+        String platform = createPlatform(fn, dockerFlags);
+        if (node != null) {
+            smolvm.ensureImage(node, containerBuilder.resolveImage(image), platform);
+        }
 
         // Build env vars
         List<String> env = new ArrayList<>();
@@ -254,20 +284,27 @@ public class ContainerLauncher implements LambdaRuntimeLauncher {
         env.add("AWS_LAMBDA_FUNCTION_TIMEOUT=" + fn.getTimeout());
         env.add("AWS_LAMBDA_LOG_GROUP_NAME=" + cwLogGroup);
         env.add("AWS_LAMBDA_LOG_STREAM_NAME=" + cwLogStream);
-        if (fn.getHandler() != null && !fn.getHandler().isBlank()) {
-            env.add("_HANDLER=" + fn.getHandler());
+        String handler = handlerFor(fn, image, lifecycle, platform);
+        if (handler != null) {
+            env.add("_HANDLER=" + handler);
         }
         // Region, credentials and the Floci endpoint the SDK should target: the same baseline
         // Floci gives every launched container. When the host ~/.aws is mounted (awsConfigPath),
         // the SDK discovers credentials from /opt/aws-config instead of injected credentials.
         Optional<String> awsConfigPath = config.services().lambda().awsConfigPath()
                 .filter(s -> !s.isBlank());
+        if (node != null && awsConfigPath.isPresent()) {
+            LOG.warnv("floci.services.lambda.aws-config-path is a bind mount and does not apply on the smolvm-pods "
+                    + "node; function {0} gets injected credentials", fn.getFunctionName());
+            awsConfigPath = Optional.empty();
+        }
         if (awsConfigPath.isEmpty()) {
             roleCredentials = executionRoleCredentials.forFunction(fn);
         }
         env.addAll(awsEnv.sdkBaselineEnv(lambdaRegion,
                 awsConfigPath.isPresent() ? Optional.of("/opt/aws-config") : Optional.empty(),
-                awsEnv.flociEndpoint(dockerFlags.dnsServers().isEmpty()), roleCredentials, lambdaAccountId));
+                node != null ? smolvm.flociEndpoint() : awsEnv.flociEndpoint(dockerFlags.dnsServers().isEmpty()),
+                roleCredentials, lambdaAccountId));
         if (fn.getEnvironment() != null) {
             boolean hasExecutionRoleCredentials = roleCredentials.isPresent();
             boolean userDefinesFullCredentialTriad = definesFullCredentialTriad(fn.getEnvironment());
@@ -299,15 +336,23 @@ public class ContainerLauncher implements LambdaRuntimeLauncher {
                 .withName(containerName)
                 .withEnv(env)
                 .withMemoryMb(fn.getMemorySize())
-                .withDockerNetwork(config.services().lambda().dockerNetwork())
-                .withHostDockerInternalOnLinux()
                 .withLogRotation()
                 .withLabels(ContainerStorageHelper.resourceIdentityLabels(
                         "lambda", fn.getFunctionName(), lambdaAccountId, lambdaRegion));
+        // On the node an environment stays on dockerd's default bridge, where the node's DNS and
+        // the node address give it the network of the node's pods.
+        if (node == null) {
+            specBuilder.withDockerNetwork(config.services().lambda().dockerNetwork())
+                    .withHostDockerInternalOnLinux();
+        } else {
+            specBuilder.withLabels(smolvm.ownerLabels());
+        }
 
         applyDockerFlags(specBuilder, dockerFlags);
 
-        specBuilder.withEmbeddedDns();
+        if (node == null) {
+            specBuilder.withEmbeddedDns();
+        }
 
         // Inject extra hosts entries into the container if present. Split on the FIRST
         // colon, mirroring docker --add-host: hostnames cannot contain colons, but IPv6
@@ -328,7 +373,7 @@ public class ContainerLauncher implements LambdaRuntimeLauncher {
         if (fn.isHotReload()) {
             specBuilder.withReadOnlyBind(fn.getHotReloadHostPath(), TASK_DIR);
         } else if (fn.getCodeLocalPath() != null) {
-            useCodeVolume = shouldUseCodeVolume(Path.of(fn.getCodeLocalPath()));
+            useCodeVolume = node == null && shouldUseCodeVolume(Path.of(fn.getCodeLocalPath()));
             if (useCodeVolume) {
                 // Large code: mount /var/task from a read-only volume that is populated ONCE per
                 // code version, instead of tar-copying its code (e.g. ~34k node_modules files) into
@@ -347,7 +392,10 @@ public class ContainerLauncher implements LambdaRuntimeLauncher {
             EmulatorConfig.EfsSharingConfig efsCfg = config.storage().efs();
             fn.getFileSystemConfigs().forEach(fileSystem -> {
                 String volumeName = efsVolumeName(fileSystem.getArn());
-                lifecycleManager.ensureSharedVolume(volumeName,
+                if (node != null) {
+                    smolvm.ensureImage(node, efsCfg.initImage(), null);
+                }
+                lifecycle.ensureSharedVolume(volumeName,
                         efsCfg.ownerUid(), efsCfg.ownerGid(), efsCfg.rootPermissions(),
                         efsCfg.initImage());
                 specBuilder.withNamedVolume(volumeName, fileSystem.getLocalMountPath(), false);
@@ -390,7 +438,10 @@ public class ContainerLauncher implements LambdaRuntimeLauncher {
 
         // Create container without starting — provided.* runtimes exec
         // /var/runtime/bootstrap on start, so code must be copied first.
-        containerId = createContainer(spec, fn, dockerFlags);
+        containerId = createContainer(lifecycle, spec, platform);
+        if (node != null) {
+            nodeContainers.put(containerId, node);
+        }
         LOG.infov("Created container {0} for function {1}", containerId, fn.getFunctionName());
         // Docker now holds the real container-to-volume reference, which removeVolume's own in-use
         // check protects from here on - release the in-flight marker that stood in for it before
@@ -400,7 +451,7 @@ public class ContainerLauncher implements LambdaRuntimeLauncher {
 
         // Copy code into container via Docker API tar stream (works inside Docker too).
         // Hot-reload functions skip the tar-copy — the bind-mount already wires the host path.
-        DockerClient dockerClient = lifecycleManager.getDockerClient();
+        DockerClient dockerClient = lifecycle.getDockerClient();
         if (!fn.isHotReload() && fn.getCodeLocalPath() != null) {
             Path codePath = Path.of(fn.getCodeLocalPath());
 
@@ -448,16 +499,18 @@ public class ContainerLauncher implements LambdaRuntimeLauncher {
         }
 
         // Now start the container with code in place
-        lifecycleManager.startCreated(containerId, spec);
+        lifecycle.startCreated(containerId, spec);
         runtimeApiServer.markContainerStarted();
-        watchForUnexpectedExit(dockerClient, containerId, runtimeApiServer);
+        // Waits and exec output are long streams, which go through the node's streaming client.
+        DockerClient streamingClient = node != null ? node.clients().streaming() : dockerClient;
+        watchForUnexpectedExit(streamingClient, containerId, runtimeApiServer);
 
         // Extensions can log as soon as they start, which is before the container's own log stream
         // is attached below. Create the group/stream up front so those early lines are not dropped
         // by CloudWatch; the call is idempotent, so attach() repeating it is harmless.
         LogDestination logDestination = new LogDestination(
                 lambdaAccountId, cwLogGroup, cwLogStream, lambdaRegion);
-        logStreamer.ensureLogGroupAndStreamForAccount(
+        logs.ensureLogGroupAndStreamForAccount(
                 lambdaAccountId, cwLogGroup, cwLogStream, lambdaRegion);
 
         // Real AWS's runtime interface client discovers and launches every binary under
@@ -466,7 +519,8 @@ public class ContainerLauncher implements LambdaRuntimeLauncher {
         // (e.g. aws-lambda-web-adapter) never start without this. Best-effort: an extension
         // launch failure shouldn't fail the whole container launch, since a function with no
         // extensions is the common case and this must be a no-op for it.
-        launchExtensions(dockerClient, containerId, fn.getFunctionName(), runtimeApiServer, logDestination, provisioned);
+        launchExtensions(dockerClient, streamingClient, logs, containerId, fn.getFunctionName(), runtimeApiServer,
+                logDestination, provisioned);
 
         // Init-readiness barrier: the execs above are detached, so without waiting here the caller
         // could enqueue the first invocation before an extension is ready to receive it — the
@@ -485,7 +539,7 @@ public class ContainerLauncher implements LambdaRuntimeLauncher {
                 LambdaExecutionRoleCredentials.sessionAccountId(fn));
 
         // Attach log streaming
-        Closeable logHandle = logStreamer.attachForAccount(
+        Closeable logHandle = logs.attachForAccount(
                 lambdaAccountId, containerId, cwLogGroup, cwLogStream,
                 lambdaRegion, "lambda:" + fn.getFunctionName());
         handle.setLogStream(logHandle);
@@ -502,10 +556,11 @@ public class ContainerLauncher implements LambdaRuntimeLauncher {
                     fn.getFunctionName(), e.getMessage());
             if (containerId != null) {
                 try {
-                    lifecycleManager.stopAndRemove(containerId, null);
+                    lifecycle.stopAndRemove(containerId, null);
                 } catch (Exception cleanupError) {
                     LOG.warnv(cleanupError, "Could not remove failed Lambda container {0}", containerId);
                 }
+                nodeContainers.remove(containerId);
             }
             if (roleCredentials.isPresent()) {
                 executionRoleCredentials.unregister(
@@ -536,6 +591,19 @@ public class ContainerLauncher implements LambdaRuntimeLauncher {
         }
     }
 
+    /** The smolvm-pods node that the function's environment runs on, or null for Floci's own Docker. */
+    private LambdaSmolvmBackend.Target nodeFor(LambdaFunction fn) {
+        if (smolvm == null || !smolvm.enabled()) {
+            return null;
+        }
+        if (fn.isHotReload()) {
+            throw new RuntimeException("Hot reload needs a bind mount of a host directory, which a Lambda "
+                    + "environment on the smolvm-pods node cannot have (floci.services.lambda.smolvm.enabled)");
+        }
+        return smolvm.target(AwsArnUtils.accountOrDefault(fn.getFunctionArn(), config.defaultAccountId()),
+                extractRegionFromArn(fn.getFunctionArn(), config.defaultRegion()));
+    }
+
     private static Optional<String> dockerPlatform(LambdaFunction fn) {
         List<String> architectures = fn.getArchitectures();
         if (architectures == null) {
@@ -551,19 +619,20 @@ public class ContainerLauncher implements LambdaRuntimeLauncher {
         };
     }
 
-    private String createContainer(ContainerSpec spec, LambdaFunction fn, LambdaDockerFlags dockerFlags) {
+    private String createContainer(ContainerLifecycleManager lifecycle, ContainerSpec spec, String platform) {
+        return platform == null ? lifecycle.create(spec) : lifecycle.create(spec, platform);
+    }
+
+    /** The platform to create the container for, or null for the daemon's own. */
+    private String createPlatform(LambdaFunction fn, LambdaDockerFlags dockerFlags) {
         if (dockerFlags.platform() != null) {
-            return lifecycleManager.create(spec, dockerFlags.platform());
+            return dockerFlags.platform();
         }
         if (!config.services().lambda().honourArchitectures()) {
-            return lifecycleManager.create(spec);
+            return null;
         }
-        Optional<String> platform = dockerPlatform(fn);
-        if (platform.isEmpty()) {
-            throw new IllegalStateException("Invalid persisted architectures "
-                    + fn.getArchitectures() + " for function '" + fn.getFunctionName() + "'");
-        }
-        return lifecycleManager.create(spec, platform.get());
+        return dockerPlatform(fn).orElseThrow(() -> new IllegalStateException("Invalid persisted architectures "
+                + fn.getArchitectures() + " for function '" + fn.getFunctionName() + "'"));
     }
 
     private LambdaDockerFlags configuredDockerFlags() {
@@ -654,8 +723,9 @@ public class ContainerLauncher implements LambdaRuntimeLauncher {
         // that long if it happens to be slow.
         int stopTimeoutSeconds = server.hasRegisteredExtensions() ? 2 : 1;
         try {
-            lifecycleManager.stopAndRemoveStrict(handle.getContainerId(), handle.getLogStream(),
+            lifecycleOf(handle).stopAndRemoveStrict(handle.getContainerId(), handle.getLogStream(),
                     stopTimeoutSeconds);
+            nodeContainers.remove(handle.getContainerId());
         } finally {
             executionRoleCredentials.unregister(
                     handle.getExecutionRoleSessionAccountId(), handle.getExecutionRoleAccessKeyId());
@@ -704,7 +774,19 @@ public class ContainerLauncher implements LambdaRuntimeLauncher {
      * @return true if the container is still running
      */
     public boolean isAlive(ContainerHandle handle) {
-        return lifecycleManager.isContainerRunning(handle.getContainerId());
+        return lifecycleOf(handle).isContainerRunning(handle.getContainerId());
+    }
+
+    /** An environment on the smolvm-pods node is woken and leased for the invocation. */
+    @Override
+    public Hold hold(ContainerHandle handle) {
+        LambdaSmolvmBackend.Target node = nodeContainers.get(handle.getContainerId());
+        return node == null ? () -> { } : smolvm.hold(node, handle.getContainerId(), handle.getFunctionName());
+    }
+
+    private ContainerLifecycleManager lifecycleOf(ContainerHandle handle) {
+        LambdaSmolvmBackend.Target node = nodeContainers.get(handle.getContainerId());
+        return node != null ? node.lifecycle() : lifecycleManager;
     }
 
     // Cap concurrent code-volume POPULATES. Populating a large function's volume creates a helper
@@ -1017,7 +1099,8 @@ public class ContainerLauncher implements LambdaRuntimeLauncher {
         acquirePopulatePermit(fn.getFunctionName());
         String helperId = null;
         try {
-            helperId = createContainer(helperSpec, fn, LambdaDockerFlags.parse(null));
+            helperId = createContainer(lifecycleManager, helperSpec,
+                    createPlatform(fn, LambdaDockerFlags.parse(null)));
             lifecycleManager.startCreated(helperId, helperSpec);
             copyDirToContainerStrict(lifecycleManager.getDockerClient(), helperId,
                     Path.of(fn.getCodeLocalPath()), TASK_DIR, fn.getFunctionName());
@@ -1267,6 +1350,30 @@ public class ContainerLauncher implements LambdaRuntimeLauncher {
     static final int COPY_MAX_ATTEMPTS = 6;
     static final long COPY_RETRY_BACKOFF_MS = 500L;
 
+    /**
+     * The handler that the runtime reads from {@code _HANDLER}. A Zip function names it. An Image function names none:
+     * AWS sets it from the function's command, which is {@code ImageConfig.Command} when that is set and otherwise the
+     * image's own CMD. A runtime interface client such as aws-lambda-ric stops at start when it is missing.
+     */
+    private String handlerFor(LambdaFunction fn, String image, ContainerLifecycleManager lifecycle,
+                              String platform) {
+        if (fn.getHandler() != null && !fn.getHandler().isBlank()) {
+            return fn.getHandler();
+        }
+        if (!"Image".equals(fn.getPackageType())) {
+            return null;
+        }
+        List<String> command = fn.getImageConfigCommand();
+        if (command == null || command.isEmpty()) {
+            String resolvedImage = containerBuilder.resolveImage(image);
+            command = lifecycle.imageCommand(resolvedImage, platform);
+        }
+        if (command == null || command.isEmpty() || command.get(0) == null || command.get(0).isBlank()) {
+            return null;
+        }
+        return command.get(0);
+    }
+
     private void copyDirToContainer(DockerClient dockerClient, String containerId,
                                     Path sourceDir, String remotePath, String functionName) {
         copyDirToContainer(dockerClient, containerId, sourceDir, remotePath, functionName,
@@ -1407,7 +1514,8 @@ public class ContainerLauncher implements LambdaRuntimeLauncher {
         LambdaExitWatcher.watch(dockerClient, containerId, runtimeApiServer::handleRuntimeProcessExited);
     }
 
-    private void launchExtensions(DockerClient dockerClient, String containerId, String functionName,
+    private void launchExtensions(DockerClient dockerClient, DockerClient streamingClient, ContainerLogStreamer logs,
+                                  String containerId, String functionName,
                                   RuntimeApiServer runtimeApiServer, LogDestination logDestination, boolean strict) {
         List<String> extensionNames = listExtensionBinaries(dockerClient, containerId, functionName, strict);
         // Arm the readiness barrier before starting any extension process, so the latch already
@@ -1431,7 +1539,7 @@ public class ContainerLauncher implements LambdaRuntimeLauncher {
                 // the container log and an observability extension's output would vanish entirely.
                 // Draining is also required in its own right — an unread exec pipe fills up and
                 // stalls the extension process.
-                dockerClient.execStartCmd(execId).exec(logStreamer.execLogCallbackForAccount(
+                streamingClient.execStartCmd(execId).exec(logs.execLogCallbackForAccount(
                         logDestination.accountId(), logDestination.logGroup(), logDestination.logStream(),
                         logDestination.region(),
                         "lambda:" + functionName + ":" + name));

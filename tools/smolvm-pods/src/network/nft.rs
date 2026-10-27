@@ -1,7 +1,8 @@
 //! The node's nftables table, `inet floci`, written whole with `nft -f`
 //! whenever the profile changes.
 //!
-//! Pods reach the node address on `cni0`. There, DNS goes to the forwarder,
+//! Pods reach the node address on `cni0`, and Docker containers on `docker0`,
+//! dockerd's default bridge. There, DNS goes to the forwarder,
 //! Floci's ports to Floci on the Floci host (the gateway, then masquerade),
 //! routed origins' ports to the relay, and anything else to the sinkhole.
 //! Under isolation, pods reach only the cluster, Floci, the endpoints and the
@@ -13,6 +14,9 @@ use std::process::{Command, Stdio};
 
 use super::profile::{AllowProtocol, Checked, Cidr, Ports};
 use super::{DNS_PORT, RELAY_PORT, SINK_PORT};
+
+/// What a chain for pods' traffic skips: everything not from a pod bridge.
+const NOT_FROM_PODS: &str = "    iifname != { \"cni0\", \"docker0\" } return\n";
 
 /// Where Floci listens, from the node.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -30,10 +34,14 @@ pub struct Node {
     pub floci: FlociHost,
     /// The interface of the default route.
     pub iface: String,
+    /// k3s's cluster and Service CIDRs, and dockerd's default bridge.
     pub cluster: Vec<Cidr>,
     /// The node's ports that pods may reach under isolation besides DNS, the
     /// relay and the sinkhole: the API server and kubelet.
     pub node_ports: Vec<u16>,
+    /// The node's own IPv4 addresses on `iface`, at which pods reach
+    /// `node_ports`: kubelet's InternalIP, which metrics-server scrapes.
+    pub own: Vec<Ipv4Addr>,
 }
 
 fn set(out: &mut String, name: &str, kind: &str, elements: &[String]) {
@@ -130,7 +138,7 @@ pub fn render(node: &Node, profile: &Checked, isolation: bool) -> String {
     set(&mut t, "host_ports", "inet_service", &ports(&host));
 
     t.push_str("  chain pods_nat {\n    type nat hook prerouting priority -90;\n");
-    t.push_str("    iifname != \"cni0\" return\n");
+    t.push_str(NOT_FROM_PODS);
     for e in &profile.profile.endpoints {
         let _ = writeln!(
             t,
@@ -156,6 +164,23 @@ pub fn render(node: &Node, profile: &Checked, isolation: bool) -> String {
     );
     if isolation {
         t.push_str("    ip daddr @cluster4 return\n");
+        // The node's own address is not in the cluster, and pods_input lets
+        // pods reach node_ports there: without this the sinkhole had them.
+        if !node.own.is_empty() && !node.node_ports.is_empty() {
+            let own = node
+                .own
+                .iter()
+                .map(Ipv4Addr::to_string)
+                .collect::<Vec<_>>()
+                .join(", ");
+            let list = node
+                .node_ports
+                .iter()
+                .map(u16::to_string)
+                .collect::<Vec<_>>()
+                .join(", ");
+            let _ = writeln!(t, "    ip daddr {{ {own} }} tcp dport {{ {list} }} return");
+        }
         if let Some(gw) = gateway {
             let _ = writeln!(t, "    ip daddr {gw} tcp dport @floci_ports return");
         }
@@ -195,7 +220,7 @@ pub fn render(node: &Node, profile: &Checked, isolation: bool) -> String {
 
     if isolation {
         t.push_str("  chain pods_forward {\n    type filter hook forward priority -10;\n");
-        t.push_str("    iifname != \"cni0\" return\n");
+        t.push_str(NOT_FROM_PODS);
         t.push_str("    ct state established,related accept\n");
         t.push_str("    ip daddr @cluster4 accept\n");
         if let Some(gw) = gateway {
@@ -208,7 +233,7 @@ pub fn render(node: &Node, profile: &Checked, isolation: bool) -> String {
     }
 
     t.push_str("  chain pods_input {\n    type filter hook input priority -10;\n");
-    t.push_str("    iifname != \"cni0\" return\n");
+    t.push_str(NOT_FROM_PODS);
     t.push_str("    ct state established,related accept\n");
     let _ = writeln!(
         t,
@@ -257,13 +282,13 @@ pub fn boot(node: &Node) -> String {
     t.push_str("add table inet floci\ndelete table inet floci\ntable inet floci {\n");
     set(&mut t, "cluster4", "ipv4_addr", &cluster);
     t.push_str("  chain pods_forward {\n    type filter hook forward priority -10;\n");
-    t.push_str("    iifname != \"cni0\" return\n");
+    t.push_str(NOT_FROM_PODS);
     t.push_str("    ct state established,related accept\n");
     t.push_str("    ip daddr @cluster4 accept\n");
     t.push_str("    counter drop\n  }\n");
     let addr = node.address;
     t.push_str("  chain pods_nat {\n    type nat hook prerouting priority -90;\n");
-    t.push_str("    iifname != \"cni0\" return\n");
+    t.push_str(NOT_FROM_PODS);
     let _ = writeln!(
         t,
         "    ip daddr {addr} meta l4proto {{ tcp, udp }} th dport 53 dnat ip to {addr}:{DNS_PORT}"
@@ -276,7 +301,7 @@ pub fn boot(node: &Node) -> String {
     );
     t.push_str("  }\n");
     t.push_str("  chain pods_input {\n    type filter hook input priority -10;\n");
-    t.push_str("    iifname != \"cni0\" return\n");
+    t.push_str(NOT_FROM_PODS);
     t.push_str("    ct state established,related accept\n");
     let _ = writeln!(
         t,
@@ -302,7 +327,7 @@ pub fn dns_only(node: &Node) -> String {
     let mut t = String::new();
     t.push_str("add table inet floci\ndelete table inet floci\ntable inet floci {\n");
     t.push_str("  chain pods_nat {\n    type nat hook prerouting priority -90;\n");
-    t.push_str("    iifname != \"cni0\" return\n");
+    t.push_str(NOT_FROM_PODS);
     let _ = writeln!(
         t,
         "    ip daddr {addr} meta l4proto {{ tcp, udp }} th dport 53 dnat ip to {addr}:{DNS_PORT}"
@@ -315,7 +340,7 @@ pub fn dns_only(node: &Node) -> String {
     );
     t.push_str("  }\n");
     t.push_str("  chain pods_input {\n    type filter hook input priority -10;\n");
-    t.push_str("    iifname != \"cni0\" return\n");
+    t.push_str(NOT_FROM_PODS);
     t.push_str("    ip daddr 127.0.0.0/8 counter drop\n  }\n}\n");
     t
 }
@@ -370,7 +395,24 @@ mod tests {
                 Cidr::parse("10.100.0.0/16").unwrap(),
             ],
             node_ports: vec![6443, 10250],
+            own: vec!["100.96.0.2".parse().unwrap()],
         }
+    }
+
+    #[test]
+    fn isolated_pods_reach_kubelet_at_the_nodes_own_address() {
+        let t = render(&mac(), &checked(true), true);
+        let nat = &t[t.find("chain pods_nat").unwrap()..];
+        let nat = &nat[..nat.find("  }\n").unwrap()];
+        let own = nat
+            .find("    ip daddr { 100.96.0.2 } tcp dport { 6443, 10250 } return\n")
+            .unwrap_or_else(|| panic!("{nat}"));
+        let sink = nat
+            .rfind("    meta l4proto { tcp, udp } dnat ip to 169.254.53.1:7072\n")
+            .unwrap();
+        assert!(own < sink, "the sinkhole comes first:\n{nat}");
+        let open = render(&mac(), &checked(false), false);
+        assert!(!open.contains("ip daddr { 100.96.0.2 }"), "{open}");
     }
 
     #[test]
@@ -394,6 +436,21 @@ mod tests {
         assert!(!t.contains("pods_forward"), "{t}");
         assert!(!t.contains("node_output"), "{t}");
         assert!(!t.contains("ip daddr @cluster4 return"), "{t}");
+    }
+
+    #[test]
+    fn docker_containers_get_the_network_of_pods() {
+        for t in [
+            render(&mac(), &checked(true), true),
+            boot(&mac()),
+            dns_only(&mac()),
+        ] {
+            assert!(!t.contains("iifname != \"cni0\""), "{t}");
+            assert!(
+                t.contains("    iifname != { \"cni0\", \"docker0\" } return\n"),
+                "{t}"
+            );
+        }
     }
 
     #[test]

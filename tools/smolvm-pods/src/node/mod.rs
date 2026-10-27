@@ -216,6 +216,14 @@ impl VmOps for MockVms {
         })
     }
 
+    fn freeze(&self, _machine: &str) -> Result<u32, String> {
+        Ok(0)
+    }
+
+    fn thaw(&self, _machine: &str) -> Result<(), String> {
+        Ok(())
+    }
+
     fn signal(
         &self,
         machine: &str,
@@ -459,11 +467,19 @@ mod tests {
     const MEASURE: &str = "SMOLVM_PODS_TEST_ALLOCATOR";
 
     fn resident_kib() -> u64 {
-        let statm = std::fs::read_to_string("/proc/self/statm").unwrap();
-        let pages: u64 = statm.split_whitespace().nth(1).unwrap().parse().unwrap();
-        // SAFETY: sysconf has no preconditions.
-        let page = unsafe { libc::sysconf(libc::_SC_PAGESIZE) };
-        pages * page as u64 / 1024
+        // statm batches RSS accounting, so a sub-MiB assertion needs the
+        // page-table snapshot rather than its approximate counters.
+        let rollup = std::fs::read_to_string("/proc/self/smaps_rollup").unwrap();
+        rollup
+            .lines()
+            .find_map(|line| {
+                line.strip_prefix("Rss:")?
+                    .split_whitespace()
+                    .next()?
+                    .parse()
+                    .ok()
+            })
+            .expect("smaps_rollup has an Rss field")
     }
 
     /// Allocates a block of `kib` KiB, writes to all of it, and frees it.
@@ -480,9 +496,13 @@ mod tests {
     /// the test measures in a process of its own.
     #[test]
     fn a_freed_block_of_a_few_mib_leaves_no_resident_memory() {
-        if std::env::var_os(MEASURE).is_some() {
-            tune_allocator();
+        if let Ok(mode) = std::env::var(MEASURE) {
+            if mode == "tuned" {
+                tune_allocator();
+            }
             let grew = std::thread::spawn(|| {
+                // Warm the measurement itself before taking either snapshot.
+                resident_kib();
                 use_block(4096);
                 let before = resident_kib();
                 use_block(4096);
@@ -491,20 +511,26 @@ mod tests {
             println!("resident growth: {} KiB", grew.join().unwrap());
             return;
         }
+        let tuned = measure_growth("tuned");
+        assert!(tuned < 1024, "the resident set grew by {tuned} KiB");
+        let untuned = measure_growth("untuned");
+        assert!(untuned >= 3072, "the control retained only {untuned} KiB");
+    }
+
+    fn measure_growth(mode: &str) -> u64 {
         let name = "node::tests::a_freed_block_of_a_few_mib_leaves_no_resident_memory";
         let out = std::process::Command::new(std::env::current_exe().unwrap())
             .args(["--exact", name, "--nocapture", "--test-threads=1"])
-            .env(MEASURE, "1")
+            .env(MEASURE, mode)
             .output()
             .unwrap();
         let stdout = String::from_utf8_lossy(&out.stdout);
         let stderr = String::from_utf8_lossy(&out.stderr);
         assert!(out.status.success(), "{stdout}{stderr}");
-        let grew: u64 = stdout
+        stdout
             .lines()
             .find_map(|line| line.split("resident growth: ").nth(1)?.strip_suffix(" KiB"))
             .and_then(|kib| kib.parse().ok())
-            .unwrap_or_else(|| panic!("no measure in {stdout}{stderr}"));
-        assert!(grew < 1024, "the resident set grew by {grew} KiB");
+            .unwrap_or_else(|| panic!("no measure in {stdout}{stderr}"))
     }
 }

@@ -35,7 +35,7 @@ packages=(
     pkg-config=1.8.1-1
 )
 # The unit tests of the patches, and of the code they change.
-tests='read_memory_image mapped_memory_image sparse_memory_image test_load_guest_memory promotion_from_backing snapshot::delta'
+tests='read_memory_image mapped_memory_image sparse_memory_image test_load_guest_memory promotion_from_backing snapshot::delta aarch64_vcpu_state_carries_its_counter_anchor'
 
 # Runs in the container: /src/libkrun is the patched checkout, /out the output
 # dir. The library records the source and registry paths, so they stay fixed.

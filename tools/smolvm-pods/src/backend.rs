@@ -79,6 +79,9 @@ pub fn now_ns() -> i64 {
 pub struct StatsSample {
     pub cpu_usage_ns: u64,
     pub memory_bytes: u64,
+    /// Set by the node from the sandbox's durable identity. Old nodes omit it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub memory_limit_bytes: Option<u64>,
 }
 
 /// Resolves when the process exits. The node service's exit watcher

@@ -44,11 +44,12 @@ use super::Backends;
 use crate::activity::Flow;
 use crate::backend::{now_ns, Adopted, AgentStats, PodBackend, ProcessSpec};
 use crate::bundle;
+use crate::engine::sandbox_memory;
 use crate::lifecycle::{
-    cpu_threshold, cpu_window, hibernation_disabled, idle_timeout, wakes_on_terminate, Activity,
-    AwakeCause, Config, ExecRecord, ExecStatus, Hooks, KillOutcome, KillRequest, Lifecycle,
-    LifecycleError, PodIdentity, PodInfo, PodRef, PodState, Reason, StdioPaths, TaskKind,
-    TaskRecord, VmExit, VmProcess,
+    cpu_threshold, cpu_window, hibernation_disabled, idle_timeout, keeps_connections,
+    wakes_on_terminate, Activity, AwakeCause, Config, ExecRecord, ExecStatus, Hooks, KillOutcome,
+    KillRequest, Lifecycle, LifecycleError, PodIdentity, PodInfo, PodRef, PodState, Reason,
+    StdioPaths, TaskKind, TaskRecord, VmExit, VmProcess,
 };
 use crate::metrics::Text;
 use crate::probe::{self, CachedAnswer, ExecCommand, OutputCapture, ProbeExec};
@@ -929,14 +930,23 @@ impl Node {
             Op::Stats { pod, id } => {
                 let pod = self.pod(&pod)?;
                 pod.require_vm()?;
+                let memory_mib = self
+                    .inner
+                    .lifecycle
+                    .get(&PodRef::sandbox(&pod.id))
+                    .and_then(|info| info.identity.memory_mib)
+                    .unwrap_or(crate::engine::DEFAULT_SANDBOX_MEMORY_MIB);
                 // While the pod sleeps: memory 0, and the front shim keeps
                 // the CPU total, which never goes back.
-                if !self.is_awake(&pod.id) {
+                let mut sample = if !self.is_awake(&pod.id) {
                     let container = id != pod.id || pod.standalone;
-                    let sample = container.then_some(StatsSample::default());
-                    return Ok(Reply::Stats { sample });
+                    container.then_some(StatsSample::default())
+                } else {
+                    pod.backend.stats(&id).await.map_err(unknown)?
+                };
+                if let Some(sample) = &mut sample {
+                    sample.memory_limit_bytes = Some(u64::from(memory_mib) * 1024 * 1024);
                 }
-                let sample = pod.backend.stats(&id).await.map_err(unknown)?;
                 Ok(Reply::Stats { sample })
             }
             Op::DropSandbox { pod, netns } => self.drop_sandbox(&pod, netns).await,
@@ -2083,6 +2093,14 @@ fn pod_identity(
         warn!("pod sandbox {id} gets the node's CPU window: {e}");
         None
     });
+    let memory = sandbox_memory(spec.as_ref());
+    for warning in &memory.warnings {
+        warn!("pod sandbox {id}: {warning}");
+    }
+    let keep_connections = keeps_connections(spec.as_ref()).unwrap_or_else(|e| {
+        warn!("pod sandbox {id} resets its connections at a pause: {e}");
+        false
+    });
     PodIdentity {
         sandbox_id: id.to_string(),
         namespace: annotation(ANN_POD_NAMESPACE),
@@ -2090,8 +2108,10 @@ fn pod_identity(
         uid: annotation(ANN_POD_UID),
         machine: id.to_string(),
         netns,
+        memory_mib: Some(memory.mib),
         hibernate_disabled: hibernation_disabled(spec.as_ref(), standalone),
         wake_on_terminate: wakes_on_terminate(spec.as_ref()),
+        keep_connections,
         idle_timeout_ms: idle.map(|t| t.as_millis() as u64),
         cpu_threshold_milli: cpu_threshold,
         cpu_window_ms: cpu_window.map(|t| t.as_millis() as u64),

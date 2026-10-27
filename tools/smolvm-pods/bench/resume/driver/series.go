@@ -170,6 +170,13 @@ func (d *driver) pause(cr record, last *diskStat) (*diskStat, error) {
 		cr["disk_background_bytes"] = (before.sectors - woke.sectors) * 512
 		cr["disk_background_s"] = before.at.Sub(woke.at).Seconds()
 	}
+	if d.workload == "memhold" {
+		skew, err := d.guestClock()
+		if err != nil {
+			return nil, err
+		}
+		cr["guest_clock_before_pause_ms"] = skew
+	}
 	cr["pause_start_epoch"] = float64(time.Now().UnixNano()) / 1e9
 	t := time.Now()
 	ms, value, err := d.lib.callMS("pause " + d.name)
@@ -240,6 +247,11 @@ func (d *driver) wake(cr record, cycle int) error {
 	}
 	cr["hash_ok"] = v["ok"] == true
 	cr["verify_ms"] = v["ms"]
+	skew, err := d.guestClock()
+	if err != nil {
+		return err
+	}
+	cr["guest_clock_ms"] = skew
 	if v["ok"] != true {
 		cr["sha256"], cr["expected"] = v["sha256"], v["expected"]
 		log.Printf("cycle %d: memory differs after resume: %v, expected %v", cycle, v["sha256"], v["expected"])

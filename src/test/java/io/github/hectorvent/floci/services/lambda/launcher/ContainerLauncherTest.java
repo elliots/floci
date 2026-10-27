@@ -116,12 +116,12 @@ class ContainerLauncherTest {
 
         when(config.services()).thenReturn(services);
         when(services.lambda()).thenReturn(lambda);
-        when(lambda.dockerNetwork()).thenReturn(Optional.empty());
+        lenient().when(lambda.dockerNetwork()).thenReturn(Optional.empty());
         lenient().when(lambda.extraHosts()).thenReturn(Optional.empty());
         lenient().when(lambda.awsConfigPath()).thenReturn(Optional.empty());
         when(config.docker()).thenReturn(docker);
-        when(docker.logMaxSize()).thenReturn("10m");
-        when(docker.logMaxFile()).thenReturn("3");
+        lenient().when(docker.logMaxSize()).thenReturn("10m");
+        lenient().when(docker.logMaxFile()).thenReturn("3");
         lenient().when(config.baseUrl()).thenReturn("http://localhost:4566");
         lenient().when(config.port()).thenReturn(4566);
         lenient().when(config.tls()).thenReturn(mock(EmulatorConfig.TlsConfig.class));
@@ -139,7 +139,7 @@ class ContainerLauncherTest {
         lenient().when(efs.mountUser()).thenReturn(Optional.empty());
         lenient().when(efs.mountGroupAdd()).thenReturn(OptionalInt.empty());
 
-        when(embeddedDnsServer.getServerIp()).thenReturn(Optional.empty());
+        lenient().when(embeddedDnsServer.getServerIp()).thenReturn(Optional.empty());
         // Default: pass images through unchanged, matching the real EcrRegistryManager's
         // behavior for non-ECR-shaped images. Individual ECR-rewrite tests override this.
         lenient().when(ecrRegistryManager.rewriteImageUri(any()))
@@ -566,7 +566,7 @@ class ContainerLauncherTest {
 
     @Test
     void launchFunction_usesEmbeddedDnsEndpointWithoutExplicitResolvers() throws Exception {
-        when(embeddedDnsServer.getServerIp()).thenReturn(Optional.of("172.18.0.4"));
+        lenient().when(embeddedDnsServer.getServerIp()).thenReturn(Optional.of("172.18.0.4"));
         when(config.dns()).thenReturn(mock(EmulatorConfig.DnsConfig.class));
         Path codePath = Files.createDirectory(tempDir.resolve("embedded-dns-code"));
 
@@ -988,6 +988,60 @@ class ContainerLauncherTest {
         assertEquals(1, env.stream().filter(e -> e.startsWith("AWS_SECRET_ACCESS_KEY=")).count());
         assertEquals(1, env.stream().filter(e -> e.startsWith("AWS_SESSION_TOKEN=")).count(),
                 "execution-role session token should appear exactly once");
+    }
+
+    private void stubImageCmd(String image, String... cmd) {
+        lenient().when(lifecycleManager.imageCommand(eq(image), any())).thenReturn(List.of(cmd));
+    }
+
+    private static List<String> handlerEnv(ContainerSpec spec) {
+        return spec.env().stream().filter(value -> value.startsWith("_HANDLER=")).toList();
+    }
+
+    // AWS sets _HANDLER for a container image function from its command; aws-lambda-ric stops at start without it.
+    @Test
+    void launchImageFunction_setsTheHandlerFromTheImageCmd() {
+        LambdaFunction fn = new LambdaFunction();
+        fn.setFunctionName("image-handler-fn");
+        fn.setPackageType("Image");
+        fn.setImageUri("localhost:5001/dispatch:1");
+        when(ecrRegistryManager.rewriteImageUri("localhost:5001/dispatch:1")).thenReturn("localhost:5001/dispatch:1");
+        stubImageCmd("localhost:5001/dispatch:1", "index.handler");
+
+        launcher.launch(fn);
+
+        assertEquals(List.of("_HANDLER=index.handler"), handlerEnv(captureRealContainerSpec()));
+    }
+
+    @Test
+    void launchImageFunction_setsTheHandlerFromImageConfigCommandBeforeTheImageCmd() {
+        LambdaFunction fn = new LambdaFunction();
+        fn.setFunctionName("image-config-handler-fn");
+        fn.setPackageType("Image");
+        fn.setImageUri("localhost:5001/dispatch:1");
+        fn.setImageConfigCommand(List.of("app.handler"));
+        when(ecrRegistryManager.rewriteImageUri("localhost:5001/dispatch:1")).thenReturn("localhost:5001/dispatch:1");
+        stubImageCmd("localhost:5001/dispatch:1", "index.handler");
+
+        launcher.launch(fn);
+
+        assertEquals(List.of("_HANDLER=app.handler"), handlerEnv(captureRealContainerSpec()));
+    }
+
+    @Test
+    void launchImageFunction_failsBeforeCreatingWhenTheImageCannotBePrepared() {
+        LambdaFunction fn = new LambdaFunction();
+        fn.setFunctionName("image-no-handler-fn");
+        fn.setPackageType("Image");
+        fn.setImageUri("localhost:5001/missing:1");
+        when(ecrRegistryManager.rewriteImageUri("localhost:5001/missing:1")).thenReturn("localhost:5001/missing:1");
+        when(lifecycleManager.imageCommand(eq("localhost:5001/missing:1"), any()))
+                .thenThrow(new NotFoundException("no such image"));
+
+        assertThrows(NotFoundException.class, () -> launcher.launch(fn));
+
+        verify(lifecycleManager, never()).create(any());
+        verify(runtimeApiServer).stop();
     }
 
     @Test

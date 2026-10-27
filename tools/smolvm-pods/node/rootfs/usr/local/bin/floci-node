@@ -41,6 +41,9 @@ containerd_socket=/run/k3s/containerd/containerd.sock
 docker_data=/var/lib/smolvm/docker
 docker_socket=/run/docker.sock
 docker_log=/var/log/dockerd.log
+# dockerd's default bridge, whose containers the node service's table treats as
+# pods (src/network/mod.rs, DOCKER_CIDR).
+docker_bridge=172.17.0.1/16
 # The cgroup of the node service and the pod VMs, beside kubelet's kubepods.
 runtime_cgroup=/sys/fs/cgroup/smolvm-pods
 # The files of the capacity view that k3s's namespace binds over the real ones.
@@ -194,8 +197,10 @@ setup_node_network() {
     printf 'nameserver %s\n' "$node_address" >"$pod_resolv"
     mkdir -p "${network_dropin%/*}"
     printf 'resolv-conf: %s\n' "$pod_resolv" >"$network_dropin"
+    # A valid image-owned symlink is preserved when smolvm prepares an
+    # interactive exec. A regular file would be reset to the guest gateway.
     rm -f /etc/resolv.conf
-    printf 'nameserver %s\n' "$node_address" >/etc/resolv.conf
+    ln -s "$pod_resolv" /etc/resolv.conf
     if ! smolvm-pods _network-boot; then
         log "warning: the node address and its table are not set up; pods have no DNS" \
             "until the node service starts its network"
@@ -882,7 +887,10 @@ supervise_node_service() {
 # after it exits. It waits for containerd's socket, which k3s makes, and keeps
 # its data on the storage disk. Its default runtime is runc; a container runs
 # in a pod VM only when it names the runtime io.containerd.smolvm-pods.v2
-# (node/README.md, "Docker").
+# (node/README.md, "Docker"). Its containers resolve through the node address,
+# as pods do: dockerd would otherwise copy the node's /etc/resolv.conf into
+# each container when it creates it, and that file can name smolvm's resolver,
+# which answers no name on an isolated node.
 supervise_dockerd() {
     local pid='' stopping=0 status
     trap 'stopping=1; if [ -n "$pid" ]; then kill -TERM "$pid" 2>/dev/null || true; fi' TERM
@@ -896,6 +904,7 @@ supervise_dockerd() {
         fi
         log "starting dockerd on $containerd_socket, logging to $docker_log"
         dockerd --containerd="$containerd_socket" --data-root "$docker_data" \
+            --bip "$docker_bridge" --dns "$node_address" \
             --host "unix://$docker_socket" >>"$docker_log" 2>&1 &
         pid=$!
         while :; do

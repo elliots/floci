@@ -6,6 +6,7 @@ import com.fasterxml.jackson.databind.node.ArrayNode;
 import com.fasterxml.jackson.databind.node.ObjectNode;
 import io.github.hectorvent.floci.core.common.AwsErrorResponse;
 import io.github.hectorvent.floci.core.common.AwsException;
+import io.github.hectorvent.floci.core.common.ClientConnection;
 import io.github.hectorvent.floci.core.common.PaginatedResult;
 import io.github.hectorvent.floci.services.sqs.model.Message;
 import io.github.hectorvent.floci.services.sqs.model.MessageAttributeValue;
@@ -31,11 +32,13 @@ public class SqsJsonHandler {
 
     private final SqsService sqsService;
     private final ObjectMapper objectMapper;
+    private final ClientConnection clientConnection;
 
     @Inject
-    public SqsJsonHandler(SqsService sqsService, ObjectMapper objectMapper) {
+    public SqsJsonHandler(SqsService sqsService, ObjectMapper objectMapper, ClientConnection clientConnection) {
         this.sqsService = sqsService;
         this.objectMapper = objectMapper;
+        this.clientConnection = clientConnection;
     }
 
     public Response handle(String action, JsonNode request, String region) throws Exception {
@@ -269,7 +272,7 @@ public class SqsJsonHandler {
         Set<String> requestedMessageAttrs = new LinkedHashSet<>(jsonNodeToList(request.path("MessageAttributeNames")));
 
         List<Message> messages = sqsService.receiveMessage(queueUrl, maxMessages,
-                visibilityTimeout, waitTimeSeconds, region);
+                visibilityTimeout, waitTimeSeconds, region, clientConnection.closedCheck());
         String defaultSenderId = sqsService.senderIdFor(queueUrl);
 
         ObjectNode response = objectMapper.createObjectNode();

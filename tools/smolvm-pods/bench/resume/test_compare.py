@@ -54,6 +54,22 @@ class CompareTest(unittest.TestCase):
         self.write("saves-off", {"memhold-idle": series("off", FULL),
                                  "memhold-all": series("off", FULL)})
 
+    def test_a_guest_clock_off_the_node_fails(self):
+        rec = series("on", 10 * MIB2)
+        for c in rec["cycles"]:
+            c["guest_clock_before_pause_ms"] = -2.0
+            if c["cycle"] > 0:
+                c["guest_clock_ms"] = -2.5
+        self.write("good", {"memhold-idle": rec})
+        status, out = self.run_compare("good", "--workloads", "idle")
+        self.assertEqual(status, 0, out)
+        self.assertIn("| guest clock less the node's, ms, median / largest by size | -2.0 / -2.5 |", out)
+        rec["cycles"][2]["guest_clock_ms"] = 31.0
+        self.write("bad", {"memhold-idle": rec})
+        status, out = self.run_compare("bad", "--workloads", "idle")
+        self.assertEqual(status, 1, out)
+        self.assertIn("the guest clock was 1 times more than 20 ms from the node's (largest 31.0 ms)", out)
+
     def test_a_good_pair_passes_with_a_table_per_workload(self):
         self.good_pair()
         status, out = self.run_compare("saves-on", "saves-off")

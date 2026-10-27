@@ -404,6 +404,11 @@ public class RuntimeApiServer {
         // Uses a reactive pattern (no thread held while waiting) to avoid Vert.x worker pool
         // exhaustion when many warm containers poll concurrently.
         router.get(NEXT_PATH).handler(ctx -> {
+            ctx.response().closeHandler(ignored -> {
+                synchronized (lock) {
+                    waitingContexts.remove(ctx);
+                }
+            });
             PendingInvocation toDispatch = null;
             boolean faultedNow = false;
             synchronized (lock) {
@@ -853,6 +858,10 @@ public class RuntimeApiServer {
             }
             if (!rejected) {
                 waitingCtxForInvocation = waitingContexts.poll();
+                while (waitingCtxForInvocation != null
+                        && (waitingCtxForInvocation.response().closed() || waitingCtxForInvocation.response().ended())) {
+                    waitingCtxForInvocation = waitingContexts.poll();
+                }
                 if (waitingCtxForInvocation == null) {
                     pendingQueue.offer(invocation);
                 } else {
@@ -879,12 +888,12 @@ public class RuntimeApiServer {
                 // this deferred dispatch reaching the event loop:
                 //   1. quiesce() may have run — atomic with clearing inFlight and
                 //      completing the caller's future with ContainerStopped. Skip.
-                //   2. The parked client may have disconnected — the ctx is ended and
+                //   2. The parked client may have disconnected: the response is closed or ended and
                 //      writing to it would fail. Requeue for the next /next poller
                 //      and drop this stale inFlight entry (the next poller will re-put
                 //      the invocation into inFlight under its own lock).
                 //
-                // Read waitingCtx.response().ended() ONCE, under the lock, so the
+                // Check whether the response is closed or ended once, under the lock, so the
                 // dispatch/requeue decision is committed atomically. Reading it a
                 // second time outside the lock (as the code did previously) let a
                 // disconnect between the two reads produce a stranded inFlight entry:
@@ -895,7 +904,7 @@ public class RuntimeApiServer {
                     if (stopped) {
                         return;
                     }
-                    if (waitingCtx.response().ended()) {
+                    if (waitingCtx.response().closed() || waitingCtx.response().ended()) {
                         pendingQueue.offer(invocation);
                         inFlight.remove(invocation.getRequestId());
                         shouldDispatch = false;

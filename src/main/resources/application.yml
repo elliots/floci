@@ -509,6 +509,9 @@ floci:
       #     - team=platform
       #   floci-address:                      # Host/IP pods use to reach Floci; auto-detected in-cluster
       #   init-image: busybox:1.36            # Init container image (needs sh, wget, unzip)
+      smolvm:
+        enabled: false                        # FLOCI_SERVICES_LAMBDA_SMOLVM_ENABLED; run every Lambda environment as a microVM on the smolvm-pods node (floci.runtime.node) that sleeps between invocations
+        idle-timeout: ""                      # FLOCI_SERVICES_LAMBDA_SMOLVM_IDLE_TIMEOUT; how long an environment has no invocation before it sleeps, such as 1m; empty takes the node's
       hot-reload:
         enabled: false
       reactive-s3-sync:

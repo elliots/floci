@@ -157,34 +157,28 @@ impl ClockSample {
 }
 
 /// Checks that the guest's monotonic clock advanced between `before` and
-/// `after` by the time the guest ran, within `tolerance` ns. The guest was
-/// frozen at most from the start of the hibernate call to the end of the
-/// wake call, and at least from the end of the hibernate call to the start
-/// of the wake call: `hibernate` and `wake` are those calls' start and end on
-/// the node's monotonic clock. Returns the guest's advance and the range it
-/// had to be in.
+/// `after` by the node's time between them, within `tolerance` ns: a guest's
+/// clocks move on while it sleeps, as the node's do. The node's time between
+/// the samples is at least from the end of the first to the start of the
+/// second, and at most from the start of the one to the end of the other.
+/// Returns the guest's advance and the range it had to be in.
 pub fn check_monotonic(
     before: &ClockSample,
     after: &ClockSample,
-    hibernate: (i64, i64),
-    wake: (i64, i64),
     tolerance: i64,
 ) -> Result<String, String> {
     let advance = after.guest_monotonic - before.guest_monotonic;
     let elapsed_min = after.node_monotonic.0 - before.node_monotonic.1;
     let elapsed_max = after.node_monotonic.1 - before.node_monotonic.0;
-    let frozen_min = wake.0 - hibernate.1;
-    let frozen_max = wake.1 - hibernate.0;
-    let low = elapsed_min - frozen_max - tolerance;
-    let high = elapsed_max - frozen_min + tolerance;
+    let low = elapsed_min - tolerance;
+    let high = elapsed_max + tolerance;
     let ms = |ns: i64| ns as f64 / 1e6;
     let summary = format!(
-        "the guest's monotonic clock advanced {:.1} ms while the node's advanced {:.1} ms, \
-         and the guest was frozen for {:.1} to {:.1} ms; expected {:.1} to {:.1} ms",
+        "the guest's monotonic clock advanced {:.1} ms while the node's advanced {:.1} to \
+         {:.1} ms; expected {:.1} to {:.1} ms",
         ms(advance),
         ms(elapsed_min),
-        ms(frozen_min),
-        ms(frozen_max),
+        ms(elapsed_max),
         ms(low),
         ms(high)
     );
@@ -324,27 +318,21 @@ mod tests {
     }
 
     #[test]
-    fn monotonic_advances_by_the_awake_time() {
-        // The node's clock advances 100 between the readings. The hibernate
-        // call takes 10 to 20, the wake 50 to 60: the guest is frozen between
-        // 30 and 50 of them, so its clock must advance 48 to 72.
+    fn monotonic_advances_with_the_node_through_a_sleep() {
+        // Each sample takes 2 on the node's clock, and the second starts 100
+        // after the first: the node's time between them is 98 to 102.
         let before = sample(1000, 0);
-        let hibernate = (10, 20);
-        let wake = (50, 60);
-        for advance in [48, 60, 72] {
+        for advance in [98, 100, 102] {
             let after = sample(1000 + advance, 100);
-            assert!(
-                check_monotonic(&before, &after, hibernate, wake, 0).is_ok(),
-                "{advance}"
-            );
+            assert!(check_monotonic(&before, &after, 0).is_ok(), "{advance}");
         }
-        for advance in [47, 73, 100] {
+        for advance in [0, 50, 97, 103] {
             let after = sample(1000 + advance, 100);
-            let error = check_monotonic(&before, &after, hibernate, wake, 0).unwrap_err();
+            let error = check_monotonic(&before, &after, 0).unwrap_err();
             assert!(error.contains("expected"), "{error}");
         }
-        let after = sample(1000 + 75, 100);
-        assert!(check_monotonic(&before, &after, hibernate, wake, 3).is_ok());
+        let after = sample(1000 + 105, 100);
+        assert!(check_monotonic(&before, &after, 3).is_ok());
     }
 
     #[test]

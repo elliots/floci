@@ -340,6 +340,11 @@ public class WarmPool implements ContainerTeardown, Resettable {
      * In ephemeral mode the container is stopped immediately.
      * Otherwise it is returned to the warm pool.
      */
+    /** Keeps an acquired environment awake for one invocation; see {@link LambdaRuntimeLauncher#hold}. */
+    public LambdaRuntimeLauncher.Hold hold(ContainerHandle handle) {
+        return lambdaRuntimeLauncher == null ? () -> { } : lambdaRuntimeLauncher.hold(handle);
+    }
+
     public void release(ContainerHandle handle) {
         if (provisioned != null && provisioned.release(handle, false)) {
             return;

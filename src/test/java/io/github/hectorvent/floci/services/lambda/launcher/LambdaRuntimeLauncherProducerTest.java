@@ -31,6 +31,7 @@ class LambdaRuntimeLauncherProducerTest {
     @Mock KubernetesPodLauncher kubernetesPodLauncher;
 
     private EmulatorConfig.LambdaServiceConfig lambda;
+    private EmulatorConfig.LambdaServiceConfig.LambdaSmolvmConfig smolvm;
     private final LambdaRuntimeLauncherProducer producer = new LambdaRuntimeLauncherProducer();
 
     @BeforeEach
@@ -39,6 +40,8 @@ class LambdaRuntimeLauncherProducerTest {
         lambda = mock(EmulatorConfig.LambdaServiceConfig.class);
         when(config.services()).thenReturn(services);
         when(services.lambda()).thenReturn(lambda);
+        smolvm = mock(EmulatorConfig.LambdaServiceConfig.LambdaSmolvmConfig.class);
+        when(lambda.smolvm()).thenReturn(smolvm);
         when(dockerInstance.get()).thenReturn(containerLauncher);
         when(kubernetesInstance.get()).thenReturn(kubernetesPodLauncher);
     }
@@ -72,6 +75,17 @@ class LambdaRuntimeLauncherProducerTest {
         assertThatThrownBy(() -> producer.launcher(config, dockerInstance, kubernetesInstance))
                 .isInstanceOf(IllegalArgumentException.class)
                 .hasMessageContaining("docker, kubernetes");
+    }
+
+    @Test
+    void theSmolvmNodeNeedsTheDockerExecutor() {
+        when(smolvm.enabled()).thenReturn(true);
+        when(lambda.executor()).thenReturn("kubernetes");
+        assertThatThrownBy(() -> producer.launcher(config, dockerInstance, kubernetesInstance))
+                .isInstanceOf(IllegalArgumentException.class)
+                .hasMessageContaining("floci.services.lambda.smolvm.enabled");
+        when(lambda.executor()).thenReturn("docker");
+        assertThat(producer.launcher(config, dockerInstance, kubernetesInstance)).isSameAs(containerLauncher);
     }
 
     @Test

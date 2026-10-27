@@ -13,6 +13,8 @@ a check passed.
 Checks of every run:
 - each workload has a record with --cycles cycles and no error;
 - memhold's memory equals what it held before the pause after every resume;
+- memhold's wall clock is within CLOCK_MS of the node's before every pause,
+  the first one right after its boot, and after every resume;
 - with delta saves off, every pause is full; with them on, the first is.
 
 Checks of two runs (the design's bars), per workload, with the run with
@@ -50,6 +52,9 @@ import sys
 ROOT = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "..", "target", "resume-check")
 PODS, SLEEPS = 500, 10
 AGREE = 0.05
+# How far memhold's wall clock may be from the node's, in ms; reading it over
+# HTTP takes a few ms of that.
+CLOCK_MS = 20
 AGREE_BYTES = 20 * 1000 * 1000
 FIRST_SLACK = 1.01
 IDLE_SHARE = 0.25
@@ -154,6 +159,7 @@ def stats(rec):
         "all_pause_ms": [v for v in map(pause_ms, paused) if v is not None],
         "all_written": nums(paused, "written_bytes"),
         "resume_s": nums(wakes, "first_answer_s"),
+        "clock": nums(cycles, "guest_clock_before_pause_ms") + nums(wakes, "guest_clock_ms"),
         "huge": [v for v in map(huge_share, wakes) if v is not None],
         "touched": [c["dirty"]["blocks_touched"] for c in later
                     if isinstance((c.get("dirty") or {}).get("blocks_touched"), int)],
@@ -229,6 +235,8 @@ def rows(s):
         ("resume to first answer, ms, median / p95",
          summary([v * 1000 for v in s["resume_s"]], ms), median(s["resume_s"])),
         ("AnonHugePages / RSS at first answer, median", f"{median(s['huge']):.3f}" if s["huge"] else "-", None),
+        ("guest clock less the node's, ms, median / largest by size",
+         f"{median(s['clock']):.1f} / {max(s['clock'], key=abs):.1f}" if s["clock"] else "-", None),
         ("RAM base after the last pause, MB", mb(s["base_bytes"]), s["base_bytes"]),
         ("memory checks failed", f"{len(s['failed_checks'])} of {checked}" if checked else "-", None),
         (f"projected writes, {PODS} pods x {SLEEPS} sleeps a day (disk), GB/day", daily(s["disk"]),
@@ -250,6 +258,10 @@ def check_run(name, workload, rec, s, cycles, failures):
     for c in s["failed_checks"]:
         failures.append(f"{where} cycle {c.get('cycle', 'final')}: memory differs after the resume "
                         f"({c.get('sha256')}, expected {c.get('expected')})")
+    off = [v for v in s["clock"] if abs(v) > CLOCK_MS]
+    if off:
+        failures.append(f"{where}: the guest clock was {len(off)} times more than {CLOCK_MS} ms "
+                        f"from the node's (largest {max(off, key=abs):.1f} ms)")
     if s["delta_saves"] == "off" and set(s["modes"]) - {"full"}:
         failures.append(f"{where}: delta saves are off, but the save modes are {s['modes']}")
     if s["delta_saves"] == "on" and s["first_mode"] not in (None, "full"):

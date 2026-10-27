@@ -614,6 +614,8 @@ These AWS Lambda operations have no handler in Floci. Calls will return `404` or
 | `FLOCI_SERVICES_LAMBDA_CONTAINER_NAME_PREFIX` | `floci` | Base name prefix for spawned Lambda containers and code volumes (e.g. `acme` → `acme-<function>-<id>` containers, `acme-code-<function>-<hash>` volumes; with `FLOCI_DOCKER_RESOURCE_NAMESPACE` set, the namespace follows the prefix and a short hash of it ends the volume name, e.g. `acme-<namespace>-code-<function>-<hash>-<namespace hash>`). Must be a valid Docker name segment (`[A-Za-z0-9][A-Za-z0-9_.-]*`); invalid values are ignored with a warning |
 | `FLOCI_SERVICES_LAMBDA_CODE_VOLUME_POPULATE_CONCURRENCY` | `max(2, cpus/2)` | Maximum concurrent first-time code-volume populates. See the note below |
 | `FLOCI_SERVICES_LAMBDA_EXECUTOR` | `docker` | Execution backend: `docker` (containers) or `kubernetes` (pods) |
+| `FLOCI_SERVICES_LAMBDA_SMOLVM_ENABLED` | `false` | Run every environment as a microVM on the Floci node that sleeps between invocations; see [Functions on a smolvm-pods node](#functions-on-a-smolvm-pods-node) |
+| `FLOCI_SERVICES_LAMBDA_SMOLVM_IDLE_TIMEOUT` | _(empty)_ | How long an environment on the node has no invocation before it sleeps, a duration from `10s` to `24h` such as `1m`; empty takes the node's own idle timeout (`5m` by default) |
 | `FLOCI_SERVICES_LAMBDA_KUBERNETES_NAMESPACE` | `default` | Namespace Lambda pods are created in |
 | `FLOCI_SERVICES_LAMBDA_KUBERNETES_LABELS` | *(unset)* | Extra pod labels as comma-separated `key=value` entries |
 | `FLOCI_SERVICES_LAMBDA_KUBERNETES_FLOCI_ADDRESS` | *(unset)* | Host/IP pods use to reach Floci; auto-detected when Floci runs in-cluster |
@@ -908,6 +910,60 @@ entries; only clients of the emulator itself use port 4566.
 - Layers published by Floci versions before this feature have no stored
   archive; re-publish them once to make them downloadable by pods.
 
+### Functions on a smolvm-pods node
+
+With `FLOCI_SERVICES_LAMBDA_SMOLVM_ENABLED=true`, Floci runs every Lambda environment on
+[the Floci node](../configuration/smolvm-runtime.md#the-floci-node), the smolvm-pods node that
+Lambda shares with RDS and EKS, instead of in its own Docker: each environment is a container of
+the node's dockerd with the runtime `io.containerd.smolvm-pods.v2`, so it runs in a microVM of its
+own. The Lambda API, invocations, logs, layers, extensions and provisioned concurrency are
+unchanged; only where the environment runs moves. It needs the `docker` executor.
+
+```bash
+export FLOCI_SERVICES_LAMBDA_SMOLVM_ENABLED=true
+export FLOCI_SERVICES_LAMBDA_SMOLVM_IDLE_TIMEOUT=1m
+# Keep sleeping environments, which use no memory, for longer than the default 5 minutes.
+export FLOCI_SERVICES_LAMBDA_CONTAINER_IDLE_TIMEOUT_SECONDS=3600
+# Either the runtime file declares the node, or Floci creates it, as for RDS.
+export FLOCI_RUNTIME_CONFIG_FILE=$HOME/.floci/runtime.yaml
+```
+
+- **The node.** The first cold start uses the runtime file's node or the node Floci created, or
+  has Floci create the node and waits for it, which took 12 seconds on an M4 Max. When Floci
+  cannot create one, the invocation fails with `Lambda.InitError` and a message that names each
+  problem. At its first use of a node, Floci removes the Lambda containers that an earlier run of
+  the same Floci left there.
+- **The network.** An environment is on dockerd's default bridge, where it gets the network of
+  the node's pods ([Network](../configuration/smolvm-runtime.md#network)): its DNS goes through
+  Floci, so `localhost.floci.io` and `floci.hostname` lead to Floci, `AWS_ENDPOINT_URL` is
+  `http://localhost.floci.io:<port>` (or `floci.hostname`), the Runtime API is at
+  `169.254.53.1`, routed third-party hosts reach their simulators over HTTPS that the
+  environment trusts, and with `network.isolation.enabled` nothing else is reachable.
+- **Sleep.** An environment sleeps when no invocation has used it for the idle timeout, and keeps
+  its memory. Each invocation wakes it first and holds it awake until the invocation ends, with
+  a lease on the node, so a long invocation does not sleep. A warm environment that sleeps is
+  still warm: the next invocation wakes it in well under a second instead of a cold start. Floci's
+  warm pool still stops an environment after `FLOCI_SERVICES_LAMBDA_CONTAINER_IDLE_TIMEOUT_SECONDS`.
+  An environment sleeps with its connections (`smolvm-pods.floci.io/reset-on-pause: "false"`), as
+  AWS freezes one: the runtime waits on `GET /runtime/invocation/next` through the sleep, and the
+  next event is the answer to that request. Its other connections can close while it sleeps.
+- **An environment that fails before it takes its event.** When an environment's runtime exits,
+  or the environment fails, before the runtime has taken the event, the handler did not run, so
+  Floci gives the event once to a new environment. An event that the runtime took is not run again.
+- **Images.** Floci pulls the runtime image, or the function's image, into its own Docker and
+  loads it into the node's dockerd, so the node needs no registry. When Floci's Docker cannot give
+  it, the node's dockerd pulls it itself.
+- **Code.** The code is copied into each container before it starts, whatever its size: the
+  shared code volumes of large functions are not used on the node.
+
+Not on the node: hot reload, which needs a bind mount of a host directory, fails to launch with a
+clear error; `FLOCI_SERVICES_LAMBDA_AWS_CONFIG_PATH` is ignored with a warning, and the
+environment gets injected credentials; `FLOCI_SERVICES_LAMBDA_DOCKER_NETWORK` does not apply;
+and volumes in `FLOCI_SERVICES_LAMBDA_DOCKER_FLAGS` name directories of the node. EFS file systems
+are named volumes of the node's dockerd, not shared with containers in Floci's own Docker. The
+node's dockerd lists the environments with `docker ps --filter label=io.floci.service=lambda`
+([Using the Floci node day to day](../configuration/smolvm-node.md#docker)).
+
 ### S3 virtual-hosted-style addressing inside Lambda containers
 
 AWS SDKs use **virtual-hosted-style** S3 addressing by default, forming URLs like
@@ -1110,6 +1166,11 @@ When unset (default), Floci injects execution-role credentials for a known role.
 ### Locally built images
 
 A container image function whose `ImageUri` names an image already present on the Docker daemon runs that image directly. This includes AWS-shaped `<account>.dkr.ecr.<region>.amazonaws.com/<repo>:<tag>` URIs, which are otherwise rewritten to [Floci's emulated ECR registry](ecr.md) at pull time: build the image under the exact URI the function declares (`docker build -t <ImageUri> .`) and no push is needed. With `FLOCI_DOCKER_IMAGE_REGISTRY_BASE` set, tag it as `<base>/<ImageUri>` instead, since that is the reference Floci launches. Set `FLOCI_SERVICES_ECR_PREFER_LOCAL_IMAGES=false` to always resolve AWS-shaped URIs through the emulated registry.
+
+For smolvm launches, Floci also checks the selected node's dockerd before rewriting an ECR
+image URI. An image already loaded there can run even if the host daemon no longer has it.
+The Docker executor prepares the image on the selected daemon before deriving `_HANDLER`
+from its CMD; an explicit `ImageConfig.Command` takes precedence.
 
 ### Private registry authentication
 

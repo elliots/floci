@@ -2,7 +2,7 @@
 //! records through a pause and a resume, and hooks that record their calls.
 
 use std::collections::{HashMap, HashSet};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
 use std::time::{Duration, Instant, UNIX_EPOCH};
 
@@ -149,6 +149,9 @@ pub struct MockVm {
     /// After the pause is durable, before the VM process stops.
     pub stop_gate: Gate,
     pub resume_gate: Gate,
+    /// Whether a resumed VM runs the guest before the resume returns, as
+    /// `wait_running` sees it.
+    pub runs_early: AtomicBool,
 }
 
 impl MockVm {
@@ -158,6 +161,7 @@ impl MockVm {
             pause_gate: Gate::new(),
             stop_gate: Gate::new(),
             resume_gate: Gate::new(),
+            runs_early: AtomicBool::new(false),
         }
     }
 
@@ -378,6 +382,10 @@ impl VmOps for MockVm {
             .is_some_and(|m| m.tso && m.process == Some(*process))
     }
 
+    fn wait_running(&self, _machine: &str, _rosetta: bool, _stop: &AtomicBool) -> bool {
+        self.runs_early.load(Ordering::SeqCst)
+    }
+
     fn ping(&self, machine: &str) -> Result<(), String> {
         let mut guard = lock(&self.inner);
         let inner = &mut *guard;
@@ -403,6 +411,16 @@ impl VmOps for MockVm {
             skew_ns,
             stepped: !(-50_000_000..=5_000_000_000).contains(&skew_ns),
         })
+    }
+
+    fn freeze(&self, machine: &str) -> Result<u32, String> {
+        self.call(format!("freeze {machine}"));
+        Ok(0)
+    }
+
+    fn thaw(&self, machine: &str) -> Result<(), String> {
+        self.call(format!("thaw {machine}"));
+        Ok(())
     }
 
     fn signal(
@@ -561,6 +579,14 @@ impl VmOps for RunningVms {
             skew_ns: 0,
             stepped: false,
         })
+    }
+
+    fn freeze(&self, _: &str) -> Result<u32, String> {
+        Ok(0)
+    }
+
+    fn thaw(&self, _: &str) -> Result<(), String> {
+        Ok(())
     }
 
     fn signal(&self, _: &str, _: &str, _: Option<&str>, _: u32, _: bool) -> Result<(), String> {

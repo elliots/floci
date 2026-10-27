@@ -85,7 +85,7 @@ for a trial with several apps.
   smolvm's copy of the tar in `~/Library/Caches`;
 - each node VM's disks. They are sparse files that grow as the node uses them, up to 40 GiB for
   the storage disk and 8 GiB for the overlay by default. Each sleeping pod has a checkpoint on
-  the storage disk: up to about 1.3 GB for a pod that uses all of its 1 GiB of RAM. Every
+  the storage disk: up to about 1.3 GB for a pod that uses all of its 1 GiB of RAM; a pod VM with less or more RAM, from its memory limit, has a checkpoint of that size. Every
   container also has a full copy of its image's root file system in its pod share, on the storage
   disk, for as long as it exists. For many or large images, give the node a larger storage disk
   with `node-vm.sh create --storage GIB`. The end-to-end suites create nodes of their own.
@@ -229,7 +229,8 @@ The smolvm Linux release has a `libkrunfw.so` for pod VMs. This builds the same 
 (libkrunfw's Linux 6.18.55, from the same pinned sources and builder as the node kernel) with the
 options in `node/podkernel/pod.config`, so that Istio's `istio-init` can set up a sidecar's
 traffic redirection inside the pod: its rules need iptables' `REDIRECT` target and `owner` match,
-which the release's kernel lacks. `node-vm.sh build` installs the result in place of the
+which the release's kernel lacks. It also has `sock_diag` with `SOCK_DESTROY`, with which the guest
+agent resets a pod's connections before it sleeps. `node-vm.sh build` installs the result in place of the
 release's library, by checksum. It takes 3 to 10 minutes on an M4 Max, with the first download of
 the kernel tarball (which `node/kernel/build.sh` keeps, so it is shared). `build.sh --stock`
 builds the release's own config and checks that the library is the release's, byte for byte,
@@ -451,7 +452,9 @@ scripts/node-vm.sh exec -- smolvm-pods ctl get default/web
   others, such as `smolvm-pods.floci.io/hibernate: "false"`, which keeps a pod from sleeping.
 - The readiness probe shows that kubelet's probes do not keep a pod awake: while it sleeps, the
   node service answers them with the app's last result.
-- Every pod VM has 2 vCPUs and 1024 MiB of RAM, whatever the pod requests. On an Apple silicon
+- Every pod VM has 2 vCPUs. Its RAM is the pod's memory limit plus 256 MiB (at least 512 MiB), or
+  1024 MiB when the pod has no limit; `smolvm.io/memory-mib` sets it
+  ([the size of a pod VM](architecture.md#the-size-of-a-pod-vm)). On an Apple silicon
   node every pod VM gets Rosetta by default (`"rosetta": true`), once the node's TSO canary has
   passed ([amd64 pods](architecture.md#amd64-pods)).
 - The first VM pod after a node starts waits for the node to expand smolvm's disk templates,
@@ -504,7 +507,7 @@ curl -s -o /dev/null -w '%{http_code} %{time_total}s\n' http://127.0.0.1:32080/
 ```
 
 It answers 200. The first connection woke the pod: its packets were held while the VM resumed,
-in about 0.2 seconds, then reached nginx unchanged. The events show `asleep` to `waking` and
+about 35 ms, then reached nginx unchanged. The events show `asleep` to `waking` and
 `waking` to `awake` with the reason `traffic` and a `reason_detail` with the caller and port 80.
 `ctl get` shows the pod `awake` with a new `vm_pid`; its IP, containers and memory are the same.
 After another 30 to 45 seconds without requests, it sleeps again.
@@ -587,7 +590,7 @@ works while it sleeps.
   service account token volumes do not update. Every file of a copy is readable by all users, so
   a Secret's `defaultMode` is not kept, and programs that refuse a loosely permissioned key, such
   as PostgreSQL's `ssl_key_file` or OpenSSH, fail ([Known limits](architecture.md#known-limits)).
-- Size the node for the pods that are awake at the same time. An awake pod can take about 1.1 GiB
+- Size the node for the pods that are awake at the same time. An awake pod with no memory limit can take about 1.1 GiB
   of the node's memory, up to 1 GiB of guest RAM and about 100 MiB for its VM process, and a pod
   that wakes has all the memory it used resident at once. The default node has 6 GiB, about
   5.2 GiB of it free, so more than four memory-heavy pods awake at once start the node's OOM
@@ -599,8 +602,9 @@ works while it sleeps.
   room, then is refused.
 - `kubectl exec -i` and `-t`, `kubectl attach`, `kubectl cp` into a pod, and containers with
   `stdin: true` or `tty: true` are refused. So are pods with `hostNetwork`.
-- A sleeping pod's peers may close its outbound connections, such as database pools and broker
-  connections, and its own timers stop until it wakes. The app should reconnect after a wake.
+- A pod resets its TCP connections with peers outside its VM as it goes to sleep, such as database
+  pools, broker connections and its clients' idle keep-alive connections, and its own timers stop
+  until it wakes. The app finds its connections closed after a wake and should reconnect.
 - Connection pools and TCP keepalives to an awake pod keep it awake.
 - A restart of the node VM loses every pod's memory and processes, awake or asleep, and kubelet
   then starts the pods again from scratch.

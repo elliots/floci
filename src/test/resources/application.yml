@@ -179,6 +179,9 @@ floci:
       durable-sweep-enabled: true
       durable-sweep-interval-seconds: 1
       # aws-config-path:
+      smolvm:
+        enabled: false
+        idle-timeout: ""
       hot-reload:
         enabled: true
       reactive-s3-sync:

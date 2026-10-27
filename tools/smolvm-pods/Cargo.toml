@@ -33,6 +33,8 @@ nix = { version = "0.27", features = ["sched", "fs", "net", "mount"] }
 # HTTPS responder's self-signed certificate, and the API server and HTTPS probe
 # clients. hyper and the rest: the pod watch and the pre-sleep probe checks
 # (HTTP/1.1, and h2c for gRPC). url: the probe checks' redirect Locations.
+# httparse: the probe responder's request heads. x509-parser: the node name in
+# the kubeconfig's client certificate.
 smoltcp = { version = "0.13", default-features = false, features = ["std", "log", "medium-ethernet", "proto-ipv4", "socket-tcp"] }
 rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
 rcgen = { version = "0.13", default-features = false, features = ["ring"] }
@@ -46,6 +48,8 @@ futures-util = "0.3"
 serde_yaml = "0.9"
 base64 = "0.22"
 url = "2"
+httparse = "1"
+x509-parser = "0.18"
 # rcgen's certificate times, for the relay's leaves.
 time = { version = "0.3", default-features = false, features = ["std"] }
 smolvm = { path = "../../../smolvm" }

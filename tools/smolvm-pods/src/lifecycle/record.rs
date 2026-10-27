@@ -21,6 +21,12 @@ pub const ANN_HIBERNATE: &str = "smolvm-pods.floci.io/hibernate";
 /// `"true"` or `"1"` does.
 pub const ANN_WAKE_ON_TERMINATE: &str = "smolvm-pods.floci.io/wake-on-terminate";
 
+/// Pod annotation that keeps the pod's connections over a pause. A pause
+/// resets the connections that leave the VM unless it says `"false"` or `"0"`:
+/// then the pod sleeps with them, as AWS freezes a Lambda environment, whose
+/// runtime waits on the Runtime API through the freeze.
+pub const ANN_RESET_ON_PAUSE: &str = "smolvm-pods.floci.io/reset-on-pause";
+
 /// Pod annotation that sets how long the pod may be idle before it sleeps, as
 /// a Go duration such as `"30s"` or `"10m"`.
 pub const ANN_IDLE_TIMEOUT: &str = "smolvm-pods.floci.io/idle-timeout";
@@ -65,6 +71,20 @@ pub fn hibernation_disabled(spec: Option<&serde_json::Value>, standalone: bool) 
 /// Whether the sandbox OCI spec asks SIGTERM to wake the pod.
 pub fn wakes_on_terminate(spec: Option<&serde_json::Value>) -> bool {
     bundle::annotation(spec, ANN_WAKE_ON_TERMINATE).and_then(bundle::parse_flag) == Some(true)
+}
+
+/// Whether the sandbox OCI spec keeps the pod's connections over a pause. A
+/// value that is not a flag is an error, and the pause then resets them.
+pub fn keeps_connections(spec: Option<&serde_json::Value>) -> Result<bool, String> {
+    match bundle::annotation(spec, ANN_RESET_ON_PAUSE) {
+        None => Ok(false),
+        Some(value) => match bundle::parse_flag(value) {
+            Some(reset) => Ok(!reset),
+            None => Err(format!(
+                "{ANN_RESET_ON_PAUSE} is not \"true\" or \"false\": {value:?}"
+            )),
+        },
+    }
 }
 
 /// The duration that the sandbox OCI spec sets with the annotation `key`, if
@@ -206,12 +226,21 @@ pub struct PodIdentity {
     pub netns: Option<String>,
     #[serde(default)]
     pub rosetta: bool,
+    /// The guest RAM of the pod's VM, in MiB, as the VM was created with it.
+    /// A record from before the VMs were sized has none: its VM has the
+    /// default size.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub memory_mib: Option<u32>,
     /// Set by [`ANN_HIBERNATE`].
     #[serde(default)]
     pub hibernate_disabled: bool,
     /// Set by [`ANN_WAKE_ON_TERMINATE`].
     #[serde(default)]
     pub wake_on_terminate: bool,
+    /// Set by [`ANN_RESET_ON_PAUSE`]: a pause does not freeze the pod or
+    /// reset its connections.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub keep_connections: bool,
     /// Set by [`ANN_IDLE_TIMEOUT`]; without it the node's default applies.
     #[serde(default)]
     pub idle_timeout_ms: Option<u64>,
@@ -446,6 +475,24 @@ mod tests {
     }
 
     #[test]
+    fn the_vm_memory_is_kept_and_an_old_record_has_none() {
+        let identity = PodIdentity {
+            sandbox_id: "pod".into(),
+            machine: "pod".into(),
+            memory_mib: Some(768),
+            ..Default::default()
+        };
+        let text = serde_json::to_string(&identity).unwrap();
+        let back: PodIdentity = serde_json::from_str(&text).unwrap();
+        assert_eq!(back.memory_mib, Some(768));
+        let old = r#"{"sandbox_id": "pod", "machine": "pod"}"#;
+        let old: PodIdentity = serde_json::from_str(old).unwrap();
+        assert_eq!(old.memory_mib, None);
+        let text = serde_json::to_string(&old).unwrap();
+        assert!(!text.contains("memory_mib"), "{text}");
+    }
+
+    #[test]
     fn only_an_explicit_false_disables_hibernation() {
         let with = |value: &str| spec(serde_json::json!({ ANN_HIBERNATE: value }));
         for value in ["false", "0", " FALSE "] {
@@ -481,6 +528,29 @@ mod tests {
         assert!(wakes_on_terminate(Some(&on)));
         assert!(!wakes_on_terminate(Some(&off)));
         assert!(!wakes_on_terminate(None));
+    }
+
+    #[test]
+    fn only_an_explicit_false_keeps_the_connections_over_a_pause() {
+        for value in ["false", "0", " FALSE "] {
+            let keep = spec(serde_json::json!({ ANN_RESET_ON_PAUSE: value }));
+            assert_eq!(keeps_connections(Some(&keep)), Ok(true), "{value:?}");
+        }
+        for value in ["true", "1"] {
+            let reset = spec(serde_json::json!({ ANN_RESET_ON_PAUSE: value }));
+            assert_eq!(keeps_connections(Some(&reset)), Ok(false), "{value:?}");
+        }
+        for value in ["no", ""] {
+            let bad = spec(serde_json::json!({ ANN_RESET_ON_PAUSE: value }));
+            assert!(keeps_connections(Some(&bad)).is_err(), "{value:?}");
+        }
+        assert_eq!(keeps_connections(None), Ok(false));
+        let old = r#"{"sandbox_id": "pod", "machine": "pod"}"#;
+        let old: PodIdentity = serde_json::from_str(old).unwrap();
+        assert!(
+            !old.keep_connections,
+            "a record from before keeps resetting"
+        );
     }
 
     #[test]

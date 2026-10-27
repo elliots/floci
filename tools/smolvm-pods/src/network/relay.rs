@@ -29,7 +29,14 @@ use super::sniff::{sniff, Hello};
 use super::{dns, original_dst, Shared, RELAY_PORT};
 use crate::sync::lock;
 
-/// How long the relay reads a connection for its name.
+/// How long the relay waits for a client's first bytes. A client may connect
+/// and send later: a Node event loop that a starved pod stalls, a pod that
+/// wakes. A routed port's clients speak first (TLS and HTTP), so waiting is
+/// safe, and giving up must not be answered in clear text: on a TLS port that
+/// reads as `wrong version number`.
+const FIRST_BYTES_FOR: Duration = Duration::from_secs(30);
+/// How long the relay reads a connection for its name once the first bytes
+/// are there.
 const SNIFF_FOR: Duration = Duration::from_secs(2);
 /// The most bytes it reads for it.
 const SNIFF_MAX: usize = 16 * 1024;
@@ -266,6 +273,62 @@ where
     }
 }
 
+/// What a connection's first bytes gave.
+#[derive(Debug)]
+enum Read {
+    /// The client closed the connection, or it failed.
+    Gone,
+    /// The client sent nothing in the time that it was given.
+    Silent,
+    /// The first bytes. `looks_tls` is true when they start a TLS record,
+    /// even when the hello is incomplete or not a ClientHello: the client
+    /// then expects TLS back, never text.
+    Hello { hello: Hello, looks_tls: bool },
+}
+
+/// Peeks at a connection for its name: up to `first_for` for the first
+/// bytes, then up to `sniff_for` for the rest of the hello.
+async fn read_hello(
+    stream: &TcpStream,
+    buf: &mut [u8],
+    first_for: Duration,
+    sniff_for: Duration,
+) -> Read {
+    let mut n = match tokio::time::timeout(first_for, stream.peek(buf)).await {
+        Ok(Ok(n)) if n > 0 => n,
+        Ok(_) => return Read::Gone,
+        Err(_) => return Read::Silent,
+    };
+    let deadline = tokio::time::Instant::now() + sniff_for;
+    loop {
+        let looks_tls = buf[0] == 0x16;
+        match sniff(&buf[..n]) {
+            Hello::More if n < buf.len() => {
+                // A peek returns at once while the bytes already read are
+                // waiting, so the deadline is checked here, not on the peek.
+                if tokio::time::Instant::now() >= deadline {
+                    return Read::Hello {
+                        hello: Hello::Other,
+                        looks_tls,
+                    };
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+                match tokio::time::timeout_at(deadline, stream.peek(buf)).await {
+                    Ok(Ok(more)) if more > 0 => n = more,
+                    Ok(_) => return Read::Gone,
+                    Err(_) => {
+                        return Read::Hello {
+                            hello: Hello::Other,
+                            looks_tls,
+                        }
+                    }
+                }
+            }
+            hello => return Read::Hello { hello, looks_tls },
+        }
+    }
+}
+
 async fn relay(shared: Arc<Shared>, stream: TcpStream, peer: SocketAddrV4) {
     let Some(dst) = original_dst(stream.as_fd()) else {
         return;
@@ -279,18 +342,27 @@ async fn relay(shared: Arc<Shared>, stream: TcpStream, peer: SocketAddrV4) {
         .filter(|r| r.origins.iter().any(|o| o.port == dst.port()))
         .collect();
     let mut buf = vec![0u8; SNIFF_MAX];
-    let deadline = tokio::time::Instant::now() + SNIFF_FOR;
-    let hello = loop {
-        match tokio::time::timeout_at(deadline, stream.peek(&mut buf)).await {
-            Ok(Ok(0)) | Ok(Err(_)) => return,
-            Ok(Ok(n)) => match sniff(&buf[..n]) {
-                Hello::More if n < SNIFF_MAX => {
-                    tokio::time::sleep(Duration::from_millis(10)).await;
-                }
-                hello => break hello,
-            },
-            Err(_) => break Hello::Other,
+    let read = read_hello(&stream, &mut buf, FIRST_BYTES_FOR, SNIFF_FOR).await;
+    let (hello, looks_tls) = match read {
+        Read::Gone => return,
+        Read::Silent => {
+            // Close without a word: the client may expect TLS.
+            shared.events.record(
+                Key {
+                    kind: Kind::RelayFailed,
+                    pod: shared.pod_name(*peer.ip()),
+                    destination: dst.ip().to_string(),
+                    port: dst.port(),
+                    protocol: "tcp",
+                },
+                Detail {
+                    error: Some(format!("the client sent nothing in {FIRST_BYTES_FOR:?}")),
+                    ..Detail::default()
+                },
+            );
+            return;
         }
+        Read::Hello { hello, looks_tls } => (hello, looks_tls),
     };
     let only = || (on_port.len() == 1).then(|| on_port[0]);
     let (tls, name, route) = match &hello {
@@ -331,7 +403,9 @@ async fn relay(shared: Arc<Shared>, stream: TcpStream, peer: SocketAddrV4) {
     };
     let Some(route) = route else {
         event(Kind::RelayFailed, None, Some("no route".into()), 0);
-        if !tls {
+        // Text only to a client that spoke HTTP: a TLS client, or one whose
+        // hello stalled or came late, gets a close, not bytes it cannot read.
+        if !tls && !looks_tls {
             let mut stream = stream;
             let _ = stream.write_all(NO_ROUTE).await;
         }
@@ -461,6 +535,140 @@ mod tests {
         assert!(verifier
             .verify_server_cert(&chain[0], &chain[1..], &other, &[], now)
             .is_err());
+    }
+
+    /// A ClientHello from rustls for `name`.
+    fn client_hello(name: &str) -> Vec<u8> {
+        let config = rustls::ClientConfig::builder_with_provider(Arc::new(
+            rustls::crypto::ring::default_provider(),
+        ))
+        .with_safe_default_protocol_versions()
+        .unwrap()
+        .with_root_certificates(rustls::RootCertStore::empty())
+        .with_no_client_auth();
+        let server = rustls::pki_types::ServerName::try_from(name.to_string()).unwrap();
+        let mut conn = rustls::ClientConnection::new(Arc::new(config), server).unwrap();
+        let mut out = Vec::new();
+        conn.write_tls(&mut out).unwrap();
+        out
+    }
+
+    /// The relay's end and the client's end of a loopback connection.
+    async fn pair() -> (TcpStream, TcpStream) {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let client = TcpStream::connect(listener.local_addr().unwrap())
+            .await
+            .unwrap();
+        let (server, _) = listener.accept().await.unwrap();
+        (server, client)
+    }
+
+    #[tokio::test]
+    async fn a_client_that_sends_nothing_gets_silence_not_text() {
+        let (server, _client) = pair().await;
+        let mut buf = vec![0u8; SNIFF_MAX];
+        let read = read_hello(
+            &server,
+            &mut buf,
+            Duration::from_millis(100),
+            Duration::from_millis(100),
+        )
+        .await;
+        assert!(matches!(read, Read::Silent), "{read:?}");
+    }
+
+    #[tokio::test]
+    async fn a_client_hello_later_than_the_sniff_time_is_still_read() {
+        let (server, mut client) = pair().await;
+        let hello = client_hello("service.example");
+        let sender = tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(300)).await;
+            client.write_all(&hello).await.unwrap();
+            client
+        });
+        let mut buf = vec![0u8; SNIFF_MAX];
+        // The sniff time is shorter than the client's delay: only the wait
+        // for the first bytes covers it.
+        let read = read_hello(
+            &server,
+            &mut buf,
+            Duration::from_secs(5),
+            Duration::from_millis(100),
+        )
+        .await;
+        match read {
+            Read::Hello {
+                hello: Hello::Tls(Some(name)),
+                looks_tls: true,
+            } => assert_eq!(name, "service.example"),
+            other => panic!("{other:?}"),
+        }
+        let _client = sender.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn a_stalled_client_hello_is_marked_as_tls() {
+        let (server, mut client) = pair().await;
+        let hello = client_hello("service.example");
+        client.write_all(&hello[..20]).await.unwrap();
+        let mut buf = vec![0u8; SNIFF_MAX];
+        let read = read_hello(
+            &server,
+            &mut buf,
+            Duration::from_secs(5),
+            Duration::from_millis(100),
+        )
+        .await;
+        // The caller must not answer this one with text.
+        assert!(
+            matches!(
+                read,
+                Read::Hello {
+                    hello: Hello::Other,
+                    looks_tls: true
+                }
+            ),
+            "{read:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn an_http_request_is_not_marked_as_tls() {
+        let (server, mut client) = pair().await;
+        client
+            .write_all(b"GET / HTTP/1.1\r\nHost: Service.Example\r\n\r\n")
+            .await
+            .unwrap();
+        let mut buf = vec![0u8; SNIFF_MAX];
+        let read = read_hello(
+            &server,
+            &mut buf,
+            Duration::from_secs(5),
+            Duration::from_millis(100),
+        )
+        .await;
+        match read {
+            Read::Hello {
+                hello: Hello::Http(Some(name)),
+                looks_tls: false,
+            } => assert_eq!(name, "service.example"),
+            other => panic!("{other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn a_client_that_closes_is_gone() {
+        let (server, client) = pair().await;
+        drop(client);
+        let mut buf = vec![0u8; SNIFF_MAX];
+        let read = read_hello(
+            &server,
+            &mut buf,
+            Duration::from_secs(5),
+            Duration::from_millis(100),
+        )
+        .await;
+        assert!(matches!(read, Read::Gone), "{read:?}");
     }
 
     #[test]

@@ -299,6 +299,8 @@ See [smolvm Runtime](./smolvm-runtime.md) for the file's rules, its `nodes` and 
 | `FLOCI_SERVICES_LAMBDA_DOCKER_HOST_OVERRIDE` | _(none)_ | Explicit host/IP Lambda containers use to reach the Runtime API, bypassing auto-detection (e.g. rootless Podman) |
 | `FLOCI_SERVICES_LAMBDA_AWS_CONFIG_PATH` | _(none)_ | Host path bind-mounted read-only at `/opt/aws-config` inside Lambda containers for real credential discovery |
 | `FLOCI_SERVICES_LAMBDA_EXECUTOR` | `docker` | Execution backend for Lambda environments: `docker` (containers) or `kubernetes` (pods) |
+| `FLOCI_SERVICES_LAMBDA_SMOLVM_ENABLED` | `false` | Run every Lambda environment as a microVM on the Floci node that sleeps between invocations |
+| `FLOCI_SERVICES_LAMBDA_SMOLVM_IDLE_TIMEOUT` | _(empty)_ | How long a Lambda environment on the node has no invocation before it sleeps, such as `1m`; empty takes the node's |
 | `FLOCI_SERVICES_LAMBDA_KUBERNETES_NAMESPACE` | `default` | Namespace Lambda pods are created in |
 | `FLOCI_SERVICES_LAMBDA_KUBERNETES_LABELS` | _(none)_ | Extra pod labels as comma-separated `key=value` entries |
 | `FLOCI_SERVICES_LAMBDA_KUBERNETES_FLOCI_ADDRESS` | _(none)_ | Host/IP Lambda pods use to reach Floci; auto-detected when Floci runs in-cluster |

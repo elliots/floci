@@ -157,8 +157,14 @@ socket is there, and starts it again 5 seconds after it exits:
 
 ```sh
 dockerd --containerd=/run/k3s/containerd/containerd.sock --data-root /var/lib/smolvm/docker \
-    --host unix:///run/docker.sock
+    --bip 172.17.0.1/16 --dns 169.254.53.1 --host unix:///run/docker.sock
 ```
+
+Containers on the default bridge get the network of pods ([Network](#network)):
+the node's DNS, Floci's ports and routed hosts at the node address, and
+isolation. `--dns` names the node address, so that a container does not take the
+node's `/etc/resolv.conf`, which can name smolvm's resolver: on an isolated node
+that resolver answers no name.
 
 dockerd keeps its containers in containerd's namespace `moby`, its images and
 volumes on the storage disk, and its log in `/var/log/dockerd.log`. The image
@@ -219,8 +225,8 @@ kubelet sees far more memory than the node has ([Capacity](#capacity)), so
 nothing in Kubernetes keeps awake pods within the node's real memory. The node
 service's wake admission does, once a cap is set; its caps are off by default.
 Three settings in `/etc/floci-node/env` set them: `FLOCI_NODE_MAX_AWAKE_PODS`,
-`FLOCI_NODE_MAX_AWAKE_MEMORY`, in MiB of guest RAM with every pod VM counted
-as 1024 MiB, and `FLOCI_NODE_ADMISSION_WAIT`, how long a wake waits for room
+`FLOCI_NODE_MAX_AWAKE_MEMORY`, in MiB of guest RAM with each pod VM counted
+as its own size ([the size of a pod VM](../docs/architecture.md#the-size-of-a-pod-vm)), and `FLOCI_NODE_ADMISSION_WAIT`, how long a wake waits for room
 before it is refused ([the node's settings](../docs/configuration.md#the-nodes-settings)).
 `floci-node` passes them to the node service each time it starts it, so after
 a change, kill the node service and it starts again with them. Creates are

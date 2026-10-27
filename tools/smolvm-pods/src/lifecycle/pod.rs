@@ -8,11 +8,12 @@ use std::collections::VecDeque;
 use std::fmt;
 use std::future::Future;
 use std::pin::Pin;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::task::{Context, Poll};
 use std::time::{Duration, Instant};
 
-use log::{info, warn};
+use log::{debug, info, warn};
 use tokio::sync::{mpsc, oneshot};
 use tokio::task::{JoinError, JoinHandle};
 
@@ -1087,11 +1088,12 @@ impl Actor {
     }
 
     async fn resume_and_finish(&mut self, mut t: Transition, started: Instant, mut during: During) {
-        let work = resume(self.shared.clone(), self.pod.id.clone(), self.machine());
+        let work = resume(self.shared.clone(), self.pod.clone(), self.machine());
         let resumed = self.drive(&mut during, work).await.and_then(|r| r);
         let e = match resumed {
-            Ok(steps) => {
+            Ok((steps, held)) => {
                 t.steps.extend(steps);
+                t.capture_to_release_ms = held.map(ms);
                 return self
                     .finish_wake(t, started, during, AwakeCause::Woke, true)
                     .await;
@@ -1151,7 +1153,9 @@ impl Actor {
         };
         t.steps.extend(post.steps);
         t.clock = Some(post.clock);
-        t.capture_to_release_ms = post.held.map(ms);
+        if let Some(held) = post.held {
+            t.capture_to_release_ms = Some(ms(held));
+        }
         t.cancelled = cause == AwakeCause::PauseCancelled;
         if t.error.is_none() {
             t.error = post.warning;
@@ -1389,8 +1393,16 @@ impl Actor {
     }
 }
 
-/// The `pausing` hook, the stop of the output pumps and the VM pause, in
-/// their own task. The slot limits pauses across pods.
+/// The freeze of the pod's containers, the `pausing` hook, the stop of the
+/// output pumps and the VM pause, in their own task. The slot limits pauses
+/// across pods.
+///
+/// The freeze resets the pod's TCP connections that leave its VM, so that no
+/// peer keeps a connection to a sleeping pod, and comes before the hold of
+/// the `pausing` hook, which would keep the resets from its peers. A freeze
+/// that fails does not stop the pause: the pod then sleeps with its
+/// connections. A pod whose `reset-on-pause` annotation is `"false"` is not
+/// frozen, and sleeps with its connections.
 async fn pause(
     shared: Arc<Shared>,
     info: PodInfo,
@@ -1413,6 +1425,27 @@ async fn pause(
         let mut steps = Steps::default();
         if reason == Reason::Idle {
             faults.hit(FaultPoint::IdleDecided);
+        }
+        // A pod that keeps its connections (ANN_RESET_ON_PAUSE) sleeps with
+        // them, so it is not frozen first.
+        if info.identity.keep_connections {
+            debug!(
+                "pod sandbox {}: keeps its connections over the pause",
+                info.identity.sandbox_id
+            );
+        } else {
+            let started = Instant::now();
+            match vm.freeze(&info.identity.machine) {
+                Ok(reset) => debug!(
+                    "pod sandbox {}: froze it and reset {reset} connections",
+                    info.identity.sandbox_id
+                ),
+                Err(e) => warn!(
+                    "pod sandbox {}: freeze it before the pause: {e}",
+                    info.identity.sandbox_id
+                ),
+            }
+            steps.push("freeze", started.elapsed());
         }
         let started = Instant::now();
         if let Err(refusal) = hooks.pausing(&info, &reason) {
@@ -1444,7 +1477,18 @@ async fn pause(
 }
 
 /// The VM resume, in its own task. The slot limits resumes across pods.
-async fn resume(shared: Arc<Shared>, id: String, machine: String) -> Result<Steps, String> {
+///
+/// smolvm's resume returns once the guest agent answers, which takes the
+/// guest's vsock reset. A pod with nothing to do in its guest before it
+/// serves (no deferred kill, no deletion while it slept) gets its held
+/// traffic as soon as the new VM process runs the guest, alongside the rest
+/// of the resume: the `early_release` step. Its time since the capture of the
+/// first held frame comes back with the steps.
+async fn resume(
+    shared: Arc<Shared>,
+    pod: Arc<Pod>,
+    machine: String,
+) -> Result<(Steps, Option<Duration>), String> {
     let mut steps = Steps::default();
     let started = Instant::now();
     let _slot = shared
@@ -1453,8 +1497,34 @@ async fn resume(shared: Arc<Shared>, id: String, machine: String) -> Result<Step
         .await
         .map_err(|e| e.to_string())?;
     steps.push("slot", started.elapsed());
-    let faults = shared.config.faults.for_pod(&id);
-    let took = shared
+    let record = pod.record();
+    let stop = Arc::new(AtomicBool::new(false));
+    let early = (record.deferred_kills.is_empty() && record.guest_deletes.is_empty()).then(|| {
+        let (shared, pod, machine, stop) =
+            (shared.clone(), pod.clone(), machine.clone(), stop.clone());
+        let rosetta = record.identity.rosetta;
+        tokio::spawn(async move {
+            let started = Instant::now();
+            let running = shared
+                .vm_call(move |vm| Ok(vm.wait_running(&machine, rosetta, &stop)))
+                .await
+                .unwrap_or(false);
+            if !running {
+                return None;
+            }
+            let hooks = shared.hooks.clone();
+            let info = pod.info(shared.now_ms());
+            match blocking(move || hooks.release(&info)).await {
+                Ok(held) => Some((started.elapsed(), held)),
+                Err(e) => {
+                    warn!("the early release of pod sandbox {} failed: {e}", pod.id);
+                    None
+                }
+            }
+        })
+    });
+    let faults = shared.config.faults.for_pod(&pod.id);
+    let resumed = shared
         .vm_call(move |vm| {
             faults.check(FaultPoint::WakeResumeError)?;
             let started = Instant::now();
@@ -1463,12 +1533,23 @@ async fn resume(shared: Arc<Shared>, id: String, machine: String) -> Result<Step
             faults.hit(FaultPoint::WakeResumed);
             Ok(took)
         })
-        .await?;
+        .await;
+    stop.store(true, Ordering::Release);
+    let released = match early {
+        Some(task) => task.await.ok().flatten(),
+        None => None,
+    };
+    let took = resumed?;
     steps.push("resume", took);
-    Ok(steps)
+    let mut held = None;
+    if let Some((took, delivered)) = released {
+        steps.push("early_release", took);
+        held = delivered;
+    }
+    Ok((steps, held))
 }
 
-/// The post-resume steps (`tso`, `ping`, `clock`, `deferred_kills`,
+/// The post-resume steps (`tso`, `ping`, `clock`, `thaw`, `deferred_kills`,
 /// `before_release` and `release`), in their own task. Each is idempotent, so
 /// recovery runs them again after a crash.
 async fn post_resume(shared: Arc<Shared>, pod: Arc<Pod>) -> Result<PostResume, String> {
@@ -1536,6 +1617,16 @@ async fn post_resume(shared: Arc<Shared>, pod: Arc<Pod>) -> Result<PostResume, S
         })
         .await?;
     steps.push("clock", started.elapsed());
+
+    // The containers thaw, if the guest did not thaw them as it resumed or
+    // the pause never came.
+    let started = Instant::now();
+    let m = machine.clone();
+    if let Err(e) = shared.vm_call(move |vm| vm.thaw(&m)).await {
+        warn!("thaw pod sandbox {}: {e}", pod.id);
+        warning = Some(format!("thaw: {e}"));
+    }
+    steps.push("thaw", started.elapsed());
 
     // The deferred kills, then the before_release hook.
     let started = Instant::now();

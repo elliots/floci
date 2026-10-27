@@ -16,10 +16,12 @@ import java.io.IOException;
 import java.net.BindException;
 import java.net.InetSocketAddress;
 import java.net.ServerSocket;
+import java.net.Socket;
 import java.net.URI;
 import java.net.http.HttpClient;
 import java.net.http.HttpRequest;
 import java.net.http.HttpResponse;
+import java.nio.charset.StandardCharsets;
 import java.time.Duration;
 import java.util.ArrayList;
 import java.util.Arrays;
@@ -34,6 +36,7 @@ import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicReference;
 import java.util.function.Consumer;
 
+import static org.awaitility.Awaitility.await;
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertNotEquals;
@@ -104,6 +107,32 @@ class RuntimeApiServerTest {
         awaitWaitingContexts(1);
 
         assertTrue(server.hasRuntimePolled());
+    }
+
+    @Test
+    @Timeout(15)
+    void nextEndpoint_disconnectedPollIsRemovedBeforeTheRuntimeReconnects() throws Exception {
+        try (Socket socket = new Socket("127.0.0.1", port)) {
+            socket.getOutputStream().write(("GET /2018-06-01/runtime/invocation/next HTTP/1.1\r\n"
+                    + "Host: localhost\r\n\r\n").getBytes(StandardCharsets.US_ASCII));
+            awaitWaitingContexts(1);
+            socket.setSoLinger(true, 0);
+        }
+        await().atMost(Duration.ofSeconds(5)).until(() -> server.waitingContextsSize() == 0);
+
+        HttpRequest request = HttpRequest.newBuilder()
+                .uri(URI.create("http://localhost:" + port + "/2018-06-01/runtime/invocation/next"))
+                .GET().build();
+        CompletableFuture<HttpResponse<String>> response = httpClient.sendAsync(request,
+                HttpResponse.BodyHandlers.ofString());
+        awaitWaitingContexts(1);
+        server.enqueue(new PendingInvocation("after-reset", "{}".getBytes(StandardCharsets.UTF_8),
+                System.currentTimeMillis() + 60_000, "arn:aws:lambda:us-east-1:000000000000:function:test",
+                new CompletableFuture<>()));
+
+        assertEquals("after-reset", response.get(5, TimeUnit.SECONDS).headers()
+                .firstValue("Lambda-Runtime-Aws-Request-Id").orElseThrow());
+        assertEquals(0, server.pendingQueueSize());
     }
 
     @Test

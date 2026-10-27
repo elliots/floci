@@ -600,6 +600,48 @@ class EcrRegistryManagerTest {
     }
 
     @Test
+    void rewriteImageUri_imageOnlyOnSelectedNodeDoesNotStartRegistry() {
+        DockerClient node = Mockito.mock(DockerClient.class);
+        InspectImageCmd inspect = Mockito.mock(InspectImageCmd.class);
+        String resolved = "mirror/" + AWS_ECR_IMAGE;
+        when(containerBuilder.resolveImage(AWS_ECR_IMAGE)).thenReturn(resolved);
+        when(node.inspectImageCmd(resolved)).thenReturn(inspect);
+        when(inspect.exec()).thenReturn(Mockito.mock(InspectImageResponse.class));
+
+        assertEquals(AWS_ECR_IMAGE, manager.rewriteImageUri(AWS_ECR_IMAGE, node));
+
+        verify(node).inspectImageCmd(resolved);
+        verify(dockerClient, never()).inspectImageCmd(anyString());
+        verify(lifecycleManager, never()).createAndStart(any());
+    }
+
+    @Test
+    void rewriteImageUri_nodeMissStillUsesImageFromHostDocker() {
+        DockerClient node = Mockito.mock(DockerClient.class);
+        when(node.inspectImageCmd(AWS_ECR_IMAGE)).thenThrow(new NotFoundException("No node image"));
+        Mockito.doReturn(Mockito.mock(InspectImageResponse.class)).when(inspectImage).exec();
+
+        assertEquals(AWS_ECR_IMAGE, manager.rewriteImageUri(AWS_ECR_IMAGE, node));
+
+        verify(dockerClient).inspectImageCmd(AWS_ECR_IMAGE);
+        verify(lifecycleManager, never()).createAndStart(any());
+    }
+
+    @Test
+    void rewriteImageUri_preferLocalOffDoesNotInspectSelectedNode() {
+        DockerClient node = Mockito.mock(DockerClient.class);
+        when(ecr.preferLocalImages()).thenReturn(false);
+        when(lifecycleManager.createAndStart(any())).thenReturn(
+                new ContainerLifecycleManager.ContainerInfo("registry-id", Map.of()));
+
+        assertEquals("localhost:4566/123456789012/us-east-1/backend-user:1",
+                manager.rewriteImageUri(AWS_ECR_IMAGE, node));
+
+        Mockito.verifyNoInteractions(node);
+        verify(lifecycleManager).createAndStart(any());
+    }
+
+    @Test
     void rewriteImageUri_imagePresentOnDaemon_preferLocalImagesOff_rewritesWithoutInspecting() {
         when(ecr.preferLocalImages()).thenReturn(false);
         Mockito.doReturn(new InspectImageResponse()).when(inspectImage).exec();

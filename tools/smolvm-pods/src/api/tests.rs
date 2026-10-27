@@ -1,3 +1,4 @@
+use std::io::Write;
 use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -99,18 +100,6 @@ fn request_bodies_parse_from_json() {
         (hold.ttl_secs, hold.holder.as_deref()),
         (None, Some("worker"))
     );
-}
-
-#[test]
-fn answers_parse_with_a_length_chunked_or_cut_off() {
-    let whole = b"HTTP/1.1 409 Conflict\r\ncontent-length: 2\r\n\r\n{}";
-    assert_eq!(parse_response(whole).unwrap(), (409, b"{}".to_vec()));
-    let chunked =
-        b"HTTP/1.1 200 OK\r\ntransfer-encoding: chunked\r\n\r\n3\r\nabc\r\n2\r\nde\r\n0\r\n\r\n";
-    assert_eq!(parse_response(chunked).unwrap(), (200, b"abcde".to_vec()));
-    let cut = b"HTTP/1.1 200 OK\r\ncontent-length: 10\r\n\r\n{}";
-    assert!(parse_response(cut).is_err());
-    assert!(parse_response(b"").is_err());
 }
 
 #[test]
@@ -1066,4 +1055,51 @@ async fn the_metrics_count_the_pods_by_state() {
     let (status, traffic) = call(&socket, "GET", "/v1/traffic", None).await;
     assert_eq!((status, traffic), (200, json!({"flows": []})));
     node.shutdown();
+}
+
+/// The status and body of a whole HTTP/1.1 response that a test read.
+pub(crate) fn parse_response(response: &[u8]) -> Result<(u16, Vec<u8>), String> {
+    let mut headers = [httparse::EMPTY_HEADER; 32];
+    let mut head = httparse::Response::new(&mut headers);
+    let httparse::Status::Complete(end) = head.parse(response).map_err(|e| e.to_string())? else {
+        return Err("the connection closed before the answer".into());
+    };
+    let status = head.code.ok_or("no status")?;
+    let header = |name: &str| {
+        head.headers
+            .iter()
+            .find(|h| h.name.eq_ignore_ascii_case(name))
+            .map(|h| String::from_utf8_lossy(h.value).trim().to_string())
+    };
+    let rest = &response[end..];
+    if header("transfer-encoding").is_some_and(|v| v.eq_ignore_ascii_case("chunked")) {
+        return dechunk(rest).map(|body| (status, body));
+    }
+    match header("content-length").and_then(|n| n.parse::<usize>().ok()) {
+        Some(n) if rest.len() < n => Err("the connection closed before the whole answer".into()),
+        Some(n) => Ok((status, rest[..n].to_vec())),
+        None => Ok((status, rest.to_vec())),
+    }
+}
+
+/// A chunked body that a test read.
+pub(crate) fn dechunk(mut data: &[u8]) -> Result<Vec<u8>, String> {
+    let mut body = Vec::new();
+    loop {
+        let httparse::Status::Complete((start, size)) =
+            httparse::parse_chunk_size(data).map_err(|_| "a chunk size")?
+        else {
+            return Err("a chunk was cut off".into());
+        };
+        let size = usize::try_from(size).map_err(|e| e.to_string())?;
+        data = &data[start..];
+        if size == 0 {
+            return Ok(body);
+        }
+        if data.len() < size + 2 {
+            return Err("a chunk was cut off".into());
+        }
+        body.extend_from_slice(&data[..size]);
+        data = &data[size + 2..];
+    }
 }

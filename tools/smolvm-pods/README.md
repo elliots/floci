@@ -36,8 +36,8 @@ A pod VM keeps the pod's CNI network: a two-port bridge in the pod's network nam
 pod's `eth0` to the VM's tap. To put a pod to sleep, the node service holds its traffic at that
 bridge and pauses the VM to a local checkpoint. While the pod sleeps, a packet socket on `eth0`
 answers ARP and kubelet's probes for it, and the first connection to the pod wakes it: the VM
-resumes in about 0.2 s, the guest clock is stepped, and the held packets go to the guest
-unchanged. A pod sleeps by itself when no connection to it has seen traffic for its idle timeout
+resumes with its clock already right, and the held packets go to the guest unchanged as soon as
+it runs, so the pod answers about 50 ms after the connection on a Mac node. A pod sleeps by itself when no connection to it has seen traffic for its idle timeout
 (5 minutes by default), its VM is not busy, and its probes pass. Floci, and anything else with the
 token, can wake a pod and keep it awake through the node service's API.
 
@@ -325,7 +325,9 @@ pages of guest RAM that changed, with full saves (`SMOLVM_DELTA_SAVES=off`). Per
 pod VM gets a cold start and its first pause, then `--cycles` cycles (default 6) of a resume, an
 optional dirtying request, an idle period (`--idle`, default 2 s) and a pause, then a last resume.
 Each pause records smolvm's save mode, bytes written and time, and memhold checks its own SHA-256
-of the memory it uses after every resume. A run takes about 10 minutes. `--settle S` also reads
+of the memory it uses after every resume, and reports its wall clock after its boot, before every
+pause and after every resume, which must be within 20 ms of the node's. A run takes about 10
+minutes. `--settle S` also reads
 the node storage disk's sectors written around each pause, after a sync and S seconds of
 writeback, less the node's background writes; it makes a run several times longer, and smolvm's
 bytes matched the disk's within 20 MB in every pause measured. The default workloads are memhold
@@ -334,7 +336,8 @@ and with all its memory rewritten (`all`). `--workloads` also takes `petclinic`,
 after a resume is one request, and `scattered`, `blocks` (whole 2 MiB blocks), `zero`, `free`,
 `fresh` and `mixed` with a percentage, such as `scattered:1`. `compare.py` prints both runs side
 by side, with the medians and p95 of the bytes, pause and resume times, the memory checks, the
-daily writes of 500 pods that each sleep 10 times a day, and the design's pass bars as checks
+daily writes of 500 pods that each sleep 10 times a day, the guest clock, and the design's pass
+bars as checks
 (`python3 -m unittest test_compare` in `bench/resume` tests it):
 
 ```sh

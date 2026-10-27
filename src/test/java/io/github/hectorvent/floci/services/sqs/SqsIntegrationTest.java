@@ -2,10 +2,17 @@ package io.github.hectorvent.floci.services.sqs;
 
 import io.github.hectorvent.floci.testing.RestAssuredJsonUtils;
 import io.quarkus.test.junit.QuarkusTest;
+import io.restassured.RestAssured;
 import io.restassured.path.xml.XmlPath;
 import io.restassured.specification.RequestSpecification;
 import org.junit.jupiter.api.*;
+import org.junit.jupiter.params.ParameterizedTest;
+import org.junit.jupiter.params.provider.ValueSource;
 
+import java.net.Socket;
+import java.net.URI;
+import java.net.URLEncoder;
+import java.nio.charset.StandardCharsets;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
@@ -844,6 +851,57 @@ class SqsIntegrationTest {
         }
     }
 
+
+    @ParameterizedTest
+    @ValueSource(strings = {"query", "json-root", "json-queue"})
+    void longPollOfAClosedConnectionTakesNoMessage(String protocol) throws Exception {
+        String goneQueueUrl = given()
+            .contentType("application/x-www-form-urlencoded")
+            .formParam("Action", "CreateQueue")
+            .formParam("QueueName", protocol + "-gone-poller-queue")
+        .when().post("/").then().statusCode(200)
+            .extract().xmlPath().getString("CreateQueueResponse.CreateQueueResult.QueueUrl");
+
+        try {
+            boolean query = protocol.equals("query");
+            String body = query
+                    ? "Action=ReceiveMessage&WaitTimeSeconds=10&QueueUrl="
+                        + URLEncoder.encode(goneQueueUrl, StandardCharsets.UTF_8)
+                    : "{\"QueueUrl\":\"" + goneQueueUrl + "\",\"WaitTimeSeconds\":10}";
+            String path = protocol.equals("json-queue") ? URI.create(goneQueueUrl).getRawPath() : "/";
+            String headers = query
+                    ? "Content-Type: application/x-www-form-urlencoded\r\n"
+                    : "Content-Type: application/x-amz-json-1.0\r\nX-Amz-Target: AmazonSQS.ReceiveMessage\r\n";
+            try (Socket socket = new Socket("127.0.0.1", RestAssured.port)) {
+                socket.getOutputStream().write(("POST " + path + " HTTP/1.1\r\nHost: localhost\r\n"
+                        + headers + "Content-Length: " + body.length() + "\r\n\r\n" + body)
+                        .getBytes(StandardCharsets.US_ASCII));
+                Thread.sleep(500); // let the poll park inside its long-poll wait
+                socket.setSoLinger(true, 0); // close with a RST, as a reset connection does
+            }
+            Thread.sleep(300);
+
+            given()
+                .contentType("application/x-www-form-urlencoded")
+                .formParam("Action", "SendMessage")
+                .formParam("QueueUrl", goneQueueUrl)
+                .formParam("MessageBody", "for-a-live-poller")
+            .when().post("/").then().statusCode(200);
+            given()
+                .contentType("application/x-www-form-urlencoded")
+                .formParam("Action", "ReceiveMessage")
+                .formParam("QueueUrl", goneQueueUrl)
+                .formParam("WaitTimeSeconds", "1")
+            .when().post("/").then().statusCode(200)
+                .body(containsString("for-a-live-poller"));
+        } finally {
+            given()
+                .contentType("application/x-www-form-urlencoded")
+                .formParam("Action", "DeleteQueue")
+                .formParam("QueueUrl", goneQueueUrl)
+            .when().post("/");
+        }
+    }
 
     @Test
     void receiveMessageWithoutWaitTimeSecondsHonoursQueueReceiveMessageWaitTimeSeconds() {

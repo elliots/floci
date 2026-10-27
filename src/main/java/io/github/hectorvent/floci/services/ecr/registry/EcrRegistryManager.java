@@ -122,6 +122,14 @@ public class EcrRegistryManager {
      * {@code floci.services.ecr.prefer-local-images} is on.
      */
     public String rewriteImageUri(String image) {
+        return rewriteImageUri(image, null);
+    }
+
+    /**
+     * Also checks the selected workload daemon before falling back to Floci's Docker and registry.
+     * An image already loaded into an isolated node need not exist on the host anymore.
+     */
+    public String rewriteImageUri(String image, DockerClient workloadDocker) {
         if (image == null) {
             return null;
         }
@@ -134,7 +142,8 @@ public class EcrRegistryManager {
         }
         if (config.services().ecr().preferLocalImages()) {
             String resolved = containerBuilder.resolveImage(image);
-            if (isPresentOnDaemon(resolved)) {
+            if ((workloadDocker != null && isPresentOnDaemon(workloadDocker, resolved))
+                    || isPresentOnDaemon(lifecycleManager.getDockerClient(), resolved)) {
                 LOG.infov("Using locally present image {0} as-is (not rewriting to the emulated ECR registry)", resolved);
                 return image;
             }
@@ -153,9 +162,9 @@ public class EcrRegistryManager {
         return rewritten;
     }
 
-    private boolean isPresentOnDaemon(String image) {
+    private boolean isPresentOnDaemon(DockerClient docker, String image) {
         try {
-            lifecycleManager.getDockerClient().inspectImageCmd(image).exec();
+            docker.inspectImageCmd(image).exec();
             return true;
         } catch (NotFoundException e) {
             return false;

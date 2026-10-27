@@ -634,6 +634,7 @@ async fn every_call_answers_while_the_node_service_is_down() {
     h.mock("sb").set_stats(Some(StatsSample {
         cpu_usage_ns: 500,
         memory_bytes: 4096,
+        ..Default::default()
     }));
     assert_eq!(h.stats("c").await.unwrap(), Some((500, 4096)));
     h.sessions(1).await;
@@ -917,6 +918,7 @@ async fn a_standalone_container_is_a_pod_of_its_own() {
     mock.set_stats(Some(StatsSample {
         cpu_usage_ns: 5,
         memory_bytes: 7,
+        ..Default::default()
     }));
     assert_eq!(h.stats("web").await.unwrap(), Some((5, 7)));
     assert!(h.pids("web").await.unwrap().contains(&100));
@@ -935,10 +937,11 @@ async fn a_standalone_container_is_a_pod_of_its_own() {
 /// dockerd reads the CPU throttling of a container's stats without a check,
 /// and reports the memory limit, which is the pod VM's memory.
 #[test]
-fn stats_carry_an_empty_cpu_throttling_and_the_vms_memory() {
+fn old_nodes_report_the_original_vm_memory() {
     let metrics = cgroup_metrics(StatsSample {
         cpu_usage_ns: 5,
         memory_bytes: 7,
+        ..Default::default()
     });
     assert!(metrics.cpu.throttling.is_some());
     assert_eq!(metrics.cpu.usage.total, 5);
@@ -1030,11 +1033,13 @@ async fn stats_are_cached() {
     mock.set_stats(Some(StatsSample {
         cpu_usage_ns: 900,
         memory_bytes: 10,
+        ..Default::default()
     }));
     assert_eq!(h.stats("c").await.unwrap(), Some((900, 10)));
     mock.set_stats(Some(StatsSample {
         cpu_usage_ns: 800,
         memory_bytes: 20,
+        ..Default::default()
     }));
     assert_eq!(h.stats("c").await.unwrap(), Some((900, 20)));
     mock.set_stats(None);
@@ -1330,5 +1335,69 @@ impl Rng {
         self.0 ^= self.0 << 25;
         self.0 ^= self.0 >> 27;
         (self.0.wrapping_mul(0x2545_f491_4f6c_dd1d) >> 33) as usize % n
+    }
+}
+
+#[test]
+fn stats_report_the_memory_of_small_and_large_vms() {
+    for mib in [512, 768, 2048, 16384] {
+        let limit = mib * 1024 * 1024;
+        let metrics = cgroup_metrics(StatsSample {
+            memory_limit_bytes: Some(limit),
+            ..Default::default()
+        });
+        assert_eq!(metrics.memory.usage.limit, limit);
+    }
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn stats_keep_the_sandbox_memory_limit_after_node_recovery() {
+    let mut h = Harness::new();
+    let bundle = h.bundle("sb", "sandbox", "");
+    let config = Path::new(&bundle).join("config.json");
+    let mut spec: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(&config).unwrap()).unwrap();
+    spec["annotations"]["smolvm.io/memory-mib"] = "768".into();
+    std::fs::write(config, spec.to_string()).unwrap();
+    h.svc
+        .create(
+            &ttctx(),
+            api::CreateTaskRequest {
+                id: "sb".into(),
+                bundle,
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+    h.start("sb", "").await.unwrap();
+    h.container("c", "sb").await;
+    h.mock("sb").set_stats(Some(StatsSample {
+        memory_bytes: 4096,
+        ..Default::default()
+    }));
+    for restarted in [false, true] {
+        if restarted {
+            h.kill_node();
+            h.start_node();
+            h.sessions(2).await;
+        }
+        let response = h
+            .svc
+            .stats(
+                &ttctx(),
+                api::StatsRequest {
+                    id: "c".into(),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+        let metrics = containerd_shim_protos::cgroups::metrics::Metrics::parse_from_bytes(
+            &response.stats.unwrap().value,
+        )
+        .unwrap();
+        assert_eq!(metrics.memory.usage.limit, 768 * 1024 * 1024);
+        assert_eq!(metrics.memory.usage.usage, 4096);
     }
 }

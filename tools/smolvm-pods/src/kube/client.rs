@@ -474,55 +474,11 @@ fn tls_config(
     Ok(config)
 }
 
-/// The common name in a certificate's subject, by a small DER walk.
+/// The common name in a certificate's subject.
 fn subject_common_name(der: &[u8]) -> Option<String> {
-    const SEQUENCE: u8 = 0x30;
-    const OID: u8 = 0x06;
-    const COMMON_NAME: [u8; 3] = [0x55, 0x04, 0x03];
-    let (_, certificate, _) = tlv(der).filter(|(tag, ..)| *tag == SEQUENCE)?;
-    let (_, mut tbs, _) = tlv(certificate).filter(|(tag, ..)| *tag == SEQUENCE)?;
-    // The explicit [0] version, then the serial, signature, issuer and
-    // validity before the subject.
-    if tbs.first() == Some(&0xa0) {
-        tbs = tlv(tbs)?.2;
-    }
-    for _ in 0..4 {
-        tbs = tlv(tbs)?.2;
-    }
-    let (_, mut names, _) = tlv(tbs).filter(|(tag, ..)| *tag == SEQUENCE)?;
-    while !names.is_empty() {
-        let (_, mut set, rest) = tlv(names)?;
-        names = rest;
-        while !set.is_empty() {
-            let (_, pair, rest) = tlv(set)?;
-            set = rest;
-            let (tag, oid, value) = tlv(pair)?;
-            if tag == OID && oid == COMMON_NAME {
-                return String::from_utf8(tlv(value)?.1.to_vec()).ok();
-            }
-        }
-    }
-    None
-}
-
-/// One DER element: its tag, its contents and the bytes after it.
-fn tlv(input: &[u8]) -> Option<(u8, &[u8], &[u8])> {
-    let (&tag, rest) = input.split_first()?;
-    let (&first, mut rest) = rest.split_first()?;
-    let len = if first < 0x80 {
-        usize::from(first)
-    } else {
-        let count = usize::from(first & 0x7f);
-        if count == 0 || count > 4 || rest.len() < count {
-            return None;
-        }
-        let len = rest[..count]
-            .iter()
-            .fold(0usize, |len, &b| (len << 8) | usize::from(b));
-        rest = &rest[count..];
-        len
-    };
-    (rest.len() >= len).then(|| (tag, &rest[..len], &rest[len..]))
+    let (_, cert) = x509_parser::parse_x509_certificate(der).ok()?;
+    let name = cert.subject().iter_common_name().next()?;
+    name.as_str().ok().map(str::to_string)
 }
 
 #[cfg(test)]

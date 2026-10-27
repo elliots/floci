@@ -103,7 +103,7 @@ than 0.
 | `--cpu-threshold` | `0.5` | VM CPU, in vCPUs averaged over `--cpu-window`, above which a pod is busy and does not sleep. `off`, `0` or `0.0` turns the CPU rule off |
 | `--cpu-window` | `60s` | The time over which VM CPU is averaged |
 | `--max-awake-pods` | `0`, no cap | A wake is admitted only while fewer pods than this are creating, awake, pausing or waking. Creates are not refused, so they can take the count above the cap |
-| `--max-awake-memory` | `0`, no cap | A wake is admitted only while the guest RAM of the pods that are creating, awake, pausing or waking, with the waking pod's, stays within this many MiB. Every pod VM counts as 1024 MiB. Creates are not refused |
+| `--max-awake-memory` | `0`, no cap | A wake is admitted only while the guest RAM of the pods that are creating, awake, pausing or waking, with the waking pod's, stays within this many MiB. Every pod VM counts as its own guest RAM, 1024 MiB when the pod has no memory limit ([the size of a pod VM](architecture.md#the-size-of-a-pod-vm)). Creates are not refused |
 | `--admission-wait` | `10s` | How long a wake waits for room under a cap before it is refused |
 | `--api-listen` | none | The API's TCP listener, `ADDR:PORT` ([The API over TCP](#the-api-over-tcp)) |
 | `--api-token-file` | `/etc/floci-node/api-token` | The listener's bearer token |
@@ -127,10 +127,12 @@ the sandbox is created. Values are trimmed and compared without case.
 | --- | --- | --- |
 | `smolvm-pods.floci.io/rosetta` | `"true"` or `"1"`; `"false"` or `"0"` | On an arm64 node every pod VM gets Rosetta and TSO when the node can give them. `"true"` requires them, and refuses the pod when the node cannot; `"false"` turns them off. Any other value refuses the pod. x86_64 nodes ignore it |
 | `smolvm-pods.floci.io/hibernate` | `"false"` or `"0"`; for a standalone container, `"true"` or `"1"` | A pod from CRI sleeps unless it says `"false"`, and then never sleeps, by the idle rule or through the API; other values are ignored. A standalone container, such as Docker's, never sleeps unless it says `"true"` |
+| `smolvm-pods.floci.io/reset-on-pause` | `"false"` or `"0"` | A pause does not freeze the pod or reset its connections, so it wakes with them ([Connections of a sleeping pod](architecture.md#connections-of-a-sleeping-pod)). Floci sets it on Lambda environments. Another value is ignored, with a warning |
 | `smolvm-pods.floci.io/wake-on-terminate` | `"true"` or `"1"` | SIGTERM to a sleeping pod wakes it and is delivered, instead of reporting exit 143 at once and killing the process at the next wake |
 | `smolvm-pods.floci.io/idle-timeout` | A duration from `10s` to `24h` | The pod's idle timeout, in place of `--idle-timeout` |
 | `smolvm-pods.floci.io/cpu-threshold` | vCPUs above 0, such as `"0.5"` or `"2"`, or `"off"` or `"0"` | The pod's CPU threshold, in place of `--cpu-threshold`; `"off"` lets the pod sleep however busy it is |
 | `smolvm-pods.floci.io/cpu-window` | A duration from `5s` to `1h` | The pod's CPU window, in place of `--cpu-window` |
+| `smolvm.io/memory-mib` | A whole number of MiB from 512 to 16384 | The guest RAM of the sandbox VM, in place of the pod's memory limit plus 256 MiB (1024 MiB without a limit). Another value is ignored, with a warning |
 | `smolvm.io/gpu` | `"true"` or `"1"` | Gives the sandbox VM a virtio-gpu device (Venus and Vulkan). Other values leave it off |
 | `smolvm.io/gpu-vram-mib` | A whole number of MiB above 0 | The size of the GPU's shared memory region, with `smolvm.io/gpu` only. Another value takes the default, with a warning |
 
@@ -217,8 +219,11 @@ Every body field is optional, and an empty body is an empty object.
 - **incarnation**, when given, must be the pod's current incarnation, or the call fails with
   `stale_incarnation`, so that a caller cannot act on a newer pod of the same name by mistake.
 - **steps_ms** has the duration of each step that ran, in order, by name: `admit`, `slot`,
-  `resume`, `tso`, `ping`, `clock`, `deferred_kills`, `before_release` and `release` for a wake;
-  `slot`, `pausing`, `stop-pumps` and `pause` for a pause, then `stop-paused` when the VM process
+  `resume`, `early_release`, `tso`, `ping`, `clock`, `thaw`, `deferred_kills`, `before_release`
+  and `release` for a wake, `early_release` being the time from the start of the resume to the
+  release of the held traffic when that came before the agent answered
+  ([Wake](architecture.md#wake));
+  `slot`, `freeze`, `pausing`, `stop-pumps` and `pause` for a pause, then `stop-paused` when the VM process
   outlived a durable pause. A wake that cancelled a pause, and its `pausing` to `awake` event, have
   the pause's steps that ran, then `resume` if smolvm resumed the frozen VM in place, then the
   wake's steps from `tso`. **clock** is `{"skew_ns", "stepped"}`: the guest's realtime less the
