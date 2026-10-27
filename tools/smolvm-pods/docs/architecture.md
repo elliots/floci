@@ -302,7 +302,9 @@ the VM process outlives a durable pause:
 2. The guest agent freezes the pod's containers with the cgroup freezer and resets each TCP
    connection that leaves the VM (see [Connections of a sleeping
    pod](#connections-of-a-sleeping-pod)). A freeze that fails is logged and the pause goes on, the
-   pod then sleeping with its connections.
+   pod then sleeping with its connections. A pod with `smolvm-pods.floci.io/reset-on-pause: "false"`
+   is not frozen and has no `freeze` step: it sleeps with its connections, as AWS freezes a Lambda
+   environment whose runtime waits on the Runtime API.
 3. The `pausing` hook holds the pod's traffic (see [Waking on incoming
    connections](#waking-on-incoming-connections)). For an idle pause it then checks conntrack
    again, and a packet since the idle decision refuses the pause.
@@ -710,6 +712,14 @@ failure, and reconnect; their peers saw the RST at the pause, not silence until 
 client of the pod, such as a pool with an idle connection or a WebSocket, sees its connection
 reset, and its next connection wakes the pod. Lambda SnapStart and CRaC ask the app to close its
 connections in a hook before the snapshot; the node does it for every app, with no hook.
+
+A pod with the annotation `smolvm-pods.floci.io/reset-on-pause: "false"` has no `freeze` step: its
+containers are not frozen and its connections stay, so the pod wakes with them. This is how AWS
+freezes a Lambda environment between invocations: the runtime waits on
+`GET /runtime/invocation/next` through the freeze, and the next event is the answer to that
+request. A reset would fail that request at the wake, and the runtime exits on it. Floci gives
+every Lambda environment that runs on the node this annotation. Its other connections can then be
+closed by their peers while it sleeps, as on AWS.
 
 ### Admission
 

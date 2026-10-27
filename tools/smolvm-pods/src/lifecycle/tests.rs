@@ -1251,6 +1251,28 @@ async fn other_signals_wake_a_sleeping_pod() {
 }
 
 #[tokio::test]
+async fn a_pod_that_keeps_its_connections_is_not_frozen_for_a_pause() {
+    let h = Harness::new().await;
+    let mut keeps = identity("pod");
+    keeps.keep_connections = true;
+    h.create_with(keeps).await.unwrap();
+    h.clear();
+    h.hibernate("pod").await.unwrap();
+    assert!(
+        !h.vm.calls().iter().any(|c| c.starts_with("freeze")),
+        "{:?}",
+        h.vm.calls()
+    );
+    let asleep = h
+        .events("pod")
+        .into_iter()
+        .rfind(|e| e.state == Asleep)
+        .unwrap();
+    let steps: Vec<_> = asleep.steps.iter().map(|s| s.step.as_str()).collect();
+    assert_eq!(steps, ["slot", "pausing", "stop-pumps", "pause"]);
+}
+
+#[tokio::test]
 async fn a_vm_exit_outside_a_pause_is_a_crash() {
     let h = Harness::awake("pod").await;
     let process = h.info("pod").vm.unwrap();

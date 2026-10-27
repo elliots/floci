@@ -46,10 +46,10 @@ use crate::backend::{now_ns, Adopted, AgentStats, PodBackend, ProcessSpec};
 use crate::bundle;
 use crate::engine::sandbox_memory;
 use crate::lifecycle::{
-    cpu_threshold, cpu_window, hibernation_disabled, idle_timeout, wakes_on_terminate, Activity,
-    AwakeCause, Config, ExecRecord, ExecStatus, Hooks, KillOutcome, KillRequest, Lifecycle,
-    LifecycleError, PodIdentity, PodInfo, PodRef, PodState, Reason, StdioPaths, TaskKind,
-    TaskRecord, VmExit, VmProcess,
+    cpu_threshold, cpu_window, hibernation_disabled, idle_timeout, keeps_connections,
+    wakes_on_terminate, Activity, AwakeCause, Config, ExecRecord, ExecStatus, Hooks, KillOutcome,
+    KillRequest, Lifecycle, LifecycleError, PodIdentity, PodInfo, PodRef, PodState, Reason,
+    StdioPaths, TaskKind, TaskRecord, VmExit, VmProcess,
 };
 use crate::metrics::Text;
 use crate::probe::{self, CachedAnswer, ExecCommand, OutputCapture, ProbeExec};
@@ -2088,6 +2088,10 @@ fn pod_identity(
     for warning in &memory.warnings {
         warn!("pod sandbox {id}: {warning}");
     }
+    let keep_connections = keeps_connections(spec.as_ref()).unwrap_or_else(|e| {
+        warn!("pod sandbox {id} resets its connections at a pause: {e}");
+        false
+    });
     PodIdentity {
         sandbox_id: id.to_string(),
         namespace: annotation(ANN_POD_NAMESPACE),
@@ -2098,6 +2102,7 @@ fn pod_identity(
         memory_mib: Some(memory.mib),
         hibernate_disabled: hibernation_disabled(spec.as_ref(), standalone),
         wake_on_terminate: wakes_on_terminate(spec.as_ref()),
+        keep_connections,
         idle_timeout_ms: idle.map(|t| t.as_millis() as u64),
         cpu_threshold_milli: cpu_threshold,
         cpu_window_ms: cpu_window.map(|t| t.as_millis() as u64),

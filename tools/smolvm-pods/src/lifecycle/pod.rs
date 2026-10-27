@@ -1401,7 +1401,8 @@ impl Actor {
 /// peer keeps a connection to a sleeping pod, and comes before the hold of
 /// the `pausing` hook, which would keep the resets from its peers. A freeze
 /// that fails does not stop the pause: the pod then sleeps with its
-/// connections.
+/// connections. A pod whose `reset-on-pause` annotation is `"false"` is not
+/// frozen, and sleeps with its connections.
 async fn pause(
     shared: Arc<Shared>,
     info: PodInfo,
@@ -1425,18 +1426,27 @@ async fn pause(
         if reason == Reason::Idle {
             faults.hit(FaultPoint::IdleDecided);
         }
-        let started = Instant::now();
-        match vm.freeze(&info.identity.machine) {
-            Ok(reset) => debug!(
-                "pod sandbox {}: froze it and reset {reset} connections",
+        // A pod that keeps its connections (ANN_RESET_ON_PAUSE) sleeps with
+        // them, so it is not frozen first.
+        if info.identity.keep_connections {
+            debug!(
+                "pod sandbox {}: keeps its connections over the pause",
                 info.identity.sandbox_id
-            ),
-            Err(e) => warn!(
-                "pod sandbox {}: freeze it before the pause: {e}",
-                info.identity.sandbox_id
-            ),
+            );
+        } else {
+            let started = Instant::now();
+            match vm.freeze(&info.identity.machine) {
+                Ok(reset) => debug!(
+                    "pod sandbox {}: froze it and reset {reset} connections",
+                    info.identity.sandbox_id
+                ),
+                Err(e) => warn!(
+                    "pod sandbox {}: freeze it before the pause: {e}",
+                    info.identity.sandbox_id
+                ),
+            }
+            steps.push("freeze", started.elapsed());
         }
-        steps.push("freeze", started.elapsed());
         let started = Instant::now();
         if let Err(refusal) = hooks.pausing(&info, &reason) {
             return Ok(Err(PauseError::Refused(refusal)));

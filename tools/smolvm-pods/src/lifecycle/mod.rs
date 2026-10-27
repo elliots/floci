@@ -41,9 +41,9 @@ pub use fault::Faults;
 #[cfg(test)]
 pub use mock::{clock_at, RunningVms};
 pub use record::{
-    cpu_threshold, cpu_window, exec_key, hibernation_disabled, idle_timeout, parse_cpu_threshold,
-    parse_duration, wakes_on_terminate, ExecRecord, ExecStatus, GuestDelete, PodIdentity,
-    PodRecord, StdioPaths, TaskKind, TaskRecord, Timing,
+    cpu_threshold, cpu_window, exec_key, hibernation_disabled, idle_timeout, keeps_connections,
+    parse_cpu_threshold, parse_duration, wakes_on_terminate, ExecRecord, ExecStatus, GuestDelete,
+    PodIdentity, PodRecord, StdioPaths, TaskKind, TaskRecord, Timing,
 };
 pub use state::{Blocker, PausePhase, PodState, Reason};
 #[cfg(test)]
