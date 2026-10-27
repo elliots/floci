@@ -152,7 +152,21 @@ const ASLEEP_WITH_PUSHES: Duration = Duration::from_secs(20);
 #[test]
 #[ignore = "needs a Mac with smolvm and Docker: SMOLVM_PODS_E2E=1 cargo test -- --ignored"]
 fn wake() {
-    let cluster = Cluster::start_with_memory("wake", Some(NODE_MEMORY_MIB));
+    with_suite("wake", wake_checks);
+}
+
+#[test]
+#[ignore = "needs a Mac with smolvm and Docker: SMOLVM_PODS_E2E=1 cargo test -- --ignored"]
+fn outbound_resets() {
+    with_suite("outbound-resets", |suite| {
+        for _ in 0..5 {
+            outbound(suite);
+        }
+    });
+}
+
+fn with_suite(name: &str, check: impl FnOnce(&Suite<'_>)) {
+    let cluster = Cluster::start_with_memory(name, Some(NODE_MEMORY_MIB));
     let testapp = cluster.node_path("testapp");
     cluster
         .node
@@ -162,30 +176,34 @@ fn wake() {
     let start = api.cursor().unwrap_or(0);
     let pods = start_pods(&cluster);
     let suite = Suite::new(&cluster, api, testapp, pods, start);
+    check(&suite);
+}
+
+fn wake_checks(suite: &Suite) {
     run_checks(&[
-        ("the test app's endpoints", &|| endpoints(&suite)),
+        ("the test app's endpoints", &|| endpoints(suite)),
         ("probes leave pods asleep", &|| {
-            probes_leave_pods_asleep(&suite)
+            probes_leave_pods_asleep(suite)
         }),
-        ("exec probes under Rosetta", &|| exec_probes(&suite)),
-        ("NodePort to a probe port", &|| node_port(&suite)),
-        ("SIGKILL of the node service", &|| node_service_kill(&suite)),
-        ("20 automatic cycles through a Service", &|| cycles(&suite)),
-        ("first-request latency", &|| latency(&suite)),
-        ("10 concurrent requests", &|| concurrent_requests(&suite)),
-        ("client IP preserved", &|| client_ip(&suite)),
-        ("pod-to-pod calls wake the callee", &|| pod_to_pod(&suite)),
-        ("streams and WebSockets", &|| streams(&suite)),
-        ("keepalive and quiet connections", &|| keepalive(&suite)),
-        ("UDP and ICMP", &|| udp_and_icmp(&suite)),
-        ("wake during a pause", &|| wake_during_pause(&suite)),
-        ("the recheck", &|| recheck(&suite)),
-        ("CPU keeps a pod awake", &|| busy_cpu(&suite)),
-        ("outbound connections", &|| outbound(&suite)),
-        ("a failing app still fails", &|| failing_app(&suite)),
-        ("TCP API", &|| tcp_api(&suite)),
-        ("admission", &|| admission(&suite)),
-        ("small scale", &|| small_scale(&suite)),
+        ("exec probes under Rosetta", &|| exec_probes(suite)),
+        ("NodePort to a probe port", &|| node_port(suite)),
+        ("SIGKILL of the node service", &|| node_service_kill(suite)),
+        ("20 automatic cycles through a Service", &|| cycles(suite)),
+        ("first-request latency", &|| latency(suite)),
+        ("10 concurrent requests", &|| concurrent_requests(suite)),
+        ("client IP preserved", &|| client_ip(suite)),
+        ("pod-to-pod calls wake the callee", &|| pod_to_pod(suite)),
+        ("streams and WebSockets", &|| streams(suite)),
+        ("keepalive and quiet connections", &|| keepalive(suite)),
+        ("UDP and ICMP", &|| udp_and_icmp(suite)),
+        ("wake during a pause", &|| wake_during_pause(suite)),
+        ("the recheck", &|| recheck(suite)),
+        ("CPU keeps a pod awake", &|| busy_cpu(suite)),
+        ("outbound connections", &|| outbound(suite)),
+        ("a failing app still fails", &|| failing_app(suite)),
+        ("TCP API", &|| tcp_api(suite)),
+        ("admission", &|| admission(suite)),
+        ("small scale", &|| small_scale(suite)),
     ]);
 }
 
@@ -1790,11 +1808,18 @@ fn outbound(suite: &Suite) {
         .collect();
     expect(suite.check_woken_by(cursor, FOLLOWER, &suite.qualified(CLIENT)));
     let mut failed = Vec::new();
-    for ((name, server), woken) in streams.iter().zip(&woken) {
+    for ((name, server), mut woken) in streams.iter().zip(woken) {
+        // The status handler can run before the stream reader after thaw.
+        // Require its reset error within a bounded time, not in the first reply.
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while woken.value("ended") == Ok("false") && Instant::now() < deadline {
+            thread::sleep(Duration::from_millis(20));
+            woken = followed(name);
+        }
         match (woken.value("ended"), woken.value("error")) {
             (Ok("true"), Ok(error)) if !error.is_empty() => step(&format!(
                 "the stream {name} from {server} ended for the app after {} lines: {error}",
-                lines(woken)
+                lines(&woken)
             )),
             _ => failed.push(format!(
                 "the stream {name} from {server} should have ended with an error: {woken}, {:?}",
